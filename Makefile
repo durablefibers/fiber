@@ -1,5 +1,5 @@
 .PHONY: help infra infra-minio down api api-s3 agent web cli build check fmt fmt-check clippy \
-	dogfood dogfood-authz dogfood-pools dogfood-artifacts dogfood-s3 \
+	dogfood dogfood-authz dogfood-pools dogfood-artifacts dogfood-s3 dogfood-compose \
 	login validate ready
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
@@ -97,5 +97,8 @@ dogfood-s3:
 	@echo "Requires: make infra-minio && make api-s3 (in another terminal) + a built fiber-agent"
 	python3 scripts/dogfood_s3_presign.py
 
+dogfood-compose:
+	bash scripts/dogfood_compose.sh
+
 dogfood: dogfood-authz dogfood-pools dogfood-artifacts
-	@echo "Run dogfood-s3 separately with MinIO + api-s3"
+	@echo "Run dogfood-s3 / dogfood-compose separately as needed"

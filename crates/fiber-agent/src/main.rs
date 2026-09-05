@@ -471,7 +471,10 @@ async fn restore_artifacts(
     restore: &[ArtifactRestore],
     log: &mut impl FnMut(&str, String),
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .context("http client")?;
     for art in restore {
         if art.name.contains("..") {
             log(
@@ -485,21 +488,45 @@ async fn restore_artifacts(
             "system",
             format!("restoring artifact {} ({} bytes)", art.name, art.size),
         );
-        let resp = client
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .with_context(|| format!("download artifact {}", art.id))?;
+        let resp = match client.get(&url).bearer_auth(token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("RESTORE FAILED {}: network error: {e}", art.name);
+                log("system", msg.clone());
+                bail!("{msg}");
+            }
+        };
         if !resp.status().is_success() {
-            bail!("restore {} failed: HTTP {}", art.name, resp.status());
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            let msg = if snippet.is_empty() {
+                format!("RESTORE FAILED {}: HTTP {status}", art.name)
+            } else {
+                format!("RESTORE FAILED {}: HTTP {status} — {snippet}", art.name)
+            };
+            log("system", msg.clone());
+            bail!("{msg}");
         }
-        let bytes = resp.bytes().await.context("read artifact body")?;
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("RESTORE FAILED {}: read body: {e}", art.name);
+                log("system", msg.clone());
+                bail!("{msg}");
+            }
+        };
         let dest = work_dir.join(&art.name);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&dest, &bytes).await?;
+        tokio::fs::write(&dest, &bytes)
+            .await
+            .with_context(|| format!("write restored artifact {}", art.name))?;
+        log(
+            "system",
+            format!("restored artifact {} → {}", art.name, dest.display()),
+        );
     }
     Ok(())
 }

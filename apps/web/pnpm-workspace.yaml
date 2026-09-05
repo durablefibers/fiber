@@ -1,5 +1,8 @@
 packages: []
 
+# pnpm 11+ reads release-age policy from this file (not .npmrc).
+minimumReleaseAge: 0
+
 allowBuilds:
   esbuild: true
   lightningcss: true

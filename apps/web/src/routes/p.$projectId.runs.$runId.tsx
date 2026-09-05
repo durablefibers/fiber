@@ -54,6 +54,9 @@ function isActiveStatus(status?: string) {
 }
 
 function logLineClass(line: string): string {
+  if (line.includes("RESTORE FAILED") || /restore .+ failed/i.test(line)) {
+    return "text-rose-300 font-medium"
+  }
   if (line.startsWith("[stderr]")) return "text-rose-300/90"
   if (line.startsWith("[system]")) return "text-amber-200/80"
   return "text-emerald-100/90"
@@ -70,6 +73,7 @@ function RunPage() {
   const [selected, setSelected] = useState<string | null>(stepSearch ?? null)
   const [logs, setLogs] = useState<string[]>([])
   const [attempts, setAttempts] = useState<StepAttempt[]>([])
+  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [followLogs, setFollowLogs] = useState(true)
   const [copied, setCopied] = useState(false)
@@ -83,6 +87,7 @@ function RunPage() {
 
   const selectStep = (id: string | null) => {
     setSelected(id)
+    setSelectedAttemptId(null)
     setFollowLogs(true)
     void navigate({
       search: (prev) => ({ ...prev, step: id ?? undefined }),
@@ -139,6 +144,21 @@ function RunPage() {
   const showingStepOnly =
     !!selectedStep &&
     artifacts.some((a) => a.step_run_id === selectedStep.id)
+
+  const restoreFailures = useMemo(
+    () =>
+      logs.filter(
+        (l) =>
+          l.includes("RESTORE FAILED") ||
+          /\[system\].*restore .+ failed/i.test(l)
+      ),
+    [logs]
+  )
+
+  const selectedAttempt = useMemo(
+    () => attempts.find((a) => a.id === selectedAttemptId) ?? null,
+    [attempts, selectedAttemptId]
+  )
 
   const refreshArtifacts = async () => {
     try {
@@ -276,13 +296,27 @@ function RunPage() {
     const step = steps.find((s) => s.id === selected || s.step_id === selected)
     if (!step) {
       setAttempts([])
+      setSelectedAttemptId(null)
       return
     }
     void api.listLogs(step.id).then((lines) => {
       setLogs(lines.map((l) => `[${l.stream}] ${l.data}`))
       setFollowLogs(true)
     })
-    void api.listStepAttempts(step.id).then(setAttempts).catch(() => setAttempts([]))
+    void api
+      .listStepAttempts(step.id)
+      .then((rows) => {
+        setAttempts(rows)
+        setSelectedAttemptId((prev) =>
+          prev && rows.some((r) => r.id === prev)
+            ? prev
+            : (rows[rows.length - 1]?.id ?? null)
+        )
+      })
+      .catch(() => {
+        setAttempts([])
+        setSelectedAttemptId(null)
+      })
   }, [selected, steps.length])
 
   // Refresh attempts when step reaches a terminal status via WS.
@@ -547,51 +581,113 @@ function RunPage() {
               {selectedStep.error ? (
                 <p className="text-rose-400">{selectedStep.error}</p>
               ) : null}
+              {restoreFailures.length > 0 ? (
+                <div className="rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-200">
+                  <div className="font-medium">Artifact restore failed</div>
+                  <ul className="mt-1 space-y-0.5 font-mono text-[10px] text-rose-100/90">
+                    {restoreFailures.map((l, i) => (
+                      <li key={i} className="break-all">
+                        {l.replace(/^\[system\]\s*/, "")}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
               {attempts.length > 0 ? (
                 <div className="pt-1">
                   <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/80">
-                    Attempts
+                    Attempts · click for details
                   </div>
-                  <ul className="max-h-28 space-y-1 overflow-y-auto">
+                  <ul className="max-h-32 space-y-1 overflow-y-auto">
                     {attempts.map((a) => {
                       const dur = formatDuration(a.started_at, a.finished_at)
+                      const active = selectedAttemptId === a.id
                       return (
-                        <li
-                          key={a.id}
-                          className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded bg-muted/30 px-1.5 py-1 font-mono text-[10px]"
-                        >
-                          <span className="text-foreground">#{a.attempt}</span>
-                          <span
-                            className="capitalize"
-                            style={{ color: statusColor(a.status) }}
+                        <li key={a.id}>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedAttemptId(active ? null : a.id)
+                            }
+                            className={`flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded px-1.5 py-1 text-left font-mono text-[10px] ${
+                              active
+                                ? "bg-sky-500/20 ring-1 ring-sky-500/40"
+                                : "bg-muted/30 hover:bg-muted/50"
+                            }`}
                           >
-                            {a.status}
-                          </span>
-                          {a.exit_code != null ? (
-                            <span>exit {a.exit_code}</span>
-                          ) : null}
-                          {dur ? (
-                            <span className="tabular-nums text-muted-foreground">
-                              {dur}
-                            </span>
-                          ) : null}
-                          {a.agent_id ? (
+                            <span className="text-foreground">#{a.attempt}</span>
                             <span
-                              className="text-muted-foreground"
-                              title={a.agent_id}
+                              className="capitalize"
+                              style={{ color: statusColor(a.status) }}
                             >
-                              agent {a.agent_id.slice(0, 8)}
+                              {a.status}
                             </span>
-                          ) : null}
-                          {a.error ? (
-                            <span className="w-full truncate text-rose-400">
-                              {a.error}
-                            </span>
-                          ) : null}
+                            {a.exit_code != null ? (
+                              <span>exit {a.exit_code}</span>
+                            ) : null}
+                            {dur ? (
+                              <span className="tabular-nums text-muted-foreground">
+                                {dur}
+                              </span>
+                            ) : null}
+                            {a.agent_id ? (
+                              <span
+                                className="text-muted-foreground"
+                                title={a.agent_id}
+                              >
+                                agent {a.agent_id.slice(0, 8)}
+                              </span>
+                            ) : null}
+                          </button>
                         </li>
                       )
                     })}
                   </ul>
+                  {selectedAttempt ? (
+                    <div className="mt-1.5 space-y-1 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-[10px]">
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-muted-foreground">
+                        <span>
+                          started{" "}
+                          <span className="text-foreground">
+                            {new Date(
+                              selectedAttempt.started_at
+                            ).toLocaleString()}
+                          </span>
+                        </span>
+                        {selectedAttempt.finished_at ? (
+                          <span>
+                            finished{" "}
+                            <span className="text-foreground">
+                              {new Date(
+                                selectedAttempt.finished_at
+                              ).toLocaleString()}
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="text-amber-200/90">in flight</span>
+                        )}
+                      </div>
+                      {selectedAttempt.agent_id ? (
+                        <div className="font-mono break-all text-muted-foreground">
+                          agent{" "}
+                          <span className="text-foreground">
+                            {selectedAttempt.agent_id}
+                          </span>
+                        </div>
+                      ) : null}
+                      {selectedAttempt.error ? (
+                        <p className="whitespace-pre-wrap text-rose-400">
+                          {selectedAttempt.error}
+                        </p>
+                      ) : null}
+                      {!selectedAttempt.error &&
+                      selectedAttempt.status === "failed" ? (
+                        <p className="text-muted-foreground">
+                          No error string stored — check logs below.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>

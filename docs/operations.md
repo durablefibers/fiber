@@ -32,15 +32,47 @@ python3 scripts/dogfood_authz_agents.py   # roles + agent CRUD/rotate
 python3 scripts/dogfood_agent_pools.py    # project-scoped vs global agents
 python3 scripts/dogfood_artifacts.py      # artifacts + path filters
 python3 scripts/dogfood_s3_presign.py     # MinIO presign upload/restore/download
-
-python3 scripts/dogfood_artifacts.py      # needs a connected agent
+bash scripts/dogfood_compose.sh           # full compose up --build smoke
 ```
 
 Expect `DOGFOOD_OK` on success.
 
 ## Backups
 
-Backup Postgres (runs, definitions, secrets ciphertext, memberships). Separately backup `FIBER_ARTIFACTS_DIR` or the S3 bucket. Keep `FIBER_SECRETS_KEY` safe — without it encrypted secrets cannot be decrypted.
+### Postgres
+
+Compose volume: `fiber_pg` (service `fiber-postgres`).
+
+```bash
+# Logical dump (preferred)
+docker compose -f deploy/docker-compose.yml exec -T fiber-postgres \
+  pg_dump -U fiber fiber > fiber-$(date +%Y%m%d).sql
+
+# Restore into a running empty DB
+docker compose -f deploy/docker-compose.yml exec -T fiber-postgres \
+  psql -U fiber fiber < fiber-YYYYMMDD.sql
+
+# Volume snapshot (stop writers first)
+docker compose -f deploy/docker-compose.yml stop fiber-api
+docker run --rm -v fiber_fiber_pg:/data -v "$PWD":/backup alpine \
+  tar czf /backup/fiber-pg.tgz -C /data .
+```
+
+Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using `name: fiber` in `deploy/docker-compose.yml`). Confirm with `docker volume ls | grep fiber`.
+
+### Artifacts & secrets key
+
+- Backup `FIBER_ARTIFACTS_DIR` **or** the S3/MinIO bucket (`fiber-artifacts`).
+- Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project secrets cannot be decrypted. Compose ships a **dev-only** sample key; replace before any real use.
+
+### What to include
+
+| Data | Where |
+|---|---|
+| Runs, pipelines, memberships, sessions | Postgres |
+| Secret ciphertext | Postgres (`project_secrets`) — needs `FIBER_SECRETS_KEY` |
+| Artifact blobs | Local dir or S3 |
+| Agent tokens | Not recoverable from DB (hashes only) — re-issue after restore |
 
 ## Upgrades
 
