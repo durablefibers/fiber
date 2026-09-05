@@ -1,0 +1,28 @@
+name: paths-filtered
+# Fires on push/PR to main only when Rust/Cargo files change; ignores docs.
+# For PR path filters, set project secret GITHUB_TOKEN (or FIBER_GITHUB_TOKEN env)
+# so Fiber can list changed files via the GitHub API.
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    paths_ignore:
+      - "**/*.md"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    paths_ignore:
+      - "**/*.md"
+steps:
+  check:
+    run: echo "path filter matched"
+    labels: [os=linux]

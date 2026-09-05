@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fiber-proto",
+    "crates/fiber-core",
+    "crates/fiber-scheduler",
+    "crates/fiber-api",
+    "crates/fiber-agent",
+    "crates/fiber-durable",
+    "crates/fiber-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Durable Fibers"]
+
+[workspace.dependencies]
+fiber-proto = { path = "crates/fiber-proto" }
+fiber-core = { path = "crates/fiber-core" }
+fiber-scheduler = { path = "crates/fiber-scheduler" }
+fiber-durable = { path = "crates/fiber-durable" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+petgraph = "0.7"
+redis = { version = "0.29", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.9"
+getrandom = "0.2"
+globset = "0.4"
+libc = "0.2"
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = "0.5"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+cron = "0.15"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "rustls"] }
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace", "metrics"] }
+tracing-opentelemetry = "0.33"

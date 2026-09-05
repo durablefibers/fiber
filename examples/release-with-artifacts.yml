@@ -1,0 +1,37 @@
+name: release-with-artifacts
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+steps:
+  checkout:
+    run: test -f README
+    labels: [os=linux]
+    retries: 1
+  build:
+    needs: [checkout]
+    run: |
+      mkdir -p out
+      echo v1.0.0 > out/VERSION
+      tar -cf out/release.tar README out/VERSION
+    labels: [os=linux]
+    artifacts: [out/VERSION, out/release.tar]
+  sign:
+    needs: [build]
+    run: echo signed > out/release.tar.sig
+    labels: [os=linux]
+    artifacts: [out/release.tar.sig]
+  staging:
+    name: deploy staging
+    needs: [sign]
+    run: echo staging $(cat out/VERSION)
+    labels: [os=linux]
+    retries: 1
+  canary:
+    needs: [staging]
+    run: sleep 0.4 && echo healthy
+    labels: [os=linux]
+  prod:
+    name: deploy prod
+    needs: [canary]
+    run: echo prod $(cat out/VERSION)
+    labels: [os=linux]

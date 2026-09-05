@@ -1,0 +1,16 @@
+name: nightly-cron
+# Example: 6-field cron (with seconds). Fires at 02:00 UTC daily.
+# Cron takes precedence over interval_minutes when both are set.
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+on:
+  cron: "0 0 2 * * *"
+steps:
+  checkout:
+    run: ls -la
+    labels: [os=linux]
+  build:
+    needs: [checkout]
+    run: echo "nightly build"
+    labels: [os=linux]

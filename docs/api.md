@@ -1,0 +1,89 @@
+# HTTP & WebSocket API
+
+Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Authorization: Bearer <session>` unless noted.
+
+## Health
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| GET | `/health` | no | Liveness |
+| GET | `/ready` | no | Postgres + Redis |
+
+## Auth
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/api/auth/login` | `{ username, password }` → `{ token, user }` |
+| POST | `/api/auth/logout` | Invalidate session |
+| GET | `/api/auth/me` | Current user |
+
+## Projects & members
+
+| Method | Path | Min role |
+|---|---|---|
+| GET/POST | `/api/projects` | session; create → owner on new project |
+| GET | `/api/projects/{id}` | reader (includes `role`) |
+| GET/POST | `/api/projects/{id}/members` | reader / admin |
+| PUT/DELETE | `/api/projects/{id}/members/{user_id}` | admin |
+| POST | `/api/users` | owner on some project |
+
+## Pipelines & runs
+
+| Method | Path | Min role |
+|---|---|---|
+| GET/POST | `/api/projects/{id}/pipelines` | reader / writer |
+| GET/PUT | `/api/pipelines/{id}` | reader / writer |
+| POST | `/api/pipelines/parse-yaml` | session |
+| POST | `/api/pipelines/{id}/runs` | writer |
+| GET | `/api/projects/{id}/runs` | reader |
+| GET | `/api/runs/{id}` | reader |
+| POST | `/api/runs/{id}/cancel` | writer |
+| GET | `/api/runs/{id}/steps` | reader |
+| GET | `/api/runs/{id}/artifacts` | reader |
+| GET | `/api/artifacts/{id}/download` | reader |
+| GET | `/api/steps/{id}/logs` | reader |
+| GET | `/api/steps/{id}/attempts` | reader |
+
+## Secrets & webhooks
+
+| Method | Path | Min role |
+|---|---|---|
+| GET/POST | `/api/projects/{id}/secrets` | admin |
+| DELETE | `/api/projects/{id}/secrets/{key}` | admin |
+| PUT | `/api/projects/{id}/webhooks/github` | admin — set HMAC secret |
+| POST | `/api/projects/{id}/webhooks/github` | GitHub (signature if configured) |
+
+## Agents (global)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET/POST | `/api/agents` | List / create (`project_id` optional; token once) |
+| GET | `/api/agents?project_id=` | Project agents + globals |
+| PUT/DELETE | `/api/agents/{id}` | Update / delete (project agents need admin) |
+| POST | `/api/agents/{id}/rotate-token` | New token once; force disconnect |
+
+## Durable fibers
+
+| Method | Path | Min role |
+|---|---|---|
+| GET/POST | `/api/projects/{id}/fibers` | reader / writer |
+| GET | `/api/fibers/{id}` | reader |
+| POST | `/api/fibers/{id}/cancel` | writer |
+
+## Agent HTTP (agent token)
+
+| Method | Path | Notes |
+|---|---|---|
+| PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path` |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }` |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT |
+| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect) |
+
+## WebSockets
+
+| Path | Auth | Notes |
+|---|---|---|
+| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete |
+| `/ws/runs/{id}?token=` | session token | Live run/step/log events |
+
+Message shapes: `crates/fiber-proto`.

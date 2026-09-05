@@ -1,0 +1,26 @@
+name: matrix-and-if
+# Matrix expands at compile time; if: filters cells / optional steps.
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+steps:
+  checkout:
+    run: test -f README
+    labels: [os=linux]
+  test:
+    needs: [checkout]
+    run: echo "testing on $MATRIX_OS" && test -n "$MATRIX_OS"
+    labels: [os=linux]
+    matrix:
+      os: [linux, macos]
+    # Only run the linux cell (macos cell is skipped).
+    if: "matrix.os == 'linux'"
+  report:
+    needs: [test]
+    run: echo "linux cell finished"
+    labels: [os=linux]
+  cleanup:
+    needs: [test]
+    run: echo "always cleanup"
+    labels: [os=linux]
+    if: "always()"

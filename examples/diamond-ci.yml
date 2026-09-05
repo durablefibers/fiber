@@ -1,0 +1,36 @@
+name: diamond-ci
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+on:
+  push:
+    branches: [main, develop]
+steps:
+  checkout:
+    run: ls -la && test -f README
+    labels: [os=linux]
+    retries: 1
+  lint:
+    needs: [checkout]
+    run: echo linting && sleep 0.3
+    labels: [os=linux]
+  unit:
+    name: unit tests
+    needs: [checkout]
+    run: echo unit && sleep 0.4
+    labels: [os=linux]
+    retries: 1
+  types:
+    name: typecheck
+    needs: [checkout]
+    run: echo typecheck && sleep 0.25
+    labels: [os=linux]
+  package:
+    needs: [lint, unit, types]
+    run: mkdir -p dist && echo bundle > dist/app.txt
+    labels: [os=linux]
+    artifacts: [dist/app.txt]
+  smoke:
+    needs: [package]
+    run: test -f dist/app.txt && echo smoke-ok
+    labels: [os=linux]

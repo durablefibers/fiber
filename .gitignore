@@ -1,0 +1,22 @@
+# Editor directories
+target/
+node_modules/
+dist/
+data/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Rust
+Cargo.lock.bak
+
+# Web
+apps/web/dist/
+apps/web/.vinxi/
+apps/web/.output/
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,28 @@
+name: fan-out-tests
+on:
+  push:
+    branches: [main]
+steps:
+  checkout:
+    run: echo ready
+    labels: [os=linux]
+  test-linux:
+    name: test linux
+    needs: [checkout]
+    run: uname -s && sleep 0.3
+    labels: [os=linux]
+    retries: 1
+  test-docker:
+    name: test docker labels
+    needs: [checkout]
+    run: echo docker-lane && sleep 0.35
+    labels: [os=linux, docker=true]
+  integration:
+    needs: [checkout]
+    run: echo integration && sleep 0.5
+    labels: [os=linux]
+  report:
+    needs: [test-linux, test-docker, integration]
+    run: echo green > report.txt
+    labels: [os=linux]
+    artifacts: [report.txt]

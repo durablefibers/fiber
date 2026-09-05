@@ -1,0 +1,25 @@
+name: build-and-test
+# Simple linear pipeline. See also:
+#   examples/diamond-ci.yml
+#   examples/fan-out-tests.yml
+#   examples/release-with-artifacts.yml
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+on:
+  push:
+    branches: [main]
+steps:
+  checkout:
+    run: ls -la && test -f README
+    labels: [os=linux]
+    retries: 1
+  build:
+    needs: [checkout]
+    run: echo "build in $(pwd)" && echo "artifact payload" > fiber-out.txt
+    labels: [os=linux]
+    artifacts: [fiber-out.txt]
+  test:
+    needs: [build]
+    run: echo "test"
+    labels: [os=linux]

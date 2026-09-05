@@ -1,0 +1,21 @@
+---
+description: Fiber product naming — always use fiber-* prefix
+alwaysApply: true
+---
+
+# Naming convention
+
+Use **`fiber`** as the product prefix everywhere.
+
+Never use `df`, `durablefibers`, or `durable_fibers` for crates, binaries, env vars, Docker services, or config filenames.
+
+| Kind | Pattern | Examples |
+|------|---------|----------|
+| Rust crates | `fiber-*` | `fiber-api`, `fiber-core`, `fiber-scheduler`, `fiber-agent`, `fiber-proto` |
+| Binaries | `fiber`, `fiber-agent` | CLI / agent entrypoints |
+| Env vars | `FIBER_*` | `FIBER_DATABASE_URL`, `FIBER_REDIS_URL`, `FIBER_AGENT_TOKEN` |
+| Docker services | `fiber-*` | `fiber-api`, `fiber-web`, `fiber-postgres` |
+| Config file | `fiber.yml` | pipeline config-as-code |
+| TS packages | `@fiber/*` if split | web app stays `apps/web` |
+
+The repo folder may be named `durablefibers`; code and packages must use `fiber`.
