@@ -82,7 +82,7 @@
       "Bash(jq:*)"
     ],
     "ask": [
-      "Bash(docker compose:*down*)",
+      "Bash(docker compose*down*)",
       "Bash(cargo publish:*)"
     ]
   }
