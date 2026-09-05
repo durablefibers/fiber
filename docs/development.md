@@ -63,6 +63,14 @@ Product prefix is **`fiber`** / `FIBER_*` — see `.cursor/rules/naming.mdc`. Ne
 | `docs/` | User + ops docs |
 | `examples/` | Sample `fiber.yml` |
 
+## Quality gate
+
+```bash
+make check   # cargo fmt --check + clippy -D warnings
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs fmt, clippy, build, and `apps/web` `tsc --noEmit` on push/PR to `main`.
+
 ## Agent tips
 
 Prefer `make` / `scripts/dev-env.sh` over ad-hoc env in shell one-liners. Do **not** `pkill -f fiber-agent` — that can match parent shells whose argv mentions the binary; kill by PID of `./target/debug/fiber-agent` only (see dogfood scripts).

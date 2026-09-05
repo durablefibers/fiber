@@ -1,15 +1,16 @@
-use crate::dag::{compile_definition, parse_pipeline_yaml, CompiledDag};
+use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml};
 use crate::models::*;
 use crate::schedule::{has_schedule, initial_due_from_definition, next_due_from_triggers};
 use crate::tokens::{generate_token, hash_token, slugify};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use fiber_proto::{PipelineDefinition, RunStatus, StepStatus};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const PIPELINE_COLS: &str = "id, project_id, name, definition, created_at, updated_at, last_scheduled_at, next_due_at";
+const PIPELINE_COLS: &str =
+    "id, project_id, name, definition, created_at, updated_at, last_scheduled_at, next_due_at";
 const AGENT_COLS: &str =
     "id, project_id, name, labels, concurrency, token_hash, last_seen_at, online, created_at";
 
@@ -149,12 +150,12 @@ impl Store {
     }
 
     pub async fn find_user_by_username(&self, username: &str) -> Result<Option<PublicUser>> {
-        Ok(sqlx::query_as::<_, PublicUser>(
-            "SELECT id, username FROM users WHERE username = $1",
+        Ok(
+            sqlx::query_as::<_, PublicUser>("SELECT id, username FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?)
     }
 
     pub async fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
@@ -172,17 +173,21 @@ impl Store {
     }
 
     pub async fn project_id_for_pipeline(&self, pipeline_id: Uuid) -> Result<Option<Uuid>> {
-        Ok(sqlx::query_scalar("SELECT project_id FROM pipelines WHERE id = $1")
-            .bind(pipeline_id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_scalar("SELECT project_id FROM pipelines WHERE id = $1")
+                .bind(pipeline_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn project_id_for_run(&self, run_id: Uuid) -> Result<Option<Uuid>> {
-        Ok(sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1")
-            .bind(run_id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn project_id_for_step(&self, step_run_id: Uuid) -> Result<Option<Uuid>> {
@@ -204,10 +209,12 @@ impl Store {
     }
 
     pub async fn project_id_for_fiber(&self, fiber_id: Uuid) -> Result<Option<Uuid>> {
-        Ok(sqlx::query_scalar("SELECT project_id FROM fibers WHERE id = $1")
-            .bind(fiber_id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_scalar("SELECT project_id FROM fibers WHERE id = $1")
+                .bind(fiber_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn get_project(&self, id: Uuid) -> Result<Option<Project>> {
@@ -382,11 +389,13 @@ impl Store {
                 Some(last) => next_due_from_triggers(on, last).unwrap_or_else(Utc::now),
                 None => initial_due_from_definition(&def).unwrap_or_else(Utc::now),
             };
-            sqlx::query("UPDATE pipelines SET next_due_at = $2 WHERE id = $1 AND next_due_at IS NULL")
-                .bind(p.id)
-                .bind(next)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE pipelines SET next_due_at = $2 WHERE id = $1 AND next_due_at IS NULL",
+            )
+            .bind(p.id)
+            .bind(next)
+            .execute(&self.pool)
+            .await?;
             n += 1;
         }
         Ok(n)
@@ -780,7 +789,12 @@ impl Store {
             let needs = s.needs_vec();
             if needs.iter().any(|n| failed.contains(n)) {
                 let updated = self
-                    .complete_step(s.id, StepStatus::Skipped, None, Some("dependency failed".into()))
+                    .complete_step(
+                        s.id,
+                        StepStatus::Skipped,
+                        None,
+                        Some("dependency failed".into()),
+                    )
                     .await?;
                 changed.push(updated);
             }
@@ -1093,11 +1107,10 @@ impl Store {
 
     pub async fn create_agent(&self, req: CreateAgentRequest) -> Result<CreateAgentResponse> {
         if let Some(pid) = req.project_id {
-            let exists: Option<(Uuid,)> =
-                sqlx::query_as("SELECT id FROM projects WHERE id = $1")
-                    .bind(pid)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM projects WHERE id = $1")
+                .bind(pid)
+                .fetch_optional(&self.pool)
+                .await?;
             if exists.is_none() {
                 return Err(anyhow!("project not found"));
             }
@@ -1143,12 +1156,12 @@ impl Store {
     }
 
     pub async fn get_agent(&self, id: Uuid) -> Result<Option<Agent>> {
-        Ok(sqlx::query_as::<_, Agent>(&format!(
-            "SELECT {AGENT_COLS} FROM agents WHERE id = $1"
-        ))
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?)
+        Ok(
+            sqlx::query_as::<_, Agent>(&format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn update_agent(&self, id: Uuid, req: UpdateAgentRequest) -> Result<Agent> {
@@ -1245,13 +1258,11 @@ impl Store {
     }
 
     pub async fn set_agent_online(&self, id: Uuid, online: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE agents SET online = $2, last_seen_at = NOW() WHERE id = $1",
-        )
-        .bind(id)
-        .bind(online)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE agents SET online = $2, last_seen_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(online)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1294,25 +1305,23 @@ impl Store {
         let pipelines = self.list_pipelines(project_id).await?;
         let mut matched = Vec::new();
         for p in pipelines {
-            if let Ok(def) = value_to_definition(&p.definition) {
-                if let Some(on) = &def.on {
-                    if let Some(push) = &on.push {
-                        let branch_ok = push.branches.is_empty()
-                            || push.branches.iter().any(|b| b == branch);
-                        if !branch_ok {
-                            continue;
-                        }
-                        if !crate::path_filter::paths_allow(
-                            changed_files,
-                            &push.paths,
-                            &push.paths_ignore,
-                        ) {
-                            continue;
-                        }
-                        matched.push(p);
-                    }
-                }
+            let Ok(def) = value_to_definition(&p.definition) else {
+                continue;
+            };
+            let Some(on) = &def.on else {
+                continue;
+            };
+            let Some(push) = &on.push else {
+                continue;
+            };
+            let branch_ok = push.branches.is_empty() || push.branches.iter().any(|b| b == branch);
+            if !branch_ok {
+                continue;
             }
+            if !crate::path_filter::paths_allow(changed_files, &push.paths, &push.paths_ignore) {
+                continue;
+            }
+            matched.push(p);
         }
         Ok(matched)
     }
@@ -1327,37 +1336,35 @@ impl Store {
         let pipelines = self.list_pipelines(project_id).await?;
         let mut matched = Vec::new();
         for p in pipelines {
-            if let Ok(def) = value_to_definition(&p.definition) {
-                if let Some(on) = &def.on {
-                    if let Some(pr) = &on.pull_request {
-                        let branch_ok = pr.branches.is_empty()
-                            || pr.branches.iter().any(|b| b == base_branch);
-                        if !branch_ok {
-                            continue;
-                        }
-                        let default_types = ["opened", "synchronize", "reopened"];
-                        let types: Vec<&str> = if pr.types.is_empty() {
-                            default_types.to_vec()
-                        } else {
-                            pr.types.iter().map(|s| s.as_str()).collect()
-                        };
-                        if !types.iter().any(|t| *t == action) {
-                            continue;
-                        }
-                        // Without a file list, path-filtered PR pipelines cannot match.
-                        if !pr.paths.is_empty() || !pr.paths_ignore.is_empty() {
-                            if !crate::path_filter::paths_allow(
-                                changed_files,
-                                &pr.paths,
-                                &pr.paths_ignore,
-                            ) {
-                                continue;
-                            }
-                        }
-                        matched.push(p);
-                    }
-                }
+            let Ok(def) = value_to_definition(&p.definition) else {
+                continue;
+            };
+            let Some(on) = &def.on else {
+                continue;
+            };
+            let Some(pr) = &on.pull_request else {
+                continue;
+            };
+            let branch_ok = pr.branches.is_empty() || pr.branches.iter().any(|b| b == base_branch);
+            if !branch_ok {
+                continue;
             }
+            let default_types = ["opened", "synchronize", "reopened"];
+            let types: Vec<&str> = if pr.types.is_empty() {
+                default_types.to_vec()
+            } else {
+                pr.types.iter().map(|s| s.as_str()).collect()
+            };
+            if !types.contains(&action) {
+                continue;
+            }
+            // Without a file list, path-filtered PR pipelines cannot match.
+            if (!pr.paths.is_empty() || !pr.paths_ignore.is_empty())
+                && !crate::path_filter::paths_allow(changed_files, &pr.paths, &pr.paths_ignore)
+            {
+                continue;
+            }
+            matched.push(p);
         }
         Ok(matched)
     }
@@ -1369,13 +1376,11 @@ impl Store {
         secret: &str,
     ) -> Result<()> {
         let id = Uuid::new_v4();
-        sqlx::query(
-            "DELETE FROM webhook_secrets WHERE project_id = $1 AND provider = $2",
-        )
-        .bind(project_id)
-        .bind(provider)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM webhook_secrets WHERE project_id = $1 AND provider = $2")
+            .bind(project_id)
+            .bind(provider)
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "INSERT INTO webhook_secrets (id, project_id, provider, secret) VALUES ($1, $2, $3, $4)",
         )
@@ -1541,10 +1546,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn list_secret_values(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn list_secret_values(&self, project_id: Uuid) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM project_secrets WHERE project_id = $1",
         )
@@ -1560,18 +1562,13 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn get_secret_plain(
-        &self,
-        project_id: Uuid,
-        key: &str,
-    ) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM project_secrets WHERE project_id = $1 AND key = $2",
-        )
-        .bind(project_id)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn get_secret_plain(&self, project_id: Uuid, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM project_secrets WHERE project_id = $1 AND key = $2")
+                .bind(project_id)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((value,)) => Ok(Some(crate::secrets::decrypt_secret(&value)?)),
             None => Ok(None),
@@ -1594,10 +1591,7 @@ fn snapshot_step_if_env(steps: &Value, step_id: &str) -> (Option<String>, Vec<(S
         if s.get("id").and_then(|v| v.as_str()) != Some(step_id) {
             continue;
         }
-        let if_expr = s
-            .get("if")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let if_expr = s.get("if").and_then(|v| v.as_str()).map(|s| s.to_string());
         let mut env = Vec::new();
         if let Some(pairs) = s.get("env").and_then(|v| v.as_array()) {
             for p in pairs {

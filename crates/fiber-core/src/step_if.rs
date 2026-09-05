@@ -17,7 +17,10 @@ pub struct IfContext {
 /// - `success()` — run when needs succeeded (default)
 /// - `matrix.<key> == 'value'` / `env.<KEY> == 'value'` — equality against matrix/env
 pub fn eval_if(expr: Option<&str>, ctx: &IfContext) -> bool {
-    let expr = expr.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("success()");
+    let expr = expr
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("success()");
     match expr {
         "always()" => true,
         "never()" => false,
@@ -46,10 +49,10 @@ fn split_eq(expr: &str) -> Option<(&str, &str)> {
 
 fn unquote(s: &str) -> Option<String> {
     let s = s.trim();
-    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-        if s.len() >= 2 {
-            return Some(s[1..s.len() - 1].to_string());
-        }
+    if ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+        && s.len() >= 2
+    {
+        return Some(s[1..s.len() - 1].to_string());
     }
     Some(s.to_string())
 }
@@ -74,21 +77,48 @@ mod tests {
 
     #[test]
     fn defaults_to_success() {
-        assert!(eval_if(None, &IfContext { needs_succeeded: true, env: vec![] }));
-        assert!(!eval_if(None, &IfContext { needs_succeeded: false, env: vec![] }));
+        assert!(eval_if(
+            None,
+            &IfContext {
+                needs_succeeded: true,
+                env: vec![]
+            }
+        ));
+        assert!(!eval_if(
+            None,
+            &IfContext {
+                needs_succeeded: false,
+                env: vec![]
+            }
+        ));
     }
 
     #[test]
     fn never_always() {
-        assert!(!eval_if(Some("never()"), &IfContext { needs_succeeded: true, env: vec![] }));
-        assert!(eval_if(Some("always()"), &IfContext { needs_succeeded: false, env: vec![] }));
+        assert!(!eval_if(
+            Some("never()"),
+            &IfContext {
+                needs_succeeded: true,
+                env: vec![]
+            }
+        ));
+        assert!(eval_if(
+            Some("always()"),
+            &IfContext {
+                needs_succeeded: false,
+                env: vec![]
+            }
+        ));
     }
 
     #[test]
     fn matrix_eq() {
         let ctx = IfContext {
             needs_succeeded: true,
-            env: vec![("os".into(), "linux".into()), ("MATRIX_OS".into(), "linux".into())],
+            env: vec![
+                ("os".into(), "linux".into()),
+                ("MATRIX_OS".into(), "linux".into()),
+            ],
         };
         assert!(eval_if(Some("matrix.os == 'linux'"), &ctx));
         assert!(!eval_if(Some("matrix.os == 'windows'"), &ctx));

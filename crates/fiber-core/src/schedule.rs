@@ -33,9 +33,7 @@ pub fn initial_due_from_definition(def: &PipelineDefinition) -> Option<DateTime<
         // Next occurrence after now (not immediate spam).
         return next_from_cron(expr, Utc::now());
     }
-    on.interval_minutes
-        .filter(|m| *m > 0)
-        .map(|_| Utc::now())
+    on.interval_minutes.filter(|m| *m > 0).map(|_| Utc::now())
 }
 
 pub fn has_schedule(on: &PipelineTriggers) -> bool {

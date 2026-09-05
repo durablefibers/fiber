@@ -123,7 +123,11 @@ async fn offer_for_step_with_pipeline(state: &AppState, step: StepRun) -> Server
             }
         }
         // Prefer compiled snapshot (matrix-expanded ids + artifacts + env).
-        if let Some(steps) = run.definition_snapshot.get("steps").and_then(|v| v.as_array()) {
+        if let Some(steps) = run
+            .definition_snapshot
+            .get("steps")
+            .and_then(|v| v.as_array())
+        {
             for s in steps {
                 if s.get("id").and_then(|v| v.as_str()) != Some(step.step_id.as_str()) {
                     continue;
@@ -196,7 +200,10 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
         return;
     }
 
-    state.scheduler.register_connection(agent_id, tx.clone()).await;
+    state
+        .scheduler
+        .register_connection(agent_id, tx.clone())
+        .await;
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

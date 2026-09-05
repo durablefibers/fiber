@@ -81,9 +81,8 @@ pub async fn list_pull_request_files(
     let mut files = Vec::new();
     let mut page = 1u32;
     loop {
-        let url = format!(
-            "{base}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}"
-        );
+        let url =
+            format!("{base}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}");
         let resp = client
             .get(&url)
             .bearer_auth(token)

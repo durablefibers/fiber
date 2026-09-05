@@ -3,10 +3,11 @@ use crate::state::AppState;
 use crate::ws::{agent_ws, run_events_ws};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use fiber_core::{
     AddMemberRequest, CreateAgentRequest, CreatePipelineRequest, CreateProjectRequest,
     CreateUserRequest, LoginRequest, ProjectRole, StartRunRequest, UpdateAgentRequest,
@@ -14,9 +15,8 @@ use fiber_core::{
 };
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -47,10 +47,7 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}/secrets",
             get(list_secrets).post(upsert_secret),
         )
-        .route(
-            "/api/projects/{id}/secrets/{key}",
-            delete(delete_secret),
-        )
+        .route("/api/projects/{id}/secrets/{key}", delete(delete_secret))
         .route("/api/pipelines/parse-yaml", post(parse_yaml))
         .route(
             "/api/pipelines/{id}",
@@ -90,10 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fibers/{id}", get(get_fiber))
         .route("/api/fibers/{id}/cancel", post(cancel_fiber))
         .route("/api/agents", get(list_agents).post(create_agent))
-        .route(
-            "/api/agents/{id}",
-            put(update_agent).delete(delete_agent),
-        )
+        .route("/api/agents/{id}", put(update_agent).delete(delete_agent))
         .route("/api/agents/{id}/rotate-token", post(rotate_agent_token))
         .route(
             "/api/projects/{id}/webhooks/github",
@@ -226,8 +220,8 @@ async fn add_member(
     Json(req): Json<AddMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
-    let role = ProjectRole::parse(&req.role)
-        .ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
+    let role =
+        ProjectRole::parse(&req.role).ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
     if role == ProjectRole::Owner {
         crate::access::require_project(&state, &user, id, ProjectRole::Owner).await?;
     }
@@ -258,7 +252,9 @@ async fn add_member(
         .add_project_member(id, target.id, role)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(json!({ "ok": true, "user_id": target.id, "role": role.as_str() })))
+    Ok(Json(
+        json!({ "ok": true, "user_id": target.id, "role": role.as_str() }),
+    ))
 }
 
 async fn update_member(
@@ -268,8 +264,8 @@ async fn update_member(
     Json(req): Json<UpdateMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
-    let role = ProjectRole::parse(&req.role)
-        .ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
+    let role =
+        ProjectRole::parse(&req.role).ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
     if role == ProjectRole::Owner {
         crate::access::require_project(&state, &user, id, ProjectRole::Owner).await?;
     }
@@ -587,9 +583,8 @@ async fn agent_upload_artifact(
         .get("x-fiber-artifact-path")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let rel = crate::artifact_util::sanitize_artifact_rel_path(header_path).ok_or_else(|| {
-        ApiError::BadRequest("missing or invalid X-Fiber-Artifact-Path".into())
-    })?;
+    let rel = crate::artifact_util::sanitize_artifact_rel_path(header_path)
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid X-Fiber-Artifact-Path".into()))?;
     let key = crate::artifacts::ArtifactBackend::object_key(
         &step.run_id.to_string(),
         &step_run_id.to_string(),
@@ -602,13 +597,7 @@ async fn agent_upload_artifact(
         .map_err(ApiError::from)?;
     let art = state
         .store
-        .create_artifact(
-            step.run_id,
-            step_run_id,
-            &rel,
-            &stored,
-            body.len() as i64,
-        )
+        .create_artifact(step.run_id, step_run_id, &rel, &stored, body.len() as i64)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({
@@ -646,9 +635,8 @@ async fn agent_presign_artifact(
             crate::artifact_util::MAX_ARTIFACT_BYTES
         )));
     }
-    let rel = crate::artifact_util::sanitize_artifact_rel_path(&body.path).ok_or_else(|| {
-        ApiError::BadRequest("missing or invalid path".into())
-    })?;
+    let rel = crate::artifact_util::sanitize_artifact_rel_path(&body.path)
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid path".into()))?;
     let key = crate::artifacts::ArtifactBackend::object_key(
         &step.run_id.to_string(),
         &step_run_id.to_string(),
@@ -702,9 +690,8 @@ async fn agent_complete_artifact(
             crate::artifact_util::MAX_ARTIFACT_BYTES
         )));
     }
-    let rel = crate::artifact_util::sanitize_artifact_rel_path(&body.path).ok_or_else(|| {
-        ApiError::BadRequest("missing or invalid path".into())
-    })?;
+    let rel = crate::artifact_util::sanitize_artifact_rel_path(&body.path)
+        .ok_or_else(|| ApiError::BadRequest("missing or invalid path".into()))?;
     let key = crate::artifacts::ArtifactBackend::object_key(
         &step.run_id.to_string(),
         &step_run_id.to_string(),
@@ -727,9 +714,7 @@ async fn agent_complete_artifact(
             )));
         }
         None => {
-            return Err(ApiError::BadRequest(
-                "object not found after upload".into(),
-            ));
+            return Err(ApiError::BadRequest("object not found after upload".into()));
         }
         Some(_) => {}
     }
@@ -836,7 +821,13 @@ async fn create_fiber(
     Json(req): Json<CreateFiberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Writer).await?;
-    if state.store.get_project(id).await.map_err(ApiError::from)?.is_none() {
+    if state
+        .store
+        .get_project(id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
         return Err(ApiError::NotFound);
     }
     if !state.fiber_scheduler.registry().contains(&req.name) {
@@ -866,7 +857,7 @@ async fn get_fiber(
         .get(id)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::NotFound)?;
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(fiber))
 }
 
@@ -882,7 +873,7 @@ async fn cancel_fiber(
         .cancel(id)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::NotFound)?;
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(fiber))
 }
 
@@ -953,17 +944,13 @@ async fn update_agent(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     require_agent_manage(&state, &user, &existing).await?;
-    let mut agent = state
-        .store
-        .update_agent(id, req)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::NotFound
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+    let mut agent = state.store.update_agent(id, req).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            ApiError::NotFound
+        } else {
+            ApiError::from(e)
+        }
+    })?;
     let labels = agent
         .labels
         .as_array()
@@ -996,11 +983,7 @@ async fn delete_agent(
     if let Err(e) = state.scheduler.on_agent_disconnect(id).await {
         tracing::warn!(error = %e, %id, "agent delete disconnect cleanup");
     }
-    let ok = state
-        .store
-        .delete_agent(id)
-        .await
-        .map_err(ApiError::from)?;
+    let ok = state.store.delete_agent(id).await.map_err(ApiError::from)?;
     if !ok {
         return Err(ApiError::NotFound);
     }
@@ -1024,17 +1007,13 @@ async fn rotate_agent_token(
         .scheduler
         .force_disconnect_agent(id, "token rotated — reconnect with the new token")
         .await;
-    let mut resp = state
-        .store
-        .rotate_agent_token(id)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::NotFound
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+    let mut resp = state.store.rotate_agent_token(id).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            ApiError::NotFound
+        } else {
+            ApiError::from(e)
+        }
+    })?;
     resp.agent.token_hash = "***".into();
     Ok(Json(resp))
 }
@@ -1162,13 +1141,12 @@ async fn github_webhook(
                     .map_err(ApiError::from)?;
                 run_ids.push(run.id);
             }
-            Ok(Json(json!({ "started": run_ids, "changed_files": changed.len() })))
+            Ok(Json(
+                json!({ "started": run_ids, "changed_files": changed.len() }),
+            ))
         }
         "pull_request" => {
-            let action = payload
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("");
+            let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
             let base = payload
                 .pointer("/pull_request/base/ref")
                 .and_then(|v| v.as_str())
@@ -1186,7 +1164,9 @@ async fn github_webhook(
             };
             // PR webhooks omit file lists; fetch via API when path filters may apply.
             if changed.is_empty()
-                && project_has_pr_path_filters(&state, id).await.unwrap_or(true)
+                && project_has_pr_path_filters(&state, id)
+                    .await
+                    .unwrap_or(true)
             {
                 match crate::github::resolve_token(&state.store, id).await {
                     Ok(Some(token)) => {
@@ -1291,10 +1271,7 @@ fn collect_explicit_changed_files(payload: &Value) -> Vec<String> {
     files
 }
 
-async fn project_has_pr_path_filters(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<bool, ApiError> {
+async fn project_has_pr_path_filters(state: &AppState, project_id: Uuid) -> Result<bool, ApiError> {
     let pipelines = state
         .store
         .list_pipelines(project_id)
@@ -1329,7 +1306,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[derive(Debug)]

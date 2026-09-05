@@ -1,13 +1,13 @@
 use anyhow::Result;
 use chrono::Utc;
-use fiber_core::{has_schedule, next_due_from_triggers, schedule_trigger_label, DueIndex, Store};
+use fiber_core::{DueIndex, Store, has_schedule, next_due_from_triggers, schedule_trigger_label};
 use fiber_proto::{RunEvent, ServerMessage, StepStatus};
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -263,13 +263,8 @@ impl Scheduler {
                         a.inflight = a.inflight.saturating_sub(1);
                     }
                 }
-                self.send_to_agent(
-                    aid,
-                    ServerMessage::Cancel {
-                        step_run_id: s.id,
-                    },
-                )
-                .await;
+                self.send_to_agent(aid, ServerMessage::Cancel { step_run_id: s.id })
+                    .await;
             }
             let ev = RunEvent::StepUpdated {
                 run_id: s.run_id,
@@ -336,11 +331,7 @@ impl Scheduler {
         for step in queued {
             let needed = step.labels_vec();
             if labels_match(&agent_labels, &needed) {
-                if let Some(leased) = self
-                    .store
-                    .lease_step(step.id, agent_id, LEASE_SECS)
-                    .await?
-                {
+                if let Some(leased) = self.store.lease_step(step.id, agent_id, LEASE_SECS).await? {
                     let mut agents = self.agents.write().await;
                     if let Some(a) = agents.get_mut(&agent_id) {
                         a.inflight += 1;

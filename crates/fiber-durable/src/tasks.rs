@@ -5,7 +5,7 @@ use crate::registry::{FiberHandler, FiberRegistry};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Register demo handlers: `ping`, `sleep_demo`, and `interval_task`.
 pub fn register_builtin_tasks(registry: &FiberRegistry) {

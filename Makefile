@@ -25,6 +25,7 @@ help:
 	@echo "  dogfood       All smoke scripts (authz, pools, artifacts, s3)"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
+	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + build + web tsc)"
 
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis

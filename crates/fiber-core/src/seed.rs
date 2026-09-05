@@ -4,7 +4,7 @@ use crate::models::{CreatePipelineRequest, CreateProjectRequest};
 use crate::roles::ProjectRole;
 use crate::store::Store;
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SHOWCASE_SLUG: &str = "showcase";

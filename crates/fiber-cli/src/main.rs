@@ -1,6 +1,6 @@
 //! `fiber` CLI — validate YAML, login, runs, members, secrets, agents, fibers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use fiber_core::dag::{compile_definition, parse_pipeline_yaml};
 use serde::Deserialize;
@@ -36,9 +36,7 @@ enum Commands {
         password: String,
     },
     /// Start a pipeline run
-    Run {
-        pipeline_id: String,
-    },
+    Run { pipeline_id: String },
     /// Project members
     #[command(subcommand)]
     Members(MembersCmd),
@@ -64,7 +62,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum MembersCmd {
-    List { project_id: String },
+    List {
+        project_id: String,
+    },
     Add {
         project_id: String,
         #[arg(long)]
@@ -88,7 +88,9 @@ enum MembersCmd {
 
 #[derive(Subcommand, Debug)]
 enum SecretsCmd {
-    List { project_id: String },
+    List {
+        project_id: String,
+    },
     Set {
         project_id: String,
         key: String,
@@ -126,14 +128,20 @@ enum AgentsCmd {
         #[arg(long)]
         concurrency: Option<u32>,
     },
-    Delete { agent_id: String },
+    Delete {
+        agent_id: String,
+    },
     /// Issue a new token (prints once) and force-disconnect the agent
-    Rotate { agent_id: String },
+    Rotate {
+        agent_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum FibersCmd {
-    List { project_id: String },
+    List {
+        project_id: String,
+    },
     Create {
         project_id: String,
         #[arg(long, default_value = "ping")]
@@ -141,8 +149,12 @@ enum FibersCmd {
         #[arg(long, default_value = "{}")]
         input: String,
     },
-    Get { fiber_id: String },
-    Cancel { fiber_id: String },
+    Get {
+        fiber_id: String,
+    },
+    Cancel {
+        fiber_id: String,
+    },
 }
 
 #[tokio::main]
@@ -204,10 +216,9 @@ async fn main() -> Result<()> {
             let client = api_client(&token);
             match sub {
                 MembersCmd::List { project_id } => {
-                    let v = api_json(
-                        client.get(format!("{base}/api/projects/{project_id}/members")),
-                    )
-                    .await?;
+                    let v =
+                        api_json(client.get(format!("{base}/api/projects/{project_id}/members")))
+                            .await?;
                     print_json(&v)?;
                 }
                 MembersCmd::Add {
@@ -260,10 +271,9 @@ async fn main() -> Result<()> {
             let client = api_client(&token);
             match sub {
                 SecretsCmd::List { project_id } => {
-                    let v = api_json(
-                        client.get(format!("{base}/api/projects/{project_id}/secrets")),
-                    )
-                    .await?;
+                    let v =
+                        api_json(client.get(format!("{base}/api/projects/{project_id}/secrets")))
+                            .await?;
                     print_json(&v)?;
                 }
                 SecretsCmd::Set {
@@ -280,9 +290,9 @@ async fn main() -> Result<()> {
                     print_json(&v)?;
                 }
                 SecretsCmd::Delete { project_id, key } => {
-                    let v = api_json(client.delete(format!(
-                        "{base}/api/projects/{project_id}/secrets/{key}"
-                    )))
+                    let v = api_json(
+                        client.delete(format!("{base}/api/projects/{project_id}/secrets/{key}")),
+                    )
                     .await?;
                     print_json(&v)?;
                 }
@@ -360,14 +370,14 @@ async fn main() -> Result<()> {
                     print_json(&v)?;
                 }
                 AgentsCmd::Delete { agent_id } => {
-                    let v = api_json(client.delete(format!("{base}/api/agents/{agent_id}"))).await?;
+                    let v =
+                        api_json(client.delete(format!("{base}/api/agents/{agent_id}"))).await?;
                     print_json(&v)?;
                 }
                 AgentsCmd::Rotate { agent_id } => {
-                    let v = api_json(
-                        client.post(format!("{base}/api/agents/{agent_id}/rotate-token")),
-                    )
-                    .await?;
+                    let v =
+                        api_json(client.post(format!("{base}/api/agents/{agent_id}/rotate-token")))
+                            .await?;
                     if let Some(t) = v["token"].as_str() {
                         eprintln!("# new agent token (copy now — shown once)");
                         println!("{t}");
@@ -385,10 +395,9 @@ async fn main() -> Result<()> {
             let client = api_client(&token);
             match sub {
                 FibersCmd::List { project_id } => {
-                    let v = api_json(
-                        client.get(format!("{base}/api/projects/{project_id}/fibers")),
-                    )
-                    .await?;
+                    let v =
+                        api_json(client.get(format!("{base}/api/projects/{project_id}/fibers")))
+                            .await?;
                     print_json(&v)?;
                 }
                 FibersCmd::Create {
@@ -410,10 +419,8 @@ async fn main() -> Result<()> {
                     print_json(&v)?;
                 }
                 FibersCmd::Cancel { fiber_id } => {
-                    let v = api_json(
-                        client.post(format!("{base}/api/fibers/{fiber_id}/cancel")),
-                    )
-                    .await?;
+                    let v = api_json(client.post(format!("{base}/api/fibers/{fiber_id}/cancel")))
+                        .await?;
                     print_json(&v)?;
                 }
             }

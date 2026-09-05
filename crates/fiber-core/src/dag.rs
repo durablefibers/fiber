@@ -77,7 +77,12 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         if !seen.insert(step.id.clone()) {
             return Err(DagError::DuplicateStep(step.id.clone()));
         }
-        if step.run.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+        if step
+            .run
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
             return Err(DagError::MissingRun(step.id.clone()));
         }
     }
@@ -148,10 +153,8 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     }
 
     let order = toposort(&graph, None).map_err(|_| DagError::Cycle)?;
-    let needs_map: HashMap<&str, &Vec<String>> = with_needs
-        .iter()
-        .map(|(c, n)| (c.id.as_str(), n))
-        .collect();
+    let needs_map: HashMap<&str, &Vec<String>> =
+        with_needs.iter().map(|(c, n)| (c.id.as_str(), n)).collect();
     let mut levels_map: HashMap<&str, usize> = HashMap::new();
     for idx in &order {
         let id = graph[*idx];
@@ -257,10 +260,8 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
     if matrix.is_empty() {
         return Ok(vec![BTreeMap::new()]);
     }
-    let mut axes: Vec<(String, Vec<String>)> = matrix
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut axes: Vec<(String, Vec<String>)> =
+        matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     axes.sort_by(|a, b| a.0.cmp(&b.0));
     for (axis, values) in &axes {
         if values.is_empty() {
@@ -293,7 +294,10 @@ fn matrix_env(combo: &BTreeMap<String, String>) -> Vec<(String, String)> {
     for (k, v) in combo {
         env.push((k.clone(), v.clone()));
         env.push((format!("MATRIX_{}", k.to_ascii_uppercase()), v.clone()));
-        env.push((format!("FIBER_MATRIX_{}", k.to_ascii_uppercase()), v.clone()));
+        env.push((
+            format!("FIBER_MATRIX_{}", k.to_ascii_uppercase()),
+            v.clone(),
+        ));
     }
     env
 }
@@ -372,7 +376,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
     let steps = match raw.steps {
         serde_yaml::Value::Sequence(seq) => seq
             .into_iter()
-            .map(|v| serde_yaml::from_value::<StepDefinition>(v))
+            .map(serde_yaml::from_value::<StepDefinition>)
             .collect::<Result<Vec<_>, _>>()?,
         serde_yaml::Value::Mapping(map) => {
             let mut out = Vec::new();
@@ -467,7 +471,11 @@ mod tests {
             name: "m".into(),
             workspace: None,
             on: None,
-            steps: vec![step("checkout", &[], "echo hi"), test, step("done", &["test"], "echo done")],
+            steps: vec![
+                step("checkout", &[], "echo hi"),
+                test,
+                step("done", &["test"], "echo done"),
+            ],
         };
         let dag = compile_definition(&def).unwrap();
         let ids: Vec<_> = dag.steps.iter().map(|s| s.id.as_str()).collect();
@@ -479,7 +487,12 @@ mod tests {
         assert!(done.needs.contains(&"test__os_macos".into()));
         let linux = dag.steps.iter().find(|s| s.id == "test__os_linux").unwrap();
         assert_eq!(linux.matrix.get("os").map(String::as_str), Some("linux"));
-        assert!(linux.env.iter().any(|(k, v)| k == "MATRIX_OS" && v == "linux"));
+        assert!(
+            linux
+                .env
+                .iter()
+                .any(|(k, v)| k == "MATRIX_OS" && v == "linux")
+        );
     }
 
     #[test]
@@ -495,7 +508,10 @@ steps:
 "#;
         let def = parse_pipeline_yaml(yaml).unwrap();
         assert_eq!(def.steps.len(), 1);
-        assert_eq!(def.steps[0].if_expr.as_deref(), Some("matrix.os == 'linux'"));
+        assert_eq!(
+            def.steps[0].if_expr.as_deref(),
+            Some("matrix.os == 'linux'")
+        );
         let dag = compile_definition(&def).unwrap();
         assert_eq!(dag.steps.len(), 2);
     }

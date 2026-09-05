@@ -15,7 +15,7 @@ pub mod types;
 
 pub use context::{FiberContext, FiberSuspended};
 pub use durability::Durability;
-pub use engine::{run_fiber, FiberOutcome};
+pub use engine::{FiberOutcome, run_fiber};
 pub use registry::FiberRegistry;
 pub use scheduler::FiberScheduler;
 pub use store::FiberStore;

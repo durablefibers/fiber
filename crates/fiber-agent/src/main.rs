@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use fiber_proto::{AgentMessage, ArtifactRestore, ServerMessage, StepStatus, WorkspaceOffer};
 use futures_util::{SinkExt, StreamExt};
@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -31,7 +31,11 @@ struct Args {
     #[arg(long, env = "FIBER_AGENT_NAME", default_value = "local")]
     name: String,
 
-    #[arg(long, env = "FIBER_AGENT_LABELS", default_value = "os=linux,docker=true")]
+    #[arg(
+        long,
+        env = "FIBER_AGENT_LABELS",
+        default_value = "os=linux,docker=true"
+    )]
     labels: String,
 
     #[arg(long, env = "FIBER_AGENT_CONCURRENCY", default_value_t = 1)]
@@ -40,7 +44,11 @@ struct Args {
     #[arg(long, env = "FIBER_AGENT_USE_DOCKER", default_value_t = true)]
     use_docker: bool,
 
-    #[arg(long, env = "FIBER_AGENT_WORKSPACE_DIR", default_value = "./data/workspaces")]
+    #[arg(
+        long,
+        env = "FIBER_AGENT_WORKSPACE_DIR",
+        default_value = "./data/workspaces"
+    )]
     workspace_dir: PathBuf,
 }
 
@@ -80,10 +88,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
-    let mut url = Url::parse(&format!(
-        "{}/ws/agent",
-        args.api_url.trim_end_matches('/')
-    ))?;
+    let mut url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
     url.query_pairs_mut().append_pair("token", &args.token);
 
     info!(url = %url, "connecting");
@@ -423,15 +428,7 @@ async fn execute_step(
     };
 
     if code == 0 && !artifacts.is_empty() {
-        upload_artifacts(
-            http_api,
-            token,
-            step_run_id,
-            &work_dir,
-            artifacts,
-            &mut log,
-        )
-        .await;
+        upload_artifacts(http_api, token, step_run_id, &work_dir, artifacts, &mut log).await;
     }
 
     Ok(code)
@@ -477,7 +474,10 @@ async fn restore_artifacts(
     let client = reqwest::Client::new();
     for art in restore {
         if art.name.contains("..") {
-            log("system", format!("skipping unsafe restore path: {}", art.name));
+            log(
+                "system",
+                format!("skipping unsafe restore path: {}", art.name),
+            );
             continue;
         }
         let url = format!("{http_api}/api/agent/artifacts/{}/download", art.id);
@@ -553,10 +553,9 @@ async fn upload_artifacts(
                         )
                         .await
                         {
-                            Ok(mode) => log(
-                                "system",
-                                format!("uploaded artifact {rel} via {mode}"),
-                            ),
+                            Ok(mode) => {
+                                log("system", format!("uploaded artifact {rel} via {mode}"))
+                            }
                             Err(msg) => log("system", msg),
                         }
                     }
@@ -722,11 +721,7 @@ async fn prepare_git_workspace(
     Ok(())
 }
 
-async fn run_git(
-    cwd: &Path,
-    args: &[&str],
-    log: &mut impl FnMut(&str, String),
-) -> Result<()> {
+async fn run_git(cwd: &Path, args: &[&str], log: &mut impl FnMut(&str, String)) -> Result<()> {
     log("system", format!("git {}", args.join(" ")));
     let output = Command::new("git")
         .args(args)

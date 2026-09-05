@@ -14,7 +14,9 @@ pub fn compile_globs(patterns: &[String]) -> GlobSet {
             builder.add(g);
         }
     }
-    builder.build().unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
 }
 
 pub fn any_match(set: &GlobSet, path: &str) -> bool {

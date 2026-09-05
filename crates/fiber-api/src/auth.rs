@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use fiber_core::Agent;
 use fiber_core::PublicUser;
 
@@ -14,10 +14,8 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = bearer_from_headers(&parts.headers).ok_or((
-            StatusCode::UNAUTHORIZED,
-            "missing bearer token",
-        ))?;
+        let token = bearer_from_headers(&parts.headers)
+            .ok_or((StatusCode::UNAUTHORIZED, "missing bearer token"))?;
         let user = state
             .store
             .user_by_session_token(&token)
@@ -38,10 +36,8 @@ impl FromRequestParts<AppState> for AuthAgent {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = agent_token_from_parts(parts).ok_or((
-            StatusCode::UNAUTHORIZED,
-            "missing agent token",
-        ))?;
+        let token = agent_token_from_parts(parts)
+            .ok_or((StatusCode::UNAUTHORIZED, "missing agent token"))?;
         let agent = state
             .store
             .agent_by_token(&token)
@@ -66,7 +62,10 @@ fn agent_token_from_parts(parts: &Parts) -> Option<String> {
 }
 
 pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))

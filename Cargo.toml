@@ -63,3 +63,7 @@ opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace", "metrics"] }
 tracing-opentelemetry = "0.33"
+
+[workspace.lints.clippy]
+# Edition 2024 let-chains make this fire constantly on protocol/control-flow code.
+collapsible_if = "allow"

@@ -129,12 +129,11 @@ impl FiberStore {
 
     async fn hydrate(&self, row: FiberRow) -> Result<FiberRecord> {
         let mut state: FiberState = serde_json::from_value(row.state).unwrap_or_default();
-        let steps = sqlx::query_as::<_, StepRow>(
-            "SELECT key, value FROM fiber_steps WHERE fiber_id = $1",
-        )
-        .bind(row.id)
-        .fetch_all(&self.pool)
-        .await?;
+        let steps =
+            sqlx::query_as::<_, StepRow>("SELECT key, value FROM fiber_steps WHERE fiber_id = $1")
+                .bind(row.id)
+                .fetch_all(&self.pool)
+                .await?;
         for s in steps {
             state.steps.insert(s.key, s.value);
         }
@@ -258,12 +257,13 @@ impl FiberStore {
     pub async fn seed_due_index(&self, stale_after_secs: i64) -> Result<()> {
         self.due.clear();
         let now = Utc::now();
-        let rows = sqlx::query_as::<_, (Uuid, String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
-            "SELECT project_id, status, wake_at, heartbeat_at FROM fibers
+        let rows =
+            sqlx::query_as::<_, (Uuid, String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+                "SELECT project_id, status, wake_at, heartbeat_at FROM fibers
              WHERE status IN ('pending', 'suspended', 'running')",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .fetch_all(&self.pool)
+            .await?;
         for (project_id, status, wake_at, heartbeat_at) in rows {
             let due = match status.as_str() {
                 "pending" => now,

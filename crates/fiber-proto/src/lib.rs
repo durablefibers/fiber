@@ -172,6 +172,7 @@ pub enum AgentMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Offer carries workspace/env/artifacts for the agent WS.
 pub enum ServerMessage {
     Welcome {
         agent_id: Uuid,

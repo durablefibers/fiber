@@ -52,7 +52,11 @@ impl RetentionConfig {
     }
 }
 
-pub async fn run_once(store: &Store, artifacts: &ArtifactBackend, cfg: &RetentionConfig) -> Result<u64> {
+pub async fn run_once(
+    store: &Store,
+    artifacts: &ArtifactBackend,
+    cfg: &RetentionConfig,
+) -> Result<u64> {
     let sessions = store.purge_expired_sessions().await.unwrap_or(0);
     if sessions > 0 {
         info!(sessions, "purged expired sessions");

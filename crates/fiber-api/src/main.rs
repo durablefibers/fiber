@@ -1,6 +1,6 @@
 mod access;
-mod artifacts;
 mod artifact_util;
+mod artifacts;
 mod auth;
 mod github;
 mod otel;
@@ -12,8 +12,8 @@ mod ws;
 use anyhow::Result;
 use artifacts::ArtifactBackend;
 use clap::Parser;
-use fiber_core::{db, Store};
-use fiber_durable::{tasks, FiberRegistry, FiberScheduler, FiberStore};
+use fiber_core::{Store, db};
+use fiber_durable::{FiberRegistry, FiberScheduler, FiberStore, tasks};
 use fiber_scheduler::Scheduler;
 use redis::aio::ConnectionManager;
 use state::AppState;
@@ -25,10 +25,18 @@ use tower_http::trace::TraceLayer;
 #[derive(Parser, Debug)]
 #[command(name = "fiber-api")]
 struct Args {
-    #[arg(long, env = "FIBER_DATABASE_URL", default_value = "postgres://fiber:fiber@localhost:15432/fiber")]
+    #[arg(
+        long,
+        env = "FIBER_DATABASE_URL",
+        default_value = "postgres://fiber:fiber@localhost:15432/fiber"
+    )]
     database_url: String,
 
-    #[arg(long, env = "FIBER_REDIS_URL", default_value = "redis://localhost:16379")]
+    #[arg(
+        long,
+        env = "FIBER_REDIS_URL",
+        default_value = "redis://localhost:16379"
+    )]
     redis_url: String,
 
     #[arg(long, env = "FIBER_LISTEN", default_value = "0.0.0.0:18080")]
