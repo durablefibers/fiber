@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bash.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-edits.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/fmt-rust.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/fmt-web.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/naming-guard.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-context.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(make help)",
+      "Bash(make check)",
+      "Bash(make fmt-check)",
+      "Bash(make clippy)",
+      "Bash(make build)",
+      "Bash(make ready)",
+      "Bash(make validate)",
+      "Bash(cargo fmt --check)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo tree:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker compose -f deploy/docker-compose.yml ps:*)",
+      "Bash(docker compose -f deploy/docker-compose.yml logs:*)",
+      "Bash(pgrep:*)",
+      "Bash(curl -sf http://127.0.0.1:18080/ready)",
+      "Bash(curl -sf http://127.0.0.1:18080/health)",
+      "Bash(rg:*)",
+      "Bash(jq:*)"
+    ],
+    "ask": [
+      "Bash(docker compose:*down*)",
+      "Bash(cargo publish:*)"
+    ]
+  }
+}
