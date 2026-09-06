@@ -6,7 +6,7 @@
 - `Authorization: Bearer <token>` on API calls  
 - `POST /api/auth/logout` invalidates the session  
 - Passwords: **argon2id** (legacy SHA-256 hashes verify and upgrade on login)  
-- Default bootstrap user: `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` (admin / fiber)
+- Default bootstrap user: `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` (admin / fiber) — also the first **instance admin**
 
 WebSocket `/ws/runs/{id}?token=<session>` requires a valid session and **reader** on the run’s project.
 
@@ -21,11 +21,27 @@ Per-project membership: `reader` < `writer` < `admin` < `owner`.
 | View project, pipelines, runs, logs, artifacts, fibers, members | ✓ | ✓ | ✓ | ✓ |
 | Create/update pipelines, start/cancel runs, fibers | | ✓ | ✓ | ✓ |
 | Secrets, webhook secret, manage members | | | ✓ | ✓ |
-| Grant/remove **owner**, create users for invites* | | | | ✓ |
-
-\* `POST /api/users` requires the caller to be an **owner** on at least one project.
+| Grant/remove **owner** | | | | ✓ |
 
 Creating a project makes the creator **owner**. Showcase seed grants the admin user owner.
+
+## Instance admin
+
+Separate from project roles: `users.is_admin`. Project routes (pipelines, runs, secrets, members) still require membership — an instance admin who is not a member of a project gets 403 on those. But instance admins manage **every agent**, and an agent token receives a project's secrets in its offers, so in practice the flag is **root**: grant it only to operators.
+
+| Capability | instance admin |
+|---|---|
+| Register / update / delete / rotate **global** agents (`project_id` null) | ✓ |
+| `GET /api/agents` without a `project_id` filter (every agent in the instance) | ✓ |
+| Manage any **project** agent (project admins can manage their own) | ✓ |
+| `GET /api/users`, `POST /api/users`, `PUT /api/users/{id}` `{ is_admin }` | ✓ |
+
+Why: a global agent's token leases steps — and receives the injected secrets — from **every** project, so minting one must not be available to an ordinary member.
+
+- Fresh installs: the bootstrap user is the first instance admin. Existing installs: nobody is promoted by the migration; at boot, `fiber-api` promotes the user named by `FIBER_ADMIN_USER` **only while the instance has no admin at all** (a recovery path — it is never re-applied on every boot, so a demotion sticks and a squatted username gains nothing). If no admin exists and `FIBER_ADMIN_USER` matches no user, the API logs an error telling you to point it at an existing username.
+- The last instance admin cannot be demoted (`PUT /api/users/{id}` → 400; enforced inside the UPDATE, so concurrent demotions cannot race to zero).
+- Project admins still invite users via `POST /api/projects/{id}/members` with a `password` — that path is project-scoped and unchanged.
+- `PublicUser` (login response, `/api/auth/me`, `GET /api/users`) carries `is_admin` so the UI can hide the global-agent form. Project member lists do not expose it.
 
 ## Members API
 

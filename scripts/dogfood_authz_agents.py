@@ -97,6 +97,32 @@ def main() -> int:
     code, secrets_denied = req("GET", f"/api/projects/{pid}/secrets", token=reader)
     check("reader cannot list secrets", code == 403, secrets_denied)
 
+    # Instance-admin gating: global agents are not for ordinary members.
+    code, ga = req(
+        "POST",
+        "/api/agents",
+        token=reader,
+        body={"name": "should-fail", "labels": ["os=linux"], "concurrency": 1},
+    )
+    check("reader cannot create global agent", code == 403, ga)
+    code, pa = req(
+        "POST",
+        "/api/agents",
+        token=reader,
+        body={"name": "should-fail", "labels": ["os=linux"], "concurrency": 1, "project_id": pid},
+    )
+    check("reader cannot create project agent", code == 403, pa)
+    code, la = req("GET", "/api/agents", token=reader)
+    check("reader cannot list all agents", code == 403, la)
+    code, lpa = req("GET", f"/api/agents?project_id={pid}", token=reader)
+    check("reader can list project agents", code == 200 and isinstance(lpa, list), lpa)
+    code, me = req("GET", "/api/auth/me", token=admin)
+    check("bootstrap admin is instance admin", code == 200 and me.get("is_admin") is True, me)
+    code, users_denied = req("GET", "/api/users", token=reader)
+    check("reader cannot list users", code == 403, users_denied)
+    code, cu_denied = req("POST", "/api/users", token=reader, body={"username": "x", "password": "y"})
+    check("reader cannot create users", code == 403, cu_denied)
+
     # Agent CRUD + rotate
     code, created = req(
         "POST",
@@ -122,6 +148,13 @@ def main() -> int:
 
     code, rotated = req("POST", f"/api/agents/{aid}/rotate-token", token=admin)
     check("rotate token", code == 200 and "token" in rotated and rotated["token"] != token1, rotated)
+
+    code, rot_denied = req("POST", f"/api/agents/{aid}/rotate-token", token=reader)
+    check("reader cannot rotate global agent", code == 403, rot_denied)
+    code, upd_denied = req("PUT", f"/api/agents/{aid}", token=reader, body={"concurrency": 9})
+    check("reader cannot update global agent", code == 403, upd_denied)
+    code, del_denied = req("DELETE", f"/api/agents/{aid}", token=reader)
+    check("reader cannot delete global agent", code == 403, del_denied)
 
     code, agents = req("GET", "/api/agents", token=admin)
     check(

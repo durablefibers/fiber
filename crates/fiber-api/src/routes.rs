@@ -38,7 +38,8 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}/members/{user_id}",
             put(update_member).delete(remove_member),
         )
-        .route("/api/users", post(create_user))
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{id}", put(update_user))
         .route(
             "/api/projects/{id}/pipelines",
             get(list_pipelines).post(create_pipeline),
@@ -303,30 +304,49 @@ async fn create_user(
     State(state): State<AppState>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Any project owner may create users for invites.
-    let projects = state
-        .store
-        .list_projects_for_user(user.id)
-        .await
-        .map_err(ApiError::from)?;
-    let mut ok = false;
-    for p in &projects {
-        if let Ok(Some(r)) = state.store.member_role(p.id, user.id).await {
-            if r.at_least(ProjectRole::Owner) {
-                ok = true;
-                break;
-            }
-        }
-    }
-    if !ok {
-        return Err(ApiError::Forbidden);
-    }
+    // Instance admins only. Project owners invite via POST /members with a password.
+    crate::access::require_instance_admin(&user)?;
     let created = state
         .store
         .create_user(&req.username, &req.password)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn list_users(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_instance_admin(&user)?;
+    let users = state.store.list_users().await.map_err(ApiError::from)?;
+    Ok(Json(users))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    is_admin: bool,
+}
+
+async fn update_user(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_instance_admin(&user)?;
+    let updated = state
+        .store
+        .set_instance_admin(id, req.is_admin)
+        .await
+        .map_err(|e| {
+            if e.to_string().ends_with("not found") {
+                ApiError::NotFound
+            } else {
+                ApiError::from(e)
+            }
+        })?;
+    Ok(Json(updated))
 }
 
 async fn list_pipelines(
@@ -882,8 +902,12 @@ async fn list_agents(
     State(state): State<AppState>,
     Query(q): Query<ListAgentsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(pid) = q.project_id {
-        crate::access::require_project(&state, &user, pid, ProjectRole::Reader).await?;
+    match q.project_id {
+        Some(pid) => {
+            crate::access::require_project(&state, &user, pid, ProjectRole::Reader).await?;
+        }
+        // Without a project filter this returns every agent in the instance.
+        None => crate::access::require_instance_admin(&user)?,
     }
     let mut agents = state
         .store
@@ -901,15 +925,30 @@ struct ListAgentsQuery {
     project_id: Option<Uuid>,
 }
 
+/// Global agents (no project) are instance-admin only: their token leases steps —
+/// and receives secrets — from every project. Project agents need project admin
+/// (instance admins may manage those too).
 async fn require_agent_manage(
     state: &AppState,
     user: &fiber_core::PublicUser,
     agent: &fiber_core::Agent,
 ) -> Result<(), ApiError> {
-    if let Some(pid) = agent.project_id {
-        crate::access::require_project(state, user, pid, ProjectRole::Admin).await?;
+    require_agent_scope(state, user, agent.project_id).await
+}
+
+async fn require_agent_scope(
+    state: &AppState,
+    user: &fiber_core::PublicUser,
+    project_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    match project_id {
+        None => crate::access::require_instance_admin(user),
+        Some(_) if user.is_admin => Ok(()),
+        Some(pid) => {
+            crate::access::require_project(state, user, pid, ProjectRole::Admin).await?;
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 async fn create_agent(
@@ -917,9 +956,7 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(pid) = req.project_id {
-        crate::access::require_project(&state, &user, pid, ProjectRole::Admin).await?;
-    }
+    require_agent_scope(&state, &user, req.project_id).await?;
     let mut resp = state.store.create_agent(req).await.map_err(|e| {
         if e.to_string().contains("project not found") {
             ApiError::NotFound
@@ -1323,6 +1360,12 @@ pub enum ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // Typed validation failures are the caller's fault.
+        if e.downcast_ref::<fiber_core::ValidationError>().is_some()
+            || e.downcast_ref::<fiber_core::DagError>().is_some()
+        {
+            return ApiError::BadRequest(format!("{e:#}"));
+        }
         let msg = e.to_string();
         if msg.contains("forbidden") {
             ApiError::Forbidden
@@ -1402,5 +1445,15 @@ mod tests {
         assert!(matches!(e, ApiError::Forbidden));
         let e: ApiError = anyhow::anyhow!("db down").into();
         assert!(matches!(e, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn api_error_maps_typed_validation_to_400() {
+        let e: ApiError = anyhow::Error::new(fiber_core::ValidationError("nope".into())).into();
+        assert!(matches!(e, ApiError::BadRequest(m) if m == "nope"));
+        let wrapped =
+            anyhow::Error::new(fiber_core::ValidationError("inner".into())).context("outer");
+        let e: ApiError = wrapped.into();
+        assert!(matches!(e, ApiError::BadRequest(m) if m == "outer: inner"));
     }
 }

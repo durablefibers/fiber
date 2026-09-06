@@ -1,6 +1,7 @@
 pub mod dag;
 pub mod db;
 pub mod due_index;
+pub mod error;
 pub mod models;
 pub mod path_filter;
 pub mod roles;
@@ -13,6 +14,7 @@ pub mod tokens;
 
 pub use dag::{CompiledDag, DagError, compile_definition};
 pub use due_index::DueIndex;
+pub use error::ValidationError;
 pub use models::*;
 pub use path_filter::paths_allow;
 pub use roles::ProjectRole;

@@ -13,7 +13,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/auth/login` | `{ username, password }` → `{ token, user }` |
+| POST | `/api/auth/login` | `{ username, password }` → `{ token, user, expires_at }` (`user.is_admin` = instance admin) |
 | POST | `/api/auth/logout` | Invalidate session |
 | GET | `/api/auth/me` | Current user |
 
@@ -25,7 +25,8 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET | `/api/projects/{id}` | reader (includes `role`) |
 | GET/POST | `/api/projects/{id}/members` | reader / admin |
 | PUT/DELETE | `/api/projects/{id}/members/{user_id}` | admin |
-| POST | `/api/users` | owner on some project |
+| GET/POST | `/api/users` | instance admin |
+| PUT | `/api/users/{id}` | instance admin — `{ is_admin }`; cannot demote the last admin |
 
 ## Pipelines & runs
 
@@ -57,10 +58,11 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Method | Path | Notes |
 |---|---|---|
-| GET/POST | `/api/agents` | List / create (`project_id` optional; token once) |
-| GET | `/api/agents?project_id=` | Project agents + globals |
-| PUT/DELETE | `/api/agents/{id}` | Update / delete (project agents need admin) |
-| POST | `/api/agents/{id}/rotate-token` | New token once; force disconnect |
+| GET | `/api/agents` | **Instance admin** — every agent |
+| GET | `/api/agents?project_id=` | reader on project — that project's agents + globals |
+| POST | `/api/agents` | Create (token returned once). Global (no `project_id`): **instance admin**; project: admin on that project |
+| PUT/DELETE | `/api/agents/{id}` | Update / delete — global: instance admin; project: project admin |
+| POST | `/api/agents/{id}/rotate-token` | New token once; force disconnect — same gate as update |
 
 ## Durable fibers
 

@@ -10,6 +10,13 @@ function wsBase() {
   return u.origin
 }
 
+export type PublicUser = {
+  id: string
+  username: string
+  /** Instance admin: global agent pool + user creation. Not a project-role bypass. */
+  is_admin: boolean
+}
+
 export type Project = {
   id: string
   name: string
@@ -228,7 +235,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   login: (username: string, password: string) =>
-    request<{ token: string; user: { id: string; username: string } }>(
+    request<{ token: string; user: PublicUser; expires_at: string }>(
       "/api/auth/login",
       {
         method: "POST",
@@ -237,7 +244,13 @@ export const api = {
     ),
   logout: () =>
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  me: () => request<{ id: string; username: string }>("/api/auth/me"),
+  me: () => request<PublicUser>("/api/auth/me"),
+  listUsers: () => request<PublicUser[]>("/api/users"),
+  setUserAdmin: (id: string, is_admin: boolean) =>
+    request<PublicUser>(`/api/users/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_admin }),
+    }),
   listProjects: () => request<Project[]>("/api/projects"),
   createProject: (name: string) =>
     request<Project>("/api/projects", {

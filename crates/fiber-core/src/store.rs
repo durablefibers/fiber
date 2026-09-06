@@ -150,12 +150,12 @@ impl Store {
     }
 
     pub async fn find_user_by_username(&self, username: &str) -> Result<Option<PublicUser>> {
-        Ok(
-            sqlx::query_as::<_, PublicUser>("SELECT id, username FROM users WHERE username = $1")
-                .bind(username)
-                .fetch_optional(&self.pool)
-                .await?,
+        Ok(sqlx::query_as::<_, PublicUser>(
+            "SELECT id, username, is_admin FROM users WHERE username = $1",
         )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
@@ -163,12 +163,55 @@ impl Store {
         let hash = crate::tokens::hash_password(password);
         Ok(sqlx::query_as::<_, PublicUser>(
             "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)
-             RETURNING id, username",
+             RETURNING id, username, is_admin",
         )
         .bind(id)
         .bind(username)
         .bind(hash)
         .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Grant or revoke instance-admin. Refuses to demote the last admin; the guard is
+    /// part of the UPDATE so two concurrent demotions cannot both succeed.
+    pub async fn set_instance_admin(&self, user_id: Uuid, is_admin: bool) -> Result<PublicUser> {
+        let updated = sqlx::query_as::<_, PublicUser>(
+            "UPDATE users SET is_admin = $2
+             WHERE id = $1
+               AND ($2 OR EXISTS (SELECT 1 FROM users o WHERE o.is_admin AND o.id <> $1))
+             RETURNING id, username, is_admin",
+        )
+        .bind(user_id)
+        .bind(is_admin)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(u) = updated {
+            return Ok(u);
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if exists {
+            Err(crate::ValidationError("cannot demote the last instance admin".into()).into())
+        } else {
+            anyhow::bail!("user not found")
+        }
+    }
+
+    pub async fn count_instance_admins(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<PublicUser>> {
+        Ok(sqlx::query_as::<_, PublicUser>(
+            "SELECT id, username, is_admin FROM users ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
         .await?)
     }
 
@@ -1412,11 +1455,25 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         if count > 0 {
+            // Recovery path only: promote FIBER_ADMIN_USER while the instance has *no*
+            // admin. Never on every boot — anyone who can create users (project admins,
+            // via member invites) could otherwise squat the name and be promoted on restart.
+            let admins = self.count_instance_admins().await?;
             if let Some(u) = self.find_user_by_username(username).await? {
+                if !u.is_admin && admins == 0 {
+                    tracing::warn!(%username, "no instance admin existed; promoting FIBER_ADMIN_USER");
+                    return self.set_instance_admin(u.id, true).await;
+                }
                 return Ok(u);
             }
+            if admins == 0 {
+                tracing::error!(
+                    %username,
+                    "no instance admin exists and FIBER_ADMIN_USER matches no user — set it to an existing username to recover"
+                );
+            }
             return Ok(sqlx::query_as::<_, PublicUser>(
-                "SELECT id, username FROM users ORDER BY created_at LIMIT 1",
+                "SELECT id, username, is_admin FROM users ORDER BY created_at, id LIMIT 1",
             )
             .fetch_one(&self.pool)
             .await?);
@@ -1424,8 +1481,8 @@ impl Store {
         let id = Uuid::new_v4();
         let hash = crate::tokens::hash_password(password);
         let user = sqlx::query_as::<_, PublicUser>(
-            "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)
-             RETURNING id, username",
+            "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, TRUE)
+             RETURNING id, username, is_admin",
         )
         .bind(id)
         .bind(username)
@@ -1438,7 +1495,7 @@ impl Store {
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Option<LoginResponse>> {
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, username, password_hash, created_at FROM users WHERE username = $1",
+            "SELECT id, username, password_hash, created_at, is_admin FROM users WHERE username = $1",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -1477,6 +1534,7 @@ impl Store {
             user: PublicUser {
                 id: user.id,
                 username: user.username,
+                is_admin: user.is_admin,
             },
             expires_at,
         }))
@@ -1485,7 +1543,7 @@ impl Store {
     pub async fn user_by_session_token(&self, token: &str) -> Result<Option<PublicUser>> {
         let hash = crate::tokens::hash_token(token);
         Ok(sqlx::query_as::<_, PublicUser>(
-            "SELECT u.id, u.username
+            "SELECT u.id, u.username, u.is_admin
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = $1 AND s.expires_at > NOW()",

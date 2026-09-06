@@ -9,7 +9,7 @@ Agents are outbound WebSocket workers that execute CI steps.
 | **Global** | `null` | Any project's queued steps (label match still applies) |
 | **Project** | UUID | Only that project's steps |
 
-Create a global agent from **Agents** (`/agents`), or a project agent from **Project → Agents**. Project agents require **admin** on that project.
+Create a global agent from **Agents** (`/agents`) — **instance admins only**, because a global agent's token leases steps (and receives secrets) from every project. Create a project agent from `/p/{project}/agents`; that requires **admin** on the project. See [authz](./authz.md#instance-admin).
 
 ## Register
 

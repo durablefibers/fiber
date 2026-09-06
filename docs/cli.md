@@ -37,8 +37,8 @@ fiber secrets delete $PROJECT_ID GITHUB_TOKEN
 ## Agents
 
 ```bash
-fiber agents list
-fiber agents list --project-id $PROJECT_ID          # project + globals
+fiber agents list                                   # every agent — instance admin only
+fiber agents list --project-id $PROJECT_ID          # project + globals (project reader)
 fiber agents create --name local --labels os=linux,docker=true
 fiber agents create --name team --labels os=linux --project-id $PROJECT_ID
 fiber agents update $AGENT_ID --concurrency 2

@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router"
 import { Copy, KeyRound, Pencil, Trash2 } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { AppShell } from "@/components/app-shell"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -69,16 +69,39 @@ export function AgentsContent({ projectId }: { projectId?: string }) {
   const [editLabels, setEditLabels] = useState("")
   const [editConcurrency, setEditConcurrency] = useState(1)
   const [, setTick] = useState(0)
+  // null = unknown (still loading /api/auth/me). Only consulted for the global pool.
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null)
+  // The global pool is instance-admin only; project pages need no such check.
+  const poolAllowed = projectId ? true : isAdmin === true
 
-  const load = async () => {
+  useEffect(() => {
+    if (projectId) return
+    let cancelled = false
+    api
+      .me()
+      .then((me) => {
+        if (!cancelled) setIsAdmin(me.is_admin)
+      })
+      .catch((e) => {
+        // A 401 already redirected to /login inside the client; anything else is shown.
+        if (!cancelled)
+          setError(e instanceof Error ? e.message : "Failed to load")
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [projectId])
+
+  const load = useCallback(async () => {
     try {
       setAgents(await api.listAgents(projectId))
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load")
     }
-  }
+  }, [projectId])
 
   useEffect(() => {
+    if (!poolAllowed) return
     void load()
     const t = setInterval(() => void load(), 5000)
     const tick = setInterval(() => setTick((n) => n + 1), 1000)
@@ -86,8 +109,7 @@ export function AgentsContent({ projectId }: { projectId?: string }) {
       clearInterval(t)
       clearInterval(tick)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reload when project changes
-  }, [projectId])
+  }, [load, poolAllowed])
 
   const create = async () => {
     try {
@@ -202,31 +224,40 @@ export function AgentsContent({ projectId }: { projectId?: string }) {
       </header>
       <div className="space-y-6 px-8 py-6">
         {error ? <p className="text-destructive text-sm">{error}</p> : null}
-        <div className="flex flex-wrap gap-2">
-          <Input
-            className="max-w-[140px]"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Name"
-          />
-          <Input
-            className="max-w-xs"
-            value={labels}
-            onChange={(e) => setLabels(e.target.value)}
-            placeholder="labels"
-          />
-          <Input
-            className="w-20"
-            type="number"
-            min={1}
-            value={concurrency}
-            onChange={(e) => setConcurrency(Number(e.target.value) || 1)}
-            title="Concurrency"
-          />
-          <Button onClick={() => void create()}>
-            {projectId ? "Register project agent" : "Register global agent"}
-          </Button>
-        </div>
+        {!projectId && isAdmin === false ? (
+          <p className="rounded-lg border border-border/70 bg-muted/40 p-4 text-muted-foreground text-sm">
+            Global agents can lease steps from every project, so only instance
+            admins can register or manage them. Project agents are managed from
+            a project's Agents page by that project's admins.
+          </p>
+        ) : null}
+        {poolAllowed ? (
+          <div className="flex flex-wrap gap-2">
+            <Input
+              className="max-w-[140px]"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Name"
+            />
+            <Input
+              className="max-w-xs"
+              value={labels}
+              onChange={(e) => setLabels(e.target.value)}
+              placeholder="labels"
+            />
+            <Input
+              className="w-20"
+              type="number"
+              min={1}
+              value={concurrency}
+              onChange={(e) => setConcurrency(Number(e.target.value) || 1)}
+              title="Concurrency"
+            />
+            <Button onClick={() => void create()}>
+              {projectId ? "Register project agent" : "Register global agent"}
+            </Button>
+          </div>
+        ) : null}
         {token ? (
           <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
             <div className="flex items-center justify-between gap-2">

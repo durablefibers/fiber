@@ -200,12 +200,16 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub created_at: DateTime<Utc>,
+    /// Instance admin: manages the global agent pool and user creation. Not a project-role bypass.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PublicUser {
     pub id: Uuid,
     pub username: String,
+    /// Instance admin (global agents, user creation). Project roles are separate.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
