@@ -1,7 +1,8 @@
-//! `fiber` CLI — validate YAML, login, runs, members, secrets, agents, fibers.
+//! `fiber` CLI — validate YAML, login, pipelines, runs, logs, artifacts, members,
+//! secrets, agents, fibers.
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use fiber_core::dag::{compile_definition, parse_pipeline_yaml};
 use serde::Deserialize;
 use serde_json::json;
@@ -17,9 +18,18 @@ struct Cli {
     #[arg(long, env = "FIBER_TOKEN")]
     token: Option<String>,
 
+    /// Print machine-readable JSON instead of the human summary.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     cmd: Commands,
 }
+
+/// `fiber run --wait` and `runs retry --wait` exit with the run's outcome, so a shell or
+/// another CI system can branch on it.
+const EXIT_RUN_FAILED: i32 = 1;
+const EXIT_WAIT_TIMEOUT: i32 = 3;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -41,7 +51,47 @@ enum Commands {
         password_stdin: bool,
     },
     /// Start a pipeline run
-    Run { pipeline_id: String },
+    Run {
+        pipeline_id: String,
+        /// Block until the run finishes and exit with its outcome (1 = failed/cancelled).
+        #[arg(long)]
+        wait: bool,
+        /// Imply --wait and stream step output as it arrives.
+        #[arg(long)]
+        follow: bool,
+        /// Give up waiting after this many seconds (exit 3).
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
+    },
+    /// Projects
+    #[command(subcommand)]
+    Projects(ProjectsCmd),
+    /// Pipelines — list, show, and apply a fiber.yml
+    #[command(subcommand)]
+    Pipelines(PipelinesCmd),
+    /// Runs — list, show, cancel, retry
+    #[command(subcommand)]
+    Runs(RunsCmd),
+    /// Print a step's logs
+    Logs {
+        step_run_id: String,
+        /// Only this attempt (default: the whole step).
+        #[arg(long)]
+        attempt: Option<i32>,
+        /// Keep printing new lines until the step finishes.
+        #[arg(long)]
+        follow: bool,
+        /// Lines to show when not following.
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
+    },
+    /// Run artifacts
+    #[command(subcommand)]
+    Artifacts(ArtifactsCmd),
+    /// Forget the saved session token
+    Logout,
+    /// Print a shell completion script (bash, zsh, fish, elvish, powershell)
+    Completions { shell: clap_complete::Shell },
     /// Project members
     #[command(subcommand)]
     Members(MembersCmd),
@@ -62,6 +112,79 @@ enum Commands {
         labels: String,
         #[arg(long, default_value_t = false)]
         docker: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectsCmd {
+    List,
+    Create { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum PipelinesCmd {
+    List {
+        project_id: String,
+    },
+    Get {
+        pipeline_id: String,
+    },
+    /// Create or update a pipeline from a fiber.yml. Matched by name within the project
+    /// unless --id is given, so re-running it is an update rather than a duplicate.
+    Apply {
+        #[arg(default_value = "fiber.yml")]
+        path: PathBuf,
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Update this pipeline regardless of the name in the file.
+        #[arg(long)]
+        id: Option<String>,
+        /// Override the pipeline name from the file.
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RunsCmd {
+    List {
+        project_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        /// Continue after this run id (from a previous page).
+        #[arg(long)]
+        before: Option<String>,
+    },
+    Get {
+        run_id: String,
+    },
+    Cancel {
+        run_id: String,
+    },
+    Retry {
+        run_id: String,
+        /// Carry over steps that already succeeded and re-run only the rest.
+        #[arg(long)]
+        failed_only: bool,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactsCmd {
+    List {
+        run_id: String,
+    },
+    Download {
+        artifact_id: String,
+        /// Where to write it (default: the artifact's file name in the current directory).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -168,6 +291,13 @@ enum FibersCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, so `fiber logs … | head` would panic on the closed pipe
+    // instead of exiting quietly the way every other Unix tool does.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -217,7 +347,12 @@ async fn main() -> Result<()> {
             save_token(&resp.token)?;
             println!("{}", resp.token);
         }
-        Commands::Run { pipeline_id } => {
+        Commands::Run {
+            pipeline_id,
+            wait,
+            follow,
+            timeout_secs,
+        } => {
             let token = resolve_token(token_opt.as_deref())?;
             let client = api_client(&token);
             let resp = api_json(
@@ -226,8 +361,338 @@ async fn main() -> Result<()> {
                     .json(&json!({ "trigger": "manual" })),
             )
             .await?;
-            let id = resp["run"]["id"].as_str().unwrap_or("?");
-            println!("started run {id}");
+            let id = resp["run"]["id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("no run id in response"))?
+                .to_string();
+            if cli.json && !(wait || follow) {
+                print_json(&resp)?;
+            } else if !(wait || follow) {
+                println!("started run {id}");
+            }
+            if wait || follow {
+                let status =
+                    wait_for_run(&client, &base, &id, follow, timeout_secs, cli.json).await?;
+                exit_for_run(&status);
+            }
+        }
+        Commands::Projects(sub) => {
+            let token = resolve_token(token_opt.as_deref())?;
+            let client = api_client(&token);
+            match sub {
+                ProjectsCmd::List => {
+                    let v = api_json(client.get(format!("{base}/api/projects"))).await?;
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        for p in v.as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{}  {}  ({})",
+                                p["id"].as_str().unwrap_or("?"),
+                                p["name"].as_str().unwrap_or("?"),
+                                p["slug"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+                ProjectsCmd::Create { name } => {
+                    let v = api_json(
+                        client
+                            .post(format!("{base}/api/projects"))
+                            .json(&json!({ "name": name })),
+                    )
+                    .await?;
+                    print_json(&v)?;
+                }
+            }
+        }
+        Commands::Pipelines(sub) => {
+            let token = resolve_token(token_opt.as_deref())?;
+            let client = api_client(&token);
+            match sub {
+                PipelinesCmd::List { project_id } => {
+                    let v =
+                        api_json(client.get(format!("{base}/api/projects/{project_id}/pipelines")))
+                            .await?;
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        for p in v.as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{}  {}",
+                                p["id"].as_str().unwrap_or("?"),
+                                p["name"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+                PipelinesCmd::Get { pipeline_id } => {
+                    let v =
+                        api_json(client.get(format!("{base}/api/pipelines/{pipeline_id}"))).await?;
+                    print_json(&v)?;
+                }
+                PipelinesCmd::Apply {
+                    path,
+                    project_id,
+                    id,
+                    name,
+                } => {
+                    let yaml = std::fs::read_to_string(&path)
+                        .with_context(|| format!("read {}", path.display()))?;
+                    // Compile locally first: a syntax or DAG error should not need a round trip.
+                    let def = parse_pipeline_yaml(&yaml).context("parse yaml")?;
+                    compile_definition(&def).context("compile dag")?;
+                    let name = name.unwrap_or_else(|| def.name.clone());
+                    let definition = serde_json::to_value(&def)?;
+
+                    let target = match id {
+                        Some(id) => Some(id),
+                        None => {
+                            let project_id = project_id.clone().ok_or_else(|| {
+                                anyhow!("pass --project-id (or --id to update a known pipeline)")
+                            })?;
+                            let existing = api_json(
+                                client.get(format!("{base}/api/projects/{project_id}/pipelines")),
+                            )
+                            .await?;
+                            existing.as_array().and_then(|a| {
+                                a.iter()
+                                    .find(|p| p["name"].as_str() == Some(name.as_str()))
+                                    .and_then(|p| p["id"].as_str().map(str::to_string))
+                            })
+                        }
+                    };
+                    let body = json!({ "name": name, "definition": definition });
+                    let (v, action) = match target {
+                        Some(pid) => (
+                            api_json(
+                                client
+                                    .put(format!("{base}/api/pipelines/{pid}"))
+                                    .json(&body),
+                            )
+                            .await?,
+                            "updated",
+                        ),
+                        None => {
+                            let project_id = project_id.ok_or_else(|| {
+                                anyhow!("pass --project-id to create a new pipeline")
+                            })?;
+                            (
+                                api_json(
+                                    client
+                                        .post(format!("{base}/api/projects/{project_id}/pipelines"))
+                                        .json(&body),
+                                )
+                                .await?,
+                                "created",
+                            )
+                        }
+                    };
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        println!("{action} {} ({})", v["id"].as_str().unwrap_or("?"), name);
+                    }
+                }
+            }
+        }
+        Commands::Runs(sub) => {
+            let token = resolve_token(token_opt.as_deref())?;
+            let client = api_client(&token);
+            match sub {
+                RunsCmd::List {
+                    project_id,
+                    limit,
+                    before,
+                } => {
+                    let mut url = format!("{base}/api/projects/{project_id}/runs?limit={limit}");
+                    if let Some(b) = before {
+                        url.push_str(&format!("&before={b}"));
+                    }
+                    let v = api_json(client.get(url)).await?;
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        for r in v["items"].as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{}  {:<9}  {}  {}",
+                                r["id"].as_str().unwrap_or("?"),
+                                r["status"].as_str().unwrap_or("?"),
+                                r["created_at"].as_str().unwrap_or("?"),
+                                r["trigger"].as_str().unwrap_or("")
+                            );
+                        }
+                        if let Some(c) = v["next_cursor"].as_str() {
+                            println!("(more: --before {c})");
+                        }
+                    }
+                }
+                RunsCmd::Get { run_id } => {
+                    let v = api_json(client.get(format!("{base}/api/runs/{run_id}"))).await?;
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        println!(
+                            "run {} {}",
+                            v["run"]["id"].as_str().unwrap_or("?"),
+                            v["run"]["status"].as_str().unwrap_or("?")
+                        );
+                        for s in v["steps"].as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "  {:<9} {:<20} {}",
+                                s["status"].as_str().unwrap_or("?"),
+                                s["step_id"].as_str().unwrap_or("?"),
+                                s["error"].as_str().unwrap_or("")
+                            );
+                        }
+                    }
+                }
+                RunsCmd::Cancel { run_id } => {
+                    let v =
+                        api_json(client.post(format!("{base}/api/runs/{run_id}/cancel"))).await?;
+                    print_json(&v)?;
+                }
+                RunsCmd::Retry {
+                    run_id,
+                    failed_only,
+                    wait,
+                    follow,
+                    timeout_secs,
+                } => {
+                    let v = api_json(
+                        client
+                            .post(format!("{base}/api/runs/{run_id}/retry"))
+                            .json(&json!({ "failed_only": failed_only })),
+                    )
+                    .await?;
+                    let id = v["run"]["id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("no run id in response"))?
+                        .to_string();
+                    if cli.json && !(wait || follow) {
+                        print_json(&v)?;
+                    } else if !(wait || follow) {
+                        println!("started run {id}");
+                    }
+                    if wait || follow {
+                        let status =
+                            wait_for_run(&client, &base, &id, follow, timeout_secs, cli.json)
+                                .await?;
+                        exit_for_run(&status);
+                    }
+                }
+            }
+        }
+        Commands::Logs {
+            step_run_id,
+            attempt,
+            follow,
+            limit,
+        } => {
+            let token = resolve_token(token_opt.as_deref())?;
+            let client = api_client(&token);
+            let mut after: Option<i64> = None;
+            loop {
+                let mut url = format!("{base}/api/steps/{step_run_id}/logs?limit={limit}");
+                if let Some(a) = attempt {
+                    url.push_str(&format!("&attempt={a}"));
+                }
+                if let Some(a) = after {
+                    url.push_str(&format!("&after_id={a}"));
+                }
+                let v = api_json(client.get(url)).await?;
+                let lines = v.as_array().cloned().unwrap_or_default();
+                for l in &lines {
+                    if cli.json {
+                        println!("{}", serde_json::to_string(l)?);
+                    } else {
+                        println!(
+                            "[{}] {}",
+                            l["stream"].as_str().unwrap_or("out"),
+                            l["data"].as_str().unwrap_or("")
+                        );
+                    }
+                    after = l["id"].as_i64().or(after);
+                }
+                if !follow {
+                    break;
+                }
+                // Stop once the step itself is finished and we have drained its output.
+                let step = api_json(client.get(format!("{base}/api/steps/{step_run_id}/attempts")))
+                    .await
+                    .unwrap_or_else(|_| json!([]));
+                let done = step
+                    .as_array()
+                    .and_then(|a| a.last().cloned())
+                    .map(|a| !a["finished_at"].is_null())
+                    .unwrap_or(false);
+                if done && lines.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+        Commands::Artifacts(sub) => {
+            let token = resolve_token(token_opt.as_deref())?;
+            let client = api_client(&token);
+            match sub {
+                ArtifactsCmd::List { run_id } => {
+                    let v =
+                        api_json(client.get(format!("{base}/api/runs/{run_id}/artifacts"))).await?;
+                    if cli.json {
+                        print_json(&v)?;
+                    } else {
+                        for a in v.as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{}  {:>10}  {}",
+                                a["id"].as_str().unwrap_or("?"),
+                                a["size"].as_i64().unwrap_or(0),
+                                a["name"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+                ArtifactsCmd::Download { artifact_id, out } => {
+                    let resp = client
+                        .get(format!("{base}/api/artifacts/{artifact_id}/download"))
+                        .send()
+                        .await?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        return Err(anyhow!(
+                            "HTTP {status}: {}",
+                            resp.text().await.unwrap_or_default()
+                        ));
+                    }
+                    let name = out.unwrap_or_else(|| {
+                        PathBuf::from(
+                            filename_from_disposition(&resp)
+                                .unwrap_or_else(|| format!("{artifact_id}.bin")),
+                        )
+                    });
+                    let bytes = resp.bytes().await?;
+                    if let Some(parent) = name.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&name, &bytes)?;
+                    println!("{} ({} bytes)", name.display(), bytes.len());
+                }
+            }
+        }
+        Commands::Logout => {
+            let path = token_path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => println!("removed {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no saved token");
+                }
+                Err(e) => return Err(e).context("remove token"),
+            }
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
         Commands::Members(sub) => {
             let token = resolve_token(token_opt.as_deref())?;
@@ -481,6 +946,98 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Poll a run until it is terminal, optionally streaming step output as it appears.
+///
+/// Returns the final status. Polling (rather than the run WebSocket) keeps this usable
+/// from a shell script behind a proxy that does not pass upgrades through.
+async fn wait_for_run(
+    client: &reqwest::Client,
+    base: &str,
+    run_id: &str,
+    follow: bool,
+    timeout_secs: u64,
+    json_out: bool,
+) -> Result<String> {
+    use std::collections::HashMap;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // step_run_id -> last log line id already printed.
+    let mut cursors: HashMap<String, i64> = HashMap::new();
+    let mut announced: HashMap<String, String> = HashMap::new();
+    loop {
+        let detail = api_json(client.get(format!("{base}/api/runs/{run_id}"))).await?;
+        let status = detail["run"]["status"]
+            .as_str()
+            .unwrap_or("running")
+            .to_string();
+        let steps = detail["steps"].as_array().cloned().unwrap_or_default();
+
+        for step in &steps {
+            let (Some(sid), Some(step_name)) = (step["id"].as_str(), step["step_id"].as_str())
+            else {
+                continue;
+            };
+            let st = step["status"].as_str().unwrap_or("");
+            if !json_out && announced.get(sid).map(String::as_str) != Some(st) {
+                announced.insert(sid.to_string(), st.to_string());
+                eprintln!("== {step_name}: {st}");
+            }
+            if !follow || matches!(st, "pending" | "queued") {
+                continue;
+            }
+            let after = cursors.get(sid).copied();
+            let mut url = format!("{base}/api/steps/{sid}/logs?limit=1000");
+            if let Some(a) = after {
+                url.push_str(&format!("&after_id={a}"));
+            }
+            let Ok(lines) = api_json(client.get(url)).await else {
+                continue;
+            };
+            for l in lines.as_array().cloned().unwrap_or_default() {
+                if json_out {
+                    println!("{}", serde_json::to_string(&l)?);
+                } else {
+                    println!("{step_name} | {}", l["data"].as_str().unwrap_or(""));
+                }
+                if let Some(id) = l["id"].as_i64() {
+                    cursors.insert(sid.to_string(), id);
+                }
+            }
+        }
+
+        if status != "running" && status != "pending" {
+            if json_out {
+                print_json(&detail)?;
+            } else {
+                println!("run {run_id} {status}");
+            }
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("timed out waiting for run {run_id} after {timeout_secs}s");
+            std::process::exit(EXIT_WAIT_TIMEOUT);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Succeeded exits 0; anything else exits 1, so `fiber run --wait` can gate a script.
+fn exit_for_run(status: &str) {
+    if status != "succeeded" {
+        std::process::exit(EXIT_RUN_FAILED);
+    }
+}
+
+fn filename_from_disposition(resp: &reqwest::Response) -> Option<String> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)?
+        .to_str()
+        .ok()?;
+    let name = raw.split("filename=").nth(1)?.trim().trim_matches('"');
+    let name = name.rsplit(['/', '\\']).next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[derive(Deserialize)]
