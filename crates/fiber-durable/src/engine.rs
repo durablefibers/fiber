@@ -16,7 +16,9 @@ pub enum FiberOutcome {
     Retry,
 }
 
-/// Execute (or resume) one fiber, persisting its outcome.
+/// Execute (or resume) one fiber the caller has already claimed via
+/// `FiberStore::claim_ready` (status = running, attempts bumped, heartbeat fresh),
+/// persisting its outcome.
 pub async fn run_fiber(
     store: &FiberStore,
     registry: &FiberRegistry,
@@ -32,12 +34,6 @@ pub async fn run_fiber(
         store.save(&record).await?;
         return Ok(FiberOutcome::Failed);
     };
-
-    record.status = FiberStatus::Running;
-    record.attempts += 1;
-    record.heartbeat_at = Some(Utc::now());
-    record.wake_at = None;
-    store.save(&record).await?;
 
     let mut ctx = FiberContext::new(record.clone(), store.clone());
     let result = handler.run(&mut ctx).await;

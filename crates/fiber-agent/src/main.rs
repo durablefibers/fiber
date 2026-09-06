@@ -5,6 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -78,20 +79,100 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // SIGTERM / SIGINT → cancel in-flight steps, report them, then exit.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        warn!("shutdown signal received; cancelling in-flight steps");
+        let _ = shutdown_tx.send(true);
+    });
+
+    // Process-wide concurrency cap: survives reconnects, so a flapping connection cannot
+    // run more than --concurrency steps at once.
+    let slots = Arc::new(tokio::sync::Semaphore::new(args.concurrency.max(1) as usize));
+    let mut backoff = Duration::from_secs(1);
     loop {
-        match run_session(&args, &labels).await {
+        let started = std::time::Instant::now();
+        match run_session(&args, &labels, shutdown_rx.clone(), Arc::clone(&slots)).await {
             Ok(()) => info!("session ended"),
-            Err(e) => error!(error = %e, "session error"),
+            Err(e) => {
+                if is_unauthorized(&e) {
+                    error!(
+                        "agent token rejected (401); not retrying — rotate or re-issue the token"
+                    );
+                    std::process::exit(2);
+                }
+                error!(error = %e, "session error");
+            }
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        if *shutdown_rx.borrow() {
+            info!("agent stopped");
+            return Ok(());
+        }
+        // A session that lasted a while was healthy: start the backoff over.
+        if started.elapsed() > Duration::from_secs(30) {
+            backoff = Duration::from_secs(1);
+        }
+        let delay = with_jitter(backoff);
+        info!(delay_ms = delay.as_millis() as u64, "reconnecting");
+        let mut sd = shutdown_rx.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = sd.changed() => {
+                info!("agent stopped");
+                return Ok(());
+            }
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
-async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn is_unauthorized(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status().as_u16() == 401
+        )
+    })
+}
+
+/// ±25% jitter so a fleet of agents does not reconnect in lockstep after an API restart.
+fn with_jitter(d: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let pct = 75 + (nanos % 51); // 75..=125
+    d * pct as u32 / 100
+}
+
+async fn run_session(
+    args: &Args,
+    labels: &[String],
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<()> {
     let mut url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
     url.query_pairs_mut().append_pair("token", &args.token);
 
-    info!(url = %url, "connecting");
+    // Never log the token-bearing URL.
+    info!(api = %args.api_url, "connecting");
     let (ws, _) = connect_async(url.as_str())
         .await
         .context("connect websocket")?;
@@ -130,12 +211,35 @@ async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
     let prepared: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
     let cancels: Arc<Mutex<HashMap<Uuid, oneshot::Sender<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let in_flight = Arc::new(AtomicU64::new(0));
+    // Graceful drain: while set, finished step tasks do not report — the socket is
+    // closed instead, and the server requeues the steps to another agent.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 let _ = out_tx.send(AgentMessage::Heartbeat { agent_id });
+            }
+            _ = shutdown.changed() => {
+                let n = cancels.lock().map(|g| g.len()).unwrap_or(0);
+                warn!(in_flight = n, "shutting down: stopping in-flight steps; the server will requeue them");
+                // Do not report terminal status: closing the socket makes the server
+                // requeue these steps (a restart must not fail the build).
+                draining.store(true, Ordering::SeqCst);
+                if let Ok(mut g) = cancels.lock() {
+                    for (_, tx) in g.drain() {
+                        let _ = tx.send(());
+                    }
+                }
+                // Wait until every step task has killed its process (bounded).
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while in_flight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                writer.abort();
+                return Ok(());
             }
             msg = stream.next() => {
                 match msg {
@@ -152,6 +256,7 @@ async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
                                 env,
                                 artifacts,
                                 restore,
+                                timeout_minutes,
                             }) => {
                                 info!(%step_id, %step_name, %run_id, "offered step");
                                 let _ = out_tx.send(AgentMessage::Claim { agent_id, step_run_id });
@@ -168,7 +273,14 @@ async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
                                 let use_docker = args.use_docker;
                                 let http_api = http_base(&args.api_url);
                                 let token = args.token.clone();
+                                let slots = Arc::clone(&slots);
+                                let draining = Arc::clone(&draining);
+                                let in_flight = Arc::clone(&in_flight);
+                                // The attempt's clock starts now, not when a local permit frees up.
+                                let offered_at = tokio::time::Instant::now();
+                                in_flight.fetch_add(1, Ordering::SeqCst);
                                 tokio::spawn(async move {
+                                    let _permit = slots.acquire_owned().await;
                                     let result = execute_step(
                                         &out_tx,
                                         agent_id,
@@ -186,10 +298,16 @@ async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
                                         &workspace_dir,
                                         &prepared,
                                         cancel_rx,
+                                        timeout_minutes,
+                                        offered_at,
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
                                         g.remove(&step_run_id);
+                                    }
+                                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                                    if draining.load(Ordering::SeqCst) {
+                                        return;
                                     }
 
                                     let complete = match result {
@@ -211,6 +329,15 @@ async fn run_session(args: &Args, labels: &[String]) -> Result<()> {
                                                 status: StepStatus::Cancelled,
                                                 exit_code: None,
                                                 error: Some("cancelled".into()),
+                                            }
+                                        }
+                                        Err(e) if e.to_string().starts_with("timed out") => {
+                                            AgentMessage::StepComplete {
+                                                agent_id,
+                                                step_run_id,
+                                                status: StepStatus::Failed,
+                                                exit_code: None,
+                                                error: Some(e.to_string()),
                                             }
                                         }
                                         Err(e) => AgentMessage::StepComplete {
@@ -283,18 +410,34 @@ async fn execute_step(
     workspace_root: &Path,
     prepared: &Mutex<HashSet<Uuid>>,
     mut cancel: oneshot::Receiver<()>,
+    timeout_minutes: Option<u32>,
+    offered_at: tokio::time::Instant,
 ) -> Result<i32> {
-    let mut seq = 0u64;
+    // One sequence for system/stdout/stderr so the server's `ORDER BY seq` interleaves
+    // streams in emission order (the old per-stream bases collided after 1000 lines).
+    let seq = Arc::new(AtomicU64::new(0));
+    let log_seq = Arc::clone(&seq);
     let mut log = |stream: &str, data: String| {
         let _ = out_tx.send(AgentMessage::LogChunk {
             agent_id,
             step_run_id,
             stream: stream.into(),
             data,
-            seq,
+            seq: log_seq.fetch_add(1, Ordering::Relaxed),
         });
-        seq += 1;
     };
+    let deadline = timeout_minutes
+        .filter(|m| *m > 0)
+        .map(|m| offered_at + Duration::from_secs(u64::from(m) * 60));
+    let timed_out_msg = || {
+        format!(
+            "timed out after {} min",
+            timeout_minutes.unwrap_or_default()
+        )
+    };
+    if let Some(m) = timeout_minutes {
+        log("system", format!("step timeout: {m} min"));
+    }
 
     let work_dir = workspace_root.join(run_id.to_string());
     tokio::fs::create_dir_all(&work_dir).await?;
@@ -338,16 +481,35 @@ async fn execute_step(
             log("system", "step cancelled during workspace prep".into());
             bail!("step cancelled");
         }
+        _ = sleep_until_opt(deadline) => {
+            let msg = timed_out_msg();
+            log("system", format!("{msg} (during workspace prep)"));
+            bail!("{msg}");
+        }
     }
 
+    // Killing the `docker run` client leaves the container running; name it so
+    // cancel / timeout can `docker kill` it.
+    let container_name = format!("fiber-step-{}", Uuid::new_v4());
+    let mut docker_container: Option<String> = None;
     let mut child = if let Some(img) = image.filter(|i| !i.is_empty()).filter(|_| use_docker) {
         let mount = format!("{}:/workspace", work_dir.display());
         log(
             "system",
             format!("running in docker image {img} (mount /workspace)"),
         );
+        docker_container = Some(container_name.clone());
         let mut cmd = Command::new("docker");
-        cmd.args(["run", "--rm", "-v", &mount, "-w", "/workspace"]);
+        cmd.args([
+            "run",
+            "--rm",
+            "--name",
+            &container_name,
+            "-v",
+            &mount,
+            "-w",
+            "/workspace",
+        ]);
         for (k, v) in env {
             cmd.args(["-e", &format!("{k}={v}")]);
         }
@@ -379,34 +541,32 @@ async fn execute_step(
     let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
     let out_tx2 = out_tx.clone();
+    let out_seq = Arc::clone(&seq);
     let out_handle = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        let mut seq = 1000u64;
         while let Ok(Some(l)) = lines.next_line().await {
             let _ = out_tx2.send(AgentMessage::LogChunk {
                 agent_id,
                 step_run_id,
                 stream: "stdout".into(),
                 data: l,
-                seq,
+                seq: out_seq.fetch_add(1, Ordering::Relaxed),
             });
-            seq += 1;
         }
     });
 
     let err_tx = out_tx.clone();
+    let err_seq = Arc::clone(&seq);
     let err_handle = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
-        let mut seq = 2000u64;
         while let Ok(Some(l)) = lines.next_line().await {
             let _ = err_tx.send(AgentMessage::LogChunk {
                 agent_id,
                 step_run_id,
                 stream: "stderr".into(),
                 data: l,
-                seq,
+                seq: err_seq.fetch_add(1, Ordering::Relaxed),
             });
-            seq += 1;
         }
     });
 
@@ -419,11 +579,18 @@ async fn execute_step(
         }
         _ = &mut cancel => {
             log("system", "killing step process".into());
-            kill_process_group(&mut child);
-            let _ = child.wait().await;
+            kill_step(&mut child, docker_container.as_deref()).await;
             let _ = out_handle.await;
             let _ = err_handle.await;
             bail!("step cancelled");
+        }
+        _ = sleep_until_opt(deadline) => {
+            let msg = timed_out_msg();
+            log("system", format!("{msg}; killing step process"));
+            kill_step(&mut child, docker_container.as_deref()).await;
+            let _ = out_handle.await;
+            let _ = err_handle.await;
+            bail!("{msg}");
         }
     };
 
@@ -432,6 +599,28 @@ async fn execute_step(
     }
 
     Ok(code)
+}
+
+/// Stop a step: the container (if any) first, then the client's process group.
+async fn kill_step(child: &mut tokio::process::Child, container: Option<&str>) {
+    if let Some(name) = container {
+        let _ = Command::new("docker")
+            .args(["kill", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    kill_process_group(child);
+    let _ = child.wait().await;
+}
+
+/// Resolves at `deadline`, or never when there is none.
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Put the child in its own process group so cancel can kill grandchildren.

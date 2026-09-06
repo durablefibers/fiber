@@ -3,6 +3,7 @@ mod artifact_util;
 mod artifacts;
 mod auth;
 mod github;
+mod login_guard;
 mod otel;
 mod retention;
 mod routes;
@@ -19,7 +20,7 @@ use redis::aio::ConnectionManager;
 use state::AppState;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug)]
@@ -94,6 +95,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         events_bus.events_loop(redis_url).await;
     });
+    let agent_cmds = scheduler.clone();
+    let redis_url = args.redis_url.clone();
+    tokio::spawn(async move {
+        agent_cmds.agent_cmds_loop(redis_url).await;
+    });
     let fibers = fiber_scheduler.clone();
     tokio::spawn(async move {
         fibers.run_loop().await;
@@ -112,19 +118,58 @@ async fn main() -> Result<()> {
         scheduler,
         fiber_scheduler,
         artifacts,
+        login_guard: Arc::new(login_guard::LoginGuard::new()),
     };
 
+    if args.admin_password == "fiber" {
+        tracing::warn!(
+            "FIBER_ADMIN_PASSWORD is the default (`fiber`) — change it before exposing this instance"
+        );
+    }
+
     let app = routes::router(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http());
 
     tracing::info!(%args.listen, "fiber-api listening");
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Browser origins allowed to call the API. `FIBER_CORS_ORIGINS` is a comma-separated
+/// list; the default covers the local web dev server. `*` opts back into any origin.
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("FIBER_CORS_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:3100,http://localhost:3100".into());
+    // `Access-Control-Allow-Headers: *` does not cover Authorization per the Fetch spec,
+    // so name the two headers the SPA actually sends.
+    let base = CorsLayer::new().allow_methods(Any).allow_headers([
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::CONTENT_TYPE,
+    ]);
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    // A wildcard anywhere in the list means "any origin" (AllowOrigin::list would panic on it).
+    if entries.contains(&"*") {
+        tracing::warn!("FIBER_CORS_ORIGINS contains `*` — any web origin may call this API");
+        return base.allow_origin(Any);
+    }
+    let origins: Vec<_> = entries
+        .into_iter()
+        .filter_map(|s| match s.parse() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = %s, "ignoring invalid FIBER_CORS_ORIGINS entry");
+                None
+            }
+        })
+        .collect();
+    tracing::info!(?origins, "CORS allowed origins");
+    base.allow_origin(AllowOrigin::list(origins))
 }

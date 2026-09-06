@@ -41,12 +41,13 @@
 3. **Offer / lease** — Connected agent receives `Offer` over WS (workspace, env, artifact restore list).
 4. **Execute** — Agent prepares git workspace, restores prior artifacts, runs shell or Docker, streams `LogChunk`.
 5. **Complete** — Agent reports status; scheduler unlocks dependents or skips on failure (fail-fast).
-6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers.
+6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers; agent-directed messages (cancel, disconnect) fan out on `fiber:agent_cmds` to whichever instance holds the agent's socket.
 
 ## Durability model
 
 - **CI steps are at-least-once.** Leases expire; stale agents are reclaimed; steps may re-run. Make `run` idempotent.
-- **Definition snapshot** on the run is immutable for that execution.
+- **Definition snapshot** on the run is immutable for that execution. Every offer an agent receives — workspace, command, image, artifacts, matrix env — is built from that snapshot; the live pipeline row is never consulted on the execution path, so editing a pipeline mid-run changes nothing for runs already started.
+- **Propagation is transactional.** Unlocking dependents, cascading skips, and finalising the run happen in one transaction with the run row locked, computed to a fixpoint — concurrent completions of sibling steps cannot interleave, and a failure at the top of a chain skips the whole chain in one pass.
 - **Append-only** `step_attempts` and `log_lines` for audit.
 - **Durable fibers** (separate from CI DAG) persist task state in Postgres and resume after crash — see [Durable fibers](./durable-fibers.md).
 

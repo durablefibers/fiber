@@ -13,7 +13,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/auth/login` | `{ username, password }` → `{ token, user }` |
+| POST | `/api/auth/login` | `{ username, password }` → `{ token, user, expires_at }` (`user.is_admin` = instance admin) |
 | POST | `/api/auth/logout` | Invalidate session |
 | GET | `/api/auth/me` | Current user |
 
@@ -25,7 +25,8 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET | `/api/projects/{id}` | reader (includes `role`) |
 | GET/POST | `/api/projects/{id}/members` | reader / admin |
 | PUT/DELETE | `/api/projects/{id}/members/{user_id}` | admin |
-| POST | `/api/users` | owner on some project |
+| GET/POST | `/api/users` | instance admin |
+| PUT | `/api/users/{id}` | instance admin — `{ is_admin }`; cannot demote the last admin |
 
 ## Pipelines & runs
 
@@ -51,16 +52,17 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET/POST | `/api/projects/{id}/secrets` | admin |
 | DELETE | `/api/projects/{id}/secrets/{key}` | admin |
 | PUT | `/api/projects/{id}/webhooks/github` | admin — set HMAC secret |
-| POST | `/api/projects/{id}/webhooks/github` | GitHub (signature if configured) |
+| POST | `/api/projects/{id}/webhooks/github` | GitHub — **requires** a configured secret and a valid `X-Hub-Signature-256`; `401` otherwise |
 
 ## Agents (global)
 
 | Method | Path | Notes |
 |---|---|---|
-| GET/POST | `/api/agents` | List / create (`project_id` optional; token once) |
-| GET | `/api/agents?project_id=` | Project agents + globals |
-| PUT/DELETE | `/api/agents/{id}` | Update / delete (project agents need admin) |
-| POST | `/api/agents/{id}/rotate-token` | New token once; force disconnect |
+| GET | `/api/agents` | **Instance admin** — every agent |
+| GET | `/api/agents?project_id=` | reader on project — that project's agents + globals |
+| POST | `/api/agents` | Create (token returned once). Global (no `project_id`): **instance admin**; project: admin on that project |
+| PUT/DELETE | `/api/agents/{id}` | Update / delete — global: instance admin; project: project admin |
+| POST | `/api/agents/{id}/rotate-token` | New token once; force disconnect — same gate as update |
 
 ## Durable fibers
 
@@ -74,16 +76,16 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Method | Path | Notes |
 |---|---|---|
-| PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path` |
-| POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }` |
-| POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT |
-| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect) |
+| PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path`; step must be **running and leased to this agent** |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }`; same lease check |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT; same lease check |
+| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect). Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
 
 ## WebSockets
 
 | Path | Auth | Notes |
 |---|---|---|
-| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete |
+| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
 | `/ws/runs/{id}?token=` | session token | Live run/step/log events |
 
 Message shapes: `crates/fiber-proto`.

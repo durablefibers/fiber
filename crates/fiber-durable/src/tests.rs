@@ -83,7 +83,7 @@ fn fiber_state_sleeps_done_in_checkpoint_blob() {
 
 #[test]
 fn failure_outcome_retries_until_max_attempts() {
-    // run_fiber increments attempts before calling the handler, so the first failure
+    // claim_ready increments attempts when it claims the fiber, so the first failure
     // arrives with attempts == 1.
     assert_eq!(failure_outcome(1, 3), FiberOutcome::Retry);
     assert_eq!(failure_outcome(2, 3), FiberOutcome::Retry);

@@ -10,6 +10,13 @@ function wsBase() {
   return u.origin
 }
 
+export type PublicUser = {
+  id: string
+  username: string
+  /** Instance admin: global agent pool + user creation. Not a project-role bypass. */
+  is_admin: boolean
+}
+
 export type Project = {
   id: string
   name: string
@@ -59,6 +66,8 @@ export type PipelineDefinition = {
     cron?: string
   }
   steps: StepDefinition[]
+  /** Whole-run wall-clock limit in minutes. */
+  timeout_minutes?: number
 }
 
 export type StepDefinition = {
@@ -74,6 +83,8 @@ export type StepDefinition = {
   matrix?: Record<string, string[]>
   /** `success()` (default), `always()`, `never()`, or `matrix.os == 'linux'`. */
   if?: string
+  /** Per-attempt wall-clock limit in minutes (server default 60 when unset). */
+  timeout_minutes?: number
 }
 
 export type Artifact = {
@@ -228,7 +239,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   login: (username: string, password: string) =>
-    request<{ token: string; user: { id: string; username: string } }>(
+    request<{ token: string; user: PublicUser; expires_at: string }>(
       "/api/auth/login",
       {
         method: "POST",
@@ -237,7 +248,13 @@ export const api = {
     ),
   logout: () =>
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  me: () => request<{ id: string; username: string }>("/api/auth/me"),
+  me: () => request<PublicUser>("/api/auth/me"),
+  listUsers: () => request<PublicUser[]>("/api/users"),
+  setUserAdmin: (id: string, is_admin: boolean) =>
+    request<PublicUser>(`/api/users/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_admin }),
+    }),
   listProjects: () => request<Project[]>("/api/projects"),
   createProject: (name: string) =>
     request<Project>("/api/projects", {
@@ -487,6 +504,9 @@ export function definitionToYaml(def: PipelineDefinition): string {
       lines.push(`  cron: ${yamlQuote(def.on.cron)}`)
     }
   }
+  if (def.timeout_minutes) {
+    lines.push(`timeout_minutes: ${def.timeout_minutes}`)
+  }
   lines.push("steps:")
   for (const s of def.steps) {
     lines.push(`  ${s.id}:`)
@@ -499,6 +519,9 @@ export function definitionToYaml(def: PipelineDefinition): string {
       lines.push(`    labels: [${s.labels.map(yamlQuote).join(", ")}]`)
     }
     if (s.retries) lines.push(`    retries: ${s.retries}`)
+    if (s.timeout_minutes) {
+      lines.push(`    timeout_minutes: ${s.timeout_minutes}`)
+    }
     if (s.if) lines.push(`    if: ${yamlQuote(s.if)}`)
     if (s.matrix && Object.keys(s.matrix).length) {
       lines.push("    matrix:")

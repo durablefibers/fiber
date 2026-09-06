@@ -137,6 +137,16 @@ pub struct LogLine {
     pub created_at: DateTime<Utc>,
 }
 
+/// A running step whose attempt exceeded its timeout (see `Store::list_timed_out_steps`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TimedOutStep {
+    pub step_run_id: Uuid,
+    pub run_id: Uuid,
+    pub step_id: String,
+    pub agent_id: Option<Uuid>,
+    pub timeout_minutes: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Artifact {
     pub id: Uuid,
@@ -200,12 +210,16 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub created_at: DateTime<Utc>,
+    /// Instance admin: manages the global agent pool and user creation. Not a project-role bypass.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PublicUser {
     pub id: Uuid,
     pub username: String,
+    /// Instance admin (global agents, user creation). Project roles are separate.
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

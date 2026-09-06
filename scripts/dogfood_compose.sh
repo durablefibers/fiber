@@ -8,6 +8,10 @@ FAILS=0
 ok() { echo "OK  $*"; }
 fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
 
+# The deployment profile expects deploy/.env; supply throwaway values when absent.
+export FIBER_SECRETS_KEY="${FIBER_SECRETS_KEY:-$(openssl rand -hex 32)}"
+export FIBER_REDIS_PASSWORD="${FIBER_REDIS_PASSWORD:-fiber}"
+
 echo "== compose build + up =="
 # Stop legacy Compose project that may own 15432/16379
 docker compose -p deploy -f "$ROOT/deploy/docker-compose.yml" stop fiber-postgres fiber-redis 2>/dev/null || true

@@ -7,13 +7,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export FIBER_ROOT="$ROOT"
 
 export FIBER_DATABASE_URL="${FIBER_DATABASE_URL:-postgres://fiber:fiber@127.0.0.1:15432/fiber}"
-export FIBER_REDIS_URL="${FIBER_REDIS_URL:-redis://127.0.0.1:16379}"
+export FIBER_REDIS_URL="${FIBER_REDIS_URL:-redis://:${FIBER_REDIS_PASSWORD:-fiber}@127.0.0.1:16379}"
 export FIBER_LISTEN="${FIBER_LISTEN:-0.0.0.0:18080}"
 export FIBER_ARTIFACTS_DIR="${FIBER_ARTIFACTS_DIR:-$ROOT/data/artifacts}"
 export FIBER_ADMIN_USER="${FIBER_ADMIN_USER:-admin}"
 export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
 export FIBER_RETENTION_DAYS="${FIBER_RETENTION_DAYS:-30}"
 export RUST_LOG="${RUST_LOG:-info,fiber_api=info,fiber_agent=info}"
+# Browser origins allowed by the API (default already covers the :3100 dev server).
+# export FIBER_CORS_ORIGINS=http://localhost:3100,http://127.0.0.1:3100
+# Step timeouts (minutes): default for steps without `timeout_minutes`, and the
+# server-side grace before it fails a step the agent did not stop itself.
+# export FIBER_STEP_TIMEOUT_DEFAULT_MINUTES=60
+# export FIBER_STEP_TIMEOUT_GRACE_MINUTES=5
 
 # Optional secrets encryption (generate once: openssl rand -hex 32)
 # export FIBER_SECRETS_KEY=...

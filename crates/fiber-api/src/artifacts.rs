@@ -44,8 +44,15 @@ impl ArtifactBackend {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| endpoint.clone());
         let region = std::env::var("FIBER_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-        let access = std::env::var("FIBER_S3_ACCESS_KEY").unwrap_or_else(|_| "fiber".into());
-        let secret = std::env::var("FIBER_S3_SECRET_KEY").unwrap_or_else(|_| "fiberfiber".into());
+        // No silent fallback to the MinIO dev credentials: a bucket without keys is a misconfiguration.
+        let access = std::env::var("FIBER_S3_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("FIBER_S3_ACCESS_KEY is required when FIBER_S3_BUCKET is set")?;
+        let secret = std::env::var("FIBER_S3_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("FIBER_S3_SECRET_KEY is required when FIBER_S3_BUCKET is set")?;
 
         let client = s3_client(&endpoint, &region, &access, &secret);
         let presign_client = if public_endpoint == endpoint {

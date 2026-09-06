@@ -150,12 +150,12 @@ impl Store {
     }
 
     pub async fn find_user_by_username(&self, username: &str) -> Result<Option<PublicUser>> {
-        Ok(
-            sqlx::query_as::<_, PublicUser>("SELECT id, username FROM users WHERE username = $1")
-                .bind(username)
-                .fetch_optional(&self.pool)
-                .await?,
+        Ok(sqlx::query_as::<_, PublicUser>(
+            "SELECT id, username, is_admin FROM users WHERE username = $1",
         )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
@@ -163,12 +163,55 @@ impl Store {
         let hash = crate::tokens::hash_password(password);
         Ok(sqlx::query_as::<_, PublicUser>(
             "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)
-             RETURNING id, username",
+             RETURNING id, username, is_admin",
         )
         .bind(id)
         .bind(username)
         .bind(hash)
         .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Grant or revoke instance-admin. Refuses to demote the last admin; the guard is
+    /// part of the UPDATE so two concurrent demotions cannot both succeed.
+    pub async fn set_instance_admin(&self, user_id: Uuid, is_admin: bool) -> Result<PublicUser> {
+        let updated = sqlx::query_as::<_, PublicUser>(
+            "UPDATE users SET is_admin = $2
+             WHERE id = $1
+               AND ($2 OR EXISTS (SELECT 1 FROM users o WHERE o.is_admin AND o.id <> $1))
+             RETURNING id, username, is_admin",
+        )
+        .bind(user_id)
+        .bind(is_admin)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(u) = updated {
+            return Ok(u);
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if exists {
+            Err(crate::ValidationError("cannot demote the last instance admin".into()).into())
+        } else {
+            anyhow::bail!("user not found")
+        }
+    }
+
+    pub async fn count_instance_admins(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<PublicUser>> {
+        Ok(sqlx::query_as::<_, PublicUser>(
+            "SELECT id, username, is_admin FROM users ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
         .await?)
     }
 
@@ -344,22 +387,32 @@ impl Store {
             .await?)
     }
 
-    /// After a schedule fire: stamp `last_scheduled_at` and set the next wake.
-    pub async fn mark_scheduled(
+    /// Claim one schedule slot with a compare-and-set: succeeds only if `next_due_at`
+    /// is still the value the caller observed **and** the pipeline has no active run.
+    /// With several API instances ticking the same schedule, exactly one wins.
+    /// Returns `false` when another instance claimed it or a run is still active.
+    pub async fn claim_schedule_slot(
         &self,
         pipeline_id: Uuid,
+        expected_due: DateTime<Utc>,
         next_due: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let claimed: Option<Uuid> = sqlx::query_scalar(
             "UPDATE pipelines
-             SET last_scheduled_at = NOW(), next_due_at = $2
-             WHERE id = $1",
+             SET last_scheduled_at = NOW(), next_due_at = $3
+             WHERE id = $1
+               AND next_due_at = $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM runs r
+                   WHERE r.pipeline_id = $1 AND r.status IN ('pending', 'running'))
+             RETURNING id",
         )
         .bind(pipeline_id)
+        .bind(expected_due)
         .bind(next_due)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(claimed.is_some())
     }
 
     /// Clear schedule wake time (no schedule configured).
@@ -401,19 +454,41 @@ impl Store {
         Ok(n)
     }
 
-    pub async fn requeue_for_retry(&self, step_run_id: Uuid) -> Result<StepRun> {
-        Ok(sqlx::query_as::<_, StepRun>(
+    /// Re-queue a failed step for another attempt, not offerable before `backoff_secs`.
+    /// The failed attempt is closed in `step_attempts` (with its exit code / error) so
+    /// the attempt history is complete and the timeout backstop, which looks at the
+    /// open attempt, never sees a stale one.
+    /// Returns `None` when the step is no longer running under `agent_id` — another
+    /// replica's backstop or a cancel got there first — so a live attempt is never
+    /// cleared by a late requeue.
+    pub async fn requeue_for_retry(
+        &self,
+        step_run_id: Uuid,
+        agent_id: Uuid,
+        backoff_secs: i64,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+    ) -> Result<Option<StepRun>> {
+        let requeued = sqlx::query_as::<_, StepRun>(
             "UPDATE step_runs
              SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
-                 error = NULL, exit_code = NULL, finished_at = NULL
-             WHERE id = $1
+                 error = NULL, exit_code = NULL, finished_at = NULL,
+                 not_before = NOW() + make_interval(secs => $2)
+             WHERE id = $1 AND status = 'running' AND agent_id = $3
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
                        started_at, finished_at",
         )
         .bind(step_run_id)
-        .fetch_one(&self.pool)
-        .await?)
+        .bind(backoff_secs as f64)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if requeued.is_some() {
+            self.finish_open_attempt(step_run_id, "failed", exit_code, error)
+                .await?;
+        }
+        Ok(requeued)
     }
 
     pub async fn start_run(
@@ -430,6 +505,9 @@ impl Store {
         let run_id = Uuid::new_v4();
         let snapshot = serde_json::to_value(&compiled)?;
 
+        // The run row and every step row land together: a half-inserted DAG would
+        // otherwise "succeed" once its partial set of steps finished.
+        let mut tx = self.pool.begin().await?;
         let run = sqlx::query_as::<_, Run>(
             "INSERT INTO runs (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at)
              VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -442,10 +520,9 @@ impl Store {
         .bind(status_str(RunStatus::Running))
         .bind(trigger)
         .bind(&snapshot)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        let mut step_runs = Vec::new();
         for step in &compiled.steps {
             let sid = Uuid::new_v4();
             // Only evaluate `if:` for roots here. Dependent steps stay Pending until
@@ -468,13 +545,10 @@ impl Store {
             } else {
                 None
             };
-            let sr = sqlx::query_as::<_, StepRun>(
+            sqlx::query(
                 "INSERT INTO step_runs
                  (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries, error)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                           retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                           started_at, finished_at",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(sid)
             .bind(run_id)
@@ -487,13 +561,15 @@ impl Store {
             .bind(json!(step.needs))
             .bind(step.retries as i32)
             .bind(error)
-            .fetch_one(&self.pool)
+            .execute(&mut *tx)
             .await?;
-            step_runs.push(sr);
         }
+        tx.commit().await?;
 
-        // If all roots skipped, propagate so dependents can resolve.
+        // If all roots skipped, propagate so dependents can resolve — and return the run
+        // as it is afterwards (it may already be terminal).
         let _ = self.propagate_after_step(run_id).await?;
+        let run = self.get_run(run_id).await?.unwrap_or(run);
 
         Ok((run, self.list_step_runs(run_id).await?, compiled))
     }
@@ -522,15 +598,8 @@ impl Store {
     }
 
     pub async fn list_step_runs(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
-        Ok(sqlx::query_as::<_, StepRun>(
-            "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                    retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                    started_at, finished_at
-             FROM step_runs WHERE run_id = $1 ORDER BY step_id",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let mut conn = self.pool.acquire().await?;
+        list_step_runs_on(&mut conn, run_id).await
     }
 
     pub async fn get_step_run(&self, id: Uuid) -> Result<Option<StepRun>> {
@@ -551,6 +620,7 @@ impl Store {
                     retries, attempt, agent_id, lease_expires_at, exit_code, error,
                     started_at, finished_at
              FROM step_runs WHERE status = 'queued'
+               AND (not_before IS NULL OR not_before <= NOW())
              ORDER BY started_at NULLS FIRST, id",
         )
         .fetch_all(&self.pool)
@@ -569,6 +639,7 @@ impl Store {
              SET status = 'running', agent_id = $2, lease_expires_at = $3,
                  started_at = COALESCE(started_at, NOW()), attempt = attempt + 1
              WHERE id = $1 AND status = 'queued'
+               AND (not_before IS NULL OR not_before <= NOW())
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
                        started_at, finished_at",
@@ -613,23 +684,8 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE step_attempts
-             SET finished_at = NOW(), status = $2, exit_code = $3, error = $4
-             WHERE id = (
-                 SELECT id FROM step_attempts
-                 WHERE step_run_id = $1 AND finished_at IS NULL
-                 ORDER BY started_at DESC
-                 LIMIT 1
-             )",
-        )
-        .bind(step_run_id)
-        .bind(status)
-        .bind(exit_code)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        finish_open_attempt_on(&mut conn, step_run_id, status, exit_code, error).await
     }
 
     pub async fn list_step_attempts(&self, step_run_id: Uuid) -> Result<Vec<StepAttempt>> {
@@ -650,28 +706,10 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<StepRun> {
-        let sr = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs
-             SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
-             WHERE id = $1
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
-        .bind(step_run_id)
-        .bind(step_status_str(status))
-        .bind(exit_code)
-        .bind(&error)
-        .fetch_one(&self.pool)
-        .await?;
-        self.finish_open_attempt(
-            step_run_id,
-            step_status_str(status),
-            exit_code,
-            error.as_deref(),
-        )
-        .await?;
-        Ok(sr)
+        let mut conn = self.pool.acquire().await?;
+        complete_step_on(&mut conn, step_run_id, status, exit_code, error, None)
+            .await?
+            .ok_or_else(|| anyhow!("step run not found"))
     }
 
     /// Complete only if still running for this agent (ignores late completes after cancel/reclaim).
@@ -723,6 +761,47 @@ impl Store {
         Ok(res.rows_affected())
     }
 
+    /// Running steps whose current attempt has exceeded its timeout plus a grace
+    /// period (the agent is expected to fail the step itself first). The timeout comes
+    /// from the run's definition snapshot, falling back to `default_minutes`.
+    pub async fn list_timed_out_steps(
+        &self,
+        default_minutes: i64,
+        grace_minutes: i64,
+    ) -> Result<Vec<TimedOutStep>> {
+        Ok(sqlx::query_as::<_, TimedOutStep>(
+            "SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
+                    COALESCE(js.t, $1)::bigint AS timeout_minutes
+             FROM step_runs s
+             JOIN runs r ON r.id = s.run_id
+             JOIN step_attempts a ON a.step_run_id = s.id AND a.finished_at IS NULL
+             LEFT JOIN LATERAL (
+                 SELECT (e->>'timeout_minutes')::bigint AS t
+                 FROM jsonb_array_elements(r.definition_snapshot->'steps') e
+                 WHERE e->>'id' = s.step_id
+                 LIMIT 1) js ON TRUE
+             WHERE s.status = 'running'
+               AND a.started_at < NOW() - make_interval(mins => (COALESCE(js.t, $1) + $2)::int)",
+        )
+        .bind(default_minutes)
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Running runs whose snapshot carries a whole-run `timeout_minutes` that has elapsed.
+    pub async fn list_timed_out_runs(&self) -> Result<Vec<(Uuid, i64)>> {
+        Ok(sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT id, (definition_snapshot->>'timeout_minutes')::bigint
+             FROM runs
+             WHERE status = 'running'
+               AND (definition_snapshot->>'timeout_minutes') IS NOT NULL
+               AND started_at < NOW() - make_interval(mins => (definition_snapshot->>'timeout_minutes')::int)",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn requeue_expired_leases(&self) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
             "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
@@ -742,8 +821,7 @@ impl Store {
 
     pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
-                 started_at = NULL, attempt = GREATEST(attempt - 1, 0)
+            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
              WHERE agent_id = $1 AND status = 'running'
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -759,142 +837,76 @@ impl Store {
         Ok(requeued)
     }
 
-    /// After a step completes, unlock dependents or skip cascade on failure.
+    /// Unlock dependents / cascade skips / finalize the run after a step changed.
+    ///
+    /// Runs as one transaction with the `runs` row locked (`FOR UPDATE`) so two steps
+    /// of the same run completing concurrently cannot interleave their reads and
+    /// writes. Transitions are computed in memory to a fixpoint, so a chain
+    /// `A(failed) → B → C → D` resolves in one call regardless of step order.
+    /// Returns every step whose status changed; publishing happens in the caller,
+    /// after commit.
     pub async fn propagate_after_step(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
-        let run = self
-            .get_run(run_id)
-            .await?
-            .ok_or_else(|| anyhow!("run not found"))?;
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, Run>(
+            "SELECT id, pipeline_id, project_id, status, trigger, definition_snapshot,
+                    created_at, started_at, finished_at
+             FROM runs WHERE id = $1 FOR UPDATE",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("run not found"))?;
         let snapshot_steps = run
             .definition_snapshot
             .get("steps")
             .cloned()
             .unwrap_or(json!([]));
 
-        let steps = self.list_step_runs(run_id).await?;
-
-        let failed: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled))
-            .map(|s| s.step_id.clone())
-            .collect();
-
+        let mut steps = list_step_runs_on(&mut tx, run_id).await?;
         let mut changed = Vec::new();
-
-        // Skip cascade: any pending/queued step that depends on failed
-        for s in &steps {
-            if !matches!(s.status_enum(), StepStatus::Pending | StepStatus::Queued) {
-                continue;
+        loop {
+            let plan = plan_transitions(&steps, &snapshot_steps);
+            if plan.is_empty() {
+                break;
             }
-            let needs = s.needs_vec();
-            if needs.iter().any(|n| failed.contains(n)) {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("dependency failed".into()),
-                    )
-                    .await?;
-                changed.push(updated);
+            let mut progressed = false;
+            for (idx, transition) in plan {
+                let id = steps[idx].id;
+                let updated = match transition {
+                    Transition::Skip(reason) => {
+                        complete_step_on(
+                            &mut tx,
+                            id,
+                            StepStatus::Skipped,
+                            None,
+                            Some(reason.to_string()),
+                            Some(&["pending", "queued"]),
+                        )
+                        .await?
+                    }
+                    Transition::Queue => {
+                        sqlx::query_as::<_, StepRun>(&format!(
+                            "UPDATE step_runs SET status = 'queued'
+                             WHERE id = $1 AND status = 'pending'
+                             RETURNING {STEP_RUN_COLS}"
+                        ))
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    }
+                };
+                if let Some(u) = updated {
+                    steps[idx] = u.clone();
+                    changed.push(u);
+                    progressed = true;
+                }
             }
-        }
-
-        // Refresh after failure skips
-        let steps = self.list_step_runs(run_id).await?;
-        let succeeded: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| s.status_enum() == StepStatus::Succeeded)
-            .map(|s| s.step_id.clone())
-            .collect();
-        let terminal: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.status_enum(),
-                    StepStatus::Succeeded
-                        | StepStatus::Failed
-                        | StepStatus::Cancelled
-                        | StepStatus::Skipped
-                )
-            })
-            .map(|s| s.step_id.clone())
-            .collect();
-
-        for s in &steps {
-            if s.status_enum() != StepStatus::Pending {
-                continue;
-            }
-            let needs = s.needs_vec();
-            if !needs.iter().all(|n| terminal.contains(n)) {
-                continue;
-            }
-
-            let (if_expr, env) = snapshot_step_if_env(&snapshot_steps, &s.step_id);
-            let always = if_expr.as_deref().map(str::trim) == Some("always()");
-            // success()/default: all needs succeeded. always(): run even if deps failed/skipped.
-            let needs_ok = if always {
-                true
-            } else {
-                needs.iter().all(|n| succeeded.contains(n))
-            };
-
-            if !needs_ok {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("dependency skipped or failed".into()),
-                    )
-                    .await?;
-                changed.push(updated);
-                continue;
-            }
-
-            let ctx = crate::step_if::IfContext {
-                needs_succeeded: needs.iter().all(|n| succeeded.contains(n)),
-                env,
-            };
-            if !crate::step_if::eval_if(if_expr.as_deref(), &ctx) {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("if: condition false".into()),
-                    )
-                    .await?;
-                changed.push(updated);
-                continue;
-            }
-
-            let updated = sqlx::query_as::<_, StepRun>(
-                "UPDATE step_runs SET status = 'queued' WHERE id = $1 AND status = 'pending'
-                 RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                           retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                           started_at, finished_at",
-            )
-            .bind(s.id)
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(u) = updated {
-                changed.push(u);
+            if !progressed {
+                break;
             }
         }
 
-        // Finalize run status
-        let steps = self.list_step_runs(run_id).await?;
-        let all_terminal = steps.iter().all(|s| {
-            matches!(
-                s.status_enum(),
-                StepStatus::Succeeded
-                    | StepStatus::Failed
-                    | StepStatus::Cancelled
-                    | StepStatus::Skipped
-            )
-        });
-        if all_terminal {
+        if steps.iter().all(|s| s.status_enum().is_terminal()) {
             let any_failed = steps
                 .iter()
                 .any(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled));
@@ -908,15 +920,25 @@ impl Store {
             )
             .bind(run_id)
             .bind(status_str(status))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
-
+        tx.commit().await?;
         Ok(changed)
     }
 
     /// Cancel a run. Returns the run and any steps that were `running` (for agent Cancel fan-out).
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<(Run, Vec<StepRun>)> {
+        self.cancel_run_with_reason(run_id, None).await
+    }
+
+    /// Cancel a run; `reason` (e.g. "run timed out") is recorded on the cancelled steps
+    /// and their open attempts so the outcome is distinguishable from a manual cancel.
+    pub async fn cancel_run_with_reason(
+        &self,
+        run_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(Run, Vec<StepRun>)> {
         let running = sqlx::query_as::<_, StepRun>(
             "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                     retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -928,15 +950,22 @@ impl Store {
         .await?;
 
         sqlx::query(
-            "UPDATE step_runs SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL
+            "UPDATE step_runs SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL,
+                 error = COALESCE($2, error)
              WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')",
         )
         .bind(run_id)
+        .bind(reason)
         .execute(&self.pool)
         .await?;
         for s in &running {
-            self.finish_open_attempt(s.id, "cancelled", None, Some("run cancelled"))
-                .await?;
+            self.finish_open_attempt(
+                s.id,
+                "cancelled",
+                None,
+                Some(reason.unwrap_or("run cancelled")),
+            )
+            .await?;
         }
         let run = sqlx::query_as::<_, Run>(
             "UPDATE runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1
@@ -974,7 +1003,7 @@ impl Store {
     pub async fn list_logs(&self, step_run_id: Uuid) -> Result<Vec<LogLine>> {
         Ok(sqlx::query_as::<_, LogLine>(
             "SELECT id, run_id, step_run_id, stream, data, seq, created_at
-             FROM log_lines WHERE step_run_id = $1 ORDER BY seq",
+             FROM log_lines WHERE step_run_id = $1 ORDER BY seq, id",
         )
         .bind(step_run_id)
         .fetch_all(&self.pool)
@@ -1012,6 +1041,21 @@ impl Store {
         )
         .bind(run_id)
         .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// True when `agent_id` currently holds a running step in the artifact's run.
+    /// Backs the agent restore-download route; global vs project pools need no special case.
+    pub async fn agent_may_read_artifact(&self, agent_id: Uuid, artifact_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM artifacts a
+                 JOIN step_runs s ON s.run_id = a.run_id
+                 WHERE a.id = $1 AND s.agent_id = $2 AND s.status = 'running')",
+        )
+        .bind(artifact_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
         .await?)
     }
 
@@ -1247,6 +1291,7 @@ impl Store {
                  FROM step_runs s
                  INNER JOIN runs r ON r.id = s.run_id
                  WHERE s.status = 'queued' AND r.project_id = $1
+                   AND (s.not_before IS NULL OR s.not_before <= NOW())
                  ORDER BY s.started_at NULLS FIRST, s.id",
             )
             .bind(pid)
@@ -1376,18 +1421,18 @@ impl Store {
         secret: &str,
     ) -> Result<()> {
         let id = Uuid::new_v4();
-        sqlx::query("DELETE FROM webhook_secrets WHERE project_id = $1 AND provider = $2")
-            .bind(project_id)
-            .bind(provider)
-            .execute(&self.pool)
-            .await?;
+        // Encrypted at rest with FIBER_SECRETS_KEY, same as project secrets.
+        let stored = crate::secrets::encrypt_secret(secret)?;
         sqlx::query(
-            "INSERT INTO webhook_secrets (id, project_id, provider, secret) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO webhook_secrets (id, project_id, provider, secret)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (project_id, provider)
+             DO UPDATE SET secret = EXCLUDED.secret, created_at = NOW()",
         )
         .bind(id)
         .bind(project_id)
         .bind(provider)
-        .bind(secret)
+        .bind(stored)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1398,13 +1443,16 @@ impl Store {
         project_id: Uuid,
         provider: &str,
     ) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar::<_, String>(
+        let row: Option<(String,)> = sqlx::query_as(
             "SELECT secret FROM webhook_secrets WHERE project_id = $1 AND provider = $2",
         )
         .bind(project_id)
         .bind(provider)
         .fetch_optional(&self.pool)
-        .await?)
+        .await?;
+        // Rows written before encryption are plaintext; decrypt_secret passes those through.
+        row.map(|(v,)| crate::secrets::decrypt_secret(&v))
+            .transpose()
     }
 
     pub async fn ensure_admin_user(&self, username: &str, password: &str) -> Result<PublicUser> {
@@ -1412,11 +1460,25 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         if count > 0 {
+            // Recovery path only: promote FIBER_ADMIN_USER while the instance has *no*
+            // admin. Never on every boot — anyone who can create users (project admins,
+            // via member invites) could otherwise squat the name and be promoted on restart.
+            let admins = self.count_instance_admins().await?;
             if let Some(u) = self.find_user_by_username(username).await? {
+                if !u.is_admin && admins == 0 {
+                    tracing::warn!(%username, "no instance admin existed; promoting FIBER_ADMIN_USER");
+                    return self.set_instance_admin(u.id, true).await;
+                }
                 return Ok(u);
             }
+            if admins == 0 {
+                tracing::error!(
+                    %username,
+                    "no instance admin exists and FIBER_ADMIN_USER matches no user — set it to an existing username to recover"
+                );
+            }
             return Ok(sqlx::query_as::<_, PublicUser>(
-                "SELECT id, username FROM users ORDER BY created_at LIMIT 1",
+                "SELECT id, username, is_admin FROM users ORDER BY created_at, id LIMIT 1",
             )
             .fetch_one(&self.pool)
             .await?);
@@ -1424,8 +1486,8 @@ impl Store {
         let id = Uuid::new_v4();
         let hash = crate::tokens::hash_password(password);
         let user = sqlx::query_as::<_, PublicUser>(
-            "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)
-             RETURNING id, username",
+            "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, TRUE)
+             RETURNING id, username, is_admin",
         )
         .bind(id)
         .bind(username)
@@ -1438,7 +1500,7 @@ impl Store {
 
     pub async fn login(&self, username: &str, password: &str) -> Result<Option<LoginResponse>> {
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, username, password_hash, created_at FROM users WHERE username = $1",
+            "SELECT id, username, password_hash, created_at, is_admin FROM users WHERE username = $1",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -1477,6 +1539,7 @@ impl Store {
             user: PublicUser {
                 id: user.id,
                 username: user.username,
+                is_admin: user.is_admin,
             },
             expires_at,
         }))
@@ -1485,7 +1548,7 @@ impl Store {
     pub async fn user_by_session_token(&self, token: &str) -> Result<Option<PublicUser>> {
         let hash = crate::tokens::hash_token(token);
         Ok(sqlx::query_as::<_, PublicUser>(
-            "SELECT u.id, u.username
+            "SELECT u.id, u.username, u.is_admin
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = $1 AND s.expires_at > NOW()",
@@ -1634,5 +1697,315 @@ fn step_status_str(s: StepStatus) -> &'static str {
         StepStatus::Failed => "failed",
         StepStatus::Cancelled => "cancelled",
         StepStatus::Skipped => "skipped",
+    }
+}
+
+const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
+     retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";
+
+async fn list_step_runs_on(conn: &mut sqlx::PgConnection, run_id: Uuid) -> Result<Vec<StepRun>> {
+    Ok(sqlx::query_as::<_, StepRun>(&format!(
+        "SELECT {STEP_RUN_COLS} FROM step_runs WHERE run_id = $1 ORDER BY step_id"
+    ))
+    .bind(run_id)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// Mark a step terminal and close its open attempt. With `expected`, the write only
+/// happens while the step is still in one of those statuses (returns `None` otherwise),
+/// so a concurrent lease or completion is never overwritten.
+async fn complete_step_on(
+    conn: &mut sqlx::PgConnection,
+    step_run_id: Uuid,
+    status: StepStatus,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    expected: Option<&[&str]>,
+) -> Result<Option<StepRun>> {
+    let guard = expected.map(|e| e.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let sr = sqlx::query_as::<_, StepRun>(&format!(
+        "UPDATE step_runs
+         SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
+         WHERE id = $1 AND ($5::text[] IS NULL OR status = ANY($5))
+         RETURNING {STEP_RUN_COLS}"
+    ))
+    .bind(step_run_id)
+    .bind(step_status_str(status))
+    .bind(exit_code)
+    .bind(&error)
+    .bind(guard)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if sr.is_some() {
+        finish_open_attempt_on(
+            conn,
+            step_run_id,
+            step_status_str(status),
+            exit_code,
+            error.as_deref(),
+        )
+        .await?;
+    }
+    Ok(sr)
+}
+
+async fn finish_open_attempt_on(
+    conn: &mut sqlx::PgConnection,
+    step_run_id: Uuid,
+    status: &str,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE step_attempts
+         SET finished_at = NOW(), status = $2, exit_code = $3, error = $4
+         WHERE id = (
+             SELECT id FROM step_attempts
+             WHERE step_run_id = $1 AND finished_at IS NULL
+             ORDER BY started_at DESC
+             LIMIT 1
+         )",
+    )
+    .bind(step_run_id)
+    .bind(status)
+    .bind(exit_code)
+    .bind(error)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    Skip(&'static str),
+    Queue,
+}
+
+/// Pure DAG bookkeeping for one pass over a run's steps: which pending/queued steps
+/// must be skipped because a dependency failed or was skipped, and which pending
+/// steps have all dependencies terminal and may be queued (subject to `if:`).
+/// Callers apply the result and re-plan until nothing changes.
+fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Transition)> {
+    use std::collections::HashSet;
+    let failed: HashSet<&str> = steps
+        .iter()
+        .filter(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled))
+        .map(|s| s.step_id.as_str())
+        .collect();
+    let succeeded: HashSet<&str> = steps
+        .iter()
+        .filter(|s| s.status_enum() == StepStatus::Succeeded)
+        .map(|s| s.step_id.as_str())
+        .collect();
+    let terminal: HashSet<&str> = steps
+        .iter()
+        .filter(|s| s.status_enum().is_terminal())
+        .map(|s| s.step_id.as_str())
+        .collect();
+    // `success()` is transitive (GitHub Actions semantics): a failure anywhere in a
+    // step's ancestry taints it, even through a succeeded `always()` step in between.
+    let mut tainted: HashSet<&str> = failed.clone();
+    loop {
+        let before = tainted.len();
+        for s in steps {
+            if !tainted.contains(s.step_id.as_str())
+                && s.needs_vec().iter().any(|n| tainted.contains(n.as_str()))
+            {
+                tainted.insert(s.step_id.as_str());
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+
+    let mut plan = Vec::new();
+    for (idx, s) in steps.iter().enumerate() {
+        let needs = s.needs_vec();
+        match s.status_enum() {
+            StepStatus::Queued => {
+                // A queued step only sees a newly failed dependency after a cancel;
+                // `always()` steps stay queued, as they would have when first planned.
+                let (if_expr, _) = snapshot_step_if_env(snapshot_steps, &s.step_id);
+                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
+                    plan.push((idx, Transition::Skip("dependency failed")));
+                }
+            }
+            StepStatus::Pending => {
+                let (if_expr, env) = snapshot_step_if_env(snapshot_steps, &s.step_id);
+                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                // Fail-fast cascade — except for `always()` steps, which wait for their
+                // dependencies to finish and then run regardless of the outcome.
+                if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
+                    plan.push((idx, Transition::Skip("dependency failed")));
+                    continue;
+                }
+                if !needs.iter().all(|n| terminal.contains(n.as_str())) {
+                    continue;
+                }
+                let needs_succeeded = needs
+                    .iter()
+                    .all(|n| succeeded.contains(n.as_str()) && !tainted.contains(n.as_str()));
+                if !always && !needs_succeeded {
+                    plan.push((idx, Transition::Skip("dependency skipped or failed")));
+                    continue;
+                }
+                let ctx = crate::step_if::IfContext {
+                    needs_succeeded,
+                    env,
+                };
+                if !crate::step_if::eval_if(if_expr.as_deref(), &ctx) {
+                    plan.push((idx, Transition::Skip("if: condition false")));
+                } else {
+                    plan.push((idx, Transition::Queue));
+                }
+            }
+            _ => {}
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod propagate_tests {
+    use super::*;
+
+    fn step(id: &str, status: StepStatus, needs: &[&str]) -> StepRun {
+        StepRun {
+            id: Uuid::new_v4(),
+            run_id: Uuid::nil(),
+            step_id: id.into(),
+            step_name: id.into(),
+            status: step_status_str(status).into(),
+            image: None,
+            run_cmd: "true".into(),
+            labels: json!([]),
+            needs: json!(needs),
+            retries: 0,
+            attempt: 0,
+            agent_id: None,
+            lease_expires_at: None,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    fn apply(steps: &mut [StepRun], plan: &[(usize, Transition)]) {
+        for (idx, t) in plan {
+            steps[*idx].status = match t {
+                Transition::Skip(_) => "skipped".into(),
+                Transition::Queue => "queued".into(),
+            };
+        }
+    }
+
+    fn run_to_fixpoint(steps: &mut [StepRun], snap: &Value) -> usize {
+        let mut passes = 0;
+        loop {
+            let plan = plan_transitions(steps, snap);
+            if plan.is_empty() {
+                return passes;
+            }
+            apply(steps, &plan);
+            passes += 1;
+        }
+    }
+
+    #[test]
+    fn queues_when_all_needs_succeeded() {
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+        ];
+        let plan = plan_transitions(&steps, &json!([]));
+        assert_eq!(plan, vec![(1, Transition::Queue)]);
+        apply(&mut steps, &plan);
+        assert!(plan_transitions(&steps, &json!([])).is_empty());
+    }
+
+    #[test]
+    fn failure_cascades_through_a_chain_in_one_call() {
+        // A(failed) → B → C → D: the old per-pass code could leave D pending forever.
+        let mut steps = vec![
+            step("a", StepStatus::Failed, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+            step("d", StepStatus::Pending, &["c"]),
+        ];
+        run_to_fixpoint(&mut steps, &json!([]));
+        assert!(
+            steps[1..].iter().all(|s| s.status == "skipped"),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn always_runs_after_failure_and_success_gate_skips() {
+        let snap = json!([
+            {"id": "cleanup", "if": "always()"},
+            {"id": "deploy"}
+        ]);
+        let mut steps = vec![
+            step("build", StepStatus::Failed, &[]),
+            step("cleanup", StepStatus::Pending, &["build"]),
+            step("deploy", StepStatus::Pending, &["build"]),
+        ];
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[1].status, "queued");
+        assert_eq!(steps[2].status, "skipped");
+    }
+
+    #[test]
+    fn failure_is_transitive_through_a_succeeded_always_step() {
+        // build(failed) → cleanup(always, succeeded) → deploy(default) must NOT run;
+        // a further always() step after cleanup still does.
+        let snap = json!([
+            {"id": "cleanup", "if": "always()"},
+            {"id": "deploy"},
+            {"id": "notify", "if": "always()"}
+        ]);
+        let mut steps = vec![
+            step("build", StepStatus::Failed, &[]),
+            step("cleanup", StepStatus::Succeeded, &["build"]),
+            step("deploy", StepStatus::Pending, &["cleanup"]),
+            step("notify", StepStatus::Pending, &["cleanup"]),
+        ];
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[2].status, "skipped");
+        assert_eq!(steps[3].status, "queued");
+    }
+
+    #[test]
+    fn waits_while_a_need_is_still_running_and_skips_on_if_false() {
+        let snap = json!([{"id": "gated", "if": "never()"}]);
+        let mut steps = vec![
+            step("a", StepStatus::Running, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("gated", StepStatus::Pending, &[]),
+        ];
+        let plan = plan_transitions(&steps, &snap);
+        assert_eq!(plan, vec![(2, Transition::Skip("if: condition false"))]);
+        apply(&mut steps, &plan);
+        steps[0].status = "succeeded".into();
+        assert_eq!(
+            plan_transitions(&steps, &snap),
+            vec![(1, Transition::Queue)]
+        );
+    }
+
+    #[test]
+    fn queued_step_whose_dependency_failed_is_skipped() {
+        let steps = vec![
+            step("a", StepStatus::Cancelled, &[]),
+            step("b", StepStatus::Queued, &["a"]),
+        ];
+        assert_eq!(
+            plan_transitions(&steps, &json!([])),
+            vec![(1, Transition::Skip("dependency failed"))]
+        );
     }
 }

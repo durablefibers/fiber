@@ -1,13 +1,17 @@
 name: fiber
+# Backing services bind to loopback only; put fiber-api / fiber-web behind TLS
+# (docs/operations.md#deployment). Settings come from deploy/.env — see deploy/.env.example.
 services:
   fiber-postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: fiber
-      POSTGRES_PASSWORD: fiber
+      # Applied when the volume is first initialised; changing it later needs ALTER ROLE.
+      POSTGRES_PASSWORD: ${FIBER_POSTGRES_PASSWORD:-fiber}
       POSTGRES_DB: fiber
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - fiber_pg:/var/lib/postgresql/data
     healthcheck:
@@ -18,46 +22,62 @@ services:
 
   fiber-redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${FIBER_REDIS_PASSWORD:-fiber}"]
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # REDISCLI_AUTH keeps the password out of the probe's argv.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
+    environment:
+      REDISCLI_AUTH: ${FIBER_REDIS_PASSWORD:-fiber}
 
   fiber-minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: fiber
-      MINIO_ROOT_PASSWORD: fiberfiber
+      MINIO_ROOT_USER: ${FIBER_S3_ACCESS_KEY:-fiber}
+      MINIO_ROOT_PASSWORD: ${FIBER_S3_SECRET_KEY:-fiberfiber}
     ports:
-      - "19000:9000"
-      - "19001:9001"
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
     volumes:
       - fiber_minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   fiber-api:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
     environment:
-      FIBER_DATABASE_URL: postgres://fiber:fiber@fiber-postgres:5432/fiber
-      FIBER_REDIS_URL: redis://fiber-redis:6379
+      FIBER_DATABASE_URL: postgres://fiber:${FIBER_POSTGRES_PASSWORD:-fiber}@fiber-postgres:5432/fiber
+      FIBER_REDIS_URL: redis://:${FIBER_REDIS_PASSWORD:-fiber}@fiber-redis:6379
       FIBER_LISTEN: 0.0.0.0:8080
       FIBER_ARTIFACTS_DIR: /data/artifacts
       FIBER_S3_BUCKET: fiber-artifacts
       FIBER_S3_ENDPOINT: http://fiber-minio:9000
-      FIBER_S3_PUBLIC_ENDPOINT: http://127.0.0.1:19000
-      FIBER_S3_ACCESS_KEY: fiber
-      FIBER_S3_SECRET_KEY: fiberfiber
+      FIBER_S3_PUBLIC_ENDPOINT: ${FIBER_S3_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
+      FIBER_S3_ACCESS_KEY: ${FIBER_S3_ACCESS_KEY:-fiber}
+      FIBER_S3_SECRET_KEY: ${FIBER_S3_SECRET_KEY:-fiberfiber}
       FIBER_S3_REGION: us-east-1
-      # Dev-only sample key (32 bytes hex). Override in production.
-      FIBER_SECRETS_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      RUST_LOG: info,fiber_api=info
+      FIBER_ADMIN_USER: ${FIBER_ADMIN_USER:-admin}
+      FIBER_ADMIN_PASSWORD: ${FIBER_ADMIN_PASSWORD:-fiber}
+      # Required for encrypted project/webhook secrets: openssl rand -hex 32 → deploy/.env.
+      # Empty = plaintext at rest (fiber-api warns at boot).
+      FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}
+      FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
+      RUST_LOG: ${RUST_LOG:-info,fiber_api=info}
     ports:
-      - "18080:8080"
+      - "${FIBER_API_BIND:-127.0.0.1}:18080:8080"
     volumes:
       - fiber_artifacts:/data/artifacts
     healthcheck:
@@ -72,18 +92,20 @@ services:
       fiber-redis:
         condition: service_healthy
       fiber-minio:
-        condition: service_started
+        condition: service_healthy
 
   fiber-web:
     build:
       context: ../apps/web
       dockerfile: Dockerfile.web
       args:
-        VITE_FIBER_API_URL: http://localhost:18080
+        VITE_FIBER_API_URL: ${VITE_FIBER_API_URL:-http://localhost:18080}
+    restart: unless-stopped
     ports:
-      - "3100:80"
+      - "${FIBER_WEB_BIND:-127.0.0.1}:3100:80"
     depends_on:
-      - fiber-api
+      fiber-api:
+        condition: service_healthy
 volumes:
   fiber_pg:
   fiber_artifacts:

@@ -22,9 +22,11 @@ pub trait Durability: Send + Sync {
 
     async fn save(&self, record: &FiberRecord) -> anyhow::Result<()>;
 
-    async fn list_ready(
+    /// Atomically claim ready fibers (mark running, bump attempts) so concurrent
+    /// schedulers never run the same fiber twice.
+    async fn claim_ready(
         &self,
-        now: DateTime<Utc>,
         stale_after_secs: i64,
+        limit: i64,
     ) -> anyhow::Result<Vec<FiberRecord>>;
 }

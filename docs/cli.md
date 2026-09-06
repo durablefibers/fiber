@@ -7,7 +7,7 @@ Binary: `fiber` (`cargo run -p fiber-cli -- …`). Auth: `fiber login` writes `~
 | Command | Purpose |
 |---|---|
 | `validate [fiber.yml]` | Parse + compile DAG locally |
-| `login` | Session token → stdout + `~/.fiber/token` |
+| `login` | Session token → stdout + `~/.fiber/token` (dir `0700`, file `0600`). `--password-stdin` keeps the password out of shell history |
 | `run <pipeline_id>` | Start a manual run |
 | `members list\|add\|set\|remove` | Project membership |
 | `secrets list\|set\|delete` | Project secrets (admin) |
@@ -31,14 +31,15 @@ Roles: `reader` < `writer` < `admin` < `owner`.
 ```bash
 fiber secrets list $PROJECT_ID
 fiber secrets set $PROJECT_ID GITHUB_TOKEN --value ghp_…
+printf '%s' "$GH_TOKEN" | fiber secrets set $PROJECT_ID GITHUB_TOKEN --value-stdin   # no argv / history exposure
 fiber secrets delete $PROJECT_ID GITHUB_TOKEN
 ```
 
 ## Agents
 
 ```bash
-fiber agents list
-fiber agents list --project-id $PROJECT_ID          # project + globals
+fiber agents list                                   # every agent — instance admin only
+fiber agents list --project-id $PROJECT_ID          # project + globals (project reader)
 fiber agents create --name local --labels os=linux,docker=true
 fiber agents create --name team --labels os=linux --project-id $PROJECT_ID
 fiber agents update $AGENT_ID --concurrency 2

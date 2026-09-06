@@ -1,9 +1,42 @@
 # Operations
 
+## Deployment
+
+`deploy/docker-compose.yml` is the reference deployment. Its defaults are chosen so that `docker compose up` on a shared host does not expose anything by accident:
+
+- Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password (`FIBER_REDIS_PASSWORD`).
+- `fiber-api` (`18080`) and `fiber-web` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_WEB_BIND=0.0.0.0` only for a trusted network.
+- Every service has `restart: unless-stopped`; the API waits for Postgres, Redis, **and** MinIO health.
+- Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
+- Set `FIBER_ADMIN_PASSWORD` **before the first boot**: it is applied only when the users table is empty. For an existing instance, change the admin password through the API/UI instead. The API warns at boot while the configured value is the default `fiber`.
+
+Minimal Caddy front end (automatic TLS):
+
+```
+ci.example.com {
+    reverse_proxy /api/* 127.0.0.1:18080
+    reverse_proxy /ws/*  127.0.0.1:18080
+    reverse_proxy       127.0.0.1:3100
+}
+```
+
+Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
+
+## Stuck runs
+
+A run that stays `running` is one of:
+
+- **Nothing to lease it** — its steps are `queued` and no online agent matches the labels / project pool. Check **Agents** for an online agent with every required label.
+- **Waiting on a retry backoff** — a failed step with `retries` is `queued` with `not_before` in the future (max 60 s).
+- **Hung step** — the attempt exceeds its `timeout_minutes` (default `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES`): the agent fails it at the deadline, and the server fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not. A whole-run `timeout_minutes` cancels the run with reason `run timed out`.
+- **Agent gone** — leases expire after 5 minutes without heartbeats and the step is re-queued (`step_attempts` shows `reclaimed`).
+
+`GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
+
 ## Health checks
 
 - `GET /health` — process up  
-- `GET /ready` — Postgres + Redis reachable (Compose healthcheck uses this)
+- `GET /ready` — Postgres + Redis reachable (Compose healthcheck uses this). Failing checks report `"error"` only; the cause is in the API log.
 
 ## Retention / GC
 
@@ -23,7 +56,16 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `FIBER_OTEL_ENDPOINT` to an OTLP HTTP colle
 
 ## Multi-instance
 
-Redis channel `fiber:events` fans out run events so multiple API processes can share UI subscriptions. Leases and DB remain the source of truth for execution.
+`fiber-api` can run as several replicas against one Postgres and one Redis:
+
+- **Leases** — `lease_step`, lease renewal, expired-lease reclaim and stale-agent marking are single conditional `UPDATE ... RETURNING` statements; two replicas cannot lease the same step.
+- **Propagation** — unlocking dependents / cascading skips / finishing a run happens in one transaction with the run row locked.
+- **Schedules** — a cron/interval slot is claimed with a compare-and-set on `pipelines.next_due_at` (plus "no active run"), so exactly one replica starts each scheduled run.
+- **Durable fibers** — ready fibers are claimed with `UPDATE ... FOR UPDATE SKIP LOCKED`; a fiber runs on one replica per attempt.
+- **Redis `fiber:events`** — run/step/log events fan out so `/ws/runs/{id}` subscribers on any replica see them.
+- **Redis `fiber:agent_cmds`** — agent-directed messages (run cancel, token rotation / delete disconnects) fan out so the replica holding the agent's socket delivers them.
+
+Agent presence (labels, concurrency, in-flight counts) is per replica: an agent is offered steps by the replica it is connected to. Redis is not a queue — queued steps live in Postgres and are pulled on each agent heartbeat.
 
 ## Dogfood scripts
 
@@ -63,19 +105,23 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 ### Artifacts & secrets key
 
 - Backup `FIBER_ARTIFACTS_DIR` **or** the S3/MinIO bucket (`fiber-artifacts`).
-- Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project secrets cannot be decrypted. Compose ships a **dev-only** sample key; replace before any real use.
+- Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project and webhook secrets cannot be decrypted. Compose reads it from `deploy/.env`; it is intentionally not committed anywhere.
 
 ### What to include
 
 | Data | Where |
 |---|---|
 | Runs, pipelines, memberships, sessions | Postgres |
-| Secret ciphertext | Postgres (`project_secrets`) — needs `FIBER_SECRETS_KEY` |
+| Secret ciphertext | Postgres (`project_secrets`, `webhook_secrets`) — needs `FIBER_SECRETS_KEY`. If the key is lost, re-enter project secrets and re-`PUT` webhook secrets (deliveries are rejected with 401 until then) |
 | Artifact blobs | Local dir or S3 |
 | Agent tokens | Not recoverable from DB (hashes only) — re-issue after restore |
 
 ## Upgrades
 
 - Schema: sqlx migrations under `crates/fiber-core/migrations/` run on API boot  
+- Redis no longer carries a step queue; after upgrading, `DEL fiber:ready_steps` removes the orphaned list left by older versions  
+- **Step timeouts apply to runs already in flight at upgrade.** Steps without `timeout_minutes` get `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60); a build that legitimately runs longer must set `timeout_minutes` on the step (or raise the default) *before* upgrading, or its in-flight attempt will be failed by the backstop  
+- Migration `007_indexes.sql` adds nine indexes (`step_runs`, `artifacts`, `log_lines`, `sessions`, `runs`, `step_attempts`). It runs at the first boot of the new version and holds a `SHARE` lock on each table while that index builds — writes to `log_lines` pause for the duration, which is seconds on a typical install. On a very large `log_lines` table, run retention first or apply the statements by hand with `CREATE INDEX CONCURRENTLY` before upgrading (the migration's `IF NOT EXISTS` then skips them).
+
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  
 - Agent tokens are hashes only — rotating requires distributing a new plaintext token

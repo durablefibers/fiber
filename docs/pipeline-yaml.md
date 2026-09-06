@@ -30,6 +30,7 @@ steps:
 | `workspace` | no | Git clone into the step workspace |
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
+| `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
 
 In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted.
 
@@ -41,7 +42,8 @@ In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `nam
 | `needs` | `[]` | Upstream step ids (DAG edges) |
 | `labels` | `[]` | Matched against agent labels (all required labels must be present) |
 | `image` | — | Optional Docker image; agent runs in container when Docker enabled |
-| `retries` | `0` | Extra attempts after failure |
+| `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts |
+| `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
 | `matrix` | — | Axis → values; expanded at compile time |
 | `if` | `success()` | Gate whether the step is queued |
@@ -66,7 +68,7 @@ Compile produces cells like `test__os_linux`. `needs` that point at a matrixed s
 | Expression | Meaning |
 |---|---|
 | `success()` | Default — run when upstreams succeeded |
-| `always()` | Run even if upstreams failed |
+| `always()` | Run once upstreams are terminal, even if they failed. Steps *after* an `always()` step still see the failure: `success()` is transitive over the whole ancestry, so `build → cleanup (always) → deploy` skips `deploy` when `build` failed |
 | `never()` | Skip |
 | `matrix.os == 'linux'` | Compare matrix (or env) axis |
 
@@ -90,3 +92,4 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 - Cycles are rejected at compile / save.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
+- What a run executes is frozen when it starts (`workspace`, `run`, `image`, `artifacts`, matrix env). Saving the pipeline afterwards affects only future runs.

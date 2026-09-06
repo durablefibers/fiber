@@ -38,7 +38,8 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}/members/{user_id}",
             put(update_member).delete(remove_member),
         )
-        .route("/api/users", post(create_user))
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{id}", put(update_user))
         .route(
             "/api/projects/{id}/pipelines",
             get(list_pipelines).post(create_pipeline),
@@ -109,13 +110,16 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     });
     let mut ok = true;
 
+    // Detail goes to the log, not to unauthenticated callers (connection strings leak).
     if let Err(e) = sqlx::query("SELECT 1").execute(&state.store.pool).await {
         ok = false;
-        checks["postgres"] = json!(format!("error: {e}"));
+        tracing::error!(error = %e, "readiness: postgres");
+        checks["postgres"] = json!("error");
     }
     if let Err(e) = state.scheduler.redis_ping().await {
         ok = false;
-        checks["redis"] = json!(format!("error: {e}"));
+        tracing::error!(error = %e, "readiness: redis");
+        checks["redis"] = json!("error");
     }
 
     let body = json!({ "ok": ok, "service": "fiber-api", "checks": checks });
@@ -129,14 +133,43 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
+    let key = crate::login_guard::LoginGuard::key(&req.username);
+    if let Err(retry_after) = state.login_guard.check(&key) {
+        return Ok(too_many_logins(retry_after));
+    }
     let resp = state
         .store
         .login(&req.username, &req.password)
         .await
-        .map_err(ApiError::from)?
-        .ok_or(ApiError::Unauthorized)?;
-    Ok(Json(resp))
+        .map_err(ApiError::from)?;
+    match resp {
+        Some(resp) => {
+            state.login_guard.record_success(&key);
+            Ok(Json(resp).into_response())
+        }
+        None => {
+            if let Some(lock) = state.login_guard.record_failure(&key) {
+                tracing::warn!(username = %key, lock_secs = lock.as_secs(), "login locked out");
+            } else {
+                tracing::warn!(username = %key, "login failed");
+            }
+            Err(ApiError::Unauthorized)
+        }
+    }
+}
+
+fn too_many_logins(retry_after: std::time::Duration) -> axum::response::Response {
+    let secs = retry_after.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, secs.to_string())],
+        Json(json!({
+            "error": "too many failed logins; try again later",
+            "retry_after_secs": secs,
+        })),
+    )
+        .into_response()
 }
 
 async fn logout(
@@ -303,30 +336,49 @@ async fn create_user(
     State(state): State<AppState>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Any project owner may create users for invites.
-    let projects = state
-        .store
-        .list_projects_for_user(user.id)
-        .await
-        .map_err(ApiError::from)?;
-    let mut ok = false;
-    for p in &projects {
-        if let Ok(Some(r)) = state.store.member_role(p.id, user.id).await {
-            if r.at_least(ProjectRole::Owner) {
-                ok = true;
-                break;
-            }
-        }
-    }
-    if !ok {
-        return Err(ApiError::Forbidden);
-    }
+    // Instance admins only. Project owners invite via POST /members with a password.
+    crate::access::require_instance_admin(&user)?;
     let created = state
         .store
         .create_user(&req.username, &req.password)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn list_users(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_instance_admin(&user)?;
+    let users = state.store.list_users().await.map_err(ApiError::from)?;
+    Ok(Json(users))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRequest {
+    is_admin: bool,
+}
+
+async fn update_user(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_instance_admin(&user)?;
+    let updated = state
+        .store
+        .set_instance_admin(id, req.is_admin)
+        .await
+        .map_err(|e| {
+            if e.to_string().ends_with("not found") {
+                ApiError::NotFound
+            } else {
+                ApiError::from(e)
+            }
+        })?;
+    Ok(Json(updated))
 }
 
 async fn list_pipelines(
@@ -570,7 +622,7 @@ async fn agent_upload_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.len() as u64 > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -626,7 +678,7 @@ async fn agent_presign_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -681,7 +733,7 @@ async fn agent_complete_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -736,12 +788,23 @@ async fn agent_complete_artifact(
     })))
 }
 
+/// Restore download. An agent may only read artifacts of runs in which it currently
+/// holds a running step (that is exactly the restore list it was offered); anything
+/// else is 404 so existence is not disclosed.
 async fn agent_download_artifact(
-    AuthAgent(_agent): AuthAgent,
+    AuthAgent(agent): AuthAgent,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::Redirect;
+    if !state
+        .store
+        .agent_may_read_artifact(agent.id, id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let artifact = state
         .store
         .get_artifact(id)
@@ -882,8 +945,12 @@ async fn list_agents(
     State(state): State<AppState>,
     Query(q): Query<ListAgentsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(pid) = q.project_id {
-        crate::access::require_project(&state, &user, pid, ProjectRole::Reader).await?;
+    match q.project_id {
+        Some(pid) => {
+            crate::access::require_project(&state, &user, pid, ProjectRole::Reader).await?;
+        }
+        // Without a project filter this returns every agent in the instance.
+        None => crate::access::require_instance_admin(&user)?,
     }
     let mut agents = state
         .store
@@ -901,15 +968,30 @@ struct ListAgentsQuery {
     project_id: Option<Uuid>,
 }
 
+/// Global agents (no project) are instance-admin only: their token leases steps —
+/// and receives secrets — from every project. Project agents need project admin
+/// (instance admins may manage those too).
 async fn require_agent_manage(
     state: &AppState,
     user: &fiber_core::PublicUser,
     agent: &fiber_core::Agent,
 ) -> Result<(), ApiError> {
-    if let Some(pid) = agent.project_id {
-        crate::access::require_project(state, user, pid, ProjectRole::Admin).await?;
+    require_agent_scope(state, user, agent.project_id).await
+}
+
+async fn require_agent_scope(
+    state: &AppState,
+    user: &fiber_core::PublicUser,
+    project_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    match project_id {
+        None => crate::access::require_instance_admin(user),
+        Some(_) if user.is_admin => Ok(()),
+        Some(pid) => {
+            crate::access::require_project(state, user, pid, ProjectRole::Admin).await?;
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 async fn create_agent(
@@ -917,9 +999,7 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(pid) = req.project_id {
-        crate::access::require_project(&state, &user, pid, ProjectRole::Admin).await?;
-    }
+    require_agent_scope(&state, &user, req.project_id).await?;
     let mut resp = state.store.create_agent(req).await.map_err(|e| {
         if e.to_string().contains("project not found") {
             ApiError::NotFound
@@ -980,9 +1060,11 @@ async fn delete_agent(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     require_agent_manage(&state, &user, &existing).await?;
-    if let Err(e) = state.scheduler.on_agent_disconnect(id).await {
-        tracing::warn!(error = %e, %id, "agent delete disconnect cleanup");
-    }
+    // Drop the live session too, so a deleted agent cannot keep leasing on its old socket.
+    state
+        .scheduler
+        .force_disconnect_agent(id, "agent deleted")
+        .await;
     let ok = state.store.delete_agent(id).await.map_err(ApiError::from)?;
     if !ok {
         return Err(ApiError::NotFound);
@@ -1076,9 +1158,17 @@ async fn set_github_secret(
     Json(body): Json<SetSecret>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
+    // An empty key makes the HMAC publicly computable, which would silently turn the
+    // fail-closed webhook back into fail-open.
+    let secret = body.secret.trim();
+    if secret.is_empty() {
+        return Err(ApiError::BadRequest(
+            "webhook secret must not be empty".into(),
+        ));
+    }
     state
         .store
-        .upsert_webhook_secret(id, "github", &body.secret)
+        .upsert_webhook_secret(id, "github", secret)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
@@ -1090,19 +1180,30 @@ async fn github_webhook(
     headers: HeaderMap,
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(secret) = state
+    // Fail closed: a project with no webhook secret configured accepts nothing.
+    // Otherwise anyone who guesses a project id can start runs (which execute
+    // repo-supplied shell with project secrets injected).
+    // A secret that cannot be read (FIBER_SECRETS_KEY missing or rotated) is treated as
+    // unconfigured: reject, and keep the reason in the server log only — this endpoint
+    // is unauthenticated, so it must not become a project-existence oracle.
+    let stored = state
         .store
         .get_webhook_secret(id, "github")
         .await
-        .map_err(ApiError::from)?
-    {
-        let sig = headers
-            .get("x-hub-signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !verify_github_sig(&secret, &body, sig) {
-            return Err(ApiError::Unauthorized);
-        }
+        .map_err(|e| {
+            tracing::error!(project_id = %id, error = %e, "github webhook secret unreadable");
+            ApiError::Unauthorized
+        })?;
+    let Some(secret) = stored.filter(|s| !s.is_empty()) else {
+        tracing::debug!(project_id = %id, "github webhook rejected: no secret configured");
+        return Err(ApiError::Unauthorized);
+    };
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_github_sig(&secret, &body, sig) {
+        return Err(ApiError::Unauthorized);
     }
 
     let event = headers
@@ -1323,11 +1424,18 @@ pub enum ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // Typed validation failures are the caller's fault.
+        if e.downcast_ref::<fiber_core::ValidationError>().is_some()
+            || e.downcast_ref::<fiber_core::DagError>().is_some()
+        {
+            return ApiError::BadRequest(format!("{e:#}"));
+        }
         let msg = e.to_string();
         if msg.contains("forbidden") {
             ApiError::Forbidden
         } else {
-            ApiError::Internal(msg)
+            // Full cause chain: the log line is the only place this text now appears.
+            ApiError::Internal(format!("{e:#}"))
         }
     }
 }
@@ -1339,7 +1447,11 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::Internal(m) => {
+                // Never echo sqlx / Redis / anyhow chains to clients.
+                tracing::error!(error = %m, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -1402,5 +1514,15 @@ mod tests {
         assert!(matches!(e, ApiError::Forbidden));
         let e: ApiError = anyhow::anyhow!("db down").into();
         assert!(matches!(e, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn api_error_maps_typed_validation_to_400() {
+        let e: ApiError = anyhow::Error::new(fiber_core::ValidationError("nope".into())).into();
+        assert!(matches!(e, ApiError::BadRequest(m) if m == "nope"));
+        let wrapped =
+            anyhow::Error::new(fiber_core::ValidationError("inner".into())).context("outer");
+        let e: ApiError = wrapped.into();
+        assert!(matches!(e, ApiError::BadRequest(m) if m == "outer: inner"));
     }
 }

@@ -26,6 +26,18 @@ pub async fn require_project(
         })
 }
 
+/// Instance-admin gate. Instance admins manage the global agent pool, every agent,
+/// and users. Project routes (pipelines, runs, secrets, members) still require
+/// membership — but because an agent token receives a project's secrets, an
+/// instance admin is a secrets superuser in practice. Treat the flag as root.
+pub fn require_instance_admin(user: &PublicUser) -> Result<(), ApiError> {
+    if user.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
 pub async fn require_pipeline(
     state: &AppState,
     user: &PublicUser,
