@@ -6,6 +6,15 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed artifact upload now fails the step.** A declared artifact that existed but
+  could not be stored — unreadable, over the 64 MiB cap, an unsafe path, or a failed
+  transfer — was logged and then ignored, so the step reported success and a later step
+  that `needs` it failed with a missing file instead. The step now fails with the real
+  reason and its dependents are skipped. A declared path that does not exist stays a
+  warning, so a step may still declare an artifact it only sometimes produces.
+
 ## [0.2.0] — 2026-09-06
 
 The first tagged release. Security and correctness hardening from a full platform audit,
