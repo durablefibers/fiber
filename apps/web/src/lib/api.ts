@@ -128,6 +128,14 @@ export type Run = {
   created_at: string
   started_at?: string
   finished_at?: string
+  /** Set when this run was created by retrying another. */
+  retry_of?: string | null
+}
+
+/** One page of runs, newest first. Pass `next_cursor` back as `before` for the next. */
+export type RunPage = {
+  items: Run[]
+  next_cursor: string | null
 }
 
 export type StepRun = {
@@ -146,6 +154,9 @@ export type StepRun = {
   error?: string
   started_at?: string
   finished_at?: string
+  /** Agent currently holding the step, and when its lease expires. */
+  agent_id?: string | null
+  lease_expires_at?: string | null
 }
 
 export type Agent = {
@@ -179,6 +190,8 @@ export type LogLine = {
   data: string
   seq: number
   created_at: string
+  /** Which attempt produced the line; `seq` restarts per attempt. */
+  attempt: number
 }
 
 const TOKEN_KEY = "fiber_session_token"
@@ -318,14 +331,39 @@ export const api = {
         body: JSON.stringify({ trigger: "manual" }),
       }
     ),
-  listRuns: (projectId: string) =>
-    request<Run[]>(`/api/projects/${projectId}/runs`),
+  listRuns: (projectId: string, opts?: { limit?: number; before?: string }) => {
+    const q = new URLSearchParams()
+    if (opts?.limit) q.set("limit", String(opts.limit))
+    if (opts?.before) q.set("before", opts.before)
+    const qs = q.toString()
+    return request<RunPage>(
+      `/api/projects/${projectId}/runs${qs ? `?${qs}` : ""}`
+    )
+  },
   getRun: (id: string) =>
     request<{ run: Run; steps: StepRun[] }>(`/api/runs/${id}`),
   cancelRun: (id: string) =>
     request<Run>(`/api/runs/${id}/cancel`, { method: "POST" }),
-  listLogs: (stepRunId: string) =>
-    request<LogLine[]>(`/api/steps/${stepRunId}/logs`),
+  /** Re-run from the original run's snapshot. `failed_only` carries succeeded steps over. */
+  retryRun: (id: string, failedOnly = false) =>
+    request<{ run: Run; steps: StepRun[] }>(`/api/runs/${id}/retry`, {
+      method: "POST",
+      body: JSON.stringify({ failed_only: failedOnly }),
+    }),
+  /** Without `after_id`, returns the newest `limit` lines. */
+  listLogs: (
+    stepRunId: string,
+    opts?: { attempt?: number; afterId?: number; limit?: number }
+  ) => {
+    const q = new URLSearchParams()
+    if (opts?.attempt !== undefined) q.set("attempt", String(opts.attempt))
+    if (opts?.afterId !== undefined) q.set("after_id", String(opts.afterId))
+    if (opts?.limit) q.set("limit", String(opts.limit))
+    const qs = q.toString()
+    return request<LogLine[]>(
+      `/api/steps/${stepRunId}/logs${qs ? `?${qs}` : ""}`
+    )
+  },
   listStepAttempts: (stepRunId: string) =>
     request<StepAttempt[]>(`/api/steps/${stepRunId}/attempts`),
   listArtifacts: (runId: string) =>

@@ -36,13 +36,14 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET/PUT | `/api/pipelines/{id}` | reader / writer |
 | POST | `/api/pipelines/parse-yaml` | session |
 | POST | `/api/pipelines/{id}/runs` | writer |
-| GET | `/api/projects/{id}/runs` | reader |
+| GET | `/api/projects/{id}/runs` | reader — `?limit=` (default 50, max 200) `&before=<run_id>`; returns `{ items, next_cursor }` |
 | GET | `/api/runs/{id}` | reader |
 | POST | `/api/runs/{id}/cancel` | writer |
+| POST | `/api/runs/{id}/retry` | writer — `{ "failed_only": bool }`; new run from the original's snapshot, `201` with `{ run, steps }` |
 | GET | `/api/runs/{id}/steps` | reader |
 | GET | `/api/runs/{id}/artifacts` | reader |
 | GET | `/api/artifacts/{id}/download` | reader |
-| GET | `/api/steps/{id}/logs` | reader |
+| GET | `/api/steps/{id}/logs` | reader — `?attempt=N` `&after_id=<id>` `&limit=` (default 1000, max 5000). Without `after_id` returns the **newest** `limit` lines |
 | GET | `/api/steps/{id}/attempts` | reader |
 
 ## Secrets & webhooks

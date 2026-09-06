@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/runs/{id}/steps", get(list_steps))
         .route("/api/runs/{id}/artifacts", get(list_run_artifacts))
         .route("/api/artifacts/{id}/download", get(download_artifact))
@@ -481,18 +482,60 @@ async fn start_run(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+struct ListRunsQuery {
+    limit: Option<i64>,
+    /// Run id from the previous page; results continue strictly older than it.
+    before: Option<Uuid>,
+}
+
 async fn list_runs(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<ListRunsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Reader).await?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let runs = state
         .store
-        .list_runs(id, 50)
+        .list_runs(id, limit, q.before)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(runs))
+    // Only advertise a cursor when the page was full: an empty next page is a wasted trip.
+    let next_cursor = (runs.len() as i64 == limit)
+        .then(|| runs.last().map(|r| r.id))
+        .flatten();
+    Ok(Json(json!({ "items": runs, "next_cursor": next_cursor })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RetryRunRequest {
+    /// Carry over steps that already succeeded and re-run only the rest.
+    #[serde(default)]
+    failed_only: bool,
+}
+
+async fn retry_run(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<RetryRunRequest>>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_run(&state, &user, id, ProjectRole::Writer).await?;
+    let failed_only = body.map(|Json(b)| b.failed_only).unwrap_or(false);
+    let (run, steps) = state
+        .store
+        .retry_run(id, failed_only)
+        .await
+        .map_err(ApiError::from)?;
+    if let Err(e) = state.scheduler.enqueue_run_ready(run.id).await {
+        tracing::warn!(error = %e, run_id = %run.id, "retry enqueue failed");
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "run": run, "steps": steps })),
+    ))
 }
 
 async fn get_run(
@@ -829,13 +872,28 @@ async fn agent_download_artifact(
     Ok((headers, bytes).into_response())
 }
 
+#[derive(Debug, Deserialize)]
+struct ListLogsQuery {
+    /// Only this attempt's output. `seq` restarts per attempt, so mixing them interleaves.
+    attempt: Option<i32>,
+    /// Return lines after this id (follow a live step). Without it, the newest `limit`.
+    after_id: Option<i64>,
+    limit: Option<i64>,
+}
+
 async fn list_logs(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<ListLogsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_step(&state, &user, id, ProjectRole::Reader).await?;
-    let logs = state.store.list_logs(id).await.map_err(ApiError::from)?;
+    let limit = q.limit.unwrap_or(1000).clamp(1, 5000);
+    let logs = state
+        .store
+        .list_logs(id, q.attempt, q.after_id, limit)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(logs))
 }
 

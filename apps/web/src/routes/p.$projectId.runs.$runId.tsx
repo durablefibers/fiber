@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router"
-import { Ban, Copy, Download, ExternalLink } from "lucide-react"
+import { Ban, Copy, Download, ExternalLink, RotateCw } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { AppShell } from "@/components/app-shell"
 import { DagCanvas } from "@/components/dag-canvas"
@@ -161,6 +161,12 @@ function RunPage() {
     () => attempts.find((a) => a.id === selectedAttemptId) ?? null,
     [attempts, selectedAttemptId]
   )
+  // The WS handler runs outside React state; it needs to know whether the newest
+  // attempt is the one on screen.
+  const viewingLatestAttemptRef = useRef(true)
+  viewingLatestAttemptRef.current =
+    attempts.length === 0 ||
+    selectedAttemptId === attempts[attempts.length - 1]?.id
 
   const refreshArtifacts = async () => {
     try {
@@ -272,7 +278,13 @@ function RunPage() {
             const step = stepsRef.current.find(
               (s) => s.id === cur || s.step_id === cur
             )
-            if (step && step.id === msg.step_run_id) {
+            // Live lines belong to the newest attempt; appending them while an older
+            // one is on screen would mix two attempts together.
+            if (
+              step &&
+              step.id === msg.step_run_id &&
+              viewingLatestAttemptRef.current
+            ) {
               const line = `[${msg.stream ?? "out"}] ${msg.data}`
               setLogs((prev) => [...prev.slice(-800), line])
             }
@@ -301,10 +313,6 @@ function RunPage() {
       setSelectedAttemptId(null)
       return
     }
-    void api.listLogs(step.id).then((lines) => {
-      setLogs(lines.map((l) => `[${l.stream}] ${l.data}`))
-      setFollowLogs(true)
-    })
     void api
       .listStepAttempts(step.id)
       .then((rows) => {
@@ -320,6 +328,32 @@ function RunPage() {
         setSelectedAttemptId(null)
       })
   }, [selected, steps.length])
+
+  // Logs are fetched per attempt: `seq` restarts each attempt, so a retried step's
+  // output would otherwise interleave. Refetches when the viewer picks another attempt.
+  useEffect(() => {
+    const step = steps.find((s) => s.id === selected || s.step_id === selected)
+    if (!step) {
+      setLogs([])
+      return
+    }
+    let cancelled = false
+    void api
+      .listLogs(step.id, { attempt: selectedAttempt?.attempt })
+      .then((lines) => {
+        if (cancelled) return
+        setLogs(lines.map((l) => `[${l.stream}] ${l.data}`))
+        setFollowLogs(true)
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "Could not load logs")
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [selected, steps, selectedAttempt?.attempt])
 
   // Refresh attempts when step reaches a terminal status via WS.
   useEffect(() => {
@@ -355,6 +389,18 @@ function RunPage() {
       setRun(r)
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cancel failed")
+    }
+  }
+
+  const retry = async (failedOnly: boolean) => {
+    try {
+      const { run: created } = await api.retryRun(runId, failedOnly)
+      void navigate({
+        to: "/p/$projectId/runs/$runId",
+        params: { projectId, runId: created.id },
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Retry failed")
     }
   }
 
@@ -462,7 +508,20 @@ function RunPage() {
             <Ban className="size-4" />
             Cancel
           </Button>
-        ) : null}
+        ) : (
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => void retry(false)}>
+              <RotateCw className="size-4" />
+              Re-run
+            </Button>
+            {run?.status === "failed" ? (
+              <Button variant="outline" onClick={() => void retry(true)}>
+                <RotateCw className="size-4" />
+                Re-run failed steps
+              </Button>
+            ) : null}
+          </div>
+        )}
       </header>
       {error ? (
         <p className="px-6 pt-3 text-destructive text-sm">{error}</p>

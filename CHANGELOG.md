@@ -6,6 +6,26 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Re-run a run**: `POST /api/runs/{id}/retry`, and buttons on the run page. It builds
+  from the original run's definition snapshot, so it reproduces what that run executed.
+  `failed_only` carries over the steps that already succeeded — copying their artifacts
+  forward so dependents can still restore them — and re-runs the rest.
+- **Attempt-scoped logs.** `log_lines` records which attempt produced each line, and
+  `GET /api/steps/{id}/logs?attempt=N` narrows to it. The run page's attempt selector now
+  changes the log pane instead of showing every attempt interleaved.
+- **Pagination.** `GET /api/projects/{id}/runs` takes `?limit=&before=` and returns
+  `{ items, next_cursor }`; older runs were previously unreachable past the newest 50.
+  `GET /api/steps/{id}/logs` takes `?after_id=&limit=` and returns the newest lines by
+  default rather than the entire log — a step that printed millions of lines could
+  previously exhaust the API's memory.
+
+### Fixed
+
+- Retention deletes an artifact blob only when no remaining run references its path, so a
+  retry cannot lose the artifacts it inherited.
+
 ### Security
 
 - **Steps only see what they need.** A step's environment is cleared before its own is

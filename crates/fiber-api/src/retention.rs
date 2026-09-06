@@ -86,17 +86,30 @@ pub async fn run_once(
         return Ok(0);
     }
 
-    for path in &paths {
-        if let Err(e) = artifacts.delete(path).await {
-            warn!(%path, error = %e, "artifact blob delete failed (continuing)");
-        }
-    }
-
+    // Delete the rows first, then only those blobs nothing points at any more: a retry
+    // carries its predecessor's artifact rows forward, so two runs can share one blob.
     let ids: Vec<Uuid> = run_ids.into_iter().collect();
     let deleted = store.delete_runs(&ids).await?;
+
+    let candidates: Vec<String> = paths.iter().cloned().collect();
+    let still_referenced = store
+        .artifact_paths_still_referenced(&candidates)
+        .await
+        .unwrap_or_default();
+    let mut removed = 0usize;
+    for path in &paths {
+        if still_referenced.contains(path) {
+            continue;
+        }
+        match artifacts.delete(path).await {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(%path, error = %e, "artifact blob delete failed (continuing)"),
+        }
+    }
     info!(
         deleted,
-        blobs = paths.len(),
+        blobs = removed,
+        blobs_kept = still_referenced.len(),
         days = cfg.days,
         keep = cfg.keep_per_pipeline,
         "retention purged terminal runs"

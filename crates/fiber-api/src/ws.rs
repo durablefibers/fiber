@@ -418,7 +418,14 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                 if let Some(step) = owned_step(&state, agent_id, step_run_id).await {
                     if let Ok(line) = state
                         .store
-                        .append_log(step.run_id, step_run_id, &stream_name, &data, seq)
+                        .append_log(
+                            step.run_id,
+                            step_run_id,
+                            &stream_name,
+                            &data,
+                            seq,
+                            step.attempt,
+                        )
                         .await
                     {
                         let ev = RunEvent::Log {
