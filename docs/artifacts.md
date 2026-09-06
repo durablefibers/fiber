@@ -6,6 +6,17 @@ not everything the run has produced, so a parallel sibling cannot drop files int
 
 Steps declare workspace-relative paths under `artifacts:`. After a **successful** step, the agent uploads each path. Later steps in the same run receive a `restore` list in their Offer and download those files into the workspace before `run`.
 
+### When an upload fails
+
+A declared artifact that exists but could not be stored **fails the step** — an unreadable
+file, one over the 64 MiB cap, an unsafe path, or a failed transfer. Otherwise the step
+would report success while a later step that `needs` it fails with a missing file, and the
+log would blame the wrong step.
+
+A declared path that simply does not exist is a warning, not a failure, so a step may
+declare an artifact it only sometimes produces. Nothing downstream can restore it either
+way, so check the step's `system` log lines if a `restore` list looks short.
+
 ## Local backend (default)
 
 - Files under `FIBER_ARTIFACTS_DIR` (default `./data/artifacts`)

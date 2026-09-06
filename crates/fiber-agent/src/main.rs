@@ -953,10 +953,17 @@ async fn execute_step_inner(
         }
     };
 
+    // A declared artifact that never reached storage must not leave the step green: a
+    // dependent step restores it and would fail later with a missing file instead.
+    let mut artifact_failures = Vec::new();
     if code == 0 && !artifacts.is_empty() {
-        upload_artifacts(http_api, token, step_run_id, work_dir, artifacts, &mut log).await;
+        artifact_failures =
+            upload_artifacts(http_api, token, step_run_id, work_dir, artifacts, &mut log).await;
     }
     drop(env_file);
+    if !artifact_failures.is_empty() {
+        bail!("artifact upload failed: {}", artifact_failures.join("; "));
+    }
 
     Ok(code)
 }
@@ -1147,6 +1154,12 @@ async fn restore_artifacts(
     Ok(())
 }
 
+/// Upload each declared artifact, returning the ones that could not be stored.
+///
+/// A path that does not exist is a warning, not a failure: a pipeline may legitimately
+/// declare an artifact its step only sometimes produces. Anything that exists but could
+/// not be stored — unreadable, over the size cap, or a failed transfer — is returned, and
+/// the caller fails the step.
 async fn upload_artifacts(
     http_api: &str,
     token: &str,
@@ -1154,7 +1167,8 @@ async fn upload_artifacts(
     work_dir: &Path,
     artifacts: &[String],
     log: &mut impl FnMut(&str, String),
-) {
+) -> Vec<String> {
+    let mut failures = Vec::new();
     let client = reqwest::Client::new();
     let proxy_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts");
     let presign_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts/presign");
@@ -1162,21 +1176,22 @@ async fn upload_artifacts(
     for rel in artifacts {
         let rel = rel.trim();
         if rel.is_empty() || rel.contains("..") {
-            log("system", format!("skipping unsafe artifact path: {rel}"));
+            let msg = format!("unsafe artifact path: {rel}");
+            log("system", msg.clone());
+            failures.push(msg);
             continue;
         }
         let path = work_dir.join(rel);
         match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.is_file() => {
                 if meta.len() > MAX_ARTIFACT_BYTES {
-                    log(
-                        "system",
-                        format!(
-                            "artifact {} too large ({} bytes); skipping",
-                            rel,
-                            meta.len()
-                        ),
+                    let msg = format!(
+                        "artifact {} too large ({} bytes, limit {MAX_ARTIFACT_BYTES})",
+                        rel,
+                        meta.len()
                     );
+                    log("system", msg.clone());
+                    failures.push(msg);
                     continue;
                 }
                 match tokio::fs::read(&path).await {
@@ -1199,16 +1214,24 @@ async fn upload_artifacts(
                             Ok(mode) => {
                                 log("system", format!("uploaded artifact {rel} via {mode}"))
                             }
-                            Err(msg) => log("system", msg),
+                            Err(msg) => {
+                                log("system", msg.clone());
+                                failures.push(msg);
+                            }
                         }
                     }
-                    Err(e) => log("system", format!("failed to read artifact {rel}: {e}")),
+                    Err(e) => {
+                        let msg = format!("failed to read artifact {rel}: {e}");
+                        log("system", msg.clone());
+                        failures.push(msg);
+                    }
                 }
             }
             Ok(_) => log("system", format!("artifact {rel} is not a file; skipping")),
             Err(e) => log("system", format!("artifact {rel} missing: {e}")),
         }
     }
+    failures
 }
 
 async fn upload_one_artifact(
