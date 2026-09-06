@@ -135,12 +135,14 @@ impl Scheduler {
         project_id: Option<Uuid>,
     ) {
         let mut agents = self.agents.write().await;
+        // A repeated Hello on a live session must not reset the concurrency accounting.
+        let inflight = agents.get(&agent_id).map(|a| a.inflight).unwrap_or(0);
         agents.insert(
             agent_id,
             AgentPresence {
                 labels,
                 concurrency,
-                inflight: 0,
+                inflight,
                 project_id,
             },
         );
@@ -316,12 +318,22 @@ impl Scheduler {
             }
         }
 
-        let (agent_labels, agent_project_id) = {
+        // Fail closed without presence: a socket that never sent Hello (or whose
+        // presence was reclaimed) gets nothing rather than the global pool.
+        let agent_labels = {
             let agents = self.agents.read().await;
             match agents.get(&agent_id) {
-                Some(a) => (a.labels.clone(), a.project_id),
-                None => (Vec::new(), None),
+                Some(a) => a.labels.clone(),
+                None => {
+                    debug!(%agent_id, "no presence for agent; not offering");
+                    return Ok(None);
+                }
             }
+        };
+        // Pool scope is authoritative from the DB row, never from in-memory state.
+        let agent_project_id = match self.store.get_agent(agent_id).await? {
+            Some(a) => a.project_id,
+            None => return Ok(None),
         };
 
         let queued = self
@@ -377,13 +389,6 @@ impl Scheduler {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<Option<fiber_core::StepRun>> {
-        {
-            let mut agents = self.agents.write().await;
-            if let Some(a) = agents.get_mut(&agent_id) {
-                a.inflight = a.inflight.saturating_sub(1);
-            }
-        }
-
         let current = match self.store.get_step_run(step_run_id).await? {
             Some(s) => s,
             None => return Ok(None),
@@ -397,6 +402,15 @@ impl Scheduler {
                 "ignoring late step complete"
             );
             return Ok(None);
+        }
+
+        // Only a completion for a step this agent really holds releases a slot;
+        // otherwise spamming StepComplete would lift the concurrency cap.
+        {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(&agent_id) {
+                a.inflight = a.inflight.saturating_sub(1);
+            }
         }
 
         if status == StepStatus::Failed && current.attempt <= current.retries {

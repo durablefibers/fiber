@@ -1058,6 +1058,21 @@ impl Store {
         .await?)
     }
 
+    /// True when `agent_id` currently holds a running step in the artifact's run.
+    /// Backs the agent restore-download route; global vs project pools need no special case.
+    pub async fn agent_may_read_artifact(&self, agent_id: Uuid, artifact_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM artifacts a
+                 JOIN step_runs s ON s.run_id = a.run_id
+                 WHERE a.id = $1 AND s.agent_id = $2 AND s.status = 'running')",
+        )
+        .bind(artifact_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn get_artifact(&self, id: Uuid) -> Result<Option<Artifact>> {
         Ok(sqlx::query_as::<_, Artifact>(
             "SELECT id, run_id, step_run_id, name, path, size, created_at

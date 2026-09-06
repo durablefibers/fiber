@@ -129,6 +129,11 @@ pub struct ArtifactRestore {
     pub size: u64,
 }
 
+/// Messages from an agent to `fiber-api` over `/ws/agent`.
+///
+/// The `agent_id` fields are informational only: the server binds the agent's identity
+/// from the authenticated token at connect time and ignores (but logs) any mismatch.
+/// Step-scoped messages are accepted only for steps currently leased to that agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessage {

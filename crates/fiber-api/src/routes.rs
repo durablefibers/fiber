@@ -590,7 +590,7 @@ async fn agent_upload_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.len() as u64 > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -646,7 +646,7 @@ async fn agent_presign_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -701,7 +701,7 @@ async fn agent_complete_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) {
+    if step.agent_id != Some(agent.id) || step.status != "running" {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -756,12 +756,23 @@ async fn agent_complete_artifact(
     })))
 }
 
+/// Restore download. An agent may only read artifacts of runs in which it currently
+/// holds a running step (that is exactly the restore list it was offered); anything
+/// else is 404 so existence is not disclosed.
 async fn agent_download_artifact(
-    AuthAgent(_agent): AuthAgent,
+    AuthAgent(agent): AuthAgent,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::Redirect;
+    if !state
+        .store
+        .agent_may_read_artifact(agent.id, id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::NotFound);
+    }
     let artifact = state
         .store
         .get_artifact(id)
@@ -1017,9 +1028,11 @@ async fn delete_agent(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     require_agent_manage(&state, &user, &existing).await?;
-    if let Err(e) = state.scheduler.on_agent_disconnect(id).await {
-        tracing::warn!(error = %e, %id, "agent delete disconnect cleanup");
-    }
+    // Drop the live session too, so a deleted agent cannot keep leasing on its old socket.
+    state
+        .scheduler
+        .force_disconnect_agent(id, "agent deleted")
+        .await;
     let ok = state.store.delete_agent(id).await.map_err(ApiError::from)?;
     if !ok {
         return Err(ApiError::NotFound);

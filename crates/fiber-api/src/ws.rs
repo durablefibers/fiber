@@ -185,7 +185,40 @@ async fn offer_for_step_with_pipeline(state: &AppState, step: StepRun) -> Server
     }
 }
 
-async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
+/// The step a message refers to, but only if `agent_id` is the agent it was last
+/// leased to. Used for log lines: output that arrives after a cancel or reclaim is
+/// still this agent's output for its own attempt, and is what an operator reads to
+/// learn why the step stopped.
+async fn owned_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Option<StepRun> {
+    let step = state.store.get_step_run(step_run_id).await.ok().flatten()?;
+    if step.agent_id != Some(agent_id) {
+        tracing::debug!(
+            %agent_id, %step_run_id, owner = ?step.agent_id,
+            "dropping agent message for a step it does not own"
+        );
+        return None;
+    }
+    Some(step)
+}
+
+/// Like `owned_step`, but the lease must still be live. Used for artifacts (and,
+/// via the scheduler, completions): once a step was reclaimed or re-leased, the
+/// re-leased attempt reports its own outputs — this attempt's are dropped.
+async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Option<StepRun> {
+    let step = owned_step(state, agent_id, step_run_id).await?;
+    if step.status_enum() != StepStatus::Running {
+        tracing::debug!(
+            %agent_id, %step_run_id, status = %step.status,
+            "dropping agent message for a step whose lease ended"
+        );
+        return None;
+    }
+    Some(step)
+}
+
+/// `agent_id` is bound once from the authenticated token and never rebound from a
+/// client-supplied field: an agent may only ever act as itself.
+async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -217,6 +250,8 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
     });
 
     let _ = state.store.set_agent_online(agent_id, true).await;
+    // Log a spoofed agent_id once per session, not once per log line.
+    let mut spoof_logged = false;
 
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
@@ -235,6 +270,14 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
                 labels,
                 concurrency,
             } => {
+                // A force-disconnected session (token rotated, agent deleted) must not be
+                // able to re-register itself by replaying Hello.
+                if !state.scheduler.has_connection(agent_id).await {
+                    let _ = tx.send(ServerMessage::Error {
+                        message: "session ended — reconnect".into(),
+                    });
+                    break;
+                }
                 info!(%agent_id, %name, ?labels, "agent hello");
                 // Reload from DB so pool scope is authoritative (not client-supplied).
                 let project_id = state
@@ -258,32 +301,36 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
                     let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
                 }
             }
-            AgentMessage::Heartbeat { agent_id: aid } => {
-                if !state.scheduler.has_connection(aid).await {
+            AgentMessage::Heartbeat { agent_id: claimed } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                // force_disconnect_agent drops the connection; the next heartbeat ends the session.
+                if !state.scheduler.has_connection(agent_id).await {
                     let _ = tx.send(ServerMessage::Error {
                         message: "session ended — reconnect".into(),
                     });
                     break;
                 }
-                agent_id = aid;
-                let _ = state.store.touch_agent(aid).await;
-                let _ = state.scheduler.renew_leases(aid).await;
-                if let Ok(Some(step)) = state.scheduler.offer_for_agent(aid).await {
+                let _ = state.store.touch_agent(agent_id).await;
+                let _ = state.scheduler.renew_leases(agent_id).await;
+                if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
                     let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
                 }
             }
             AgentMessage::Claim {
-                agent_id: _,
+                agent_id: claimed,
                 step_run_id: _,
-            } => {}
+            } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+            }
             AgentMessage::LogChunk {
-                agent_id: _,
+                agent_id: claimed,
                 step_run_id,
                 stream: stream_name,
                 data,
                 seq,
             } => {
-                if let Ok(Some(step)) = state.store.get_step_run(step_run_id).await {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                if let Some(step) = owned_step(&state, agent_id, step_run_id).await {
                     if let Ok(line) = state
                         .store
                         .append_log(step.run_id, step_run_id, &stream_name, &data, seq)
@@ -304,18 +351,19 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
                 }
             }
             AgentMessage::Artifact {
-                agent_id: _,
+                agent_id: claimed,
                 step_run_id,
                 name,
                 path: rel_path,
                 size,
                 content_base64,
             } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
                 // Prefer HTTP upload; keep WS base64 as a small-file fallback.
                 let Some(b64) = content_base64 else {
                     continue;
                 };
-                if let Ok(Some(step)) = state.store.get_step_run(step_run_id).await {
+                if let Some(step) = leased_step(&state, agent_id, step_run_id).await {
                     let rel = crate::artifact_util::sanitize_artifact_rel_path(&rel_path)
                         .or_else(|| crate::artifact_util::sanitize_artifact_rel_path(&name));
                     let Some(rel) = rel else {
@@ -354,19 +402,21 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
                 }
             }
             AgentMessage::StepComplete {
-                agent_id: aid,
+                agent_id: claimed,
                 step_run_id,
                 status,
                 exit_code,
                 error,
             } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                // on_step_complete additionally rejects completions for steps not leased to agent_id.
                 match state
                     .scheduler
-                    .on_step_complete(aid, step_run_id, status, exit_code, error)
+                    .on_step_complete(agent_id, step_run_id, status, exit_code, error)
                     .await
                 {
                     Ok(_) => {
-                        if let Ok(Some(step)) = state.scheduler.offer_for_agent(aid).await {
+                        if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
                             let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
                         }
                     }
@@ -381,6 +431,14 @@ async fn handle_agent(socket: WebSocket, state: AppState, mut agent_id: Uuid) {
         warn!(error = %e, %agent_id, "agent disconnect cleanup failed");
     }
     writer.abort();
+}
+
+/// Client-supplied `agent_id` fields are ignored; log the first disagreement per session.
+fn warn_if_spoofed(bound: Uuid, claimed: Uuid, logged: &mut bool) {
+    if bound != claimed && !*logged {
+        *logged = true;
+        warn!(%bound, %claimed, "agent message carried a different agent_id; ignoring it");
+    }
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {

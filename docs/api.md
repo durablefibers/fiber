@@ -76,16 +76,16 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Method | Path | Notes |
 |---|---|---|
-| PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path` |
-| POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }` |
-| POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT |
-| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect) |
+| PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path`; step must be **running and leased to this agent** |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }`; same lease check |
+| POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT; same lease check |
+| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect). Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
 
 ## WebSockets
 
 | Path | Auth | Notes |
 |---|---|---|
-| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete |
+| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
 | `/ws/runs/{id}?token=` | session token | Live run/step/log events |
 
 Message shapes: `crates/fiber-proto`.
