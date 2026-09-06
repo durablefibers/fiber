@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Fiber — self-hosted, canvas-first DAG CI ("Jenkins alternative"). Rust control plane + TypeScript UI. Repo folder is `durablefibers`; **all code, crates, binaries, env vars, and Docker services use the `fiber` / `FIBER_*` prefix** — never `df`, `durablefibers`, or `durable_fibers` (`.cursor/rules/naming.mdc`).
+Fiber — self-hosted, canvas-first DAG CI ("Jenkins alternative"). Rust control plane + TypeScript UI. Repo folder is `durablefibers`; **all code, crates, binaries, env vars, and Docker services use the `fiber` / `FIBER_*` prefix** — never `df`, `durablefibers`, or `durable_fibers` (`.claude/rules/naming.md`).
 
 ## Commands
 
-Prefer `make` targets and `scripts/dev-env.sh` over ad-hoc env in shell one-liners (`.cursor/rules/dx.mdc`). `make help` lists everything.
+Prefer `make` targets and `scripts/dev-env.sh` over ad-hoc env in shell one-liners (`.claude/rules/dx.md`). `make help` lists everything.
 
 ```bash
 make infra          # Postgres :15432 + Redis :16379 (docker compose, deploy/docker-compose.yml)

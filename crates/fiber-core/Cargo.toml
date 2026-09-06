@@ -3,6 +3,10 @@ name = "fiber-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Domain model, Postgres store, DAG compiler, and migrations for Fiber."
 
 [dependencies]
 fiber-proto = { workspace = true }

@@ -15,6 +15,10 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Durable Fibers"]
+repository = "https://github.com/durablefibers/fiber"
+homepage = "https://github.com/durablefibers/fiber"
+readme = "README.md"
+rust-version = "1.97"
 
 [workspace.dependencies]
 fiber-proto = { path = "crates/fiber-proto" }

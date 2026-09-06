@@ -1,5 +1,7 @@
 # Fiber — Durable CI
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+
 Self-hosted, canvas-first Jenkins alternative. Rust control plane, TypeScript UI (TanStack Start + React Flow + shadcn).
 
 **Docs:** [docs/](./docs/) — getting started, [development](./docs/development.md) (`make help`), architecture, pipeline YAML, agents, artifacts, authz, [CLI](./docs/cli.md), API, operations, [roadmap](./docs/roadmap.md).
@@ -130,4 +132,23 @@ crates/fiber-proto/
 examples/              # sample fiber.yml pipelines
 ```
 
-Naming: `fiber-*` / `FIBER_*` — see `.cursor/rules/naming.mdc`.
+Naming: `fiber-*` / `FIBER_*` — see `.claude/rules/naming.md`.
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](./CONTRIBUTING.md) covers the local
+setup, the gate every change has to pass (`make check`, `make test`, and the dogfood smokes),
+and the handful of invariants — at-least-once steps, the immutable run snapshot, append-only
+migrations — that a patch has to respect.
+
+By participating you agree to the [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+## Security
+
+Please do not open a public issue for a vulnerability. [SECURITY.md](./SECURITY.md) has the
+private reporting channel, along with the trust model: what Fiber defends against, and what
+it deliberately does not.
+
+## License
+
+[Apache License 2.0](./LICENSE). See [NOTICE](./NOTICE) for attribution.

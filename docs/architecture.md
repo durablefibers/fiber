@@ -53,4 +53,4 @@
 
 ## Naming
 
-Use product prefix `fiber` everywhere (`fiber-*` crates, `FIBER_*` env). Never `df` / `durablefibers` as a package prefix. See `.cursor/rules/naming.mdc`.
+Use product prefix `fiber` everywhere (`fiber-*` crates, `FIBER_*` env). Never `df` / `durablefibers` as a package prefix. See `.claude/rules/naming.md`.

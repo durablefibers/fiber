@@ -8,6 +8,10 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **The project is open source under Apache 2.0.** `LICENSE`, `NOTICE`,
+  `CONTRIBUTING.md`, `SECURITY.md` (with the trust model spelled out), and a
+  Contributor Covenant `CODE_OF_CONDUCT.md`, plus issue and pull-request templates
+  and Dependabot for Cargo, npm, Actions, and Docker.
 - **GitHub commit statuses.** A webhook-triggered run reports `pending` when it starts and
   `success` / `failure` / `error` when it finishes, under the context
   `fiber/<pipeline name>`, so a pull request can require it as a check. Needs a token with

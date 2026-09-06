@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PostToolUse(Edit|Write): enforce the fiber-* / FIBER_* product prefix.
-# .cursor/rules/naming.mdc — the repo folder is `durablefibers`, the code never is.
+# .claude/rules/naming.md — the repo folder is `durablefibers`, the code never is.
 # Advisory: exits 2 so Claude sees the feedback and fixes it, without reverting the edit.
 set -uo pipefail
 
@@ -18,7 +18,7 @@ hits="$(grep -nE '\b(durablefibers|durable_fibers)\b|\bDF_[A-Z_]+|\bdf-(api|core
 [ -z "$hits" ] && exit 0
 
 {
-  echo "Naming violation in $path — product prefix is 'fiber' / 'FIBER_*', never df / durablefibers (.cursor/rules/naming.mdc):"
+  echo "Naming violation in $path — product prefix is 'fiber' / 'FIBER_*', never df / durablefibers (.claude/rules/naming.md):"
   echo "$hits"
   echo "Rename to fiber-* (crates, binaries, Docker services) or FIBER_* (env vars) and re-apply."
 } >&2

@@ -3,6 +3,10 @@ name = "fiber-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "The `fiber` command line client for a Fiber instance."
 
 [[bin]]
 name = "fiber"
