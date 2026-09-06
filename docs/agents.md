@@ -73,8 +73,12 @@ A step is offered only if:
 
 | Event | Behavior |
 |---|---|
-| Heartbeat | Touches `last_seen_at`, renews leases, may receive new offers |
-| Disconnect / WS close | Agent marked offline; in-flight steps requeued |
+| Heartbeat | Touches `last_seen_at`, renews leases, may receive new offers. Retried steps are not offered before their backoff (`not_before`) |
+| Step timeout | Every offer carries `timeout_minutes`; the agent kills the process group at the deadline and reports `failed` (`timed out after N min`). The server fails it itself after a grace period if the agent does not |
+| SIGTERM / SIGINT | In-flight step processes are stopped and the socket is closed **without** reporting a result, so the server requeues those steps to another agent (a rolling agent restart does not fail a build). The agent exits once its steps are stopped (≤ 10 s) |
+| Reconnect | Exponential backoff 1 s → 30 s with jitter; a `401` (revoked token) exits the process with status 2 instead of retrying forever |
+| Concurrency | `--concurrency` is enforced locally with a process-wide semaphore as well as by the server; a step parked on it still counts against its `timeout_minutes`, which start when the offer is received |
+| Disconnect / WS close | Agent marked offline; in-flight steps requeued (the bounced attempt counts against `retries`) |
 | Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + requeue |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
 | Update | `PUT /api/agents/{id}` — name / labels / concurrency (inflight preserved; pool unchanged) |
@@ -89,6 +93,6 @@ A step is offered only if:
 ## Executor
 
 - **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the workspace directory.
-- **Docker**: if `image` is set (or docker mode on), runs inside the image with the workspace mounted.
+- **Docker**: if `image` is set (or docker mode on), runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client.
 
 Process groups: cancel kills the step’s process group so grandchildren die too.

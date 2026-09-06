@@ -23,6 +23,8 @@ pub enum DagError {
     EmptyMatrixAxis { step: String, axis: String },
     #[error("step `{0}` matrix expands to more than {MAX_MATRIX_CELLS} cells")]
     MatrixTooLarge(String),
+    #[error("`{0}`: timeout_minutes must be at least 1")]
+    InvalidTimeout(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,9 @@ pub struct CompiledStep {
     /// Copied from definition `if:`.
     #[serde(default, rename = "if")]
     pub if_expr: Option<String>,
+    /// Copied from definition `timeout_minutes:` (per attempt).
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +61,9 @@ pub struct CompiledDag {
     pub workspace: Option<fiber_proto::WorkspaceConfig>,
     pub steps: Vec<CompiledStep>,
     pub levels: Vec<Vec<String>>,
+    /// Whole-run wall-clock limit in minutes, if any.
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -70,6 +78,14 @@ struct ExpandedCell {
 pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagError> {
     if def.steps.is_empty() {
         return Err(DagError::Empty);
+    }
+    if def.timeout_minutes == Some(0) {
+        return Err(DagError::InvalidTimeout("pipeline".into()));
+    }
+    for step in &def.steps {
+        if step.timeout_minutes == Some(0) {
+            return Err(DagError::InvalidTimeout(format!("step {}", step.id)));
+        }
     }
 
     let mut seen = HashSet::new();
@@ -191,6 +207,7 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             matrix: cell.matrix.clone(),
             env: cell.env.clone(),
             if_expr: cell.template.if_expr.clone(),
+            timeout_minutes: cell.template.timeout_minutes,
         });
     }
 
@@ -203,6 +220,7 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         workspace: def.workspace.clone(),
         steps: compiled,
         levels,
+        timeout_minutes: def.timeout_minutes,
     })
 }
 
@@ -337,8 +355,10 @@ pub fn definition_from_map(
                 artifacts: s.artifacts,
                 matrix: s.matrix,
                 if_expr: s.if_expr,
+                timeout_minutes: s.timeout_minutes,
             })
             .collect(),
+        timeout_minutes: None,
     }
 }
 
@@ -358,6 +378,8 @@ pub struct StepDefinitionInput {
     pub matrix: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default, rename = "if")]
     pub if_expr: Option<String>,
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
 }
 
 /// Parse YAML where `steps` may be a map (GitHub Actions style) or a list.
@@ -370,6 +392,8 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
         #[serde(default)]
         on: Option<fiber_proto::PipelineTriggers>,
         steps: serde_yaml::Value,
+        #[serde(default)]
+        timeout_minutes: Option<u32>,
     }
 
     let raw: Raw = serde_yaml::from_str(yaml)?;
@@ -397,6 +421,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
                     artifacts: input.artifacts,
                     matrix: input.matrix,
                     if_expr: input.if_expr,
+                    timeout_minutes: input.timeout_minutes,
                 });
             }
             out
@@ -409,6 +434,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
         workspace: raw.workspace,
         on: raw.on,
         steps,
+        timeout_minutes: raw.timeout_minutes,
     })
 }
 
@@ -429,7 +455,45 @@ mod tests {
             artifacts: vec![],
             matrix: None,
             if_expr: None,
+            timeout_minutes: None,
         }
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected_and_positive_is_kept() {
+        let mut s = step("a", &[], "true");
+        s.timeout_minutes = Some(0);
+        let def = PipelineDefinition {
+            name: "t".into(),
+            workspace: None,
+            on: None,
+            steps: vec![s.clone()],
+            timeout_minutes: None,
+        };
+        assert!(matches!(
+            compile_definition(&def),
+            Err(DagError::InvalidTimeout(_))
+        ));
+        s.timeout_minutes = Some(5);
+        let def = PipelineDefinition {
+            timeout_minutes: Some(0),
+            steps: vec![s.clone()],
+            ..def
+        };
+        assert!(matches!(
+            compile_definition(&def),
+            Err(DagError::InvalidTimeout(_))
+        ));
+        let def = PipelineDefinition {
+            timeout_minutes: Some(30),
+            ..def
+        };
+        let dag = compile_definition(&def).unwrap();
+        assert_eq!(dag.timeout_minutes, Some(30));
+        assert_eq!(dag.steps[0].timeout_minutes, Some(5));
+        // The step timeout survives the JSON snapshot round-trip.
+        let v = serde_json::to_value(&dag).unwrap();
+        assert_eq!(v["steps"][0]["timeout_minutes"], 5);
     }
 
     #[test]
@@ -438,6 +502,7 @@ mod tests {
             name: "demo".into(),
             workspace: None,
             on: None,
+            timeout_minutes: None,
             steps: vec![
                 step("a", &[], "echo a"),
                 step("b", &["a"], "echo b"),
@@ -456,6 +521,7 @@ mod tests {
             name: "bad".into(),
             workspace: None,
             on: None,
+            timeout_minutes: None,
             steps: vec![step("a", &["b"], "echo a"), step("b", &["a"], "echo b")],
         };
         assert!(matches!(compile_definition(&def), Err(DagError::Cycle)));
@@ -471,6 +537,7 @@ mod tests {
             name: "m".into(),
             workspace: None,
             on: None,
+            timeout_minutes: None,
             steps: vec![
                 step("checkout", &[], "echo hi"),
                 test,

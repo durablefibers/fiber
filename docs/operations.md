@@ -22,6 +22,17 @@ ci.example.com {
 
 Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
 
+## Stuck runs
+
+A run that stays `running` is one of:
+
+- **Nothing to lease it** — its steps are `queued` and no online agent matches the labels / project pool. Check **Agents** for an online agent with every required label.
+- **Waiting on a retry backoff** — a failed step with `retries` is `queued` with `not_before` in the future (max 60 s).
+- **Hung step** — the attempt exceeds its `timeout_minutes` (default `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES`): the agent fails it at the deadline, and the server fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not. A whole-run `timeout_minutes` cancels the run with reason `run timed out`.
+- **Agent gone** — leases expire after 5 minutes without heartbeats and the step is re-queued (`step_attempts` shows `reclaimed`).
+
+`GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
+
 ## Health checks
 
 - `GET /health` — process up  
@@ -109,6 +120,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 
 - Schema: sqlx migrations under `crates/fiber-core/migrations/` run on API boot  
 - Redis no longer carries a step queue; after upgrading, `DEL fiber:ready_steps` removes the orphaned list left by older versions  
+- **Step timeouts apply to runs already in flight at upgrade.** Steps without `timeout_minutes` get `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60); a build that legitimately runs longer must set `timeout_minutes` on the step (or raise the default) *before* upgrading, or its in-flight attempt will be failed by the backstop  
 - Migration `007_indexes.sql` adds nine indexes (`step_runs`, `artifacts`, `log_lines`, `sessions`, `runs`, `step_attempts`). It runs at the first boot of the new version and holds a `SHARE` lock on each table while that index builds — writes to `log_lines` pause for the duration, which is seconds on a typical install. On a very large `log_lines` table, run retention first or apply the statements by hand with `CREATE INDEX CONCURRENTLY` before upgrading (the migration's `IF NOT EXISTS` then skips them).
 
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  

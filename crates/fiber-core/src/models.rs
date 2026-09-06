@@ -137,6 +137,16 @@ pub struct LogLine {
     pub created_at: DateTime<Utc>,
 }
 
+/// A running step whose attempt exceeded its timeout (see `Store::list_timed_out_steps`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TimedOutStep {
+    pub step_run_id: Uuid,
+    pub run_id: Uuid,
+    pub step_id: String,
+    pub agent_id: Option<Uuid>,
+    pub timeout_minutes: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Artifact {
     pub id: Uuid,

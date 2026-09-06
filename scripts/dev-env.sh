@@ -16,6 +16,10 @@ export FIBER_RETENTION_DAYS="${FIBER_RETENTION_DAYS:-30}"
 export RUST_LOG="${RUST_LOG:-info,fiber_api=info,fiber_agent=info}"
 # Browser origins allowed by the API (default already covers the :3100 dev server).
 # export FIBER_CORS_ORIGINS=http://localhost:3100,http://127.0.0.1:3100
+# Step timeouts (minutes): default for steps without `timeout_minutes`, and the
+# server-side grace before it fails a step the agent did not stop itself.
+# export FIBER_STEP_TIMEOUT_DEFAULT_MINUTES=60
+# export FIBER_STEP_TIMEOUT_GRACE_MINUTES=5
 
 # Optional secrets encryption (generate once: openssl rand -hex 32)
 # export FIBER_SECRETS_KEY=...

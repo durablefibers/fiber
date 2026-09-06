@@ -66,6 +66,8 @@ export type PipelineDefinition = {
     cron?: string
   }
   steps: StepDefinition[]
+  /** Whole-run wall-clock limit in minutes. */
+  timeout_minutes?: number
 }
 
 export type StepDefinition = {
@@ -81,6 +83,8 @@ export type StepDefinition = {
   matrix?: Record<string, string[]>
   /** `success()` (default), `always()`, `never()`, or `matrix.os == 'linux'`. */
   if?: string
+  /** Per-attempt wall-clock limit in minutes (server default 60 when unset). */
+  timeout_minutes?: number
 }
 
 export type Artifact = {
@@ -500,6 +504,9 @@ export function definitionToYaml(def: PipelineDefinition): string {
       lines.push(`  cron: ${yamlQuote(def.on.cron)}`)
     }
   }
+  if (def.timeout_minutes) {
+    lines.push(`timeout_minutes: ${def.timeout_minutes}`)
+  }
   lines.push("steps:")
   for (const s of def.steps) {
     lines.push(`  ${s.id}:`)
@@ -512,6 +519,9 @@ export function definitionToYaml(def: PipelineDefinition): string {
       lines.push(`    labels: [${s.labels.map(yamlQuote).join(", ")}]`)
     }
     if (s.retries) lines.push(`    retries: ${s.retries}`)
+    if (s.timeout_minutes) {
+      lines.push(`    timeout_minutes: ${s.timeout_minutes}`)
+    }
     if (s.if) lines.push(`    if: ${yamlQuote(s.if)}`)
     if (s.matrix && Object.keys(s.matrix).length) {
       lines.push("    matrix:")

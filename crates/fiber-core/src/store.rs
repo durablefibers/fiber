@@ -454,19 +454,41 @@ impl Store {
         Ok(n)
     }
 
-    pub async fn requeue_for_retry(&self, step_run_id: Uuid) -> Result<StepRun> {
-        Ok(sqlx::query_as::<_, StepRun>(
+    /// Re-queue a failed step for another attempt, not offerable before `backoff_secs`.
+    /// The failed attempt is closed in `step_attempts` (with its exit code / error) so
+    /// the attempt history is complete and the timeout backstop, which looks at the
+    /// open attempt, never sees a stale one.
+    /// Returns `None` when the step is no longer running under `agent_id` — another
+    /// replica's backstop or a cancel got there first — so a live attempt is never
+    /// cleared by a late requeue.
+    pub async fn requeue_for_retry(
+        &self,
+        step_run_id: Uuid,
+        agent_id: Uuid,
+        backoff_secs: i64,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+    ) -> Result<Option<StepRun>> {
+        let requeued = sqlx::query_as::<_, StepRun>(
             "UPDATE step_runs
              SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
-                 error = NULL, exit_code = NULL, finished_at = NULL
-             WHERE id = $1
+                 error = NULL, exit_code = NULL, finished_at = NULL,
+                 not_before = NOW() + make_interval(secs => $2)
+             WHERE id = $1 AND status = 'running' AND agent_id = $3
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
                        started_at, finished_at",
         )
         .bind(step_run_id)
-        .fetch_one(&self.pool)
-        .await?)
+        .bind(backoff_secs as f64)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if requeued.is_some() {
+            self.finish_open_attempt(step_run_id, "failed", exit_code, error)
+                .await?;
+        }
+        Ok(requeued)
     }
 
     pub async fn start_run(
@@ -598,6 +620,7 @@ impl Store {
                     retries, attempt, agent_id, lease_expires_at, exit_code, error,
                     started_at, finished_at
              FROM step_runs WHERE status = 'queued'
+               AND (not_before IS NULL OR not_before <= NOW())
              ORDER BY started_at NULLS FIRST, id",
         )
         .fetch_all(&self.pool)
@@ -616,6 +639,7 @@ impl Store {
              SET status = 'running', agent_id = $2, lease_expires_at = $3,
                  started_at = COALESCE(started_at, NOW()), attempt = attempt + 1
              WHERE id = $1 AND status = 'queued'
+               AND (not_before IS NULL OR not_before <= NOW())
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
                        started_at, finished_at",
@@ -737,6 +761,47 @@ impl Store {
         Ok(res.rows_affected())
     }
 
+    /// Running steps whose current attempt has exceeded its timeout plus a grace
+    /// period (the agent is expected to fail the step itself first). The timeout comes
+    /// from the run's definition snapshot, falling back to `default_minutes`.
+    pub async fn list_timed_out_steps(
+        &self,
+        default_minutes: i64,
+        grace_minutes: i64,
+    ) -> Result<Vec<TimedOutStep>> {
+        Ok(sqlx::query_as::<_, TimedOutStep>(
+            "SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
+                    COALESCE(js.t, $1)::bigint AS timeout_minutes
+             FROM step_runs s
+             JOIN runs r ON r.id = s.run_id
+             JOIN step_attempts a ON a.step_run_id = s.id AND a.finished_at IS NULL
+             LEFT JOIN LATERAL (
+                 SELECT (e->>'timeout_minutes')::bigint AS t
+                 FROM jsonb_array_elements(r.definition_snapshot->'steps') e
+                 WHERE e->>'id' = s.step_id
+                 LIMIT 1) js ON TRUE
+             WHERE s.status = 'running'
+               AND a.started_at < NOW() - make_interval(mins => (COALESCE(js.t, $1) + $2)::int)",
+        )
+        .bind(default_minutes)
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Running runs whose snapshot carries a whole-run `timeout_minutes` that has elapsed.
+    pub async fn list_timed_out_runs(&self) -> Result<Vec<(Uuid, i64)>> {
+        Ok(sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT id, (definition_snapshot->>'timeout_minutes')::bigint
+             FROM runs
+             WHERE status = 'running'
+               AND (definition_snapshot->>'timeout_minutes') IS NOT NULL
+               AND started_at < NOW() - make_interval(mins => (definition_snapshot->>'timeout_minutes')::int)",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn requeue_expired_leases(&self) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
             "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
@@ -756,8 +821,7 @@ impl Store {
 
     pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
-                 started_at = NULL, attempt = GREATEST(attempt - 1, 0)
+            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
              WHERE agent_id = $1 AND status = 'running'
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -865,6 +929,16 @@ impl Store {
 
     /// Cancel a run. Returns the run and any steps that were `running` (for agent Cancel fan-out).
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<(Run, Vec<StepRun>)> {
+        self.cancel_run_with_reason(run_id, None).await
+    }
+
+    /// Cancel a run; `reason` (e.g. "run timed out") is recorded on the cancelled steps
+    /// and their open attempts so the outcome is distinguishable from a manual cancel.
+    pub async fn cancel_run_with_reason(
+        &self,
+        run_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(Run, Vec<StepRun>)> {
         let running = sqlx::query_as::<_, StepRun>(
             "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                     retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -876,15 +950,22 @@ impl Store {
         .await?;
 
         sqlx::query(
-            "UPDATE step_runs SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL
+            "UPDATE step_runs SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL,
+                 error = COALESCE($2, error)
              WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')",
         )
         .bind(run_id)
+        .bind(reason)
         .execute(&self.pool)
         .await?;
         for s in &running {
-            self.finish_open_attempt(s.id, "cancelled", None, Some("run cancelled"))
-                .await?;
+            self.finish_open_attempt(
+                s.id,
+                "cancelled",
+                None,
+                Some(reason.unwrap_or("run cancelled")),
+            )
+            .await?;
         }
         let run = sqlx::query_as::<_, Run>(
             "UPDATE runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1
@@ -922,7 +1003,7 @@ impl Store {
     pub async fn list_logs(&self, step_run_id: Uuid) -> Result<Vec<LogLine>> {
         Ok(sqlx::query_as::<_, LogLine>(
             "SELECT id, run_id, step_run_id, stream, data, seq, created_at
-             FROM log_lines WHERE step_run_id = $1 ORDER BY seq",
+             FROM log_lines WHERE step_run_id = $1 ORDER BY seq, id",
         )
         .bind(step_run_id)
         .fetch_all(&self.pool)
@@ -1210,6 +1291,7 @@ impl Store {
                  FROM step_runs s
                  INNER JOIN runs r ON r.id = s.run_id
                  WHERE s.status = 'queued' AND r.project_id = $1
+                   AND (s.not_before IS NULL OR s.not_before <= NOW())
                  ORDER BY s.started_at NULLS FIRST, s.id",
             )
             .bind(pid)
