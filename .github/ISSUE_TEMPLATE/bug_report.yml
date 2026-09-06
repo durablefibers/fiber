@@ -1,0 +1,50 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security issue, please do **not** open an issue — see
+        [SECURITY.md](https://github.com/durablefibers/fiber/blob/main/SECURITY.md) for the private reporting channel.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: >
+        Steps against a local stack (`make infra && make api`). A minimal `fiber.yml`
+        is the most useful thing you can include.
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >
+        API log, agent log, or step logs. Redact secrets — Fiber masks known secret
+        values in step logs, but not everything.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`fiber-api --version`, or the commit you are on."
+    validations:
+      required: true
+  - type: dropdown
+    id: how-run
+    attributes:
+      label: How are you running it
+      options:
+        - Compose (deploy/docker-compose.yml)
+        - From source (make api / make agent)
+        - Published images
+        - Other
+    validations:
+      required: true

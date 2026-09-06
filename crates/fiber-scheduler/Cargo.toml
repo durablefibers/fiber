@@ -3,6 +3,10 @@ name = "fiber-scheduler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Step lease queue, agent registry, and schedule loop for Fiber."
 
 [dependencies]
 fiber-core = { workspace = true }

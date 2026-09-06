@@ -53,7 +53,7 @@ Login defaults: **admin** / **fiber**.
 
 ## Naming
 
-Product prefix is **`fiber`** / `FIBER_*` — see `.cursor/rules/naming.mdc`. Never `df` / `durablefibers` in crates, env, or Compose service names.
+Product prefix is **`fiber`** / `FIBER_*` — see `.claude/rules/naming.md`. Never `df` / `durablefibers` in crates, env, or Compose service names.
 
 ## Layout
 

@@ -1,8 +1,3 @@
----
-description: Fiber product naming — always use fiber-* prefix
-alwaysApply: true
----
-
 # Naming convention
 
 Use **`fiber`** as the product prefix everywhere.
@@ -19,3 +14,5 @@ Never use `df`, `durablefibers`, or `durable_fibers` for crates, binaries, env v
 | TS packages | `@fiber/*` if split | web app stays `apps/web` |
 
 The repo folder may be named `durablefibers`; code and packages must use `fiber`.
+
+Enforced by `.claude/hooks/naming-guard.sh` on every edit.

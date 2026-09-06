@@ -3,6 +3,10 @@ name = "fiber-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Wire and pipeline-YAML types shared by the Fiber API, agent, and CLI."
 
 [dependencies]
 chrono = { workspace = true }

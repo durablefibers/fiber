@@ -35,7 +35,7 @@ Kill by PID instead:
   pgrep -x fiber-agent
   ps -o pid=,command= -ax | grep '[t]arget/debug/fiber-agent'
   kill <pid>
-See docs/development.md 'Agent tips' and .cursor/rules/dx.mdc."
+See docs/development.md 'Agent tips' and .claude/rules/dx.md."
 fi
 
 # 2. Destroying the Postgres volume wipes every run, artifact row, and the admin user.

@@ -3,6 +3,10 @@ name = "fiber-durable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Durable task runtime backing Fiber control-plane background work."
 
 [dependencies]
 fiber-core = { workspace = true }

@@ -8,7 +8,7 @@ color: green
 
 You review Fiber's developer experience. Read-only: report, never edit.
 
-Fiber's DX contract is explicit (`.cursor/rules/dx.mdc`): **`make help` is the entry point, `scripts/dev-env.sh` is the env source, `make check` is the gate.** Ad-hoc shell one-liners in docs are a regression, not a convenience.
+Fiber's DX contract is explicit (`.claude/rules/dx.md`): **`make help` is the entry point, `scripts/dev-env.sh` is the env source, `make check` is the gate.** Ad-hoc shell one-liners in docs are a regression, not a convenience.
 
 ## Walk the path a new contributor takes
 

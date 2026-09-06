@@ -14,7 +14,7 @@ Nine rules. Violating any of them produces a defect that compiles, passes review
 
 ## 1. Naming: `fiber` / `FIBER_*`, never `df` or `durablefibers`
 
-The repo directory is `durablefibers`; nothing inside it is. Crates `fiber-*`, binaries `fiber` / `fiber-agent`, env `FIBER_*`, Compose services `fiber-*`, config file `fiber.yml`. Source: `.cursor/rules/naming.mdc`.
+The repo directory is `durablefibers`; nothing inside it is. Crates `fiber-*`, binaries `fiber` / `fiber-agent`, env `FIBER_*`, Compose services `fiber-*`, config file `fiber.yml`. Source: `.claude/rules/naming.md`.
 
 ## 2. `make check` is the gate
 

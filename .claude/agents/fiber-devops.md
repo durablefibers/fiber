@@ -25,7 +25,7 @@ Ports are deliberately non-default to avoid colliding with whatever else is on t
 | MinIO API / console | 19000 / 19001 |
 
 - Postgres is **17-alpine**. A volume created by 16 will not start under 17; the documented recovery destroys data, so never run it yourself — tell the user.
-- Compose service names are `fiber-postgres`, `fiber-redis`, `fiber-minio`, `fiber-api`, `fiber-web`. The `fiber-` prefix is mandatory (`.cursor/rules/naming.mdc`).
+- Compose service names are `fiber-postgres`, `fiber-redis`, `fiber-minio`, `fiber-api`, `fiber-web`. The `fiber-` prefix is mandatory (`.claude/rules/naming.md`).
 - The Compose healthcheck uses `GET /ready` (Postgres + Redis reachable). `/health` is liveness only.
 - CI is two jobs: `check` (fmt, clippy `-D warnings` across all six crates, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`) and `web` (pnpm + Node, `pnpm install --frozen-lockfile`, `pnpm exec tsc --noEmit`). `RUSTFLAGS: -Dwarnings` is set in the workflow env.
 - `fiber-api` applies migrations on boot, so rolling an image forward rolls the schema forward. Migrations must stay compatible with the *previous* image for the duration of a rolling deploy.

@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest something Fiber should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Worth a look at [docs/roadmap.md](https://github.com/durablefibers/fiber/blob/main/docs/roadmap.md) first — it lists
+        what is planned and what is deliberately out of scope for a self-hosted CI core.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Fiber makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: A rough shape is fine. If it changes `fiber.yml`, sketch the YAML.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you have tried instead
