@@ -142,6 +142,15 @@ timeout now inherit `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60) — see the upgrad
   restore lists, the retention cascade, session purge).
 - Agent log lines use a single sequence per attempt; stdout and stderr no longer collide after
   1000 lines.
+- **The released binaries no longer link OpenSSL.** The agent's WebSocket client used
+  `native-tls`, so the published `fiber-agent` / `fiber` tarballs failed to start on any host
+  without `libssl3` — including `debian:bookworm-slim`. Both the WebSocket and the HTTP
+  client now use rustls with the host's certificate store, which also means a self-hosted
+  instance behind a private CA works: previously the WebSocket trusted the system store
+  while artifact upload and restore trusted a bundled root list, so steps ran but their
+  artifacts silently failed to transfer. `SSL_CERT_FILE` and `SSL_CERT_DIR` are honoured.
+- The agent logs the whole error chain when a session fails, instead of just
+  `connect websocket` with the cause dropped.
 
 ### Changed
 

@@ -22,6 +22,21 @@ ci.example.com {
 
 Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
 
+### Agent TLS
+
+Point agents at `wss://ci.example.com` and they use the host's own certificate store for
+both the WebSocket and the artifact HTTP calls, so a private or corporate CA works as soon
+as it is installed on the host. On Unix, `SSL_CERT_FILE` and `SSL_CERT_DIR` override that
+if you would rather point at one bundle:
+
+```
+Environment=SSL_CERT_FILE=/etc/fiber/internal-ca.pem
+```
+
+The binaries link no OpenSSL, so a host needs no `libssl` — only a CA bundle
+(`ca-certificates` on Debian and Ubuntu). Without one, nothing is trusted and every TLS
+connection fails.
+
 ## Re-running a run
 
 `POST /api/runs/{id}/retry` creates a new run from the original's **definition snapshot**,
