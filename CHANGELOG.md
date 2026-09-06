@@ -6,95 +6,13 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
-### Added
-
-- **The project is open source under Apache 2.0.** `LICENSE`, `NOTICE`,
-  `CONTRIBUTING.md`, `SECURITY.md` (with the trust model spelled out), and a
-  Contributor Covenant `CODE_OF_CONDUCT.md`, plus issue and pull-request templates
-  and Dependabot for Cargo, npm, Actions, and Docker.
-- **GitHub commit statuses.** A webhook-triggered run reports `pending` when it starts and
-  `success` / `failure` / `error` when it finishes, under the context
-  `fiber/<pipeline name>`, so a pull request can require it as a check. Needs a token with
-  `repo:status`; without one nothing changes, and a status that cannot be posted never
-  fails a run. `FIBER_PUBLIC_URL` makes the status link to the run page.
-- **Pull requests from forks are contained.** Such a run is marked untrusted: it receives
-  no project secrets whatever its `secrets:` says, and its steps are offered only to
-  agents bound to that project, never to the global pool. Unknown provenance counts as
-  untrusted and a retry stays untrusted. This limits the blast radius rather than
-  sandboxing the code — the docs say plainly that these runs belong on a disposable,
-  project-dedicated agent.
-- Commit statuses are posted only with a **project** token (never the instance-wide
-  environment one) and only to the repository the pipeline's workspace points at, so a
-  project cannot aim the instance's credentials at someone else's repository. Webhook
-  `head_sha` / `head_ref` are validated before reaching `git`, which is also invoked with
-  `--`; a commit outside the shallow window is fetched in bounded steps and a run that
-  cannot check out its commit fails rather than building a different one.
-- **Runs record the commit they are for** (`head_sha`, `head_ref`, `pr_number`,
-  `repo_full_name`). The agent checks out that commit exactly, so a second push while a
-  run is queued no longer retargets it, and pull requests are fetched as
-  `refs/pull/<n>/head` from the base repository — which is what makes a **fork's pull
-  request** build at all. A retry re-runs, and reports against, the same commit.
-- `fiber.yml` at the repository root: Fiber's own gate, for dogfooding.
-
-- **CLI parity with the API.** `pipelines apply` pushes a `fiber.yml` (create or update,
-  compiled locally first); `run --wait` / `--follow` block and exit with the run's outcome
-  (0 succeeded, 1 failed, 3 timed out) so another CI system or a git hook can gate on it;
-  plus `projects`, `runs list/get/cancel/retry`, `logs` (with `--attempt` and `--follow`),
-  `artifacts list/download`, `logout`, `completions`, and a global `--json`.
-- **Re-run a run**: `POST /api/runs/{id}/retry`, and buttons on the run page. It builds
-  from the original run's definition snapshot, so it reproduces what that run executed.
-  `failed_only` carries over the steps that already succeeded — copying their artifacts
-  forward so dependents can still restore them — and re-runs the rest.
-- **Attempt-scoped logs.** `log_lines` records which attempt produced each line, and
-  `GET /api/steps/{id}/logs?attempt=N` narrows to it. The run page's attempt selector now
-  changes the log pane instead of showing every attempt interleaved.
-- **Pagination.** `GET /api/projects/{id}/runs` takes `?limit=&before=` and returns
-  `{ items, next_cursor }`; older runs were previously unreachable past the newest 50.
-  `GET /api/steps/{id}/logs` takes `?after_id=&limit=` and returns the newest lines by
-  default rather than the entire log — a step that printed millions of lines could
-  previously exhaust the API's memory.
-
-### Fixed
-
-- Retention deletes an artifact blob only when no remaining run references its path, so a
-  retry cannot lose the artifacts it inherited.
-
-### Security
-
-- **Steps only see what they need.** A step's environment is cleared before its own is
-  applied, so repo-supplied shell can no longer read the agent's `FIBER_AGENT_TOKEN`
-  (which would let it lease other projects' steps and read their secrets). Docker steps
-  receive their environment through a `0600` env-file instead of `-e KEY=VALUE`, which
-  put every project secret in the host's process list. Secret values are masked as `***`
-  in log lines. A new `secrets:` list on a step narrows which project secrets it gets at
-  all; omitted still means all of them.
-- **Container limits.** Step containers run with `--security-opt no-new-privileges` and a
-  512 process limit, plus configurable `--user`, `--network`, `--memory`, and `--cpus`
-  (`FIBER_AGENT_DOCKER_*`). Memory and CPU limits are off by default so an upgrade cannot
-  start OOM-killing existing builds; whatever applies is logged as a `system` line.
-- **Environment-variable names are validated** before reaching a step. A `docker
-  --env-file` line without `=` means "copy this variable from my own environment", so a
-  pipeline could otherwise use a matrix axis name containing a newline to make the docker
-  client hand the step the agent's token. The docker client now also starts from a cleared
-  environment.
-
-### Fixed
-
-- **Each step gets its own workspace**, so steps of one run on the same agent no longer
-  overwrite each other's build output. Steps of a run share one git clone through
-  worktrees, so the second step costs a checkout rather than another fetch.
-- **Workspaces are cleaned up**: a step's directory goes when it finishes (including on
-  cancel, timeout, or failure), the run's tree when its last step on that agent finishes,
-  and anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` is swept at startup. They
-  previously accumulated for the life of the agent.
-- **Artifacts restore from dependencies only.** A step receives the artifacts of the
-  steps it transitively `needs`, not every artifact in the run, so a parallel sibling
-  cannot drop files into its workspace.
-
 ## [0.2.0] — 2026-09-06
 
-Security and correctness hardening from a full platform audit, plus agent packaging.
-Schema migrations `005`–`008` apply automatically on `fiber-api` boot.
+The first tagged release. Security and correctness hardening from a full platform audit,
+agent packaging, run operations, GitHub commit statuses, and the open-source licensing.
+Schema migrations `005`–`011` apply automatically on `fiber-api` boot. Steps without a
+timeout now inherit `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60) — see the upgrade note in
+`docs/operations.md`.
 
 ### Security
 
@@ -117,6 +35,81 @@ Schema migrations `005`–`008` apply automatically on `fiber-api` boot.
   allowlist, a per-username login throttle, and masked error responses; S3 credentials are required
   rather than defaulted. The CLI writes `~/.fiber/token` as `0600` and accepts `--password-stdin` /
   `--value-stdin`.
+- **Steps only see what they need.** A step's environment is cleared before its own is
+  applied, so repo-supplied shell can no longer read the agent's `FIBER_AGENT_TOKEN`
+  (which would let it lease other projects' steps and read their secrets). Docker steps
+  receive their environment through a `0600` env-file instead of `-e KEY=VALUE`, which
+  put every project secret in the host's process list. Secret values are masked as `***`
+  in log lines. A new `secrets:` list on a step narrows which project secrets it gets at
+  all; omitted still means all of them.
+- **Container limits.** Step containers run with `--security-opt no-new-privileges` and a
+  512 process limit, plus configurable `--user`, `--network`, `--memory`, and `--cpus`
+  (`FIBER_AGENT_DOCKER_*`). Memory and CPU limits are off by default so an upgrade cannot
+  start OOM-killing existing builds; whatever applies is logged as a `system` line.
+- **Environment-variable names are validated** before reaching a step. A `docker
+  --env-file` line without `=` means "copy this variable from my own environment", so a
+  pipeline could otherwise use a matrix axis name containing a newline to make the docker
+  client hand the step the agent's token. The docker client now also starts from a cleared
+  environment.
+- **Pull requests from forks are contained.** Such a run is marked untrusted: it receives
+  no project secrets whatever its `secrets:` says, and its steps are offered only to
+  agents bound to that project, never to the global pool. Unknown provenance counts as
+  untrusted and a retry stays untrusted. This limits the blast radius rather than
+  sandboxing the code — the docs say plainly that these runs belong on a disposable,
+  project-dedicated agent.
+- Commit statuses are posted only with a **project** token (never the instance-wide
+  environment one) and only to the repository the pipeline's workspace points at, so a
+  project cannot aim the instance's credentials at someone else's repository. Webhook
+  `head_sha` / `head_ref` are validated before reaching `git`, which is also invoked with
+  `--`; a commit outside the shallow window is fetched in bounded steps and a run that
+  cannot check out its commit fails rather than building a different one.
+
+### Added
+
+- **The project is open source under Apache 2.0.** `LICENSE`, `NOTICE`,
+  `CONTRIBUTING.md`, `SECURITY.md` (with the trust model spelled out), and a
+  Contributor Covenant `CODE_OF_CONDUCT.md`, plus issue and pull-request templates
+  and Dependabot for Cargo, npm, Actions, and Docker.
+- **Step and run timeouts.** `timeout_minutes` on a step (per attempt) and on the pipeline (whole
+  run). Agents enforce their own deadline and kill the process group and container; the server is a
+  backstop after `FIBER_STEP_TIMEOUT_GRACE_MINUTES`.
+- **Agent packaging.** A published `fiber-agent` image, an optional `fiber-agent` Compose service
+  (isolated from Postgres/Redis/MinIO on its own network), a systemd unit, and
+  `scripts/install-agent.sh` for attaching a second machine. Tagging `vX.Y.Z` runs the gate and
+  publishes images plus agent/CLI binaries.
+- **Runs record the commit they are for** (`head_sha`, `head_ref`, `pr_number`,
+  `repo_full_name`). The agent checks out that commit exactly, so a second push while a
+  run is queued no longer retargets it, and pull requests are fetched as
+  `refs/pull/<n>/head` from the base repository — which is what makes a **fork's pull
+  request** build at all. A retry re-runs, and reports against, the same commit.
+- **GitHub commit statuses.** A webhook-triggered run reports `pending` when it starts and
+  `success` / `failure` / `error` when it finishes, under the context
+  `fiber/<pipeline name>`, so a pull request can require it as a check. Needs a token with
+  `repo:status`; without one nothing changes, and a status that cannot be posted never
+  fails a run. `FIBER_PUBLIC_URL` makes the status link to the run page.
+- **Re-run a run**: `POST /api/runs/{id}/retry`, and buttons on the run page. It builds
+  from the original run's definition snapshot, so it reproduces what that run executed.
+  `failed_only` carries over the steps that already succeeded — copying their artifacts
+  forward so dependents can still restore them — and re-runs the rest.
+- **Attempt-scoped logs.** `log_lines` records which attempt produced each line, and
+  `GET /api/steps/{id}/logs?attempt=N` narrows to it. The run page's attempt selector now
+  changes the log pane instead of showing every attempt interleaved.
+- **Pagination.** `GET /api/projects/{id}/runs` takes `?limit=&before=` and returns
+  `{ items, next_cursor }`; older runs were previously unreachable past the newest 50.
+  `GET /api/steps/{id}/logs` takes `?after_id=&limit=` and returns the newest lines by
+  default rather than the entire log — a step that printed millions of lines could
+  previously exhaust the API's memory.
+- **CLI parity with the API.** `pipelines apply` pushes a `fiber.yml` (create or update,
+  compiled locally first); `run --wait` / `--follow` block and exit with the run's outcome
+  (0 succeeded, 1 failed, 3 timed out) so another CI system or a git hook can gate on it;
+  plus `projects`, `runs list/get/cancel/retry`, `logs` (with `--attempt` and `--follow`),
+  `artifacts list/download`, `logout`, `completions`, and a global `--json`.
+- `fiber.yml` at the repository root: Fiber's own gate, for dogfooding.
+- `--version` on `fiber-api` and `fiber-agent`.
+- Agent lifecycle hardening: SIGTERM stops steps and lets the server requeue them (a rolling
+  restart no longer fails a build), exponential reconnect backoff with jitter, exit on a revoked
+  token, and local enforcement of `--concurrency`.
+- CI runs `cargo test`, Biome, vitest, the web build, and both container images.
 
 ### Fixed
 
@@ -133,26 +126,22 @@ Schema migrations `005`–`008` apply automatically on `fiber-api` boot.
 - **Retry backoff is real.** It is persisted on the row (`step_runs.not_before`) instead of a
   sleeping task pushing to a Redis list nobody read, and an attempt lost to a disconnect counts
   against `retries`.
+- **Each step gets its own workspace**, so steps of one run on the same agent no longer
+  overwrite each other's build output. Steps of a run share one git clone, so the second
+  step costs a checkout rather than another fetch.
+- **Workspaces are cleaned up**: a step's directory goes when it finishes (including on
+  cancel, timeout, or failure), the run's tree when its last step on that agent finishes,
+  and anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` is swept at startup. They
+  previously accumulated for the life of the agent.
+- **Artifacts restore from dependencies only.** A step receives the artifacts of the
+  steps it transitively `needs`, not every artifact in the run, so a parallel sibling
+  cannot drop files into its workspace.
+- Retention deletes an artifact blob only when no remaining run references its path, so a
+  retry cannot lose the artifacts it inherited.
 - Nine indexes for the hot paths (lease renewal, expired-lease reclaim, queued offers, artifact
   restore lists, the retention cascade, session purge).
 - Agent log lines use a single sequence per attempt; stdout and stderr no longer collide after
   1000 lines.
-
-### Added
-
-- **Step and run timeouts.** `timeout_minutes` on a step (per attempt) and on the pipeline (whole
-  run). Agents enforce their own deadline and kill the process group and container; the server is a
-  backstop after `FIBER_STEP_TIMEOUT_GRACE_MINUTES`. Steps without a timeout get
-  `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60) — see the upgrade note in `docs/operations.md`.
-- **Agent packaging.** A published `fiber-agent` image, an optional `fiber-agent` Compose service
-  (isolated from Postgres/Redis/MinIO on its own network), a systemd unit, and
-  `scripts/install-agent.sh` for attaching a second machine. Tagging `vX.Y.Z` runs the gate and
-  publishes images plus agent/CLI binaries.
-- `--version` on `fiber-api` and `fiber-agent`.
-- Agent lifecycle hardening: SIGTERM stops steps and lets the server requeue them (a rolling
-  restart no longer fails a build), exponential reconnect backoff with jitter, exit on a revoked
-  token, and local enforcement of `--concurrency`.
-- CI runs `cargo test`, Biome, vitest, the web build, and both container images.
 
 ### Changed
 

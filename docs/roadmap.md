@@ -4,16 +4,24 @@ Shipped: MVP DAG CI, agents (global + project pools), artifacts (local + S3 pres
 
 Hardening (audit, September 2026): CI now runs the test suites; instance-admin gate on global agents and user management; agent identity bound to the token with per-step ownership checks; webhooks fail closed with encrypted secrets; loopback-bound Compose with a CORS allowlist, login throttle, and masked errors; offers built from the run snapshot only; transactional propagation with `always()` / transitive `success()` fixed; hot-path indexes; multi-replica safety (schedule CAS, fiber claim, cross-replica cancel / revocation); step and run `timeout_minutes`, persisted retry backoff, agent SIGTERM handling and reconnect backoff.
 
+Open source under Apache 2.0 since September 2026 — see `CONTRIBUTING.md` and `SECURITY.md`.
+
 ## Next
 
-Production hardening via real use — before GitLab / Vault / cloud agents. Ordered so that each step is safe to run on a public endpoint.
+Production hardening via real use — before GitLab / Vault / cloud agents.
+
+`v0.2.0` shipped the first three items of this vertical: agent install packaging (image,
+Compose service, systemd unit, install script, and a release workflow publishing images and
+binaries on tags), agent hygiene (cleared environments, `--env-file`, container limits, log
+redaction, per-step `secrets:`, per-step workspaces with GC, `needs`-derived artifact
+restore), and run ops (retry from UI/CLI/API, attempt-scoped logs, cursor pagination, lease
+and next-run visibility, WS reconnect, and CLI parity). GitHub commit statuses, exact-commit
+checkout, and fork-PR containment landed with it.
 
 | # | Item | Goal |
 |---|---|---|
-| 1 | **Agent install packaging** | `Dockerfile.agent`, agent service in Compose (so `make dogfood-compose` runs a real pipeline), systemd unit + install script, images on `ghcr.io` and binaries on tags; `CHANGELOG.md` and a release version |
-| 2 | **Agent hygiene** | `env_clear` + allowlist for host shell; `--env-file` instead of `-e K=V`; `--user` / `--network` / memory / cpu / pids limits; secret redaction in logs; per-step `secrets:` allowlist; workspace GC and per-step workspaces; restore lists derived from `needs` |
-| 3 | **Run ops polish** | Retry / re-run from the UI, CLI and API (cancel ships); attempt-scoped logs and cursor pagination for runs and logs; lease / agent / next-run visibility; Agents entry in the project nav; WS reconnect with refetch; CLI `pipelines apply`, `run --wait`, `runs` / `logs` / `artifacts` verbs |
-| 4 | **Dogfood on this repo** | GitHub webhook (secret set) → build/test pipeline on a labeled agent for `durablefibers/fiber`; capture the commit SHA and report commit statuses; fix what breaks under real push/PR traffic |
+| 1 | **Dogfood on this repo** | Point a public Fiber at `durablefibers/fiber` with a webhook secret set, build `fiber.yml` on a labeled agent, require the commit status on pull requests, and fix what breaks under real push/PR traffic. Needs a public URL for the instance. |
+| 2 | **Publish the images** | `ghcr.io/durablefibers/fiber-api` and `fiber-agent` need a one-time package visibility flip after the first tagged release, and `docs/operations.md` should point at them instead of a local build. |
 
 ## Later
 
