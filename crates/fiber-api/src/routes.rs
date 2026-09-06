@@ -1232,6 +1232,25 @@ async fn set_github_secret(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// A commit id we are willing to hand to `git checkout`. Anything else (an empty string,
+/// a revision expression, a value starting with `-` that git would read as an option) is
+/// dropped rather than passed through.
+fn valid_head_sha(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A ref safe to pass to `git fetch`. Rejects option-looking values and path tricks.
+fn valid_head_ref(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 255
+        && !r.starts_with('-')
+        && !r.contains("..")
+        && !r.contains(char::is_whitespace)
+        && !r
+            .chars()
+            .any(|c| c.is_control() || c == '~' || c == '^' || c == ':' || c == '?')
+}
+
 async fn github_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1281,6 +1300,22 @@ async fn github_webhook(
                 .trim_start_matches("refs/heads/")
                 .to_string();
             let changed = collect_push_changed_files(&payload);
+            // The commit that was pushed, so the agent builds it rather than whatever the
+            // branch points at by the time it fetches.
+            let commit = fiber_core::RunCommit {
+                head_sha: payload
+                    .get("after")
+                    .or_else(|| payload.pointer("/head_commit/id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| valid_head_sha(s) && !s.chars().all(|c| c == '0'))
+                    .map(str::to_string),
+                head_ref: Some(branch.clone()).filter(|b| valid_head_ref(b)),
+                pr_number: None,
+                repo_full_name: crate::github::repo_full_name(&payload)
+                    .map(|(o, r)| format!("{o}/{r}")),
+                // A push landed in the project's own repository.
+                untrusted: false,
+            };
             let pipelines = state
                 .store
                 .find_pipelines_for_push(id, &branch, &changed)
@@ -1290,9 +1325,16 @@ async fn github_webhook(
             for p in pipelines {
                 let (run, _, _) = state
                     .store
-                    .start_run(p.id, &format!("github:push:{branch}"))
+                    .start_run_for_commit(p.id, &format!("github:push:{branch}"), commit.clone())
                     .await
                     .map_err(ApiError::from)?;
+                // Off the request path: a slow GitHub must not stall the delivery past
+                // its timeout and cause a redelivery (and a duplicate run).
+                let store = state.store.clone();
+                let run_for_status = run.clone();
+                tokio::spawn(async move {
+                    crate::github::report_run_status(&store, &run_for_status).await;
+                });
                 state
                     .scheduler
                     .enqueue_run_ready(run.id)
@@ -1358,6 +1400,34 @@ async fn github_webhook(
                     }
                 }
             }
+            // `refs/pull/<n>/head` is served by the base repository, so a pull request
+            // from a fork builds without any access to the fork itself.
+            let commit = fiber_core::RunCommit {
+                head_sha: payload
+                    .pointer("/pull_request/head/sha")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| valid_head_sha(s))
+                    .map(str::to_string),
+                head_ref: (number > 0).then(|| format!("refs/pull/{number}/head")),
+                pr_number: (number > 0).then_some(number as i32),
+                repo_full_name: crate::github::repo_full_name(&payload)
+                    .map(|(o, r)| format!("{o}/{r}")),
+                // A pull request whose head lives in another repository was written by
+                // someone outside the project. Build it, but give it no secrets.
+                untrusted: {
+                    let head_repo = payload
+                        .pointer("/pull_request/head/repo/full_name")
+                        .and_then(|v| v.as_str());
+                    let base_repo = payload
+                        .pointer("/repository/full_name")
+                        .and_then(|v| v.as_str());
+                    match (head_repo, base_repo) {
+                        (Some(h), Some(b)) => h != b,
+                        // Unknown provenance is treated as untrusted.
+                        _ => true,
+                    }
+                },
+            };
             let pipelines = state
                 .store
                 .find_pipelines_for_pull_request(id, &base, action, &changed)
@@ -1367,9 +1437,20 @@ async fn github_webhook(
             for p in pipelines {
                 let (run, _, _) = state
                     .store
-                    .start_run(p.id, &format!("github:pr:{number}:{action}"))
+                    .start_run_for_commit(
+                        p.id,
+                        &format!("github:pr:{number}:{action}"),
+                        commit.clone(),
+                    )
                     .await
                     .map_err(ApiError::from)?;
+                // Off the request path: a slow GitHub must not stall the delivery past
+                // its timeout and cause a redelivery (and a duplicate run).
+                let store = state.store.clone();
+                let run_for_status = run.clone();
+                tokio::spawn(async move {
+                    crate::github::report_run_status(&store, &run_for_status).await;
+                });
                 state
                     .scheduler
                     .enqueue_run_ready(run.id)

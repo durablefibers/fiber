@@ -152,8 +152,15 @@ pub struct PipelineDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceOffer {
     pub repo: String,
+    /// What to fetch: a branch, or `refs/pull/<n>/head` for a pull request. A pull
+    /// request's head ref is fetchable from the base repository, so a fork's PR builds
+    /// without any access to the fork.
     #[serde(rename = "ref")]
     pub git_ref: String,
+    /// Exact commit to check out after fetching. When a webhook supplied it, the run
+    /// builds that commit rather than wherever the ref has moved to since.
+    #[serde(default)]
+    pub sha: Option<String>,
 }
 
 /// Prior-step artifact the agent should download into the workspace before running.

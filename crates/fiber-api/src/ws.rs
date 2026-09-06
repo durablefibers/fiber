@@ -63,7 +63,15 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     match state.store.get_run(step.run_id).await {
         Ok(Some(run)) => {
             let snapshot = &run.definition_snapshot;
-            workspace = workspace_from_snapshot(snapshot);
+            workspace = workspace_from_snapshot(snapshot).map(|mut ws| {
+                // The webhook recorded what to build; the snapshot only knows the
+                // pipeline's default ref.
+                if let Some(r) = run.head_ref.clone() {
+                    ws.git_ref = r;
+                }
+                ws.sha = run.head_sha.clone();
+                ws
+            });
             let mut secret_allow: Option<Vec<String>> = None;
             match snapshot_step(snapshot, &step.step_id) {
                 Some(s) => {
@@ -85,7 +93,12 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
                     "step missing from run snapshot; offering without artifacts/env"
                 ),
             }
-            if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
+            if run.untrusted {
+                warn!(
+                    run_id = %run.id,
+                    "run builds code from outside the project (fork pull request); injecting no secrets"
+                );
+            } else if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
                 let mut available: Vec<String> = Vec::new();
                 for (k, v) in secrets {
                     available.push(k.clone());
@@ -207,7 +220,11 @@ fn workspace_from_snapshot(snapshot: &serde_json::Value) -> Option<WorkspaceOffe
         .and_then(|v| v.as_str())
         .unwrap_or("main")
         .to_string();
-    Some(WorkspaceOffer { repo, git_ref })
+    Some(WorkspaceOffer {
+        repo,
+        git_ref,
+        sha: None,
+    })
 }
 
 /// Artifacts to place in the step's workspace before it runs: those produced by the

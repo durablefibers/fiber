@@ -496,6 +496,19 @@ impl Store {
         pipeline_id: Uuid,
         trigger: &str,
     ) -> Result<(Run, Vec<StepRun>, CompiledDag)> {
+        self.start_run_for_commit(pipeline_id, trigger, RunCommit::default())
+            .await
+    }
+
+    /// Start a run for a specific commit. The agent checks out `head_sha` rather than
+    /// whatever the branch points at by the time it clones, so a second push mid-build
+    /// cannot retarget this run.
+    pub async fn start_run_for_commit(
+        &self,
+        pipeline_id: Uuid,
+        trigger: &str,
+        commit: RunCommit,
+    ) -> Result<(Run, Vec<StepRun>, CompiledDag)> {
         let pipeline = self
             .get_pipeline(pipeline_id)
             .await?
@@ -509,8 +522,10 @@ impl Store {
         // otherwise "succeed" once its partial set of steps finished.
         let mut tx = self.pool.begin().await?;
         let run = sqlx::query_as::<_, Run>(&format!(
-            "INSERT INTO runs (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            "INSERT INTO runs
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
+                head_sha, head_ref, pr_number, repo_full_name, untrusted)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11)
              RETURNING {RUN_COLS}"
         ))
         .bind(run_id)
@@ -519,6 +534,11 @@ impl Store {
         .bind(status_str(RunStatus::Running))
         .bind(trigger)
         .bind(&snapshot)
+        .bind(&commit.head_sha)
+        .bind(&commit.head_ref)
+        .bind(commit.pr_number)
+        .bind(&commit.repo_full_name)
+        .bind(commit.untrusted)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -609,8 +629,9 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let run = sqlx::query_as::<_, Run>(&format!(
             "INSERT INTO runs
-               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at, retry_of)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
+              retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
              RETURNING {RUN_COLS}"
         ))
         .bind(new_run_id)
@@ -620,6 +641,13 @@ impl Store {
         .bind(format!("retry:{run_id}"))
         .bind(&original.definition_snapshot)
         .bind(run_id)
+        // A retry re-runs the same commit, so it reports against it too.
+        .bind(&original.head_sha)
+        .bind(&original.head_ref)
+        .bind(original.pr_number)
+        .bind(&original.repo_full_name)
+        // Re-running a fork's pull request is still running someone else's code.
+        .bind(original.untrusted)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -759,14 +787,18 @@ impl Store {
         .await?)
     }
 
+    /// Queued steps for the global pool: everything except untrusted runs, which need a
+    /// project-dedicated agent (see `list_queued_steps_for_pool`).
     pub async fn list_queued_steps(&self) -> Result<Vec<StepRun>> {
         Ok(sqlx::query_as::<_, StepRun>(
-            "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                    retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                    started_at, finished_at
-             FROM step_runs WHERE status = 'queued'
-               AND (not_before IS NULL OR not_before <= NOW())
-             ORDER BY started_at NULLS FIRST, id",
+            "SELECT s.id, s.run_id, s.step_id, s.step_name, s.status, s.image, s.run_cmd,
+                    s.labels, s.needs, s.retries, s.attempt, s.agent_id, s.lease_expires_at,
+                    s.exit_code, s.error, s.started_at, s.finished_at
+             FROM step_runs s
+             INNER JOIN runs r ON r.id = s.run_id
+             WHERE s.status = 'queued' AND NOT r.untrusted
+               AND (s.not_before IS NULL OR s.not_before <= NOW())
+             ORDER BY s.started_at NULLS FIRST, s.id",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -1457,6 +1489,13 @@ impl Store {
     }
 
     /// Queued steps an agent may lease: global agents see all; scoped agents see one project.
+    /// Queued steps this agent may take.
+    ///
+    /// A run marked `untrusted` is building code from outside the project (a fork's pull
+    /// request). Withholding its secrets is not enough on its own: the step still executes
+    /// as the agent's user, where it can read the agent's own token out of `/proc` and
+    /// then lease other projects' work. So untrusted steps are offered **only** to agents
+    /// bound to that project — never to the global pool.
     pub async fn list_queued_steps_for_pool(
         &self,
         agent_project_id: Option<Uuid>,
@@ -1879,7 +1918,8 @@ fn step_status_str(s: StepStatus) -> &'static str {
 }
 
 const RUN_COLS: &str = "id, pipeline_id, project_id, status, trigger, definition_snapshot, \
-     created_at, started_at, finished_at, retry_of";
+     created_at, started_at, finished_at, retry_of, head_sha, head_ref, pr_number, \
+     repo_full_name, untrusted";
 
 const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";

@@ -3,6 +3,7 @@ mod artifact_util;
 mod artifacts;
 mod auth;
 mod github;
+mod github_status;
 mod login_guard;
 mod otel;
 mod retention;
@@ -94,6 +95,11 @@ async fn main() -> Result<()> {
     let redis_url = args.redis_url.clone();
     tokio::spawn(async move {
         events_bus.events_loop(redis_url).await;
+    });
+    let status_store = store.clone();
+    let status_scheduler = scheduler.clone();
+    tokio::spawn(async move {
+        github_status::report_loop(status_store, status_scheduler).await;
     });
     let agent_cmds = scheduler.clone();
     let redis_url = args.redis_url.clone();

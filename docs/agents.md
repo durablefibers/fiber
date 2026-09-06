@@ -183,6 +183,7 @@ Steps run repo-supplied shell, so the agent narrows what is reachable:
 | **Container limits** | `--security-opt no-new-privileges` and `--pids-limit 512` by default, plus `--user`, `--network`, `--memory`, `--cpus` from `FIBER_AGENT_DOCKER_*`. Memory and CPU limits are off unless set; whatever applies is printed as a `system` log line so an exit 137 is diagnosable |
 | **Workspace** | One directory per step, deleted when the step finishes — including on cancel, timeout, or failure. The run's tree goes when its last step on this agent finishes; anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` (24) is swept at startup |
 | **Artifacts** | Only those produced by the steps this one transitively `needs` |
+| **Untrusted runs** | A fork's pull request is offered only to agents bound to that project, never to the global pool, and receives no secrets — see [triggers](./triggers.md#pull-requests-from-forks) |
 
 A step with a git workspace is cloned from one reference clone per run, so a second step
 costs a local object copy rather than another fetch, and the checkout is self-contained
