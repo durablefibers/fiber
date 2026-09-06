@@ -23,7 +23,7 @@ RUN cargo build --release --locked -p fiber-api -p fiber-agent -p fiber-cli \
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 curl \
+        ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 FROM runtime AS fiber-api

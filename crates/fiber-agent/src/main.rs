@@ -317,7 +317,7 @@ async fn main() -> Result<()> {
                     );
                     std::process::exit(2);
                 }
-                error!(error = %e, "session error");
+                error!(error = format!("{e:#}"), "session error");
             }
         }
         if *shutdown_rx.borrow() {
