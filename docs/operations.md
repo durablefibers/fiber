@@ -22,6 +22,28 @@ ci.example.com {
 
 Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
 
+## Re-running a run
+
+`POST /api/runs/{id}/retry` creates a new run from the original's **definition snapshot**,
+so it re-runs what that run actually executed, not the pipeline as it stands now. The new
+run records `retry_of`, and its trigger is `retry:<original id>`.
+
+- `{ "failed_only": true }` carries over the steps that already succeeded — marked
+  succeeded, never re-executed, with their artifacts copied forward so dependents can
+  still restore them — and re-runs everything else. Use it when a long build succeeded and
+  only a flaky test needs another go.
+- Without it, every step runs again.
+
+Because a retry shares artifact blobs with the run it came from, retention deletes a blob
+only once no remaining run references its path.
+
+## Reading logs
+
+`GET /api/steps/{id}/logs` returns the newest 1000 lines by default. `?attempt=N` narrows
+to one attempt — `seq` restarts per attempt, so a retried step's output interleaves
+otherwise — and `?after_id=<id>` returns what followed a line you already have, which is
+how you tail a live step.
+
 ## Stuck runs
 
 A run that stays `running` is one of:

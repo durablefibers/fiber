@@ -80,7 +80,7 @@ function ProjectPage() {
         ])
         setProject(p)
         setPipelines(pipes)
-        setRuns(r)
+        setRuns(r.items)
         const admin = p.role === "admin" || p.role === "owner"
         if (admin) {
           const [secs, mems] = await Promise.all([

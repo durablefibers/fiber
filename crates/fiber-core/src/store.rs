@@ -508,12 +508,11 @@ impl Store {
         // The run row and every step row land together: a half-inserted DAG would
         // otherwise "succeed" once its partial set of steps finished.
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(
+        let run = sqlx::query_as::<_, Run>(&format!(
             "INSERT INTO runs (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at)
              VALUES ($1, $2, $3, $4, $5, $6, NOW())
-             RETURNING id, pipeline_id, project_id, status, trigger, definition_snapshot,
-                       created_at, started_at, finished_at",
-        )
+             RETURNING {RUN_COLS}"
+        ))
         .bind(run_id)
         .bind(pipeline_id)
         .bind(pipeline.project_id)
@@ -575,24 +574,170 @@ impl Store {
     }
 
     pub async fn get_run(&self, id: Uuid) -> Result<Option<Run>> {
-        Ok(sqlx::query_as::<_, Run>(
-            "SELECT id, pipeline_id, project_id, status, trigger, definition_snapshot,
-                    created_at, started_at, finished_at
-             FROM runs WHERE id = $1",
+        Ok(
+            sqlx::query_as::<_, Run>(&format!("SELECT {RUN_COLS} FROM runs WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(id)
-        .fetch_optional(&self.pool)
+    }
+
+    /// Re-run a finished run from **its own** definition snapshot, not the pipeline as it
+    /// stands now — a retry reproduces what the original executed.
+    ///
+    /// With `failed_only`, steps that succeeded the first time are carried over as
+    /// already-succeeded (their artifacts copied so dependents can still restore them)
+    /// and only the rest run again. Otherwise every step runs.
+    pub async fn retry_run(&self, run_id: Uuid, failed_only: bool) -> Result<(Run, Vec<StepRun>)> {
+        let original = self
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow!("run not found"))?;
+        if !original.status_enum().is_terminal() {
+            return Err(crate::ValidationError(
+                "run is still active; cancel it before retrying".into(),
+            )
+            .into());
+        }
+        let compiled: CompiledDag = serde_json::from_value(original.definition_snapshot.clone())
+            .map_err(|e| {
+                crate::ValidationError(format!("run snapshot is not a compiled pipeline: {e}"))
+            })?;
+        let previous = self.list_step_runs(run_id).await?;
+
+        let new_run_id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, Run>(&format!(
+            "INSERT INTO runs
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at, retry_of)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+             RETURNING {RUN_COLS}"
+        ))
+        .bind(new_run_id)
+        .bind(original.pipeline_id)
+        .bind(original.project_id)
+        .bind(status_str(RunStatus::Running))
+        .bind(format!("retry:{run_id}"))
+        .bind(&original.definition_snapshot)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        for step in &compiled.steps {
+            let sid = Uuid::new_v4();
+            let prior = previous.iter().find(|p| p.step_id == step.id);
+            let carry_over =
+                failed_only && prior.is_some_and(|p| p.status_enum() == StepStatus::Succeeded);
+            let status = if carry_over {
+                StepStatus::Succeeded
+            } else if step.needs.is_empty() {
+                let if_ctx = crate::step_if::IfContext {
+                    needs_succeeded: true,
+                    env: step.env.clone(),
+                };
+                if crate::step_if::eval_if(step.if_expr.as_deref(), &if_ctx) {
+                    StepStatus::Queued
+                } else {
+                    StepStatus::Skipped
+                }
+            } else {
+                StepStatus::Pending
+            };
+            let error = match status {
+                StepStatus::Skipped => Some("if: condition false".to_string()),
+                _ => None,
+            };
+            sqlx::query(
+                "INSERT INTO step_runs
+                 (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
+                  error, exit_code, started_at, finished_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            )
+            .bind(sid)
+            .bind(new_run_id)
+            .bind(&step.id)
+            .bind(&step.name)
+            .bind(step_status_str(status))
+            .bind(&step.image)
+            .bind(&step.run)
+            .bind(json!(step.labels))
+            .bind(json!(step.needs))
+            .bind(step.retries as i32)
+            .bind(error)
+            .bind(
+                carry_over
+                    .then(|| prior.and_then(|p| p.exit_code))
+                    .flatten(),
+            )
+            .bind(
+                carry_over
+                    .then(|| prior.and_then(|p| p.started_at))
+                    .flatten(),
+            )
+            .bind(
+                carry_over
+                    .then(|| prior.and_then(|p| p.finished_at))
+                    .flatten(),
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            // A carried-over step produces nothing this time, so its artifacts are copied
+            // forward; otherwise its dependents would have nothing to restore. The blob is
+            // shared — retention only deletes one once no run references it.
+            if carry_over && let Some(p) = prior {
+                sqlx::query(
+                    "INSERT INTO artifacts (id, run_id, step_run_id, name, path, size)
+                     SELECT gen_random_uuid(), $1, $2, name, path, size
+                     FROM artifacts WHERE step_run_id = $3",
+                )
+                .bind(new_run_id)
+                .bind(sid)
+                .bind(p.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+
+        let _ = self.propagate_after_step(new_run_id).await?;
+        let run = self.get_run(new_run_id).await?.unwrap_or(run);
+        Ok((run, self.list_step_runs(new_run_id).await?))
+    }
+
+    /// Of `paths`, those still referenced by an artifact row. Retention must not delete a
+    /// blob a retry (or any other run) still points at.
+    pub async fn artifact_paths_still_referenced(&self, paths: &[String]) -> Result<Vec<String>> {
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT path FROM artifacts WHERE path = ANY($1)",
+        )
+        .bind(paths)
+        .fetch_all(&self.pool)
         .await?)
     }
 
-    pub async fn list_runs(&self, project_id: Uuid, limit: i64) -> Result<Vec<Run>> {
-        Ok(sqlx::query_as::<_, Run>(
-            "SELECT id, pipeline_id, project_id, status, trigger, definition_snapshot,
-                    created_at, started_at, finished_at
-             FROM runs WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2",
-        )
+    /// Newest first. `before` is a run id from a previous page (keyset on
+    /// `(created_at, id)`), so pages stay stable while new runs arrive.
+    pub async fn list_runs(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        before: Option<Uuid>,
+    ) -> Result<Vec<Run>> {
+        Ok(sqlx::query_as::<_, Run>(&format!(
+            "SELECT {RUN_COLS} FROM runs
+                 WHERE project_id = $1
+                   AND ($3::uuid IS NULL OR (created_at, id) < (
+                         SELECT created_at, id FROM runs WHERE id = $3))
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT $2"
+        ))
         .bind(project_id)
         .bind(limit)
+        .bind(before)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -847,11 +992,9 @@ impl Store {
     /// after commit.
     pub async fn propagate_after_step(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(
-            "SELECT id, pipeline_id, project_id, status, trigger, definition_snapshot,
-                    created_at, started_at, finished_at
-             FROM runs WHERE id = $1 FOR UPDATE",
-        )
+        let run = sqlx::query_as::<_, Run>(&format!(
+            "SELECT {RUN_COLS} FROM runs WHERE id = $1 FOR UPDATE"
+        ))
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -967,11 +1110,10 @@ impl Store {
             )
             .await?;
         }
-        let run = sqlx::query_as::<_, Run>(
+        let run = sqlx::query_as::<_, Run>(&format!(
             "UPDATE runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1
-             RETURNING id, pipeline_id, project_id, status, trigger, definition_snapshot,
-                       created_at, started_at, finished_at",
-        )
+                 RETURNING {RUN_COLS}"
+        ))
         .bind(run_id)
         .fetch_one(&self.pool)
         .await?;
@@ -985,29 +1127,65 @@ impl Store {
         stream: &str,
         data: &str,
         seq: u64,
+        attempt: i32,
     ) -> Result<LogLine> {
         Ok(sqlx::query_as::<_, LogLine>(
-            "INSERT INTO log_lines (run_id, step_run_id, stream, data, seq)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING id, run_id, step_run_id, stream, data, seq, created_at",
+            "INSERT INTO log_lines (run_id, step_run_id, stream, data, seq, attempt)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, run_id, step_run_id, stream, data, seq, created_at, attempt",
         )
         .bind(run_id)
         .bind(step_run_id)
         .bind(stream)
         .bind(data)
         .bind(seq as i64)
+        .bind(attempt)
         .fetch_one(&self.pool)
         .await?)
     }
 
-    pub async fn list_logs(&self, step_run_id: Uuid) -> Result<Vec<LogLine>> {
-        Ok(sqlx::query_as::<_, LogLine>(
-            "SELECT id, run_id, step_run_id, stream, data, seq, created_at
-             FROM log_lines WHERE step_run_id = $1 ORDER BY seq, id",
-        )
+    /// Log lines for a step, oldest first.
+    ///
+    /// With `after_id` this returns the lines following that id (for polling a live
+    /// step); without it, the **last** `limit` lines, which is what a viewer opening a
+    /// finished step wants. `attempt` narrows to one attempt — `seq` restarts per
+    /// attempt, so a retried step's output would otherwise interleave.
+    pub async fn list_logs(
+        &self,
+        step_run_id: Uuid,
+        attempt: Option<i32>,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<LogLine>> {
+        const COLS: &str = "id, run_id, step_run_id, stream, data, seq, created_at, attempt";
+        if let Some(after) = after_id {
+            return Ok(sqlx::query_as::<_, LogLine>(&format!(
+                "SELECT {COLS} FROM log_lines
+                 WHERE step_run_id = $1 AND id > $2
+                   AND ($3::int IS NULL OR attempt = $3)
+                 ORDER BY id
+                 LIMIT $4"
+            ))
+            .bind(step_run_id)
+            .bind(after)
+            .bind(attempt)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?);
+        }
+        let mut tail = sqlx::query_as::<_, LogLine>(&format!(
+            "SELECT {COLS} FROM log_lines
+             WHERE step_run_id = $1 AND ($2::int IS NULL OR attempt = $2)
+             ORDER BY id DESC
+             LIMIT $3"
+        ))
         .bind(step_run_id)
+        .bind(attempt)
+        .bind(limit)
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        tail.reverse();
+        Ok(tail)
     }
 
     pub async fn create_artifact(
@@ -1699,6 +1877,9 @@ fn step_status_str(s: StepStatus) -> &'static str {
         StepStatus::Skipped => "skipped",
     }
 }
+
+const RUN_COLS: &str = "id, pipeline_id, project_id, status, trigger, definition_snapshot, \
+     created_at, started_at, finished_at, retry_of";
 
 const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";

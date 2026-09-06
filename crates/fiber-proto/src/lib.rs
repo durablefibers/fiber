@@ -37,6 +37,16 @@ pub enum RunStatus {
     Cancelled,
 }
 
+impl RunStatus {
+    /// Succeeded / Failed / Cancelled — the run will not change again.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDefinition {
     pub id: String,

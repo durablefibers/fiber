@@ -49,6 +49,8 @@ pub struct Run {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// The run this one re-ran, when it was created by a retry.
+    pub retry_of: Option<Uuid>,
 }
 
 impl Run {
@@ -135,6 +137,8 @@ pub struct LogLine {
     pub data: String,
     pub seq: i64,
     pub created_at: DateTime<Utc>,
+    /// Which attempt of the step produced this line; `seq` restarts per attempt.
+    pub attempt: i32,
 }
 
 /// A running step whose attempt exceeded its timeout (see `Store::list_timed_out_steps`).
