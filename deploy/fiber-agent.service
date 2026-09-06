@@ -1,0 +1,41 @@
+# Fiber CI agent. Installed by scripts/install-agent.sh to
+# /etc/systemd/system/fiber-agent.service; settings live in /etc/fiber/agent.env.
+[Unit]
+Description=Fiber CI agent
+Documentation=https://github.com/durablefibers/fiber/blob/main/docs/agents.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fiber
+Group=fiber
+EnvironmentFile=/etc/fiber/agent.env
+ExecStart=/usr/local/bin/fiber-agent
+WorkingDirectory=/var/lib/fiber
+StateDirectory=fiber
+# systemd re-applies this on every start; without it the installer's 0750 becomes 0755.
+StateDirectoryMode=0750
+
+Restart=always
+RestartSec=5
+# The agent exits 2 when its token is missing or revoked — restarting cannot fix that.
+RestartPreventExitStatus=2
+
+# SIGTERM stops in-flight steps and closes the socket without reporting, so the server
+# requeues them to another agent. Give it room to kill process groups first.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+# Steps are repo-supplied shell, so this is a boundary, not a sandbox: anyone who can
+# write a fiber.yml runs code here. Keep agents on hosts you would grant those people.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

@@ -31,8 +31,10 @@ make agent         # needs FIBER_AGENT_TOKEN
 make login         # session → ~/.fiber/token
 make validate      # examples/fiber.yml
 make check         # fmt --check + clippy -D warnings
+make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace + apps/web vitest
 make dogfood       # authz + pools + artifacts smokes
+make dogfood-compose  # full Compose stack incl. a real pipeline on the containerised agent
 make dogfood-s3    # MinIO presign (api-s3 running)
 make ready         # GET /ready
 ```
@@ -72,7 +74,7 @@ make test    # cargo test --workspace, then apps/web vitest
 cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # web lint/format, types, build
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`: Rust fmt, clippy (`-D warnings`), `cargo test --workspace`, build; `apps/web` Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`; and a `docker build` of `deploy/Dockerfile.api` and `apps/web/Dockerfile.web`. The Rust toolchain is pinned by `rust-toolchain.toml` (kept in step with `deploy/Dockerfile.api`).
+GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`: Rust fmt, clippy (`-D warnings`), `cargo test --workspace`, build; `apps/web` Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`; and a `docker build` of `deploy/Dockerfile` and `apps/web/Dockerfile.web`. The Rust toolchain is pinned by `rust-toolchain.toml` (kept in step with `deploy/Dockerfile`).
 
 Web unit tests live next to their modules as `src/**/*.test.ts(x)` and run under `vitest.config.ts` (jsdom; `src/test-setup.ts` installs an in-memory `localStorage`).
 

@@ -108,6 +108,10 @@ cp deploy/.env.example deploy/.env      # set FIBER_SECRETS_KEY (openssl rand -h
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
+Add a worker with `docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent`
+(set `FIBER_AGENT_TOKEN` in `deploy/.env` first), or attach another machine with
+[`scripts/install-agent.sh`](scripts/install-agent.sh) — see [agents](docs/agents.md#install).
+
 - UI: http://localhost:3100 · API: http://localhost:18080 (both loopback-only by default — see [operations](docs/operations.md#deployment) for TLS / exposure)
 - Postgres **15432** · Redis **16379** · MinIO **19000** (loopback-only)
 

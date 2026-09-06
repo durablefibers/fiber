@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Toolchain version comes from rust-toolchain.toml (kept in step with deploy/Dockerfile.api).
+      # Toolchain version comes from rust-toolchain.toml (kept in step with deploy/Dockerfile).
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
@@ -68,17 +68,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: build fiber-api image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/Dockerfile.api
+          file: deploy/Dockerfile
+          target: fiber-api
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: build fiber-agent image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: fiber-agent
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: build fiber-web image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: apps/web
           file: apps/web/Dockerfile.web

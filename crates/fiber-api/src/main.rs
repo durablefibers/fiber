@@ -24,7 +24,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug)]
-#[command(name = "fiber-api")]
+#[command(name = "fiber-api", version)]
 struct Args {
     #[arg(
         long,

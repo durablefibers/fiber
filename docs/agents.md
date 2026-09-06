@@ -46,7 +46,79 @@ cargo run -p fiber-cli -- agents list --project-id $PROJECT_ID
 
 See [cli.md](./cli.md).
 
-## Run
+## Install
+
+Three ways to attach a machine, all needing a token from **Register** above.
+
+### systemd (a build host)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/durablefibers/fiber/main/scripts/install-agent.sh \
+  | sudo FIBER_AGENT_TOKEN="$FIBER_AGENT_TOKEN" bash -s -- \
+      --api-url wss://ci.example.com --labels os=linux
+```
+
+Pass the token in the environment rather than as `--token`: argv is world-readable in
+`ps` for as long as the script runs.
+
+Downloads the release binary for the host architecture (verifying its checksum), creates the
+`fiber` system user, checks the tarball against its published `.sha256` (integrity, not
+provenance — both come from the same release), writes `/etc/fiber/agent.env` (mode `0640`,
+root-owned so the token is not world-readable), installs [`deploy/fiber-agent.service`](../deploy/fiber-agent.service), and
+enables it. Add `--docker` to allow `image:` steps (adds `fiber` to the `docker` group).
+`--uninstall` removes the service, keeping `/etc/fiber` and `/var/lib/fiber`.
+
+Re-running it is the upgrade path: settings you do not pass again are read back from
+`/etc/fiber/agent.env`, and the service is restarted so the new binary takes effect.
+
+It installs from a published release, so it needs one to exist for the host platform
+(linux x86_64 / arm64). For an air-gapped host, or before the first release, pass a tarball you
+built yourself — `cargo build --release -p fiber-agent -p fiber-cli` then
+`tar -C target/release -czf fiber-agent.tar.gz fiber-agent fiber`:
+
+```bash
+sudo ./scripts/install-agent.sh --api-url wss://ci.example.com --token … --tarball fiber-agent.tar.gz
+```
+
+```bash
+journalctl -u fiber-agent -f          # logs
+sudo systemctl restart fiber-agent    # after editing /etc/fiber/agent.env
+```
+
+The unit sets `RestartPreventExitStatus=2`, so an agent whose token was revoked stops instead of
+restart-looping, and `TimeoutStopSec=30` so SIGTERM can stop steps before the kill. It also runs
+with `ProtectSystem=full` and `NoNewPrivileges=true`: `/usr` and `/etc` are read-only to steps and
+`sudo` does not work, so a pipeline that expects to install packages system-wide will fail here.
+Relax those in a drop-in if your builds need it.
+
+### Container
+
+```bash
+docker run -d --restart unless-stopped --name fiber-agent \
+  -e FIBER_API_URL=wss://ci.example.com \
+  -e FIBER_AGENT_TOKEN=… \
+  -e FIBER_AGENT_LABELS=os=linux \
+  -v fiber_workspaces:/data/workspaces \
+  --init \
+  ghcr.io/durablefibers/fiber-agent:latest
+```
+
+`--init` reaps step grandchildren that reparent to the agent. Use a named volume as shown:
+a host bind mount arrives root-owned and the agent runs as uid 10001, so it could not write
+workspaces.
+
+The image runs as a non-root user and ships `git`. `image:` steps additionally need the Docker
+CLI and a mounted socket — mounting `/var/run/docker.sock` grants root on the host, so do it only
+on hosts where that is acceptable.
+
+Alongside a Compose deployment, the bundled worker starts with a profile:
+
+```bash
+echo "FIBER_AGENT_TOKEN=…" >> deploy/.env
+docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent
+```
+
+### From source
 
 ```bash
 export FIBER_AGENT_TOKEN=…
@@ -59,6 +131,8 @@ export FIBER_AGENT_WORKSPACE_DIR=./data/workspaces
 cargo run -p fiber-agent
 # or: cargo run -p fiber-cli -- agent --token "$FIBER_AGENT_TOKEN"
 ```
+
+## Run
 
 Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client).
 

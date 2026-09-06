@@ -81,6 +81,16 @@ docker compose -f deploy/docker-compose.yml up --build
 
 Everything binds to `127.0.0.1` by default; see [operations → Deployment](./operations.md#deployment) for the reverse-proxy / TLS setup and how to expose it. MinIO artifacts are on by default in Compose. See [Artifacts](./artifacts.md).
 
+To run pipelines on the Compose stack, add a worker: create an agent (Agents page or
+`fiber agents create --name compose --labels os=linux`), put its token in `deploy/.env` as
+`FIBER_AGENT_TOKEN`, then:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent
+```
+
+For a separate build machine, see [agents → Install](./agents.md#install).
+
 ## Next
 
 - [Pipeline YAML](./pipeline-yaml.md)

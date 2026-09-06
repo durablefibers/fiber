@@ -23,6 +23,7 @@ Production hardening via real use — before GitLab / Vault / cloud agents. Orde
 | **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
 | **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
 | **Observability** | `/metrics`, OTel in the agent, JSON logs, request ids, supervised background loops surfaced in `/ready` |
+| **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable web image so it can be published; build attestations for release assets |
 | **Sessions** | Password change, revoke-all, sliding expiry, tokens off the WS query string |
 | **SCM** | GitLab / Bitbucket webhooks; multibranch indexing |
 | **Secrets** | Vault / OIDC / external secret stores (beyond encrypted project secrets) |
