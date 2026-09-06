@@ -4,16 +4,71 @@ Binary: `fiber` (`cargo run -p fiber-cli -- …`). Auth: `fiber login` writes `~
 
 ## Commands
 
+Add `--json` to any command for machine-readable output.
+
 | Command | Purpose |
 |---|---|
 | `validate [fiber.yml]` | Parse + compile DAG locally |
-| `login` | Session token → stdout + `~/.fiber/token` (dir `0700`, file `0600`). `--password-stdin` keeps the password out of shell history |
-| `run <pipeline_id>` | Start a manual run |
+| `login` / `logout` | Session token → stdout + `~/.fiber/token` (dir `0700`, file `0600`). `--password-stdin` keeps the password out of shell history; `logout` deletes the file |
+| `projects list\|create` | Projects you can see |
+| `pipelines list\|get\|apply` | `apply` pushes a `fiber.yml` — create or update |
+| `run <pipeline_id>` | Start a manual run; `--wait` / `--follow` block and exit with the outcome |
+| `runs list\|get\|cancel\|retry` | Run history and control |
+| `logs <step_run_id>` | Step output; `--attempt N`, `--follow` |
+| `artifacts list\|download` | Run artifacts |
+| `completions <shell>` | Completion script for bash, zsh, fish, elvish, powershell |
 | `members list\|add\|set\|remove` | Project membership |
 | `secrets list\|set\|delete` | Project secrets (admin) |
 | `agents list\|create\|update\|delete\|rotate` | Agent registrations |
 | `agent` | Spawn `fiber-agent` with token/labels |
 | `fibers list\|create\|get\|cancel` | Durable control-plane tasks |
+
+## CI as code
+
+```bash
+fiber pipelines apply fiber.yml --project-id $PROJECT_ID   # create, or update by name
+fiber pipelines apply fiber.yml --id $PIPELINE_ID          # update a specific one
+```
+
+The file is parsed and the DAG compiled locally first, so a syntax or cycle error fails
+before anything is sent.
+
+## Running from another CI system, or a git hook
+
+```bash
+fiber run $PIPELINE_ID --follow           # stream output, block until finished
+echo $?                                   # 0 succeeded · 1 failed/cancelled · 3 timed out
+```
+
+`--wait` is the same without the output. Step transitions go to stderr and log lines to
+stdout, so `fiber run … --follow > build.log` keeps the two apart. Waiting polls the API
+rather than holding a WebSocket, so it works behind proxies that do not pass upgrades.
+
+```bash
+fiber runs list $PROJECT_ID --limit 20                 # newest first
+fiber runs list $PROJECT_ID --before $LAST_RUN_ID      # next page
+fiber runs get $RUN_ID
+fiber runs retry $RUN_ID --failed-only --wait          # re-run only what failed
+fiber runs cancel $RUN_ID
+```
+
+## Logs and artifacts
+
+```bash
+fiber logs $STEP_RUN_ID                # newest 1000 lines
+fiber logs $STEP_RUN_ID --attempt 2    # one attempt (seq restarts per attempt)
+fiber logs $STEP_RUN_ID --follow       # tail until the step finishes
+
+fiber artifacts list $RUN_ID
+fiber artifacts download $ARTIFACT_ID --out ./dist/app.tar
+```
+
+## Shell completion
+
+```bash
+fiber completions zsh  > ~/.zfunc/_fiber
+fiber completions bash > /etc/bash_completion.d/fiber
+```
 
 ## Members
 

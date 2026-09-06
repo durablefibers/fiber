@@ -8,6 +8,11 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **CLI parity with the API.** `pipelines apply` pushes a `fiber.yml` (create or update,
+  compiled locally first); `run --wait` / `--follow` block and exit with the run's outcome
+  (0 succeeded, 1 failed, 3 timed out) so another CI system or a git hook can gate on it;
+  plus `projects`, `runs list/get/cancel/retry`, `logs` (with `--attempt` and `--follow`),
+  `artifacts list/download`, `logout`, `completions`, and a global `--json`.
 - **Re-run a run**: `POST /api/runs/{id}/retry`, and buttons on the run page. It builds
   from the original run's definition snapshot, so it reproduces what that run executed.
   `failed_only` carries over the steps that already succeeded — copying their artifacts
