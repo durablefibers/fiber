@@ -9,6 +9,7 @@ use fiber_proto::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -57,15 +58,13 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     let mut artifacts = Vec::new();
     let mut workspace = None;
     let mut timeout_minutes = None;
+    let mut secret_keys = Vec::new();
+    let mut needs_closure = None;
     match state.store.get_run(step.run_id).await {
         Ok(Some(run)) => {
-            if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
-                for (k, v) in secrets {
-                    env.push((k, v));
-                }
-            }
             let snapshot = &run.definition_snapshot;
             workspace = workspace_from_snapshot(snapshot);
+            let mut secret_allow: Option<Vec<String>> = None;
             match snapshot_step(snapshot, &step.step_id) {
                 Some(s) => {
                     artifacts = snapshot_str_list(s.get("artifacts"));
@@ -74,17 +73,44 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
                         .get("timeout_minutes")
                         .and_then(|v| v.as_u64())
                         .map(|m| m as u32);
+                    // Absent (or null) = every project secret; a list = only those names.
+                    secret_allow = s
+                        .get("secrets")
+                        .filter(|v| !v.is_null())
+                        .map(|v| snapshot_str_list(Some(v)));
+                    needs_closure = Some(needs_closure_for(snapshot, &step.step_id));
                 }
                 None => warn!(
                     run_id = %step.run_id, step = %step.step_id,
                     "step missing from run snapshot; offering without artifacts/env"
                 ),
             }
+            if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
+                let mut available: Vec<String> = Vec::new();
+                for (k, v) in secrets {
+                    available.push(k.clone());
+                    if secret_allow.as_ref().is_some_and(|a| !a.contains(&k)) {
+                        continue;
+                    }
+                    secret_keys.push(k.clone());
+                    env.push((k, v));
+                }
+                if let Some(allow) = &secret_allow {
+                    for name in allow {
+                        if !available.contains(name) {
+                            warn!(
+                                run_id = %step.run_id, step = %step.step_id, secret = %name,
+                                "step requests a secret the project does not define"
+                            );
+                        }
+                    }
+                }
+            }
         }
         Ok(None) => warn!(run_id = %step.run_id, "run missing while building offer"),
         Err(e) => warn!(run_id = %step.run_id, error = %e, "loading run for offer"),
     }
-    let restore = restore_list(state, step.run_id, step.id).await;
+    let restore = restore_list(state, step.run_id, step.id, needs_closure.as_ref()).await;
     // Agents always get a limit: the step's own, else the server default.
     let default_minutes = fiber_scheduler::TimeoutConfig::from_env().default_minutes as u32;
     ServerMessage::Offer {
@@ -99,7 +125,39 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         artifacts,
         restore,
         timeout_minutes: Some(timeout_minutes.unwrap_or(default_minutes)),
+        secret_keys,
     }
+}
+
+/// Every step `step_id` transitively depends on, from the run snapshot. A step may only
+/// see artifacts produced by these — the whole run's output would let unrelated parallel
+/// steps drop files into its workspace.
+fn needs_closure_for(snapshot: &serde_json::Value, step_id: &str) -> HashSet<String> {
+    let mut needs_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    if let Some(steps) = snapshot.get("steps").and_then(|v| v.as_array()) {
+        for s in steps {
+            let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let needs = s
+                .get("needs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_str()).collect())
+                .unwrap_or_default();
+            needs_of.insert(id, needs);
+        }
+    }
+    let mut closure = HashSet::new();
+    let mut stack: Vec<&str> = needs_of.get(step_id).cloned().unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        if !closure.insert(id.to_string()) {
+            continue;
+        }
+        if let Some(parents) = needs_of.get(id) {
+            stack.extend(parents.iter().copied());
+        }
+    }
+    closure
 }
 
 /// The compiled step entry for `step_id` inside a `CompiledDag` snapshot.
@@ -152,18 +210,39 @@ fn workspace_from_snapshot(snapshot: &serde_json::Value) -> Option<WorkspaceOffe
     Some(WorkspaceOffer { repo, git_ref })
 }
 
+/// Artifacts to place in the step's workspace before it runs: those produced by the
+/// steps it depends on, latest wins per path.
 async fn restore_list(
     state: &AppState,
     run_id: Uuid,
     current_step_run_id: Uuid,
+    needs_closure: Option<&HashSet<String>>,
 ) -> Vec<ArtifactRestore> {
     let Ok(arts) = state.store.list_artifacts(run_id).await else {
         return vec![];
     };
-    // Prefer latest artifact per workspace path (name); skip this step's own (none yet).
+    // step_run_id -> step_id, so artifacts can be attributed to the step that produced them.
+    let producer: HashMap<Uuid, String> = match state.store.list_step_runs(run_id).await {
+        Ok(steps) => steps.into_iter().map(|s| (s.id, s.step_id)).collect(),
+        Err(e) => {
+            warn!(%run_id, error = %e, "cannot map artifacts to steps; restoring none");
+            return vec![];
+        }
+    };
     let mut by_name = std::collections::BTreeMap::new();
     for a in arts {
         if a.step_run_id == current_step_run_id {
+            continue;
+        }
+        // No closure means the step is not in the snapshot — the offer already went out
+        // without its artifacts or env, so restore nothing rather than everything.
+        let Some(closure) = needs_closure else {
+            continue;
+        };
+        if !producer
+            .get(&a.step_run_id)
+            .is_some_and(|id| closure.contains(id))
+        {
             continue;
         }
         by_name.insert(
@@ -574,6 +653,24 @@ mod tests {
         assert_eq!(workspace_from_snapshot(&snap).unwrap().git_ref, "main");
         assert!(workspace_from_snapshot(&json!({"workspace": null})).is_none());
         assert!(workspace_from_snapshot(&json!({"steps": []})).is_none());
+    }
+
+    #[test]
+    fn needs_closure_is_transitive_and_excludes_siblings() {
+        let snap = json!({"steps": [
+            {"id": "checkout", "needs": []},
+            {"id": "build", "needs": ["checkout"]},
+            {"id": "test-a", "needs": ["build"]},
+            {"id": "test-b", "needs": ["build"]},
+            {"id": "package", "needs": ["test-a"]}
+        ]});
+        let c = needs_closure_for(&snap, "package");
+        assert!(c.contains("test-a") && c.contains("build") && c.contains("checkout"));
+        // A sibling branch is not a dependency: its artifacts must not be restored.
+        assert!(!c.contains("test-b"));
+        assert!(!c.contains("package"));
+        assert!(needs_closure_for(&snap, "checkout").is_empty());
+        assert!(needs_closure_for(&snap, "nope").is_empty());
     }
 
     #[test]

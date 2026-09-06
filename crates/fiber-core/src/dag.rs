@@ -52,6 +52,9 @@ pub struct CompiledStep {
     /// Copied from definition `timeout_minutes:` (per attempt).
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Copied from definition `secrets:` — `None` means every project secret.
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +211,7 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             env: cell.env.clone(),
             if_expr: cell.template.if_expr.clone(),
             timeout_minutes: cell.template.timeout_minutes,
+            secrets: cell.template.secrets.clone(),
         });
     }
 
@@ -356,6 +360,7 @@ pub fn definition_from_map(
                 matrix: s.matrix,
                 if_expr: s.if_expr,
                 timeout_minutes: s.timeout_minutes,
+                secrets: s.secrets,
             })
             .collect(),
         timeout_minutes: None,
@@ -380,6 +385,8 @@ pub struct StepDefinitionInput {
     pub if_expr: Option<String>,
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 /// Parse YAML where `steps` may be a map (GitHub Actions style) or a list.
@@ -422,6 +429,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
                     matrix: input.matrix,
                     if_expr: input.if_expr,
                     timeout_minutes: input.timeout_minutes,
+                    secrets: input.secrets,
                 });
             }
             out
@@ -456,7 +464,29 @@ mod tests {
             matrix: None,
             if_expr: None,
             timeout_minutes: None,
+            secrets: None,
         }
+    }
+
+    #[test]
+    fn step_secrets_allowlist_survives_compile_and_snapshot() {
+        let mut a = step("a", &[], "true");
+        a.secrets = Some(vec!["NPM_TOKEN".into()]);
+        let mut b = step("b", &[], "true");
+        b.secrets = Some(vec![]);
+        let def = PipelineDefinition {
+            name: "s".into(),
+            workspace: None,
+            on: None,
+            timeout_minutes: None,
+            steps: vec![a, b, step("c", &[], "true")],
+        };
+        let dag = compile_definition(&def).unwrap();
+        let v = serde_json::to_value(&dag).unwrap();
+        assert_eq!(v["steps"][0]["secrets"], serde_json::json!(["NPM_TOKEN"]));
+        assert_eq!(v["steps"][1]["secrets"], serde_json::json!([]));
+        // Omitted stays null — "every project secret", the historical behaviour.
+        assert!(v["steps"][2]["secrets"].is_null());
     }
 
     #[test]

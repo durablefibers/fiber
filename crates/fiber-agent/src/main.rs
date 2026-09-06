@@ -51,6 +51,215 @@ struct Args {
         default_value = "./data/workspaces"
     )]
     workspace_dir: PathBuf,
+
+    /// Extra environment variables to pass from the agent's own environment into steps,
+    /// comma-separated (e.g. `SSH_AUTH_SOCK,CARGO_HOME`). Everything else is cleared.
+    #[arg(long, env = "FIBER_AGENT_ENV_PASSTHROUGH", default_value = "")]
+    env_passthrough: String,
+
+    /// Delete per-run workspaces older than this many hours. 0 disables the sweep.
+    #[arg(long, env = "FIBER_AGENT_WORKSPACE_TTL_HOURS", default_value_t = 24)]
+    workspace_ttl_hours: u64,
+
+    /// `--user` for step containers (e.g. `1000:1000`). Empty = the image default.
+    #[arg(long, env = "FIBER_AGENT_DOCKER_USER", default_value = "")]
+    docker_user: String,
+
+    /// `--network` for step containers. `none` isolates them from the network entirely.
+    #[arg(long, env = "FIBER_AGENT_DOCKER_NETWORK", default_value = "bridge")]
+    docker_network: String,
+
+    /// `--memory` for step containers (e.g. `2g`). Empty = unlimited, so an existing
+    /// build is not silently OOM-killed after an upgrade.
+    #[arg(long, env = "FIBER_AGENT_DOCKER_MEMORY", default_value = "")]
+    docker_memory: String,
+
+    /// `--cpus` for step containers (e.g. `2`). Empty = unlimited.
+    #[arg(long, env = "FIBER_AGENT_DOCKER_CPUS", default_value = "")]
+    docker_cpus: String,
+
+    /// `--pids-limit` for step containers. 0 = unlimited.
+    #[arg(long, env = "FIBER_AGENT_DOCKER_PIDS_LIMIT", default_value_t = 512)]
+    docker_pids_limit: i64,
+}
+
+/// Environment a step inherits from the agent process. Everything else is cleared, so
+/// repo-supplied shell cannot read `FIBER_AGENT_TOKEN` (which would let it lease steps
+/// and read other projects' secrets).
+const ENV_ALLOWLIST: &[&str] = &[
+    // Shell basics.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    // Egress on networks that require a proxy or an internal CA. Without these a
+    // corporate agent cannot reach anything, which is a worse failure than the
+    // (small) chance of a credential embedded in a proxy URL.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+];
+
+/// Variables the `docker` client itself needs to find and talk to a daemon.
+const DOCKER_CLIENT_ENV: &[&str] = &[
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CONTEXT",
+    "XDG_RUNTIME_DIR",
+];
+
+/// A name usable as a shell/`--env-file` variable. Anything else is refused: docker
+/// reads a line *without* `=` as "take this variable from my own environment", so a key
+/// carrying a newline could make the docker client hand a step its own environment —
+/// including the agent token.
+fn is_valid_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Execution policy for one step, resolved once from the agent's flags.
+#[derive(Clone)]
+struct ExecConfig {
+    use_docker: bool,
+    env_passthrough: Vec<String>,
+    docker_user: String,
+    docker_network: String,
+    docker_memory: String,
+    docker_cpus: String,
+    docker_pids_limit: i64,
+}
+
+impl ExecConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            use_docker: args.use_docker,
+            env_passthrough: args
+                .env_passthrough
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            docker_user: args.docker_user.clone(),
+            docker_network: args.docker_network.clone(),
+            docker_memory: args.docker_memory.clone(),
+            docker_cpus: args.docker_cpus.clone(),
+            docker_pids_limit: args.docker_pids_limit,
+        }
+    }
+}
+
+/// Per-run workspace refcount: the last step of a run to finish on this agent deletes
+/// the run's tree. Without it every run leaks a checkout for the agent's lifetime.
+#[derive(Default)]
+struct Workspaces {
+    live: Mutex<HashMap<Uuid, usize>>,
+    /// One lock per run, held while its reference clone is created: two steps of the
+    /// same run starting together would otherwise each delete the other's in-flight clone.
+    prep: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl Workspaces {
+    fn run_lock(&self, run_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut g = self.prep.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(g.entry(run_id).or_default())
+    }
+
+    fn enter(&self, run_id: Uuid) {
+        if let Ok(mut g) = self.live.lock() {
+            *g.entry(run_id).or_insert(0) += 1;
+        }
+    }
+
+    /// True when this was the run's last step here, so its tree can go.
+    fn leave(&self, run_id: Uuid) -> bool {
+        let Ok(mut g) = self.live.lock() else {
+            return false;
+        };
+        match g.get_mut(&run_id) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                g.remove(&run_id);
+                if let Ok(mut p) = self.prep.lock() {
+                    p.remove(&run_id);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Replaces every occurrence of a secret value in log output with `***`.
+#[derive(Clone, Default)]
+struct Redactor {
+    values: Vec<String>,
+}
+
+impl Redactor {
+    /// Values shorter than this are skipped: masking a two-character secret would blank
+    /// out unrelated output without protecting much.
+    const MIN_LEN: usize = 8;
+
+    fn new(env: &[(String, String)], secret_keys: &[String]) -> Self {
+        let mut values: Vec<String> = Vec::new();
+        for (k, v) in env.iter().filter(|(k, _)| secret_keys.contains(k)) {
+            let _ = k;
+            if v.len() >= Self::MIN_LEN {
+                values.push(v.clone());
+            }
+            // Logs arrive a line at a time, so a multi-line secret (a PEM key, a service
+            // account JSON) would never match as a whole. Mask its lines individually.
+            if v.contains('\n') {
+                values.extend(
+                    v.lines()
+                        .map(str::trim_end)
+                        .filter(|l| l.len() >= Self::MIN_LEN)
+                        .map(str::to_string),
+                );
+            }
+        }
+        // Longest first, so a secret containing another is masked whole.
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        values.dedup();
+        Self { values }
+    }
+
+    fn apply(&self, line: &str) -> String {
+        if self.values.is_empty() {
+            return line.to_string();
+        }
+        let mut out = line.to_string();
+        for v in &self.values {
+            if out.contains(v.as_str()) {
+                out = out.replace(v.as_str(), "***");
+            }
+        }
+        out
+    }
 }
 
 fn http_base(api_url: &str) -> String {
@@ -76,6 +285,8 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
     std::fs::create_dir_all(&args.workspace_dir)?;
+    // Anything left from a previous process (crash, kill -9) is nobody's to finish.
+    sweep_stale_workspaces(&args.workspace_dir, args.workspace_ttl_hours).await;
     let labels: Vec<String> = args
         .labels
         .split(',')
@@ -213,6 +424,7 @@ async fn run_session(
     });
 
     let prepared: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
+    let workspaces: Arc<Workspaces> = Arc::new(Workspaces::default());
     let cancels: Arc<Mutex<HashMap<Uuid, oneshot::Sender<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let in_flight = Arc::new(AtomicU64::new(0));
@@ -261,6 +473,7 @@ async fn run_session(
                                 artifacts,
                                 restore,
                                 timeout_minutes,
+                                secret_keys,
                             }) => {
                                 info!(%step_id, %step_name, %run_id, "offered step");
                                 let _ = out_tx.send(AgentMessage::Claim { agent_id, step_run_id });
@@ -274,7 +487,6 @@ async fn run_session(
                                 let prepared = Arc::clone(&prepared);
                                 let cancels = Arc::clone(&cancels);
                                 let workspace_dir = args.workspace_dir.clone();
-                                let use_docker = args.use_docker;
                                 let http_api = http_base(&args.api_url);
                                 let token = args.token.clone();
                                 let slots = Arc::clone(&slots);
@@ -282,7 +494,10 @@ async fn run_session(
                                 let in_flight = Arc::clone(&in_flight);
                                 // The attempt's clock starts now, not when a local permit frees up.
                                 let offered_at = tokio::time::Instant::now();
+                                let redactor = Redactor::new(&env, &secret_keys);
+                                let exec = ExecConfig::from_args(args);
                                 in_flight.fetch_add(1, Ordering::SeqCst);
+                                let workspaces = Arc::clone(&workspaces);
                                 tokio::spawn(async move {
                                     let _permit = slots.acquire_owned().await;
                                     let result = execute_step(
@@ -298,12 +513,14 @@ async fn run_session(
                                         &restore,
                                         &http_api,
                                         &token,
-                                        use_docker,
                                         &workspace_dir,
                                         &prepared,
                                         cancel_rx,
                                         timeout_minutes,
                                         offered_at,
+                                        &redactor,
+                                        &exec,
+                                        &workspaces,
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
@@ -341,15 +558,17 @@ async fn run_session(
                                                 step_run_id,
                                                 status: StepStatus::Failed,
                                                 exit_code: None,
-                                                error: Some(e.to_string()),
+                                                error: Some(redactor.apply(&e.to_string())),
                                             }
                                         }
+                                        // Redacted like log lines: an error string can pick
+                                        // up a value through `.context(...)`.
                                         Err(e) => AgentMessage::StepComplete {
                                             agent_id,
                                             step_run_id,
                                             status: StepStatus::Failed,
                                             exit_code: None,
-                                            error: Some(e.to_string()),
+                                            error: Some(redactor.apply(&e.to_string())),
                                         },
                                     };
                                     let _ = out_tx.send(complete);
@@ -396,6 +615,11 @@ async fn run_session(
     }
 }
 
+/// Run one step, then release its workspace whatever the outcome.
+///
+/// Each step gets its own directory under the run's tree: steps of one run can be offered
+/// to this agent concurrently, and a shared directory means they overwrite each other's
+/// build output. Files move between steps as artifacts, not by sharing a checkout.
 #[allow(clippy::too_many_arguments)]
 async fn execute_step(
     out_tx: &tokio::sync::mpsc::UnboundedSender<AgentMessage>,
@@ -410,23 +634,83 @@ async fn execute_step(
     restore: &[ArtifactRestore],
     http_api: &str,
     token: &str,
-    use_docker: bool,
     workspace_root: &Path,
+    prepared: &Mutex<HashSet<Uuid>>,
+    cancel: oneshot::Receiver<()>,
+    timeout_minutes: Option<u32>,
+    offered_at: tokio::time::Instant,
+    redactor: &Redactor,
+    exec: &ExecConfig,
+    workspaces: &Workspaces,
+) -> Result<i32> {
+    let run_dir = workspace_root.join(run_id.to_string());
+    let work_dir = run_dir.join(step_run_id.to_string());
+    workspaces.enter(run_id);
+    let result = execute_step_inner(
+        out_tx,
+        agent_id,
+        step_run_id,
+        run_id,
+        image,
+        run,
+        workspace,
+        env,
+        artifacts,
+        restore,
+        http_api,
+        token,
+        &run_dir,
+        &work_dir,
+        prepared,
+        cancel,
+        timeout_minutes,
+        offered_at,
+        redactor,
+        exec,
+        workspaces,
+    )
+    .await;
+    // Cancel, timeout and prep failures all land here: a leaked checkout per aborted
+    // attempt would fill the disk faster than successful runs do.
+    cleanup_workspace(workspaces, run_id, &run_dir, &work_dir, prepared).await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_step_inner(
+    out_tx: &tokio::sync::mpsc::UnboundedSender<AgentMessage>,
+    agent_id: Uuid,
+    step_run_id: Uuid,
+    run_id: Uuid,
+    image: Option<&str>,
+    run: &str,
+    workspace: Option<&WorkspaceOffer>,
+    env: &[(String, String)],
+    artifacts: &[String],
+    restore: &[ArtifactRestore],
+    http_api: &str,
+    token: &str,
+    run_dir: &Path,
+    work_dir: &Path,
     prepared: &Mutex<HashSet<Uuid>>,
     mut cancel: oneshot::Receiver<()>,
     timeout_minutes: Option<u32>,
     offered_at: tokio::time::Instant,
+    redactor: &Redactor,
+    exec: &ExecConfig,
+    workspaces: &Workspaces,
 ) -> Result<i32> {
     // One sequence for system/stdout/stderr so the server's `ORDER BY seq` interleaves
     // streams in emission order (the old per-stream bases collided after 1000 lines).
     let seq = Arc::new(AtomicU64::new(0));
     let log_seq = Arc::clone(&seq);
+    let log_redactor = redactor.clone();
     let mut log = |stream: &str, data: String| {
         let _ = out_tx.send(AgentMessage::LogChunk {
             agent_id,
             step_run_id,
             stream: stream.into(),
-            data,
+            data: log_redactor.apply(&data),
             seq: log_seq.fetch_add(1, Ordering::Relaxed),
         });
     };
@@ -443,30 +727,29 @@ async fn execute_step(
         log("system", format!("step timeout: {m} min"));
     }
 
-    let work_dir = workspace_root.join(run_id.to_string());
-    tokio::fs::create_dir_all(&work_dir).await?;
+    tokio::fs::create_dir_all(work_dir).await?;
 
     // Workspace prep can be interrupted by cancel.
     let prep = async {
         if let Some(ws) = workspace {
-            let already = prepared
-                .lock()
-                .map(|g| g.contains(&run_id))
-                .unwrap_or(false);
-            if !already {
-                log(
-                    "system",
-                    format!("preparing workspace from {} @ {}", ws.repo, ws.git_ref),
-                );
-                prepare_git_workspace(&work_dir, ws, &mut log).await?;
-                if let Ok(mut g) = prepared.lock() {
-                    g.insert(run_id);
-                }
-                log(
-                    "system",
-                    format!("workspace ready at {}", work_dir.display()),
-                );
+            log(
+                "system",
+                format!("preparing workspace from {} @ {}", ws.repo, ws.git_ref),
+            );
+            // One network clone per run, then a local copy per step. The lock keeps
+            // concurrent steps of this run from racing to create the reference.
+            let reference = run_dir.join(".repo");
+            let lock = workspaces.run_lock(run_id);
+            {
+                let _guard = lock.lock().await;
+                prepare_reference_clone(&reference, ws, run_id, prepared, &mut log).await?;
             }
+            clone_step_workspace(&reference, work_dir, &mut log).await?;
+            tokio::fs::create_dir_all(work_dir).await?;
+            log(
+                "system",
+                format!("workspace ready at {}", work_dir.display()),
+            );
         } else {
             log(
                 "system",
@@ -474,7 +757,7 @@ async fn execute_step(
             );
         }
         if !restore.is_empty() {
-            restore_artifacts(http_api, token, &work_dir, restore, &mut log).await?;
+            restore_artifacts(http_api, token, work_dir, restore, &mut log).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -496,7 +779,9 @@ async fn execute_step(
     // cancel / timeout can `docker kill` it.
     let container_name = format!("fiber-step-{}", Uuid::new_v4());
     let mut docker_container: Option<String> = None;
-    let mut child = if let Some(img) = image.filter(|i| !i.is_empty()).filter(|_| use_docker) {
+    // Kept alive until the child exits: dropping it deletes the file docker reads.
+    let mut env_file: Option<tempfile::NamedTempFile> = None;
+    let mut child = if let Some(img) = image.filter(|i| !i.is_empty()).filter(|_| exec.use_docker) {
         let mount = format!("{}:/workspace", work_dir.display());
         log(
             "system",
@@ -513,10 +798,66 @@ async fn execute_step(
             &mount,
             "-w",
             "/workspace",
+            // A step cannot gain privileges beyond the user it starts as.
+            "--security-opt",
+            "no-new-privileges",
         ]);
-        for (k, v) in env {
-            cmd.args(["-e", &format!("{k}={v}")]);
+        if !exec.docker_user.is_empty() {
+            cmd.args(["--user", &exec.docker_user]);
         }
+        if !exec.docker_network.is_empty() {
+            cmd.args(["--network", &exec.docker_network]);
+        }
+        if !exec.docker_memory.is_empty() {
+            cmd.args(["--memory", &exec.docker_memory]);
+        }
+        if !exec.docker_cpus.is_empty() {
+            cmd.args(["--cpus", &exec.docker_cpus]);
+        }
+        if exec.docker_pids_limit > 0 {
+            cmd.args(["--pids-limit", &exec.docker_pids_limit.to_string()]);
+        }
+        // Say what was applied: a step killed for exceeding a limit exits 137 with no
+        // other clue.
+        let mut limits = Vec::new();
+        if !exec.docker_memory.is_empty() {
+            limits.push(format!("memory={}", exec.docker_memory));
+        }
+        if !exec.docker_cpus.is_empty() {
+            limits.push(format!("cpus={}", exec.docker_cpus));
+        }
+        if exec.docker_pids_limit > 0 {
+            limits.push(format!("pids={}", exec.docker_pids_limit));
+        }
+        limits.push(format!("network={}", exec.docker_network));
+        log("system", format!("container limits: {}", limits.join(" ")));
+        // The docker client is spawned from the agent, whose environment holds
+        // FIBER_AGENT_TOKEN. Start it from nothing so an env-file line without `=`
+        // (which tells docker to copy a variable from its own environment) has nothing
+        // worth copying, then add back only what the client needs to reach a daemon.
+        cmd.env_clear();
+        for name in ENV_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(DOCKER_CLIENT_ENV.iter().copied())
+            .chain(exec.env_passthrough.iter().map(String::as_str))
+        {
+            if let Ok(v) = std::env::var(name) {
+                cmd.env(name, v);
+            }
+        }
+        // `-e K=V` would put every project secret in the host's process list. An
+        // env-file is read by docker and never appears in anyone's argv.
+        let (file, from_client_env) = write_env_file(env, &mut log)?;
+        cmd.args(["--env-file", &file.path().to_string_lossy()]);
+        // Values an env-file cannot express (they contain newlines) are handed over as
+        // `-e NAME`, which makes docker read NAME from the client environment we set here
+        // — still never in argv.
+        for (k, v) in &from_client_env {
+            cmd.args(["-e", k]);
+            cmd.env(k, v);
+        }
+        env_file = Some(file);
         cmd.args([img, "sh", "-lc", run])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -530,10 +871,22 @@ async fn execute_step(
         );
         let mut cmd = Command::new("sh");
         cmd.args(["-lc", run])
-            .current_dir(&work_dir)
+            .current_dir(work_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Start from nothing: the agent's own environment holds FIBER_AGENT_TOKEN, which
+        // repo-supplied shell must never see.
+        cmd.env_clear();
+        for name in ENV_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(exec.env_passthrough.iter().map(String::as_str))
+        {
+            if let Ok(v) = std::env::var(name) {
+                cmd.env(name, v);
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -546,6 +899,7 @@ async fn execute_step(
 
     let out_tx2 = out_tx.clone();
     let out_seq = Arc::clone(&seq);
+    let out_redactor = redactor.clone();
     let out_handle = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(l)) = lines.next_line().await {
@@ -553,7 +907,7 @@ async fn execute_step(
                 agent_id,
                 step_run_id,
                 stream: "stdout".into(),
-                data: l,
+                data: out_redactor.apply(&l),
                 seq: out_seq.fetch_add(1, Ordering::Relaxed),
             });
         }
@@ -561,6 +915,7 @@ async fn execute_step(
 
     let err_tx = out_tx.clone();
     let err_seq = Arc::clone(&seq);
+    let err_redactor = redactor.clone();
     let err_handle = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
@@ -568,7 +923,7 @@ async fn execute_step(
                 agent_id,
                 step_run_id,
                 stream: "stderr".into(),
-                data: l,
+                data: err_redactor.apply(&l),
                 seq: err_seq.fetch_add(1, Ordering::Relaxed),
             });
         }
@@ -599,10 +954,78 @@ async fn execute_step(
     };
 
     if code == 0 && !artifacts.is_empty() {
-        upload_artifacts(http_api, token, step_run_id, &work_dir, artifacts, &mut log).await;
+        upload_artifacts(http_api, token, step_run_id, work_dir, artifacts, &mut log).await;
     }
+    drop(env_file);
 
     Ok(code)
+}
+
+/// Drop this step's directory, and the whole run tree once its last step here is done.
+async fn cleanup_workspace(
+    workspaces: &Workspaces,
+    run_id: Uuid,
+    run_dir: &Path,
+    work_dir: &Path,
+    prepared: &Mutex<HashSet<Uuid>>,
+) {
+    let _ = tokio::fs::remove_dir_all(work_dir).await;
+    if workspaces.leave(run_id) {
+        if let Ok(mut g) = prepared.lock() {
+            g.remove(&run_id);
+        }
+        // Rename first: deleting a large tree takes time, and a new step of this run
+        // could otherwise start creating its directory inside the one being removed.
+        let trash = run_dir.with_extension(format!("trash-{}", Uuid::new_v4()));
+        match tokio::fs::rename(run_dir, &trash).await {
+            Ok(()) => {
+                if let Err(e) = tokio::fs::remove_dir_all(&trash).await {
+                    warn!(path = %trash.display(), error = %e, "could not remove run workspace");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %run_dir.display(), error = %e, "could not rename run workspace")
+            }
+        }
+    }
+}
+
+/// Write `KEY=VALUE` lines for `docker --env-file`, mode 0600.
+///
+/// Returns the file plus the pairs it could not express (values containing a newline),
+/// which the caller passes as `-e NAME` so docker reads them from the client environment.
+/// Keys are validated: a line without `=` means "copy this from my own environment",
+/// so an attacker-chosen key containing a newline could otherwise smuggle one in.
+fn write_env_file(
+    env: &[(String, String)],
+    log: &mut impl FnMut(&str, String),
+) -> Result<(tempfile::NamedTempFile, Vec<(String, String)>)> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new().prefix("fiber-env-").tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut deferred = Vec::new();
+    for (k, v) in env {
+        if !is_valid_env_key(k) {
+            log(
+                "system",
+                format!("ignoring environment variable with an unusable name: {k:?}"),
+            );
+            continue;
+        }
+        if v.contains('\n') {
+            deferred.push((k.clone(), v.clone()));
+            continue;
+        }
+        writeln!(file, "{k}={v}")?;
+    }
+    file.flush()?;
+    Ok((file, deferred))
 }
 
 /// Stop a step: the container (if any) first, then the client's process group.
@@ -866,79 +1289,145 @@ async fn upload_one_artifact(
     }
 }
 
-async fn prepare_git_workspace(
-    work_dir: &Path,
+/// One network clone per run, shared by every step of that run on this agent.
+async fn prepare_reference_clone(
+    reference: &Path,
     ws: &WorkspaceOffer,
+    run_id: Uuid,
+    prepared: &Mutex<HashSet<Uuid>>,
     log: &mut impl FnMut(&str, String),
 ) -> Result<()> {
-    let git_dir = work_dir.join(".git");
-    if git_dir.exists() {
-        log("system", "fetching updates…".into());
-        run_git(work_dir, &["fetch", "--all", "--prune"], log).await?;
-        if run_git(work_dir, &["checkout", "--force", &ws.git_ref], log)
-            .await
-            .is_err()
-        {
-            run_git(
-                work_dir,
-                &[
-                    "checkout",
-                    "--force",
-                    "-B",
-                    &ws.git_ref,
-                    &format!("origin/{}", ws.git_ref),
-                ],
-                log,
-            )
-            .await?;
-        }
-        let _ = run_git(work_dir, &["reset", "--hard", "HEAD"], log).await;
-        let _ = run_git(work_dir, &["clean", "-fdx"], log).await;
-    } else {
-        log("system", format!("cloning {} …", ws.repo));
+    let already = prepared
+        .lock()
+        .map(|g| g.contains(&run_id))
+        .unwrap_or(false);
+    if already && reference.join(".git").exists() {
+        return Ok(());
+    }
+    if reference.exists() {
+        let _ = tokio::fs::remove_dir_all(reference).await;
+    }
+    if let Some(parent) = reference.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    log("system", format!("cloning {} …", ws.repo));
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--branch",
+            &ws.git_ref,
+            "--single-branch",
+            "--depth",
+            "50",
+            &ws.repo,
+            &reference.to_string_lossy(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("git clone")?;
+    if !status.success() {
+        log(
+            "system",
+            "branch clone failed; cloning default then checking out ref".into(),
+        );
+        let _ = tokio::fs::remove_dir_all(reference).await;
         let status = Command::new("git")
             .args([
                 "clone",
-                "--branch",
-                &ws.git_ref,
-                "--single-branch",
                 "--depth",
                 "50",
                 &ws.repo,
-                &work_dir.to_string_lossy(),
+                &reference.to_string_lossy(),
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .status()
             .await
-            .context("git clone")?;
+            .context("git clone default")?;
         if !status.success() {
-            log(
-                "system",
-                "branch clone failed; cloning default then checking out ref".into(),
-            );
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
-            tokio::fs::create_dir_all(work_dir).await?;
-            let status = Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "50",
-                    &ws.repo,
-                    &work_dir.to_string_lossy(),
-                ])
-                .kill_on_drop(true)
-                .status()
-                .await
-                .context("git clone default")?;
-            if !status.success() {
-                bail!("git clone failed");
-            }
-            run_git(work_dir, &["checkout", "--force", &ws.git_ref], log).await?;
+            bail!("git clone failed");
         }
+        run_git(reference, &["checkout", "--force", &ws.git_ref], log).await?;
+    }
+    if let Ok(mut g) = prepared.lock() {
+        g.insert(run_id);
     }
     Ok(())
+}
+
+/// A step's own checkout, cloned from the run's reference over `file://`.
+///
+/// Not `git worktree`: a worktree's `.git` is a file pointing at an absolute path inside
+/// the reference, which is not mounted into a step container, so git would not work
+/// there. Not `git clone --local` either: that refuses a shallow source. `file://` copies
+/// objects locally (no network) and produces a self-contained repository.
+async fn clone_step_workspace(
+    reference: &Path,
+    work_dir: &Path,
+    log: &mut impl FnMut(&str, String),
+) -> Result<()> {
+    if work_dir.join(".git").exists() {
+        // A retried attempt reuses this path: put it back to a clean tree.
+        let _ = run_git(work_dir, &["reset", "--hard", "HEAD"], log).await;
+        let _ = run_git(work_dir, &["clean", "-fdx"], log).await;
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_dir(work_dir).await;
+    let src = format!("file://{}", reference.display());
+    let out = Command::new("git")
+        .args(["clone", "--depth", "1", &src])
+        .arg(work_dir)
+        .output()
+        .await
+        .context("git clone from the run reference")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        log("system", format!("workspace clone failed: {}", err.trim()));
+        bail!("could not create the step workspace from the run's clone");
+    }
+    Ok(())
+}
+
+/// Delete run workspaces — and orphaned step env files — left behind by a crash.
+async fn sweep_stale_workspaces(root: &Path, ttl_hours: u64) {
+    if ttl_hours == 0 {
+        return;
+    }
+    let ttl = Duration::from_secs(ttl_hours * 3600);
+    // A `kill -9` skips NamedTempFile's cleanup, leaving a file of secrets in TMPDIR.
+    if let Ok(mut tmp) = tokio::fs::read_dir(std::env::temp_dir()).await {
+        while let Ok(Some(entry)) = tmp.next_entry().await {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("fiber-env-")
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > ttl);
+        if stale {
+            info!(path = %entry.path().display(), "removing stale workspace");
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 async fn run_git(cwd: &Path, args: &[&str], log: &mut impl FnMut(&str, String)) -> Result<()> {
@@ -970,3 +1459,132 @@ async fn run_git(cwd: &Path, args: &[&str], log: &mut impl FnMut(&str, String)) 
 
 #[allow(dead_code)]
 fn _ws_ty(_: Ws) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn redactor_masks_secret_values_anywhere_in_a_line() {
+        let e = env(&[
+            ("NPM_TOKEN", "supersecretvalue"),
+            ("MATRIX_OS", "linux"),
+            ("SHORT", "abc"),
+        ]);
+        let r = Redactor::new(&e, &["NPM_TOKEN".into(), "SHORT".into()]);
+        assert_eq!(r.apply("using supersecretvalue now"), "using *** now");
+        assert_eq!(
+            r.apply("Authorization: Bearer supersecretvalue"),
+            "Authorization: Bearer ***"
+        );
+        // Non-secret env is untouched, and a too-short secret is not masked (it would
+        // blank out unrelated output for little gain).
+        assert_eq!(r.apply("os=linux abc"), "os=linux abc");
+    }
+
+    #[test]
+    fn redactor_masks_the_longer_secret_when_one_contains_another() {
+        let e = env(&[("A", "tokenvalue1234"), ("B", "tokenvalue")]);
+        let r = Redactor::new(&e, &["A".into(), "B".into()]);
+        assert_eq!(r.apply("x tokenvalue1234 y"), "x *** y");
+    }
+
+    #[test]
+    fn redactor_without_secrets_is_a_passthrough() {
+        let r = Redactor::new(&env(&[("A", "value123456")]), &[]);
+        assert_eq!(r.apply("value123456"), "value123456");
+    }
+
+    #[test]
+    fn env_file_is_private_and_defers_unrepresentable_values() {
+        let e = env(&[
+            ("TOKEN", "s3cret"),
+            ("MULTI", "line1\nline2"),
+            ("PLAIN", "ok"),
+        ]);
+        let mut log = |_: &str, _: String| {};
+        let (f, deferred) = write_env_file(&e, &mut log).unwrap();
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert!(body.contains("TOKEN=s3cret"));
+        assert!(body.contains("PLAIN=ok"));
+        // A newline cannot go in an env-file; it is handed over as `-e NAME` instead.
+        assert!(!body.contains("MULTI"));
+        assert_eq!(
+            deferred,
+            vec![("MULTI".to_string(), "line1\nline2".to_string())]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "step env file must not be readable by others"
+            );
+        }
+    }
+
+    #[test]
+    fn env_file_refuses_keys_that_could_smuggle_a_line() {
+        // A line without `=` tells docker to copy that variable from its own environment,
+        // so a key carrying a newline must never reach the file.
+        let e = env(&[
+            ("FIBER_AGENT_TOKEN\nX", "linux"),
+            ("HAS SPACE", "v"),
+            ("1LEADING_DIGIT", "v"),
+            ("", "v"),
+            ("GOOD_KEY", "value"),
+        ]);
+        let mut log = |_: &str, _: String| {};
+        let (f, deferred) = write_env_file(&e, &mut log).unwrap();
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(body, "GOOD_KEY=value\n");
+        assert!(deferred.is_empty());
+        for line in body.lines() {
+            assert!(line.contains('='), "every line must bind a value: {line:?}");
+        }
+    }
+
+    #[test]
+    fn env_key_validation() {
+        assert!(is_valid_env_key("PATH"));
+        assert!(is_valid_env_key("_x9"));
+        assert!(!is_valid_env_key("A\nB"));
+        assert!(!is_valid_env_key("A B"));
+        assert!(!is_valid_env_key("9A"));
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("A=B"));
+    }
+
+    #[test]
+    fn redactor_masks_each_line_of_a_multi_line_secret() {
+        let key = "-----BEGIN KEY-----\nabcdefghijklmnop\nqrstuvwxyz123456\n-----END KEY-----";
+        let r = Redactor::new(&env(&[("DEPLOY_KEY", key)]), &["DEPLOY_KEY".into()]);
+        // Logs arrive one line at a time, so the whole-value pattern never matches.
+        assert_eq!(r.apply("abcdefghijklmnop"), "***");
+        assert_eq!(
+            r.apply("prefix qrstuvwxyz123456 suffix"),
+            "prefix *** suffix"
+        );
+    }
+
+    #[test]
+    fn workspace_refcount_deletes_only_after_the_last_step() {
+        let w = Workspaces::default();
+        let run = Uuid::new_v4();
+        w.enter(run);
+        w.enter(run);
+        assert!(!w.leave(run), "another step of this run is still running");
+        assert!(w.leave(run), "last step out removes the run tree");
+        // Unknown runs never claim ownership.
+        assert!(!w.leave(Uuid::new_v4()));
+    }
+}

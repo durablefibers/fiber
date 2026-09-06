@@ -35,6 +35,9 @@ fi
 
 export FIBER_API_URL="${FIBER_API_URL:-http://127.0.0.1:18080}"
 export FIBER_AGENT_WORKSPACE_DIR="${FIBER_AGENT_WORKSPACE_DIR:-$ROOT/data/workspaces}"
+# Step isolation knobs — see docs/agents.md "What a step can see".
+# export FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK
+# export FIBER_AGENT_DOCKER_NETWORK=none
 export FIBER_AGENT_USE_DOCKER="${FIBER_AGENT_USE_DOCKER:-false}"
 export FIBER_AGENT_NAME="${FIBER_AGENT_NAME:-local}"
 export FIBER_AGENT_LABELS="${FIBER_AGENT_LABELS:-os=linux}"

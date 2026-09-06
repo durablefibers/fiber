@@ -60,7 +60,14 @@ Login is throttled per username: 10 failures within 10 minutes lock that usernam
 | `FIBER_AGENT_LABELS` | `os=linux,docker=true` | Comma-separated |
 | `FIBER_AGENT_CONCURRENCY` | `1` | Max parallel steps |
 | `FIBER_AGENT_USE_DOCKER` | `true` | Docker vs host shell |
-| `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Per-run work dirs |
+| `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Root for per-step work dirs |
+| `FIBER_AGENT_ENV_PASSTHROUGH` | empty | Comma-separated names to pass from the agent's environment into steps, on top of the built-in allowlist (shell basics, proxy and CA settings). Everything else is cleared — use this for `SSH_AUTH_SOCK`, `CARGO_HOME`, `JAVA_HOME`, `NVM_DIR` and similar |
+| `FIBER_AGENT_WORKSPACE_TTL_HOURS` | `24` | Sweep run workspaces older than this at startup; `0` disables |
+| `FIBER_AGENT_DOCKER_USER` | image default | `--user` for step containers |
+| `FIBER_AGENT_DOCKER_NETWORK` | `bridge` | `--network`; `none` isolates steps from the network |
+| `FIBER_AGENT_DOCKER_MEMORY` | unlimited | `--memory` for step containers, e.g. `2g`. Off by default so an upgrade cannot start OOM-killing existing builds |
+| `FIBER_AGENT_DOCKER_CPUS` | unlimited | `--cpus` for step containers, e.g. `2` |
+| `FIBER_AGENT_DOCKER_PIDS_LIMIT` | `512` | `--pids-limit`; `0` = unlimited |
 
 Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned, mode `0640`);
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,

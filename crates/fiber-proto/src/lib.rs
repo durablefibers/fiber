@@ -65,6 +65,11 @@ pub struct StepDefinition {
     /// (`FIBER_STEP_TIMEOUT_DEFAULT_MINUTES`, 60).
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Project secrets to inject, by name. Omitted = every project secret (the historical
+    /// behaviour); an empty list = none. Naming them keeps credentials out of steps that
+    /// have no use for them — notably steps running a third-party `image:`.
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 fn default_retries() -> u32 {
@@ -222,6 +227,10 @@ pub enum ServerMessage {
         /// the server independently fails it after a grace period. Absent from old servers.
         #[serde(default)]
         timeout_minutes: Option<u32>,
+        /// Which `env` entries are project secrets. The agent redacts their values from
+        /// log lines; it does not otherwise treat them differently.
+        #[serde(default)]
+        secret_keys: Vec<String>,
     },
     Cancel {
         step_run_id: Uuid,

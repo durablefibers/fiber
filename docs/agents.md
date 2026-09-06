@@ -166,7 +166,31 @@ A step is offered only if:
 
 ## Executor
 
-- **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the workspace directory.
+- **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the step's workspace directory.
 - **Docker**: if `image` is set (or docker mode on), runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client.
 
-Process groups: cancel kills the step’s process group so grandchildren die too.
+Process groups: cancel kills the step's process group so grandchildren die too.
+
+## What a step can see
+
+Steps run repo-supplied shell, so the agent narrows what is reachable:
+
+| | Behaviour |
+|---|---|
+| **Environment** | Cleared, then rebuilt: shell basics (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TERM`, `TMPDIR`), proxy and CA settings (`HTTP(S)_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`), anything in `FIBER_AGENT_ENV_PASSTHROUGH`, then the offer's env. The agent's own variables — notably `FIBER_AGENT_TOKEN` — are not inherited |
+| **Secrets** | Only the project secrets the step asks for (`secrets:` in the pipeline; all of them when omitted). Values are masked as `***` in log lines and in the step's error |
+| **Docker env** | Passed with `--env-file` on a `0600` temporary file, never `-e KEY=VALUE`, which would put every secret in the host's process list. The docker client is itself started with a cleared environment, and variable names are validated, so a hostile name cannot make docker copy one of its own variables into the step |
+| **Container limits** | `--security-opt no-new-privileges` and `--pids-limit 512` by default, plus `--user`, `--network`, `--memory`, `--cpus` from `FIBER_AGENT_DOCKER_*`. Memory and CPU limits are off unless set; whatever applies is printed as a `system` log line so an exit 137 is diagnosable |
+| **Workspace** | One directory per step, deleted when the step finishes — including on cancel, timeout, or failure. The run's tree goes when its last step on this agent finishes; anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` (24) is swept at startup |
+| **Artifacts** | Only those produced by the steps this one transitively `needs` |
+
+A step with a git workspace is cloned from one reference clone per run, so a second step
+costs a local object copy rather than another fetch, and the checkout is self-contained
+(`git` works the same inside a container as on the host).
+
+Masking is a substring match on the secret's value, so it does not catch a value the step
+transforms first (base64, URL-encoding) or one shorter than 8 characters. Treat it as a
+guard against accidental `echo`, not as permission to print secrets.
+
+This is a boundary, not a sandbox: anyone who can write a `fiber.yml` still runs code as
+the agent user. Keep agents on hosts you would grant those people.

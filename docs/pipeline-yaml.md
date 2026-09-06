@@ -44,11 +44,19 @@ In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `nam
 | `image` | — | Optional Docker image; agent runs in container when Docker enabled |
 | `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts |
 | `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
+| `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
 | `matrix` | — | Axis → values; expanded at compile time |
 | `if` | `success()` | Gate whether the step is queued |
 
-Injected env (among others): `FIBER_RUN_ID`, `FIBER_STEP_ID`, project secrets as env vars, and for matrix cells `MATRIX_<AXIS>` / `FIBER_MATRIX_<AXIS>`.
+Injected env (among others): `FIBER_RUN_ID`, `FIBER_STEP_ID`, project secrets as env vars (see `secrets:` to narrow them), and for matrix cells `MATRIX_<AXIS>` / `FIBER_MATRIX_<AXIS>`. Secret **values** are masked as `***` in step logs (a substring match, so it will not catch a value the step re-encodes first). Nothing else from the agent's own environment reaches a step.
+
+```yaml
+publish:
+  needs: [build]
+  run: npm publish
+  secrets: [NPM_TOKEN]     # only this one; other project secrets stay out
+```
 
 ## Matrix
 
@@ -86,10 +94,12 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 | `examples/matrix.yml` | Matrix + `if` |
 | `examples/cron.yml` | Cron schedule |
 | `examples/paths-filtered.yml` | Path filters |
+| `examples/scoped-secrets.yml` | Per-step `secrets:` allowlist |
 
 ## Semantics
 
 - Cycles are rejected at compile / save.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
+- Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.
 - What a run executes is frozen when it starts (`workspace`, `run`, `image`, `artifacts`, matrix env). Saving the pipeline afterwards affects only future runs.
