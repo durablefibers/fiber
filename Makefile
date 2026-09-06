@@ -1,4 +1,4 @@
-.PHONY: help infra infra-minio down api api-s3 agent web cli build check fmt fmt-check clippy \
+.PHONY: help infra infra-minio down api api-s3 agent web cli build check fmt fmt-check clippy test test-rust test-web \
 	dogfood dogfood-authz dogfood-pools dogfood-artifacts dogfood-s3 dogfood-compose \
 	login validate ready
 
@@ -12,6 +12,7 @@ help:
 	@echo "  down          Stop Compose services"
 	@echo "  build         cargo build workspace + fiber-cli"
 	@echo "  check         fmt --check + clippy -D warnings"
+	@echo "  test          cargo test --workspace + web vitest"
 	@echo "  fmt           cargo fmt"
 	@echo "  clippy        cargo clippy"
 	@echo "  api           Run fiber-api on :18080 (source scripts/dev-env.sh)"
@@ -25,7 +26,7 @@ help:
 	@echo "  dogfood       All smoke scripts (authz, pools, artifacts, s3)"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
-	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + build + web tsc)"
+	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; web biome + tsc + vitest + build; docker build)"
 
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis
@@ -46,6 +47,14 @@ clippy:
 	cargo clippy -p fiber-api -p fiber-agent -p fiber-cli -p fiber-core -p fiber-scheduler -p fiber-durable -- -D warnings
 
 check: fmt-check clippy
+
+test: test-rust test-web
+
+test-rust:
+	cargo test --workspace
+
+test-web:
+	cd apps/web && pnpm test
 
 fmt-check:
 	cargo fmt --check

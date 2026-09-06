@@ -69,16 +69,29 @@ pub async fn run_fiber(
             }
             record.error = Some(format!("{e:#}"));
             record.heartbeat_at = None;
-            if record.attempts >= max_attempts {
-                record.status = FiberStatus::Failed;
-                store.save(&record).await?;
-                Ok(FiberOutcome::Failed)
-            } else {
-                record.status = FiberStatus::Suspended;
-                record.wake_at = Some(Utc::now() + chrono::Duration::seconds(RETRY_BACKOFF_SECS));
-                store.save(&record).await?;
-                Ok(FiberOutcome::Retry)
+            let outcome = failure_outcome(record.attempts, max_attempts);
+            match outcome {
+                FiberOutcome::Failed => {
+                    record.status = FiberStatus::Failed;
+                }
+                _ => {
+                    record.status = FiberStatus::Suspended;
+                    record.wake_at =
+                        Some(Utc::now() + chrono::Duration::seconds(RETRY_BACKOFF_SECS));
+                }
             }
+            store.save(&record).await?;
+            Ok(outcome)
         }
+    }
+}
+
+/// Decide whether a failed attempt is retried or terminal. Pure so it can be unit-tested
+/// without a store; `run_fiber` applies the matching status/wake_at.
+pub fn failure_outcome(attempts: i32, max_attempts: i32) -> FiberOutcome {
+    if attempts >= max_attempts {
+        FiberOutcome::Failed
+    } else {
+        FiberOutcome::Retry
     }
 }

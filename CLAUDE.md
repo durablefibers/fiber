@@ -25,14 +25,14 @@ Login defaults: **admin / fiber**.
 
 ### Tests
 
-Rust tests are pure unit tests (no DB/Redis needed) living in `#[cfg(test)]` modules in `fiber-core` (`dag`, `due_index`, `path_filter`, `schedule`, `secrets`, `step_if`, `tokens`) and `fiber-durable/src/tests.rs`.
+Rust tests are pure unit tests (no DB/Redis needed) living in `#[cfg(test)]` modules in `fiber-core` (`dag`, `due_index`, `path_filter`, `schedule`, `secrets`, `step_if`, `tokens`), `fiber-api` (`routes` webhook signatures, `artifact_util`), and `fiber-durable/src/tests.rs`. `make test` runs all of them plus the web vitest suite.
 
 ```bash
-cargo test -p fiber-core -p fiber-durable
+cargo test --workspace
 cargo test -p fiber-core dag::            # one module
 cargo test -p fiber-durable due_index_earliest_and_authoritative   # one test
-cd apps/web && pnpm test                  # vitest
-cd apps/web && pnpm exec tsc --noEmit     # what CI runs for the web app
+cd apps/web && pnpm test                  # vitest (src/**/*.test.ts, jsdom)
+cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # what CI runs for the web app
 ```
 
 End-to-end coverage is the **dogfood smokes**, not integration tests — they drive the live API and print `DOGFOOD_OK`:
@@ -43,7 +43,7 @@ make dogfood-s3             # needs infra-minio + api-s3 + a built fiber-agent
 make dogfood-compose        # full `compose up --build` smoke
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy (`-D warnings`), `cargo build -p fiber-api -p fiber-agent -p fiber-cli`, and `apps/web` `tsc --noEmit`.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy (`-D warnings`), `cargo test --workspace`, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`, `apps/web` Biome + `tsc --noEmit` + vitest + `pnpm build`, and a `docker build` of both images.
 
 ## Architecture
 

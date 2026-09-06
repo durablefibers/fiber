@@ -169,12 +169,10 @@ function ProjectFibersPage() {
                     ) : null}
                   </TableCell>
                   <TableCell>{f.attempts}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {f.wake_at
-                      ? new Date(f.wake_at).toLocaleString()
-                      : "—"}
+                  <TableCell className="text-muted-foreground text-xs">
+                    {f.wake_at ? new Date(f.wake_at).toLocaleString() : "—"}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
+                  <TableCell className="text-muted-foreground text-xs">
                     {new Date(f.updated_at).toLocaleString()}
                   </TableCell>
                   <TableCell>

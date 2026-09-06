@@ -189,6 +189,17 @@ export type SecretMeta = {
   updated_at: string
 }
 
+/** Unwrap the server's `{ "error": "..." }` envelope; fall back to the raw body. */
+function errorMessage(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown }
+    if (parsed && typeof parsed.error === "string") return parsed.error
+  } catch {
+    // not JSON
+  }
+  return body
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken()
   const res = await fetch(`${API_URL}${path}`, {
@@ -210,7 +221,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.text()
-    throw new Error(body || res.statusText)
+    throw new Error(errorMessage(body) || res.statusText)
   }
   return res.json() as Promise<T>
 }
@@ -362,10 +373,9 @@ export const api = {
   deleteAgent: (id: string) =>
     request<{ ok: boolean }>(`/api/agents/${id}`, { method: "DELETE" }),
   rotateAgentToken: (id: string) =>
-    request<{ agent: Agent; token: string }>(
-      `/api/agents/${id}/rotate-token`,
-      { method: "POST" }
-    ),
+    request<{ agent: Agent; token: string }>(`/api/agents/${id}/rotate-token`, {
+      method: "POST",
+    }),
   setGithubSecret: (projectId: string, secret: string) =>
     request<{ ok: boolean }>(`/api/projects/${projectId}/webhooks/github`, {
       method: "PUT",
@@ -493,9 +503,7 @@ export function definitionToYaml(def: PipelineDefinition): string {
     if (s.matrix && Object.keys(s.matrix).length) {
       lines.push("    matrix:")
       for (const [axis, values] of Object.entries(s.matrix)) {
-        lines.push(
-          `      ${axis}: [${values.map(yamlQuote).join(", ")}]`
-        )
+        lines.push(`      ${axis}: [${values.map(yamlQuote).join(", ")}]`)
       }
     }
     if (s.artifacts?.length) {
@@ -510,7 +518,7 @@ export function definitionToYaml(def: PipelineDefinition): string {
       }
     }
   }
-  return lines.join("\n") + "\n"
+  return `${lines.join("\n")}\n`
 }
 
 function yamlQuote(s: string): string {

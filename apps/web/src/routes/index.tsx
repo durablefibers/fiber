@@ -55,7 +55,8 @@ function ProjectsPage() {
       <header className="border-border/70 border-b px-8 py-6">
         <h1 className="font-semibold text-2xl tracking-tight">Projects</h1>
         <p className="mt-1 text-muted-foreground text-sm">
-          Pipeline canvas, agents, and runs — calm project UI, Jenkins-capable CI.
+          Pipeline canvas, agents, and runs — calm project UI, Jenkins-capable
+          CI.
         </p>
       </header>
       <div className="flex flex-1 flex-col gap-6 px-8 py-6">

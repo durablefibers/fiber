@@ -31,6 +31,7 @@ make agent         # needs FIBER_AGENT_TOKEN
 make login         # session → ~/.fiber/token
 make validate      # examples/fiber.yml
 make check         # fmt --check + clippy -D warnings
+make test          # cargo test --workspace + apps/web vitest
 make dogfood       # authz + pools + artifacts smokes
 make dogfood-s3    # MinIO presign (api-s3 running)
 make ready         # GET /ready
@@ -67,9 +68,13 @@ Product prefix is **`fiber`** / `FIBER_*` — see `.cursor/rules/naming.mdc`. Ne
 
 ```bash
 make check   # cargo fmt --check + clippy -D warnings
+make test    # cargo test --workspace, then apps/web vitest
+cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # web lint/format, types, build
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs fmt, clippy, build, and `apps/web` `tsc --noEmit` on push/PR to `main`.
+GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`: Rust fmt, clippy (`-D warnings`), `cargo test --workspace`, build; `apps/web` Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`; and a `docker build` of `deploy/Dockerfile.api` and `apps/web/Dockerfile.web`. The Rust toolchain is pinned by `rust-toolchain.toml` (kept in step with `deploy/Dockerfile.api`).
+
+Web unit tests live next to their modules as `src/**/*.test.ts(x)` and run under `vitest.config.ts` (jsdom; `src/test-setup.ts` installs an in-memory `localStorage`).
 
 ## Agent tips
 
