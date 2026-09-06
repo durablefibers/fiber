@@ -6,6 +6,38 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **Steps only see what they need.** A step's environment is cleared before its own is
+  applied, so repo-supplied shell can no longer read the agent's `FIBER_AGENT_TOKEN`
+  (which would let it lease other projects' steps and read their secrets). Docker steps
+  receive their environment through a `0600` env-file instead of `-e KEY=VALUE`, which
+  put every project secret in the host's process list. Secret values are masked as `***`
+  in log lines. A new `secrets:` list on a step narrows which project secrets it gets at
+  all; omitted still means all of them.
+- **Container limits.** Step containers run with `--security-opt no-new-privileges` and a
+  512 process limit, plus configurable `--user`, `--network`, `--memory`, and `--cpus`
+  (`FIBER_AGENT_DOCKER_*`). Memory and CPU limits are off by default so an upgrade cannot
+  start OOM-killing existing builds; whatever applies is logged as a `system` line.
+- **Environment-variable names are validated** before reaching a step. A `docker
+  --env-file` line without `=` means "copy this variable from my own environment", so a
+  pipeline could otherwise use a matrix axis name containing a newline to make the docker
+  client hand the step the agent's token. The docker client now also starts from a cleared
+  environment.
+
+### Fixed
+
+- **Each step gets its own workspace**, so steps of one run on the same agent no longer
+  overwrite each other's build output. Steps of a run share one git clone through
+  worktrees, so the second step costs a checkout rather than another fetch.
+- **Workspaces are cleaned up**: a step's directory goes when it finishes (including on
+  cancel, timeout, or failure), the run's tree when its last step on that agent finishes,
+  and anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` is swept at startup. They
+  previously accumulated for the life of the agent.
+- **Artifacts restore from dependencies only.** A step receives the artifacts of the
+  steps it transitively `needs`, not every artifact in the run, so a parallel sibling
+  cannot drop files into its workspace.
+
 ## [0.2.0] — 2026-09-06
 
 Security and correctness hardening from a full platform audit, plus agent packaging.

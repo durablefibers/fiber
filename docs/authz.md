@@ -59,7 +59,7 @@ CLI: `fiber members …` — [cli.md](./cli.md).
 
 ## Secrets
 
-Project secrets (`POST/GET/DELETE /api/projects/{id}/secrets`) inject as env vars into every step.
+Project secrets (`POST/GET/DELETE /api/projects/{id}/secrets`) inject as env vars. By default every step of the project receives all of them; a step can narrow that with `secrets:` in the pipeline (see [pipeline-yaml](./pipeline-yaml.md)). Agents mask secret values in log lines and pass them to containers through a private env-file rather than the command line.
 
 - At rest: AES-GCM when `FIBER_SECRETS_KEY` is 64 hex chars; otherwise plaintext (dev warning)
 - Admins+ only to list/mutate

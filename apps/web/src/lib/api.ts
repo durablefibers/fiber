@@ -85,6 +85,8 @@ export type StepDefinition = {
   if?: string
   /** Per-attempt wall-clock limit in minutes (server default 60 when unset). */
   timeout_minutes?: number
+  /** Project secrets to inject, by name. Omitted = all of them; `[]` = none. */
+  secrets?: string[]
 }
 
 export type Artifact = {
@@ -521,6 +523,9 @@ export function definitionToYaml(def: PipelineDefinition): string {
     if (s.retries) lines.push(`    retries: ${s.retries}`)
     if (s.timeout_minutes) {
       lines.push(`    timeout_minutes: ${s.timeout_minutes}`)
+    }
+    if (s.secrets) {
+      lines.push(`    secrets: [${s.secrets.map(yamlQuote).join(", ")}]`)
     }
     if (s.if) lines.push(`    if: ${yamlQuote(s.if)}`)
     if (s.matrix && Object.keys(s.matrix).length) {

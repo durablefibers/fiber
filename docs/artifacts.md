@@ -1,5 +1,9 @@
 # Artifacts
 
+Artifacts are how files move between steps: every step gets its own workspace, and before
+a step runs it receives the artifacts produced by the steps it transitively `needs` —
+not everything the run has produced, so a parallel sibling cannot drop files into it.
+
 Steps declare workspace-relative paths under `artifacts:`. After a **successful** step, the agent uploads each path. Later steps in the same run receive a `restore` list in their Offer and download those files into the workspace before `run`.
 
 ## Local backend (default)
