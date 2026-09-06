@@ -11,8 +11,10 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-const QUEUE_KEY: &str = "fiber:ready_steps";
 const EVENTS_CHANNEL: &str = "fiber:events";
+/// Agent-directed messages (cancel, disconnect) fanned out to every API instance, so
+/// the one holding the agent's socket delivers them.
+const AGENT_CMDS_CHANNEL: &str = "fiber:agent_cmds";
 const LEASE_SECS: i64 = 300;
 
 #[derive(Clone)]
@@ -39,10 +41,22 @@ pub struct AgentPresence {
     pub project_id: Option<Uuid>,
 }
 
+/// Envelope on `fiber:agent_cmds`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadyOffer {
-    pub step_run_id: Uuid,
-    pub labels: Vec<String>,
+pub struct AgentCommand {
+    pub agent_id: Uuid,
+    pub kind: AgentCommandKind,
+}
+
+/// Deliberately narrow: nothing on this channel can make an agent *run* anything, so a
+/// Redis compromise cannot become code execution on build machines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentCommandKind {
+    /// Kill a step the agent is running (run cancel, timeout).
+    Cancel { step_run_id: Uuid },
+    /// Terminate the agent's session here (token rotated, agent deleted).
+    Disconnect { reason: String },
 }
 
 impl Scheduler {
@@ -127,6 +141,83 @@ impl Scheduler {
         Ok(())
     }
 
+    async fn publish_agent_command(&self, cmd: &AgentCommand) {
+        let Ok(payload) = serde_json::to_string(cmd) else {
+            return;
+        };
+        let envelope = format!("{}|{}", self.instance_id, payload);
+        let mut redis = self.redis.clone();
+        if let Err(e) = redis
+            .publish::<_, _, ()>(AGENT_CMDS_CHANNEL, envelope)
+            .await
+        {
+            warn!(error = %e, "redis publish fiber:agent_cmds failed");
+        }
+    }
+
+    /// Subscribe to `fiber:agent_cmds` and deliver commands to agents connected to
+    /// this instance. Dedicated connection (pubsub holds the link).
+    pub async fn agent_cmds_loop(self: Arc<Self>, redis_url: String) {
+        loop {
+            if let Err(e) = self.agent_cmds_loop_once(&redis_url).await {
+                warn!(error = %e, "redis agent-command subscriber ended; reconnecting");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn agent_cmds_loop_once(&self, redis_url: &str) -> Result<()> {
+        use futures_util::StreamExt;
+        let client = redis::Client::open(redis_url)?;
+        let mut pubsub = client.get_async_pubsub().await?;
+        pubsub.subscribe(AGENT_CMDS_CHANNEL).await?;
+        info!(
+            channel = AGENT_CMDS_CHANNEL,
+            "subscribed to redis agent commands"
+        );
+        let mut stream = pubsub.on_message();
+        while let Some(msg) = stream.next().await {
+            let envelope: String = msg.get_payload().unwrap_or_default();
+            let Some((origin, payload)) = envelope.split_once('|') else {
+                continue;
+            };
+            if origin == self.instance_id.to_string() {
+                continue;
+            }
+            let Ok(cmd) = serde_json::from_str::<AgentCommand>(payload) else {
+                continue;
+            };
+            self.apply_agent_command(cmd).await;
+        }
+        Ok(())
+    }
+
+    /// Apply a command for an agent that may be connected to this instance.
+    async fn apply_agent_command(&self, cmd: AgentCommand) {
+        match cmd.kind {
+            AgentCommandKind::Cancel { step_run_id } => {
+                self.deliver_cancel(cmd.agent_id, step_run_id, true).await;
+            }
+            AgentCommandKind::Disconnect { reason } => {
+                if !self.has_connection(cmd.agent_id).await {
+                    return;
+                }
+                self.send_local(cmd.agent_id, ServerMessage::Error { message: reason })
+                    .await;
+                // Requeue is idempotent (the originating instance already did it).
+                let _ = self.on_agent_disconnect(cmd.agent_id).await;
+            }
+        }
+    }
+
+    async fn send_local(&self, agent_id: Uuid, msg: ServerMessage) -> bool {
+        let conns = self.connections.read().await;
+        match conns.get(&agent_id) {
+            Some(tx) => tx.send(msg).is_ok(),
+            None => false,
+        }
+    }
+
     pub async fn register_agent(
         &self,
         agent_id: Uuid,
@@ -182,8 +273,10 @@ impl Scheduler {
     }
 
     /// Notify the agent and drop its outbound channel (writer exits; reads should stop).
+    /// End an agent's session wherever it is connected: locally now, and on every
+    /// other instance via `fiber:agent_cmds`. Its running steps are requeued.
     pub async fn force_disconnect_agent(&self, agent_id: Uuid, reason: &str) {
-        self.send_to_agent(
+        self.send_local(
             agent_id,
             ServerMessage::Error {
                 message: reason.to_string(),
@@ -191,12 +284,48 @@ impl Scheduler {
         )
         .await;
         let _ = self.on_agent_disconnect(agent_id).await;
+        self.publish_agent_command(&AgentCommand {
+            agent_id,
+            kind: AgentCommandKind::Disconnect {
+                reason: reason.to_string(),
+            },
+        })
+        .await;
     }
 
-    pub async fn send_to_agent(&self, agent_id: Uuid, msg: ServerMessage) {
-        let conns = self.connections.read().await;
-        if let Some(tx) = conns.get(&agent_id) {
-            let _ = tx.send(msg);
+    /// Ask the agent holding `step_run_id` to kill it, wherever it is connected:
+    /// delivered here if the socket is local, and always fanned out over Redis (a
+    /// local send success only proves the writer task is alive, not that this replica
+    /// still holds the agent's live socket). `release_slot` frees the agent's
+    /// concurrency slot on the delivering replica — pass `false` when the completion
+    /// path already did.
+    pub async fn cancel_step_on_agent(
+        &self,
+        agent_id: Uuid,
+        step_run_id: Uuid,
+        release_slot: bool,
+    ) {
+        self.deliver_cancel(agent_id, step_run_id, release_slot)
+            .await;
+        self.publish_agent_command(&AgentCommand {
+            agent_id,
+            kind: AgentCommandKind::Cancel { step_run_id },
+        })
+        .await;
+    }
+
+    async fn deliver_cancel(&self, agent_id: Uuid, step_run_id: Uuid, release_slot: bool) {
+        if !self
+            .send_local(agent_id, ServerMessage::Cancel { step_run_id })
+            .await
+        {
+            return;
+        }
+        if release_slot {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(&agent_id) {
+                a.inflight = a.inflight.saturating_sub(1);
+            }
         }
     }
 
@@ -241,15 +370,12 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Steps are pulled from Postgres by `offer_for_agent` on every heartbeat and
+    /// completion, so becoming `queued` is the whole enqueue. Kept as a hook for
+    /// logging / a future push-notify; there is deliberately no Redis queue (the old
+    /// list was never consumed and was rotated in full on every lease).
     pub async fn enqueue_step(&self, step_run_id: Uuid, labels: Vec<String>) -> Result<()> {
-        let offer = ReadyOffer {
-            step_run_id,
-            labels,
-        };
-        let payload = serde_json::to_string(&offer)?;
-        let mut redis = self.redis.clone();
-        let _: () = redis.rpush(QUEUE_KEY, payload).await?;
-        debug!(%step_run_id, "enqueued step");
+        debug!(%step_run_id, ?labels, "step queued");
         Ok(())
     }
 
@@ -259,14 +385,8 @@ impl Scheduler {
 
         for s in &running {
             if let Some(aid) = s.agent_id {
-                {
-                    let mut agents = self.agents.write().await;
-                    if let Some(a) = agents.get_mut(&aid) {
-                        a.inflight = a.inflight.saturating_sub(1);
-                    }
-                }
-                self.send_to_agent(aid, ServerMessage::Cancel { step_run_id: s.id })
-                    .await;
+                // The replica that delivers the Cancel releases the agent's slot.
+                self.cancel_step_on_agent(aid, s.id, true).await;
             }
             let ev = RunEvent::StepUpdated {
                 run_id: s.run_id,
@@ -349,28 +469,11 @@ impl Scheduler {
                         a.inflight += 1;
                     }
                     info!(%agent_id, step = %leased.step_id, "leased step");
-                    let _ = self.drain_redis_step(leased.id).await;
                     return Ok(Some(leased));
                 }
             }
         }
         Ok(None)
-    }
-
-    async fn drain_redis_step(&self, step_run_id: Uuid) -> Result<()> {
-        let mut redis = self.redis.clone();
-        let len: isize = redis.llen(QUEUE_KEY).await.unwrap_or(0);
-        for _ in 0..len {
-            let item: Option<String> = redis.lpop(QUEUE_KEY, None).await?;
-            if let Some(s) = item {
-                if let Ok(offer) = serde_json::from_str::<ReadyOffer>(&s) {
-                    if offer.step_run_id != step_run_id {
-                        let _: () = redis.rpush(QUEUE_KEY, s).await?;
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub async fn renew_leases(&self, agent_id: Uuid) -> Result<()> {
@@ -504,15 +607,10 @@ impl Scheduler {
     #[tracing::instrument(skip(self), level = "info")]
     async fn tick_schedules(&self) -> Result<()> {
         let now = chrono::Utc::now();
-        // Fast path: in-memory index says nothing is due yet.
-        if let Some(earliest) = self.schedule_due.earliest() {
-            if earliest > now {
-                debug!(%earliest, "no pipeline schedules due yet");
-                return Ok(());
-            }
-        }
-
-        // DB is source of truth (index may over-report or be empty before seed/create).
+        // Always ask Postgres (an indexed scan of `next_due_at`). The in-memory due
+        // index is seeded at boot and not updated when pipelines are created or
+        // edited through the API — using it as a gate meant schedules created after
+        // boot never fired until the next restart.
         let pipelines = self.store.list_due_pipelines(now).await?;
         for p in pipelines {
             let Ok(def) = fiber_core::store::value_to_definition(&p.definition) else {
@@ -528,20 +626,29 @@ impl Scheduler {
                 self.schedule_due.set(p.id, None);
                 continue;
             }
-            let recent = self.store.list_runs(p.project_id, 20).await?;
-            let active = recent.iter().any(|r| {
-                r.pipeline_id == p.id && matches!(r.status.as_str(), "pending" | "running")
-            });
-            if active {
+            let Some(observed_due) = p.next_due_at else {
+                continue;
+            };
+            let next = next_due_from_triggers(on, Utc::now());
+            // Compare-and-set on next_due_at (plus "no active run"): across several API
+            // instances exactly one claims the slot; the rest see it already advanced.
+            // While a run is still active the slot stays put and is retried next tick.
+            if !self
+                .store
+                .claim_schedule_slot(p.id, observed_due, next)
+                .await?
+            {
+                debug!(pipeline = %p.id, "schedule slot not claimed (active run or claimed elsewhere)");
                 continue;
             }
+            self.schedule_due.set(p.id, next);
             let trigger = schedule_trigger_label(on);
             info!(pipeline = %p.id, %trigger, "scheduled run");
-            let (run, _, _) = self.store.start_run(p.id, &trigger).await?;
-            let next = next_due_from_triggers(on, Utc::now());
-            self.store.mark_scheduled(p.id, next).await?;
-            self.schedule_due.set(p.id, next);
-            self.enqueue_run_ready(run.id).await?;
+            match self.store.start_run(p.id, &trigger).await {
+                Ok((run, _, _)) => self.enqueue_run_ready(run.id).await?,
+                // The slot is already advanced; skipping one occurrence beats double-firing.
+                Err(e) => warn!(pipeline = %p.id, error = %e, "scheduled run failed to start"),
+            }
         }
         Ok(())
     }
@@ -563,9 +670,9 @@ impl Scheduler {
         let stale = self.store.mark_stale_agents_offline(stale_secs).await?;
         for agent_id in stale {
             info!(%agent_id, stale_secs, "marked agent offline (stale heartbeat)");
-            if let Err(e) = self.on_agent_disconnect(agent_id).await {
-                warn!(error = %e, %agent_id, "stale agent disconnect cleanup failed");
-            }
+            // Requeues here and drops the socket on whichever replica still holds it.
+            self.force_disconnect_agent(agent_id, "stale heartbeat — reconnect")
+                .await;
         }
 
         let requeued = self.store.requeue_expired_leases().await?;
@@ -594,4 +701,43 @@ fn labels_match(agent: &[String], required: &[String]) -> bool {
         return true;
     }
     required.iter().all(|r| agent.iter().any(|a| a == r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_command_round_trips() {
+        let cmd = AgentCommand {
+            agent_id: Uuid::nil(),
+            kind: AgentCommandKind::Cancel {
+                step_run_id: Uuid::nil(),
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"cancel\""));
+        let back: AgentCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.kind, AgentCommandKind::Cancel { .. }));
+        // Nothing executable can ride this channel.
+        assert!(serde_json::from_str::<AgentCommand>(
+            r#"{"agent_id":"00000000-0000-0000-0000-000000000000","kind":{"type":"message","message":{"type":"offer"}}}"#
+        )
+        .is_err());
+        let d = serde_json::to_string(&AgentCommand {
+            agent_id: Uuid::nil(),
+            kind: AgentCommandKind::Disconnect { reason: "x".into() },
+        })
+        .unwrap();
+        assert!(d.contains("\"type\":\"disconnect\""));
+    }
+
+    #[test]
+    fn labels_match_requires_all_required() {
+        let agent = vec!["os=linux".to_string(), "docker=true".to_string()];
+        assert!(labels_match(&agent, &[]));
+        assert!(labels_match(&agent, &["os=linux".to_string()]));
+        assert!(!labels_match(&agent, &["os=macos".to_string()]));
+        assert!(!labels_match(&[], &["os=linux".to_string()]));
+    }
 }

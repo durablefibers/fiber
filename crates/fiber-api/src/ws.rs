@@ -29,7 +29,8 @@ pub async fn agent_ws(
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
     };
-    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id))
+    let token_hash = fiber_core::tokens::hash_token(&qs.token);
+    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash))
 }
 
 /// Build the offer for a leased step from the run's definition snapshot **only**.
@@ -192,7 +193,7 @@ async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Opt
 
 /// `agent_id` is bound once from the authenticated token and never rebound from a
 /// client-supplied field: an agent may only ever act as itself.
-async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
+async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_hash: String) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -277,6 +278,19 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
             }
             AgentMessage::Heartbeat { agent_id: claimed } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                // Revocation must not depend on Redis delivery: a rotated or deleted token
+                // ends the session on its next heartbeat, whichever replica holds it.
+                let still_valid = matches!(
+                    state.store.get_agent(agent_id).await,
+                    Ok(Some(a)) if a.token_hash == token_hash
+                );
+                if !still_valid {
+                    warn!(%agent_id, "agent token no longer valid; ending session");
+                    let _ = tx.send(ServerMessage::Error {
+                        message: "agent token revoked — reconnect with a valid token".into(),
+                    });
+                    break;
+                }
                 // force_disconnect_agent drops the connection; the next heartbeat ends the session.
                 if !state.scheduler.has_connection(agent_id).await {
                     let _ = tx.send(ServerMessage::Error {

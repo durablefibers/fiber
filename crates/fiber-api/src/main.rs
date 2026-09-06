@@ -95,6 +95,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         events_bus.events_loop(redis_url).await;
     });
+    let agent_cmds = scheduler.clone();
+    let redis_url = args.redis_url.clone();
+    tokio::spawn(async move {
+        agent_cmds.agent_cmds_loop(redis_url).await;
+    });
     let fibers = fiber_scheduler.clone();
     tokio::spawn(async move {
         fibers.run_loop().await;

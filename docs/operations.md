@@ -45,7 +45,16 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `FIBER_OTEL_ENDPOINT` to an OTLP HTTP colle
 
 ## Multi-instance
 
-Redis channel `fiber:events` fans out run events so multiple API processes can share UI subscriptions. Leases and DB remain the source of truth for execution.
+`fiber-api` can run as several replicas against one Postgres and one Redis:
+
+- **Leases** — `lease_step`, lease renewal, expired-lease reclaim and stale-agent marking are single conditional `UPDATE ... RETURNING` statements; two replicas cannot lease the same step.
+- **Propagation** — unlocking dependents / cascading skips / finishing a run happens in one transaction with the run row locked.
+- **Schedules** — a cron/interval slot is claimed with a compare-and-set on `pipelines.next_due_at` (plus "no active run"), so exactly one replica starts each scheduled run.
+- **Durable fibers** — ready fibers are claimed with `UPDATE ... FOR UPDATE SKIP LOCKED`; a fiber runs on one replica per attempt.
+- **Redis `fiber:events`** — run/step/log events fan out so `/ws/runs/{id}` subscribers on any replica see them.
+- **Redis `fiber:agent_cmds`** — agent-directed messages (run cancel, token rotation / delete disconnects) fan out so the replica holding the agent's socket delivers them.
+
+Agent presence (labels, concurrency, in-flight counts) is per replica: an agent is offered steps by the replica it is connected to. Redis is not a queue — queued steps live in Postgres and are pulled on each agent heartbeat.
 
 ## Dogfood scripts
 
@@ -99,6 +108,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 ## Upgrades
 
 - Schema: sqlx migrations under `crates/fiber-core/migrations/` run on API boot  
+- Redis no longer carries a step queue; after upgrading, `DEL fiber:ready_steps` removes the orphaned list left by older versions  
 - Migration `007_indexes.sql` adds nine indexes (`step_runs`, `artifacts`, `log_lines`, `sessions`, `runs`, `step_attempts`). It runs at the first boot of the new version and holds a `SHARE` lock on each table while that index builds — writes to `log_lines` pause for the duration, which is seconds on a typical install. On a very large `log_lines` table, run retention first or apply the statements by hand with `CREATE INDEX CONCURRENTLY` before upgrading (the migration's `IF NOT EXISTS` then skips them).
 
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  

@@ -211,24 +211,36 @@ impl FiberStore {
     }
 
     /// Ready: pending, suspended with wake_at <= now, or running with stale heartbeat.
-    pub async fn list_ready(
-        &self,
-        now: DateTime<Utc>,
-        stale_after_secs: i64,
-    ) -> Result<Vec<FiberRecord>> {
-        let stale_before = now - chrono::Duration::seconds(stale_after_secs);
+    /// Atomically claim up to 50 ready fibers: pending, suspended-and-due, or running
+    /// with a stale heartbeat. The claim flips them to `running`, bumps `attempts`, and
+    /// stamps the heartbeat inside the same statement (`FOR UPDATE SKIP LOCKED`), so two
+    /// API instances sweeping concurrently never execute the same fiber twice.
+    /// Atomically claim up to `limit` ready fibers: pending, suspended-and-due, or
+    /// running with a stale heartbeat. The claim flips them to `running`, bumps
+    /// `attempts`, and stamps the heartbeat inside the same statement
+    /// (`FOR UPDATE SKIP LOCKED`), so two API instances sweeping concurrently never
+    /// execute the same fiber twice. All timestamps come from the database clock so
+    /// replicas with skewed clocks do not see each other's fresh claims as stale.
+    pub async fn claim_ready(&self, stale_after_secs: i64, limit: i64) -> Result<Vec<FiberRecord>> {
         let rows = sqlx::query_as::<_, FiberRow>(
-            "SELECT id, project_id, name, status, input, state, result, error, attempts,
-                    wake_at, heartbeat_at, created_at, updated_at
-             FROM fibers
-             WHERE status = 'pending'
-                OR (status = 'suspended' AND (wake_at IS NULL OR wake_at <= $1))
-                OR (status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < $2))
-             ORDER BY created_at ASC
-             LIMIT 50",
+            "UPDATE fibers
+             SET status = 'running', attempts = attempts + 1, heartbeat_at = NOW(),
+                 wake_at = NULL, updated_at = NOW()
+             WHERE id IN (
+                 SELECT id FROM fibers
+                 WHERE status = 'pending'
+                    OR (status = 'suspended' AND (wake_at IS NULL OR wake_at <= NOW()))
+                    OR (status = 'running'
+                        AND (heartbeat_at IS NULL
+                             OR heartbeat_at < NOW() - make_interval(secs => $1)))
+                 ORDER BY created_at ASC
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED)
+             RETURNING id, project_id, name, status, input, state, result, error, attempts,
+                       wake_at, heartbeat_at, created_at, updated_at",
         )
-        .bind(now)
-        .bind(stale_before)
+        .bind(stale_after_secs as f64)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -327,12 +339,12 @@ impl Durability for FiberStore {
         FiberStore::save(self, record).await
     }
 
-    async fn list_ready(
+    async fn claim_ready(
         &self,
-        now: DateTime<Utc>,
         stale_after_secs: i64,
+        limit: i64,
     ) -> anyhow::Result<Vec<FiberRecord>> {
-        FiberStore::list_ready(self, now, stale_after_secs).await
+        FiberStore::claim_ready(self, stale_after_secs, limit).await
     }
 }
 

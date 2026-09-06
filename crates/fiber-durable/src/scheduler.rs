@@ -9,6 +9,9 @@ use tracing::{debug, info, warn};
 const POLL_SECS: u64 = 2;
 const STALE_AFTER_SECS: i64 = 60;
 const MAX_ATTEMPTS: i32 = 3;
+/// Fibers claimed per sweep. They run concurrently, so a slow one cannot let the
+/// others' claims go stale (and be re-claimed elsewhere) while they wait their turn.
+const CLAIM_BATCH: i64 = 20;
 
 #[derive(Clone)]
 pub struct FiberScheduler {
@@ -59,19 +62,32 @@ impl FiberScheduler {
             }
         }
 
-        let ready = self.store.list_ready(now, STALE_AFTER_SECS).await?;
+        let ready = self
+            .store
+            .claim_ready(STALE_AFTER_SECS, CLAIM_BATCH)
+            .await?;
         let mut n = 0;
         let mut touched = std::collections::HashSet::new();
+        let mut tasks = tokio::task::JoinSet::new();
         for record in ready {
             touched.insert(record.project_id);
-            let name = record.name.clone();
-            let id = record.id;
-            match run_fiber(&self.store, &self.registry, record, MAX_ATTEMPTS).await {
-                Ok(outcome) => {
+            let store = self.store.clone();
+            let registry = self.registry.clone();
+            tasks.spawn(async move {
+                let name = record.name.clone();
+                let id = record.id;
+                let result = run_fiber(&store, &registry, record, MAX_ATTEMPTS).await;
+                (id, name, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((id, name, Ok(outcome))) => {
                     info!(%id, %name, ?outcome, "fiber ran");
                     n += 1;
                 }
-                Err(e) => warn!(%id, %name, error = %e, "fiber run error"),
+                Ok((id, name, Err(e))) => warn!(%id, %name, error = %e, "fiber run error"),
+                Err(e) => warn!(error = %e, "fiber task panicked"),
             }
         }
         for project_id in touched {

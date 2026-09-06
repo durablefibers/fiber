@@ -387,22 +387,32 @@ impl Store {
             .await?)
     }
 
-    /// After a schedule fire: stamp `last_scheduled_at` and set the next wake.
-    pub async fn mark_scheduled(
+    /// Claim one schedule slot with a compare-and-set: succeeds only if `next_due_at`
+    /// is still the value the caller observed **and** the pipeline has no active run.
+    /// With several API instances ticking the same schedule, exactly one wins.
+    /// Returns `false` when another instance claimed it or a run is still active.
+    pub async fn claim_schedule_slot(
         &self,
         pipeline_id: Uuid,
+        expected_due: DateTime<Utc>,
         next_due: Option<DateTime<Utc>>,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let claimed: Option<Uuid> = sqlx::query_scalar(
             "UPDATE pipelines
-             SET last_scheduled_at = NOW(), next_due_at = $2
-             WHERE id = $1",
+             SET last_scheduled_at = NOW(), next_due_at = $3
+             WHERE id = $1
+               AND next_due_at = $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM runs r
+                   WHERE r.pipeline_id = $1 AND r.status IN ('pending', 'running'))
+             RETURNING id",
         )
         .bind(pipeline_id)
+        .bind(expected_due)
         .bind(next_due)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(claimed.is_some())
     }
 
     /// Clear schedule wake time (no schedule configured).

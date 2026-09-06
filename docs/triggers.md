@@ -46,7 +46,7 @@ on:
 ```
 
 - Cron wins if both are set.
-- Due times stored on `pipelines.next_due_at`; scheduler self-reschedules after fire.
+- Due times stored on `pipelines.next_due_at`; the scheduler polls Postgres every 30 s, so a schedule saved through the API or UI fires on the next tick without a restart. With several API replicas the slot is claimed with a compare-and-set, so each occurrence starts exactly one run; while a previous run of the pipeline is still active the occurrence is skipped and retried next tick.
 - Trigger label looks like `schedule:60m` or cron-derived.
 
 ## Webhook security

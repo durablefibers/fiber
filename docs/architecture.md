@@ -41,7 +41,7 @@
 3. **Offer / lease** — Connected agent receives `Offer` over WS (workspace, env, artifact restore list).
 4. **Execute** — Agent prepares git workspace, restores prior artifacts, runs shell or Docker, streams `LogChunk`.
 5. **Complete** — Agent reports status; scheduler unlocks dependents or skips on failure (fail-fast).
-6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers.
+6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers; agent-directed messages (cancel, disconnect) fan out on `fiber:agent_cmds` to whichever instance holds the agent's socket.
 
 ## Durability model
 
