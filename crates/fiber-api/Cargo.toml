@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "HTTP and WebSocket control plane for Fiber, the self-hosted DAG CI."
+description = "HTTP and WebSocket control plane for Fiber, the self-hosted durable CI."
 
 [[bin]]
 name = "fiber-api"

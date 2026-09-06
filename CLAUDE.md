@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Fiber — self-hosted, canvas-first DAG CI ("Jenkins alternative"). Rust control plane + TypeScript UI. Repo folder is `durablefibers`; **all code, crates, binaries, env vars, and Docker services use the `fiber` / `FIBER_*` prefix** — never `df`, `durablefibers`, or `durable_fibers` (`.claude/rules/naming.md`).
+Fiber — self-hosted, canvas-first durable CI ("Jenkins alternative"). Rust control plane + TypeScript UI. Repo folder is `durablefibers`; **all code, crates, binaries, env vars, and Docker services use the `fiber` / `FIBER_*` prefix** — never `df`, `durablefibers`, or `durable_fibers` (`.claude/rules/naming.md`).
 
 ## Commands
 

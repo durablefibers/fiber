@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking. Fiber is a self-hosted DAG CI system: a Rust control plane, a
+Thanks for looking. Fiber is a self-hosted durable CI system: a Rust control plane, a
 TypeScript UI, and an agent that executes pipeline steps.
 
 ## Getting set up
