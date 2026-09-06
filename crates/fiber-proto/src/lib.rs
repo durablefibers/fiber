@@ -60,6 +60,11 @@ pub struct StepDefinition {
     /// Condition: `success()` (default), `always()`, `never()`, or `matrix.os == 'linux'`.
     #[serde(default, rename = "if")]
     pub if_expr: Option<String>,
+    /// Wall-clock limit for one attempt of this step, in minutes (workspace prep and
+    /// artifact restore included). Unset = the server default
+    /// (`FIBER_STEP_TIMEOUT_DEFAULT_MINUTES`, 60).
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
 }
 
 fn default_retries() -> u32 {
@@ -124,6 +129,9 @@ pub struct PipelineDefinition {
     #[serde(default)]
     pub on: Option<PipelineTriggers>,
     pub steps: Vec<StepDefinition>,
+    /// Wall-clock limit for the whole run, in minutes, from run start. Unset = none.
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +218,10 @@ pub enum ServerMessage {
         /// Prior artifacts to restore into the workspace before the step runs.
         #[serde(default)]
         restore: Vec<ArtifactRestore>,
+        /// Attempt wall-clock limit in minutes; the agent kills the step past it and
+        /// the server independently fails it after a grace period. Absent from old servers.
+        #[serde(default)]
+        timeout_minutes: Option<u32>,
     },
     Cancel {
         step_run_id: Uuid,

@@ -381,7 +381,15 @@ impl Scheduler {
 
     /// Cancel run in DB, notify agents to kill in-flight steps, publish events.
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<fiber_core::Run> {
-        let (run, running) = self.store.cancel_run(run_id).await?;
+        self.cancel_run_with_reason(run_id, None).await
+    }
+
+    pub async fn cancel_run_with_reason(
+        &self,
+        run_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<fiber_core::Run> {
+        let (run, running) = self.store.cancel_run_with_reason(run_id, reason).await?;
 
         for s in &running {
             if let Some(aid) = s.agent_id {
@@ -429,27 +437,40 @@ impl Scheduler {
 
     /// Find a queued step matching agent labels + project pool and lease it.
     pub async fn offer_for_agent(&self, agent_id: Uuid) -> Result<Option<fiber_core::StepRun>> {
-        {
-            let agents = self.agents.read().await;
-            if let Some(a) = agents.get(&agent_id) {
-                if a.inflight >= a.concurrency {
-                    return Ok(None);
-                }
-            }
-        }
-
+        // Reserve a concurrency slot under one write lock (check + increment together),
+        // and give it back below if nothing was leased. Two concurrent offers for the
+        // same agent can no longer both pass the check.
         // Fail closed without presence: a socket that never sent Hello (or whose
         // presence was reclaimed) gets nothing rather than the global pool.
         let agent_labels = {
-            let agents = self.agents.read().await;
-            match agents.get(&agent_id) {
-                Some(a) => a.labels.clone(),
+            let mut agents = self.agents.write().await;
+            match agents.get_mut(&agent_id) {
+                Some(a) if a.inflight >= a.concurrency => return Ok(None),
+                Some(a) => {
+                    a.inflight += 1;
+                    a.labels.clone()
+                }
                 None => {
                     debug!(%agent_id, "no presence for agent; not offering");
                     return Ok(None);
                 }
             }
         };
+        let leased = self.try_lease_for(agent_id, agent_labels).await;
+        if !matches!(leased, Ok(Some(_))) {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(&agent_id) {
+                a.inflight = a.inflight.saturating_sub(1);
+            }
+        }
+        leased
+    }
+
+    async fn try_lease_for(
+        &self,
+        agent_id: Uuid,
+        agent_labels: Vec<String>,
+    ) -> Result<Option<fiber_core::StepRun>> {
         // Pool scope is authoritative from the DB row, never from in-memory state.
         let agent_project_id = match self.store.get_agent(agent_id).await? {
             Some(a) => a.project_id,
@@ -464,10 +485,6 @@ impl Scheduler {
             let needed = step.labels_vec();
             if labels_match(&agent_labels, &needed) {
                 if let Some(leased) = self.store.lease_step(step.id, agent_id, LEASE_SECS).await? {
-                    let mut agents = self.agents.write().await;
-                    if let Some(a) = agents.get_mut(&agent_id) {
-                        a.inflight += 1;
-                    }
                     info!(%agent_id, step = %leased.step_id, "leased step");
                     return Ok(Some(leased));
                 }
@@ -525,7 +542,22 @@ impl Scheduler {
                 backoff_secs,
                 "retrying failed step"
             );
-            let retried = self.store.requeue_for_retry(step_run_id).await?;
+            // The backoff lives on the row (`not_before`), so it survives restarts and
+            // is honoured by every instance's offers.
+            let Some(retried) = self
+                .store
+                .requeue_for_retry(
+                    step_run_id,
+                    agent_id,
+                    backoff_secs as i64,
+                    exit_code,
+                    error.as_deref(),
+                )
+                .await?
+            else {
+                debug!(%step_run_id, "retry requeue skipped: step no longer running here");
+                return Ok(None);
+            };
             let ev = RunEvent::StepUpdated {
                 run_id: retried.run_id,
                 step_run_id: retried.id,
@@ -535,13 +567,6 @@ impl Scheduler {
             if let Ok(payload) = serde_json::to_string(&ev) {
                 self.publish_event(&payload).await;
             }
-            let scheduler = self.clone();
-            let labels = retried.labels_vec();
-            let sid = retried.id;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                let _ = scheduler.enqueue_step(sid, labels).await;
-            });
             return Ok(Some(retried));
         }
 
@@ -675,6 +700,8 @@ impl Scheduler {
                 .await;
         }
 
+        self.enforce_timeouts().await?;
+
         let requeued = self.store.requeue_expired_leases().await?;
         if requeued.is_empty() {
             return Ok(());
@@ -693,6 +720,69 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+}
+
+impl Scheduler {
+    /// Server-side backstop for step and run timeouts. Agents enforce the step limit
+    /// themselves; this catches agents that are old, hung, or gone, after a grace period.
+    async fn enforce_timeouts(&self) -> Result<()> {
+        let cfg = TimeoutConfig::from_env();
+        for t in self
+            .store
+            .list_timed_out_steps(cfg.default_minutes, cfg.grace_minutes)
+            .await?
+        {
+            let Some(agent_id) = t.agent_id else {
+                continue;
+            };
+            warn!(step = %t.step_id, run = %t.run_id, minutes = t.timeout_minutes, "step timed out (server backstop)");
+            let error = format!("timed out after {} min", t.timeout_minutes);
+            // Fails the attempt (honouring retries), propagates, publishes — then asks the
+            // agent to kill whatever is still running for it.
+            self.on_step_complete(
+                agent_id,
+                t.step_run_id,
+                StepStatus::Failed,
+                None,
+                Some(error),
+            )
+            .await?;
+            // on_step_complete already released the slot for a locally held agent.
+            self.cancel_step_on_agent(agent_id, t.step_run_id, false)
+                .await;
+        }
+        for (run_id, minutes) in self.store.list_timed_out_runs().await? {
+            warn!(run = %run_id, minutes, "run timed out");
+            let reason = format!("run timed out after {minutes} min");
+            self.cancel_run_with_reason(run_id, Some(&reason)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Step-timeout defaults; see docs/configuration.md.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutConfig {
+    /// Applied to steps that set no `timeout_minutes`.
+    pub default_minutes: i64,
+    /// Extra minutes the server waits past a step's timeout before failing it itself.
+    pub grace_minutes: i64,
+}
+
+impl TimeoutConfig {
+    pub fn from_env() -> Self {
+        let read = |k: &str, d: i64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v >= 1)
+                .unwrap_or(d)
+        };
+        Self {
+            default_minutes: read("FIBER_STEP_TIMEOUT_DEFAULT_MINUTES", 60),
+            grace_minutes: read("FIBER_STEP_TIMEOUT_GRACE_MINUTES", 5),
+        }
     }
 }
 

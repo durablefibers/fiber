@@ -15,6 +15,7 @@ const def: PipelineDefinition = {
     pull_request: { branches: ["main"], types: ["opened"] },
     cron: "0 */15 * * * *",
   },
+  timeout_minutes: 90,
   steps: [
     {
       id: "checkout",
@@ -30,6 +31,7 @@ const def: PipelineDefinition = {
       run: "make test\necho done",
       image: "rust:1.97",
       retries: 2,
+      timeout_minutes: 15,
       if: "matrix.os == 'linux'",
       matrix: { os: ["linux", "macos"] },
       artifacts: ["out/report.xml"],
@@ -55,6 +57,7 @@ describe("definitionToYaml", () => {
         "    branches: [main]",
         "    types: [opened]",
         '  cron: "0 */15 * * * *"',
+        "timeout_minutes: 90",
         "steps:",
         "  checkout:",
         '    labels: ["os=linux"]',
@@ -64,6 +67,7 @@ describe("definitionToYaml", () => {
         "    needs: [checkout]",
         "    image: rust:1.97",
         "    retries: 2",
+        "    timeout_minutes: 15",
         "    if: \"matrix.os == 'linux'\"",
         "    matrix:",
         "      os: [linux, macos]",

@@ -23,10 +23,20 @@ pub async fn agent_ws(
     State(state): State<AppState>,
     Query(qs): Query<AgentQs>,
 ) -> impl IntoResponse {
+    // 401 is fatal for the agent (it exits rather than retrying a revoked token), so a
+    // store error must not be mistaken for one.
     let agent = match state.store.agent_by_token(&qs.token).await {
         Ok(Some(a)) => a,
-        _ => {
+        Ok(None) => {
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        Err(e) => {
+            warn!(error = %e, "agent auth lookup failed");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "auth unavailable",
+            )
+                .into_response();
         }
     };
     let token_hash = fiber_core::tokens::hash_token(&qs.token);
@@ -46,6 +56,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     ];
     let mut artifacts = Vec::new();
     let mut workspace = None;
+    let mut timeout_minutes = None;
     match state.store.get_run(step.run_id).await {
         Ok(Some(run)) => {
             if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
@@ -59,6 +70,10 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
                 Some(s) => {
                     artifacts = snapshot_str_list(s.get("artifacts"));
                     env.extend(snapshot_env(s.get("env")));
+                    timeout_minutes = s
+                        .get("timeout_minutes")
+                        .and_then(|v| v.as_u64())
+                        .map(|m| m as u32);
                 }
                 None => warn!(
                     run_id = %step.run_id, step = %step.step_id,
@@ -70,6 +85,8 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         Err(e) => warn!(run_id = %step.run_id, error = %e, "loading run for offer"),
     }
     let restore = restore_list(state, step.run_id, step.id).await;
+    // Agents always get a limit: the step's own, else the server default.
+    let default_minutes = fiber_scheduler::TimeoutConfig::from_env().default_minutes as u32;
     ServerMessage::Offer {
         step_run_id: step.id,
         run_id: step.run_id,
@@ -81,6 +98,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         env,
         artifacts,
         restore,
+        timeout_minutes: Some(timeout_minutes.unwrap_or(default_minutes)),
     }
 }
 
