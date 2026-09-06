@@ -358,7 +358,7 @@ cargo run -p fiber-agent`}
                     <TableCell>
                       <div className="flex justify-end gap-1">
                         {!manage ? (
-                          <span className="text-muted-foreground text-[10px]">
+                          <span className="text-[10px] text-muted-foreground">
                             manage on Agents
                           </span>
                         ) : editing ? (

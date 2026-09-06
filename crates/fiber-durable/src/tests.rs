@@ -1,5 +1,5 @@
 use crate::context::FiberSuspended;
-use crate::engine::FiberOutcome;
+use crate::engine::{FiberOutcome, failure_outcome};
 use crate::registry::FiberRegistry;
 use crate::tasks::register_builtin_tasks;
 use crate::types::{FiberState, FiberStatus};
@@ -54,9 +54,18 @@ fn fiber_status_roundtrip() {
 
 #[test]
 fn fiber_outcome_serde() {
-    let o = FiberOutcome::Suspended;
-    let v = serde_json::to_value(o).unwrap();
-    assert_eq!(v, json!("suspended"));
+    for (o, expected) in [
+        (FiberOutcome::Completed, "completed"),
+        (FiberOutcome::Suspended, "suspended"),
+        (FiberOutcome::Failed, "failed"),
+        (FiberOutcome::Retry, "retry"),
+    ] {
+        assert_eq!(serde_json::to_value(o).unwrap(), json!(expected));
+        assert_eq!(
+            serde_json::from_value::<FiberOutcome>(json!(expected)).unwrap(),
+            o
+        );
+    }
 }
 
 #[test]
@@ -73,17 +82,14 @@ fn fiber_state_sleeps_done_in_checkpoint_blob() {
 }
 
 #[test]
-fn max_attempts_outcome_is_failed_when_exhausted() {
-    // Contract: engine returns Failed when attempts >= max_attempts (see run_fiber).
-    let attempts = 3;
-    let max_attempts = 3;
-    assert!(attempts >= max_attempts);
-    assert_eq!(
-        if attempts >= max_attempts {
-            FiberOutcome::Failed
-        } else {
-            FiberOutcome::Retry
-        },
-        FiberOutcome::Failed
-    );
+fn failure_outcome_retries_until_max_attempts() {
+    // run_fiber increments attempts before calling the handler, so the first failure
+    // arrives with attempts == 1.
+    assert_eq!(failure_outcome(1, 3), FiberOutcome::Retry);
+    assert_eq!(failure_outcome(2, 3), FiberOutcome::Retry);
+    assert_eq!(failure_outcome(3, 3), FiberOutcome::Failed);
+    assert_eq!(failure_outcome(4, 3), FiberOutcome::Failed);
+    // max_attempts <= 1 means no retries at all.
+    assert_eq!(failure_outcome(1, 1), FiberOutcome::Failed);
+    assert_eq!(failure_outcome(1, 0), FiberOutcome::Failed);
 }

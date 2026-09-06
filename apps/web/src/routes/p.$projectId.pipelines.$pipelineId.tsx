@@ -28,7 +28,8 @@ import { cn } from "@/lib/utils"
 
 export const Route = createFileRoute("/p/$projectId/pipelines/$pipelineId")({
   validateSearch: (search: Record<string, unknown>): { step?: string } => ({
-    step: typeof search.step === "string" && search.step ? search.step : undefined,
+    step:
+      typeof search.step === "string" && search.step ? search.step : undefined,
   }),
   component: PipelineEditorPage,
 })
@@ -62,8 +63,7 @@ function Field({
           ...(control as React.ReactElement),
           props: {
             ...(control as React.ReactElement<{ id?: string }>).props,
-            id:
-              (control as React.ReactElement<{ id?: string }>).props.id ?? id,
+            id: (control as React.ReactElement<{ id?: string }>).props.id ?? id,
           },
         }
       : children

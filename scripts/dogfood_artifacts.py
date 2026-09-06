@@ -9,7 +9,8 @@ import time
 import urllib.request
 
 API = "http://127.0.0.1:18080"
-WS_DIR = "/Users/blake/Projects/durablefibers/data/workspaces"
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+WS_DIR = os.path.join(ROOT, "data", "workspaces")
 
 
 def req(method: str, path: str, token: str | None = None, body: dict | None = None, headers: dict | None = None):

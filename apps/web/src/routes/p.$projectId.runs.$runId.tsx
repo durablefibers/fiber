@@ -18,7 +18,8 @@ import {
 
 export const Route = createFileRoute("/p/$projectId/runs/$runId")({
   validateSearch: (search: Record<string, unknown>): { step?: string } => ({
-    step: typeof search.step === "string" && search.step ? search.step : undefined,
+    step:
+      typeof search.step === "string" && search.step ? search.step : undefined,
   }),
   component: RunPage,
 })
@@ -29,7 +30,10 @@ function formatBytes(n: number) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function formatDuration(start?: string | null, end?: string | null): string | null {
+function formatDuration(
+  start?: string | null,
+  end?: string | null
+): string | null {
   if (!start) return null
   const a = new Date(start).getTime()
   const b = end ? new Date(end).getTime() : Date.now()
@@ -46,11 +50,7 @@ function formatDuration(start?: string | null, end?: string | null): string | nu
 }
 
 function isActiveStatus(status?: string) {
-  return (
-    status === "pending" ||
-    status === "queued" ||
-    status === "running"
-  )
+  return status === "pending" || status === "queued" || status === "running"
 }
 
 function logLineClass(line: string): string {
@@ -73,7 +73,9 @@ function RunPage() {
   const [selected, setSelected] = useState<string | null>(stepSearch ?? null)
   const [logs, setLogs] = useState<string[]>([])
   const [attempts, setAttempts] = useState<StepAttempt[]>([])
-  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null)
+  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(
+    null
+  )
   const [error, setError] = useState<string | null>(null)
   const [followLogs, setFollowLogs] = useState(true)
   const [copied, setCopied] = useState(false)
@@ -131,7 +133,8 @@ function RunPage() {
   }, [steps])
 
   const selectedStep = useMemo(
-    () => steps.find((s) => s.id === selected || s.step_id === selected) ?? null,
+    () =>
+      steps.find((s) => s.id === selected || s.step_id === selected) ?? null,
     [steps, selected]
   )
 
@@ -142,8 +145,7 @@ function RunPage() {
   }, [artifacts, selectedStep])
 
   const showingStepOnly =
-    !!selectedStep &&
-    artifacts.some((a) => a.step_run_id === selectedStep.id)
+    !!selectedStep && artifacts.some((a) => a.step_run_id === selectedStep.id)
 
   const restoreFailures = useMemo(
     () =>
@@ -252,7 +254,7 @@ function RunPage() {
                       finished_at:
                         msg.status === "running"
                           ? s.finished_at
-                          : s.finished_at ?? new Date().toISOString(),
+                          : (s.finished_at ?? new Date().toISOString()),
                       started_at:
                         msg.status === "running" && !s.started_at
                           ? new Date().toISOString()
@@ -322,7 +324,11 @@ function RunPage() {
   // Refresh attempts when step reaches a terminal status via WS.
   useEffect(() => {
     if (!selectedStep) return
-    if (!["succeeded", "failed", "cancelled", "skipped"].includes(selectedStep.status)) {
+    if (
+      !["succeeded", "failed", "cancelled", "skipped"].includes(
+        selectedStep.status
+      )
+    ) {
       return
     }
     void api
@@ -372,7 +378,8 @@ function RunPage() {
 
   const runDuration = formatDuration(
     run?.started_at ?? run?.created_at,
-    run?.finished_at ?? (isActiveStatus(run?.status) ? new Date().toISOString() : null)
+    run?.finished_at ??
+      (isActiveStatus(run?.status) ? new Date().toISOString() : null)
   )
   // Re-render live duration while the run is active.
   void tick
@@ -420,7 +427,9 @@ function RunPage() {
                 {isActiveStatus(run?.status) ? "…" : ""}
               </span>
             ) : null}
-            <span className="text-muted-foreground text-xs">{run?.trigger}</span>
+            <span className="text-muted-foreground text-xs">
+              {run?.trigger}
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
             {run?.pipeline_id ? (
@@ -554,7 +563,7 @@ function RunPage() {
           {selectedStep ? (
             <div className="space-y-1.5 border-border/60 border-b px-3 py-2 text-[11px] text-muted-foreground">
               <div className="flex flex-wrap gap-x-3 gap-y-1">
-                <span className="capitalize text-foreground">
+                <span className="text-foreground capitalize">
                   {selectedStep.status}
                 </span>
                 <span>
@@ -574,7 +583,7 @@ function RunPage() {
                 ) : null}
               </div>
               {selectedStep.run_cmd ? (
-                <pre className="max-h-16 overflow-auto rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-foreground/80 whitespace-pre-wrap">
+                <pre className="max-h-16 overflow-auto whitespace-pre-wrap rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-foreground/80">
                   {selectedStep.run_cmd}
                 </pre>
               ) : null}
@@ -595,7 +604,7 @@ function RunPage() {
               ) : null}
               {attempts.length > 0 ? (
                 <div className="pt-1">
-                  <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/80">
+                  <div className="mb-1 text-[10px] text-muted-foreground/80 uppercase tracking-wide">
                     Attempts · click for details
                   </div>
                   <ul className="max-h-32 space-y-1 overflow-y-auto">
@@ -615,7 +624,9 @@ function RunPage() {
                                 : "bg-muted/30 hover:bg-muted/50"
                             }`}
                           >
-                            <span className="text-foreground">#{a.attempt}</span>
+                            <span className="text-foreground">
+                              #{a.attempt}
+                            </span>
                             <span
                               className="capitalize"
                               style={{ color: statusColor(a.status) }}
@@ -626,7 +637,7 @@ function RunPage() {
                               <span>exit {a.exit_code}</span>
                             ) : null}
                             {dur ? (
-                              <span className="tabular-nums text-muted-foreground">
+                              <span className="text-muted-foreground tabular-nums">
                                 {dur}
                               </span>
                             ) : null}
@@ -668,7 +679,7 @@ function RunPage() {
                         )}
                       </div>
                       {selectedAttempt.agent_id ? (
-                        <div className="font-mono break-all text-muted-foreground">
+                        <div className="break-all font-mono text-muted-foreground">
                           agent{" "}
                           <span className="text-foreground">
                             {selectedAttempt.agent_id}

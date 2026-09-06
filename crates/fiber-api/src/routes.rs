@@ -1344,3 +1344,63 @@ impl IntoResponse for ApiError {
         (status, Json(json!({ "error": msg }))).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sign(secret: &str, body: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn github_signature_accepts_valid() {
+        let body = r#"{"ref":"refs/heads/main"}"#;
+        assert!(verify_github_sig("s3cret", body, &sign("s3cret", body)));
+    }
+
+    #[test]
+    fn github_signature_rejects_wrong_secret_body_or_prefix() {
+        let body = r#"{"ref":"refs/heads/main"}"#;
+        let sig = sign("s3cret", body);
+        assert!(!verify_github_sig("other", body, &sig));
+        assert!(!verify_github_sig("s3cret", "tampered", &sig));
+        assert!(!verify_github_sig(
+            "s3cret",
+            body,
+            sig.trim_start_matches("sha256=")
+        ));
+        assert!(!verify_github_sig(
+            "s3cret",
+            body,
+            &sig.replace("sha256=", "sha1=")
+        ));
+        assert!(!verify_github_sig("s3cret", body, ""));
+    }
+
+    #[test]
+    fn github_signature_rejects_truncated_or_padded() {
+        let body = "x";
+        let sig = sign("k", body);
+        assert!(!verify_github_sig("k", body, &sig[..sig.len() - 1]));
+        assert!(!verify_github_sig("k", body, &format!("{sig}0")));
+    }
+
+    #[test]
+    fn constant_time_eq_semantics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn api_error_maps_forbidden_from_anyhow() {
+        let e: ApiError = anyhow::anyhow!("forbidden: reader cannot write").into();
+        assert!(matches!(e, ApiError::Forbidden));
+        let e: ApiError = anyhow::anyhow!("db down").into();
+        assert!(matches!(e, ApiError::Internal(_)));
+    }
+}

@@ -292,7 +292,7 @@ function DagCanvasInner({
         nodesConnectable={editable}
         elementsSelectable
         defaultEdgeOptions={edgeDefaults}
-        className="h-full w-full !bg-transparent"
+        className="!bg-transparent h-full w-full"
         minZoom={0.35}
         maxZoom={1.5}
       >

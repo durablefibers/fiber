@@ -15,8 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain version comes from rust-toolchain.toml (kept in step with deploy/Dockerfile.api).
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97"
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -30,6 +32,9 @@ jobs:
           -p fiber-api -p fiber-agent -p fiber-cli
           -p fiber-core -p fiber-scheduler -p fiber-durable
           -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
 
       - name: build
         run: cargo build -p fiber-api -p fiber-agent -p fiber-cli
@@ -50,4 +55,33 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec tsc --noEmit
+      - name: biome
+        run: pnpm check
+      - name: typecheck
+        run: pnpm exec tsc --noEmit
+      - name: test
+        run: pnpm test
+      - name: build
+        run: pnpm build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: build fiber-api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: build fiber-web image
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/web
+          file: apps/web/Dockerfile.web
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

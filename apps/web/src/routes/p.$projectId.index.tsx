@@ -68,8 +68,7 @@ function ProjectPage() {
   const [pickerOpen, setPickerOpen] = useState(false)
   const [creating, setCreating] = useState(false)
 
-  const canAdmin =
-    project?.role === "admin" || project?.role === "owner"
+  const canAdmin = project?.role === "admin" || project?.role === "owner"
 
   useEffect(() => {
     void (async () => {
@@ -334,75 +333,79 @@ function ProjectPage() {
           </div>
           {canAdmin ? (
             <>
-          <div className="mt-8 rounded-lg border border-border/60 p-4">
-            <h2 className="font-medium text-sm">Secrets</h2>
-            <p className="mt-1 text-muted-foreground text-xs">
-              Injected as env vars into every step on this project.
-            </p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Input
-                className="max-w-[140px]"
-                placeholder="KEY"
-                value={secretKey}
-                onChange={(e) => setSecretKey(e.target.value)}
-              />
-              <Input
-                className="max-w-[180px]"
-                type="password"
-                placeholder="value"
-                value={secretValue}
-                onChange={(e) => setSecretValue(e.target.value)}
-              />
-              <Button variant="outline" onClick={() => void saveSecret()}>
-                Save
-              </Button>
-            </div>
-            {secretMsg ? (
-              <p className="mt-2 text-muted-foreground text-xs">{secretMsg}</p>
-            ) : null}
-            <ul className="mt-3 space-y-1">
-              {secrets.map((s) => (
-                <li
-                  key={s.id}
-                  className="flex items-center justify-between rounded-md px-2 py-1 text-sm hover:bg-muted/50"
-                >
-                  <code className="text-xs">{s.key}</code>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void removeSecret(s.key)}
-                  >
-                    Delete
+              <div className="mt-8 rounded-lg border border-border/60 p-4">
+                <h2 className="font-medium text-sm">Secrets</h2>
+                <p className="mt-1 text-muted-foreground text-xs">
+                  Injected as env vars into every step on this project.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Input
+                    className="max-w-[140px]"
+                    placeholder="KEY"
+                    value={secretKey}
+                    onChange={(e) => setSecretKey(e.target.value)}
+                  />
+                  <Input
+                    className="max-w-[180px]"
+                    type="password"
+                    placeholder="value"
+                    value={secretValue}
+                    onChange={(e) => setSecretValue(e.target.value)}
+                  />
+                  <Button variant="outline" onClick={() => void saveSecret()}>
+                    Save
                   </Button>
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div className="mt-8 rounded-lg border border-border/60 p-4">
-            <h2 className="font-medium text-sm">GitHub webhook</h2>
-            <p className="mt-1 text-muted-foreground text-xs">
-              For PR path filters, also add a{" "}
-              <code className="text-[11px]">GITHUB_TOKEN</code> project secret
-              (contents:read).
-            </p>
-            <code className="mt-2 block break-all text-[11px] text-muted-foreground">
-              {api.apiUrl}/api/projects/{projectId}/webhooks/github
-            </code>
-            <div className="mt-3 flex gap-2">
-              <Input
-                type="password"
-                placeholder="Webhook secret"
-                value={webhookSecret}
-                onChange={(e) => setWebhookSecret(e.target.value)}
-              />
-              <Button variant="outline" onClick={() => void saveWebhook()}>
-                Save
-              </Button>
-            </div>
-            {webhookMsg ? (
-              <p className="mt-2 text-muted-foreground text-xs">{webhookMsg}</p>
-            ) : null}
-          </div>
+                </div>
+                {secretMsg ? (
+                  <p className="mt-2 text-muted-foreground text-xs">
+                    {secretMsg}
+                  </p>
+                ) : null}
+                <ul className="mt-3 space-y-1">
+                  {secrets.map((s) => (
+                    <li
+                      key={s.id}
+                      className="flex items-center justify-between rounded-md px-2 py-1 text-sm hover:bg-muted/50"
+                    >
+                      <code className="text-xs">{s.key}</code>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => void removeSecret(s.key)}
+                      >
+                        Delete
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="mt-8 rounded-lg border border-border/60 p-4">
+                <h2 className="font-medium text-sm">GitHub webhook</h2>
+                <p className="mt-1 text-muted-foreground text-xs">
+                  For PR path filters, also add a{" "}
+                  <code className="text-[11px]">GITHUB_TOKEN</code> project
+                  secret (contents:read).
+                </p>
+                <code className="mt-2 block break-all text-[11px] text-muted-foreground">
+                  {api.apiUrl}/api/projects/{projectId}/webhooks/github
+                </code>
+                <div className="mt-3 flex gap-2">
+                  <Input
+                    type="password"
+                    placeholder="Webhook secret"
+                    value={webhookSecret}
+                    onChange={(e) => setWebhookSecret(e.target.value)}
+                  />
+                  <Button variant="outline" onClick={() => void saveWebhook()}>
+                    Save
+                  </Button>
+                </div>
+                {webhookMsg ? (
+                  <p className="mt-2 text-muted-foreground text-xs">
+                    {webhookMsg}
+                  </p>
+                ) : null}
+              </div>
             </>
           ) : null}
         </section>
