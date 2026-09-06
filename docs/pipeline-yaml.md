@@ -66,7 +66,7 @@ Compile produces cells like `test__os_linux`. `needs` that point at a matrixed s
 | Expression | Meaning |
 |---|---|
 | `success()` | Default — run when upstreams succeeded |
-| `always()` | Run even if upstreams failed |
+| `always()` | Run once upstreams are terminal, even if they failed. Steps *after* an `always()` step still see the failure: `success()` is transitive over the whole ancestry, so `build → cleanup (always) → deploy` skips `deploy` when `build` failed |
 | `never()` | Skip |
 | `matrix.os == 'linux'` | Compare matrix (or env) axis |
 
@@ -90,3 +90,4 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 - Cycles are rejected at compile / save.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
+- What a run executes is frozen when it starts (`workspace`, `run`, `image`, `artifacts`, matrix env). Saving the pipeline afterwards affects only future runs.

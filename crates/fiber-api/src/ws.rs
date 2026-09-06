@@ -4,7 +4,6 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use fiber_core::models::StepRun;
-use fiber_core::store::value_to_definition;
 use fiber_proto::{
     AgentMessage, ArtifactRestore, RunEvent, ServerMessage, StepStatus, WorkspaceOffer,
 };
@@ -33,53 +32,105 @@ pub async fn agent_ws(
     ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id))
 }
 
+/// Build the offer for a leased step from the run's definition snapshot **only**.
+///
+/// The snapshot (`CompiledDag`, stored on the run at start) is immutable for that
+/// execution: editing the pipeline while a run is in flight must not change the
+/// workspace, command, artifacts or env an agent receives. Nothing here reads the
+/// live pipeline row.
 async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
-    let workspace = match state.store.get_run(step.run_id).await {
-        Ok(Some(run)) => workspace_from_snapshot(&run.definition_snapshot),
-        _ => None,
-    };
+    let mut env = vec![
+        ("FIBER_RUN_ID".into(), step.run_id.to_string()),
+        ("FIBER_STEP_ID".into(), step.step_id.clone()),
+    ];
+    let mut artifacts = Vec::new();
+    let mut workspace = None;
+    match state.store.get_run(step.run_id).await {
+        Ok(Some(run)) => {
+            if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
+                for (k, v) in secrets {
+                    env.push((k, v));
+                }
+            }
+            let snapshot = &run.definition_snapshot;
+            workspace = workspace_from_snapshot(snapshot);
+            match snapshot_step(snapshot, &step.step_id) {
+                Some(s) => {
+                    artifacts = snapshot_str_list(s.get("artifacts"));
+                    env.extend(snapshot_env(s.get("env")));
+                }
+                None => warn!(
+                    run_id = %step.run_id, step = %step.step_id,
+                    "step missing from run snapshot; offering without artifacts/env"
+                ),
+            }
+        }
+        Ok(None) => warn!(run_id = %step.run_id, "run missing while building offer"),
+        Err(e) => warn!(run_id = %step.run_id, error = %e, "loading run for offer"),
+    }
     let restore = restore_list(state, step.run_id, step.id).await;
-    let step_id = step.step_id.clone();
     ServerMessage::Offer {
         step_run_id: step.id,
         run_id: step.run_id,
-        step_id: step_id.clone(),
+        step_id: step.step_id.clone(),
         step_name: step.step_name,
         image: step.image,
         run: step.run_cmd,
         workspace,
-        env: vec![
-            ("FIBER_RUN_ID".into(), step.run_id.to_string()),
-            ("FIBER_STEP_ID".into(), step_id),
-        ],
-        artifacts: vec![],
+        env,
+        artifacts,
         restore,
     }
 }
 
+/// The compiled step entry for `step_id` inside a `CompiledDag` snapshot.
+fn snapshot_step<'a>(
+    snapshot: &'a serde_json::Value,
+    step_id: &str,
+) -> Option<&'a serde_json::Value> {
+    snapshot
+        .get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(step_id))
+}
+
+fn snapshot_str_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_env(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p.get(0)?.as_str()?.to_string(),
+                        p.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `CompiledDag.workspace` — serialized `WorkspaceConfig` (`{repo, ref}`) or `null`.
 fn workspace_from_snapshot(snapshot: &serde_json::Value) -> Option<WorkspaceOffer> {
-    // Snapshot is CompiledDag — workspace lives on original definition.
-    // Prefer nested `workspace` if present; also accept top-level from pipeline def JSON.
-    if let Some(ws) = snapshot.get("workspace") {
-        let repo = ws.get("repo")?.as_str()?.to_string();
-        let git_ref = ws
-            .get("ref")
-            .or_else(|| ws.get("git_ref"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("main")
-            .to_string();
-        return Some(WorkspaceOffer { repo, git_ref });
-    }
-    // Fallback: try parsing as full pipeline definition embedded
-    if let Ok(def) = value_to_definition(snapshot) {
-        if let Some(ws) = def.workspace {
-            return Some(WorkspaceOffer {
-                repo: ws.repo,
-                git_ref: ws.git_ref.unwrap_or_else(|| "main".into()),
-            });
-        }
-    }
-    None
+    let ws = snapshot.get("workspace")?;
+    let repo = ws.get("repo")?.as_str()?.to_string();
+    let git_ref = ws
+        .get("ref")
+        .or_else(|| ws.get("git_ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("main")
+        .to_string();
+    Some(WorkspaceOffer { repo, git_ref })
 }
 
 async fn restore_list(
@@ -106,83 +157,6 @@ async fn restore_list(
         );
     }
     by_name.into_values().collect()
-}
-
-/// Prefer workspace from the live pipeline definition (source of truth).
-async fn offer_for_step_with_pipeline(state: &AppState, step: StepRun) -> ServerMessage {
-    let mut workspace = None;
-    let mut artifacts = Vec::new();
-    let mut env = vec![
-        ("FIBER_RUN_ID".into(), step.run_id.to_string()),
-        ("FIBER_STEP_ID".into(), step.step_id.clone()),
-    ];
-    if let Ok(Some(run)) = state.store.get_run(step.run_id).await {
-        if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
-            for (k, v) in secrets {
-                env.push((k, v));
-            }
-        }
-        // Prefer compiled snapshot (matrix-expanded ids + artifacts + env).
-        if let Some(steps) = run
-            .definition_snapshot
-            .get("steps")
-            .and_then(|v| v.as_array())
-        {
-            for s in steps {
-                if s.get("id").and_then(|v| v.as_str()) != Some(step.step_id.as_str()) {
-                    continue;
-                }
-                if let Some(arr) = s.get("artifacts").and_then(|v| v.as_array()) {
-                    artifacts = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                }
-                if let Some(pairs) = s.get("env").and_then(|v| v.as_array()) {
-                    for p in pairs {
-                        if let (Some(k), Some(v)) = (
-                            p.get(0).and_then(|x| x.as_str()),
-                            p.get(1).and_then(|x| x.as_str()),
-                        ) {
-                            env.push((k.to_string(), v.to_string()));
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if let Ok(Some(pipe)) = state.store.get_pipeline(run.pipeline_id).await {
-            if let Ok(def) = value_to_definition(&pipe.definition) {
-                if let Some(ws) = def.workspace {
-                    workspace = Some(WorkspaceOffer {
-                        repo: ws.repo,
-                        git_ref: ws.git_ref.unwrap_or_else(|| "main".into()),
-                    });
-                }
-                if artifacts.is_empty() {
-                    if let Some(s) = def.steps.iter().find(|s| s.id == step.step_id) {
-                        artifacts = s.artifacts.clone();
-                    }
-                }
-            }
-        }
-        if workspace.is_none() {
-            workspace = workspace_from_snapshot(&run.definition_snapshot);
-        }
-    }
-    let restore = restore_list(state, step.run_id, step.id).await;
-    ServerMessage::Offer {
-        step_run_id: step.id,
-        run_id: step.run_id,
-        step_id: step.step_id.clone(),
-        step_name: step.step_name,
-        image: step.image,
-        run: step.run_cmd,
-        workspace,
-        env,
-        artifacts,
-        restore,
-    }
 }
 
 /// The step a message refers to, but only if `agent_id` is the agent it was last
@@ -298,7 +272,7 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
                     .await;
                 let _ = state.store.touch_agent(agent_id).await;
                 if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
+                    let _ = tx.send(offer_for_step(&state, step).await);
                 }
             }
             AgentMessage::Heartbeat { agent_id: claimed } => {
@@ -313,7 +287,7 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
                 let _ = state.store.touch_agent(agent_id).await;
                 let _ = state.scheduler.renew_leases(agent_id).await;
                 if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
+                    let _ = tx.send(offer_for_step(&state, step).await);
                 }
             }
             AgentMessage::Claim {
@@ -417,7 +391,7 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid) {
                 {
                     Ok(_) => {
                         if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                            let _ = tx.send(offer_for_step_with_pipeline(&state, step).await);
+                            let _ = tx.send(offer_for_step(&state, step).await);
                         }
                     }
                     Err(e) => warn!(error = %e, "step complete failed"),
@@ -550,12 +524,44 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
     }
 }
 
-#[allow(dead_code)]
-async fn _unused_offer(state: &AppState, step: StepRun) -> ServerMessage {
-    offer_for_step(state, step).await
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-#[allow(dead_code)]
-fn _status_ok() -> StepStatus {
-    StepStatus::Succeeded
+    #[test]
+    fn workspace_comes_from_snapshot_only() {
+        let snap = json!({"workspace": {"repo": "https://x/y.git", "ref": "v1"}, "steps": []});
+        let ws = workspace_from_snapshot(&snap).unwrap();
+        assert_eq!(
+            (ws.repo.as_str(), ws.git_ref.as_str()),
+            ("https://x/y.git", "v1")
+        );
+        // Missing ref defaults to main; null / absent workspace → no checkout.
+        let snap = json!({"workspace": {"repo": "r"}});
+        assert_eq!(workspace_from_snapshot(&snap).unwrap().git_ref, "main");
+        assert!(workspace_from_snapshot(&json!({"workspace": null})).is_none());
+        assert!(workspace_from_snapshot(&json!({"steps": []})).is_none());
+    }
+
+    #[test]
+    fn step_artifacts_and_env_come_from_snapshot() {
+        let snap = json!({"steps": [
+            {"id": "a", "artifacts": ["out/a"], "env": [["MATRIX_OS", "linux"], ["bad"]]},
+            {"id": "b"}
+        ]});
+        let a = snapshot_step(&snap, "a").unwrap();
+        assert_eq!(
+            snapshot_str_list(a.get("artifacts")),
+            vec!["out/a".to_string()]
+        );
+        assert_eq!(
+            snapshot_env(a.get("env")),
+            vec![("MATRIX_OS".to_string(), "linux".to_string())]
+        );
+        let b = snapshot_step(&snap, "b").unwrap();
+        assert!(snapshot_str_list(b.get("artifacts")).is_empty());
+        assert!(snapshot_env(b.get("env")).is_empty());
+        assert!(snapshot_step(&snap, "zzz").is_none());
+    }
 }

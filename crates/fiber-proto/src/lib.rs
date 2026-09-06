@@ -14,6 +14,19 @@ pub enum StepStatus {
     Skipped,
 }
 
+impl StepStatus {
+    /// Succeeded / Failed / Cancelled / Skipped — nothing further will happen to the step.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            StepStatus::Succeeded
+                | StepStatus::Failed
+                | StepStatus::Cancelled
+                | StepStatus::Skipped
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {

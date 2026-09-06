@@ -473,6 +473,9 @@ impl Store {
         let run_id = Uuid::new_v4();
         let snapshot = serde_json::to_value(&compiled)?;
 
+        // The run row and every step row land together: a half-inserted DAG would
+        // otherwise "succeed" once its partial set of steps finished.
+        let mut tx = self.pool.begin().await?;
         let run = sqlx::query_as::<_, Run>(
             "INSERT INTO runs (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at)
              VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -485,10 +488,9 @@ impl Store {
         .bind(status_str(RunStatus::Running))
         .bind(trigger)
         .bind(&snapshot)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        let mut step_runs = Vec::new();
         for step in &compiled.steps {
             let sid = Uuid::new_v4();
             // Only evaluate `if:` for roots here. Dependent steps stay Pending until
@@ -511,13 +513,10 @@ impl Store {
             } else {
                 None
             };
-            let sr = sqlx::query_as::<_, StepRun>(
+            sqlx::query(
                 "INSERT INTO step_runs
                  (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries, error)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                           retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                           started_at, finished_at",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(sid)
             .bind(run_id)
@@ -530,13 +529,15 @@ impl Store {
             .bind(json!(step.needs))
             .bind(step.retries as i32)
             .bind(error)
-            .fetch_one(&self.pool)
+            .execute(&mut *tx)
             .await?;
-            step_runs.push(sr);
         }
+        tx.commit().await?;
 
-        // If all roots skipped, propagate so dependents can resolve.
+        // If all roots skipped, propagate so dependents can resolve — and return the run
+        // as it is afterwards (it may already be terminal).
         let _ = self.propagate_after_step(run_id).await?;
+        let run = self.get_run(run_id).await?.unwrap_or(run);
 
         Ok((run, self.list_step_runs(run_id).await?, compiled))
     }
@@ -565,15 +566,8 @@ impl Store {
     }
 
     pub async fn list_step_runs(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
-        Ok(sqlx::query_as::<_, StepRun>(
-            "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                    retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                    started_at, finished_at
-             FROM step_runs WHERE run_id = $1 ORDER BY step_id",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?)
+        let mut conn = self.pool.acquire().await?;
+        list_step_runs_on(&mut conn, run_id).await
     }
 
     pub async fn get_step_run(&self, id: Uuid) -> Result<Option<StepRun>> {
@@ -656,23 +650,8 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE step_attempts
-             SET finished_at = NOW(), status = $2, exit_code = $3, error = $4
-             WHERE id = (
-                 SELECT id FROM step_attempts
-                 WHERE step_run_id = $1 AND finished_at IS NULL
-                 ORDER BY started_at DESC
-                 LIMIT 1
-             )",
-        )
-        .bind(step_run_id)
-        .bind(status)
-        .bind(exit_code)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        finish_open_attempt_on(&mut conn, step_run_id, status, exit_code, error).await
     }
 
     pub async fn list_step_attempts(&self, step_run_id: Uuid) -> Result<Vec<StepAttempt>> {
@@ -693,28 +672,10 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<StepRun> {
-        let sr = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs
-             SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
-             WHERE id = $1
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
-        .bind(step_run_id)
-        .bind(step_status_str(status))
-        .bind(exit_code)
-        .bind(&error)
-        .fetch_one(&self.pool)
-        .await?;
-        self.finish_open_attempt(
-            step_run_id,
-            step_status_str(status),
-            exit_code,
-            error.as_deref(),
-        )
-        .await?;
-        Ok(sr)
+        let mut conn = self.pool.acquire().await?;
+        complete_step_on(&mut conn, step_run_id, status, exit_code, error, None)
+            .await?
+            .ok_or_else(|| anyhow!("step run not found"))
     }
 
     /// Complete only if still running for this agent (ignores late completes after cancel/reclaim).
@@ -802,142 +763,76 @@ impl Store {
         Ok(requeued)
     }
 
-    /// After a step completes, unlock dependents or skip cascade on failure.
+    /// Unlock dependents / cascade skips / finalize the run after a step changed.
+    ///
+    /// Runs as one transaction with the `runs` row locked (`FOR UPDATE`) so two steps
+    /// of the same run completing concurrently cannot interleave their reads and
+    /// writes. Transitions are computed in memory to a fixpoint, so a chain
+    /// `A(failed) → B → C → D` resolves in one call regardless of step order.
+    /// Returns every step whose status changed; publishing happens in the caller,
+    /// after commit.
     pub async fn propagate_after_step(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
-        let run = self
-            .get_run(run_id)
-            .await?
-            .ok_or_else(|| anyhow!("run not found"))?;
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, Run>(
+            "SELECT id, pipeline_id, project_id, status, trigger, definition_snapshot,
+                    created_at, started_at, finished_at
+             FROM runs WHERE id = $1 FOR UPDATE",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("run not found"))?;
         let snapshot_steps = run
             .definition_snapshot
             .get("steps")
             .cloned()
             .unwrap_or(json!([]));
 
-        let steps = self.list_step_runs(run_id).await?;
-
-        let failed: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled))
-            .map(|s| s.step_id.clone())
-            .collect();
-
+        let mut steps = list_step_runs_on(&mut tx, run_id).await?;
         let mut changed = Vec::new();
-
-        // Skip cascade: any pending/queued step that depends on failed
-        for s in &steps {
-            if !matches!(s.status_enum(), StepStatus::Pending | StepStatus::Queued) {
-                continue;
+        loop {
+            let plan = plan_transitions(&steps, &snapshot_steps);
+            if plan.is_empty() {
+                break;
             }
-            let needs = s.needs_vec();
-            if needs.iter().any(|n| failed.contains(n)) {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("dependency failed".into()),
-                    )
-                    .await?;
-                changed.push(updated);
+            let mut progressed = false;
+            for (idx, transition) in plan {
+                let id = steps[idx].id;
+                let updated = match transition {
+                    Transition::Skip(reason) => {
+                        complete_step_on(
+                            &mut tx,
+                            id,
+                            StepStatus::Skipped,
+                            None,
+                            Some(reason.to_string()),
+                            Some(&["pending", "queued"]),
+                        )
+                        .await?
+                    }
+                    Transition::Queue => {
+                        sqlx::query_as::<_, StepRun>(&format!(
+                            "UPDATE step_runs SET status = 'queued'
+                             WHERE id = $1 AND status = 'pending'
+                             RETURNING {STEP_RUN_COLS}"
+                        ))
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    }
+                };
+                if let Some(u) = updated {
+                    steps[idx] = u.clone();
+                    changed.push(u);
+                    progressed = true;
+                }
             }
-        }
-
-        // Refresh after failure skips
-        let steps = self.list_step_runs(run_id).await?;
-        let succeeded: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| s.status_enum() == StepStatus::Succeeded)
-            .map(|s| s.step_id.clone())
-            .collect();
-        let terminal: std::collections::HashSet<String> = steps
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.status_enum(),
-                    StepStatus::Succeeded
-                        | StepStatus::Failed
-                        | StepStatus::Cancelled
-                        | StepStatus::Skipped
-                )
-            })
-            .map(|s| s.step_id.clone())
-            .collect();
-
-        for s in &steps {
-            if s.status_enum() != StepStatus::Pending {
-                continue;
-            }
-            let needs = s.needs_vec();
-            if !needs.iter().all(|n| terminal.contains(n)) {
-                continue;
-            }
-
-            let (if_expr, env) = snapshot_step_if_env(&snapshot_steps, &s.step_id);
-            let always = if_expr.as_deref().map(str::trim) == Some("always()");
-            // success()/default: all needs succeeded. always(): run even if deps failed/skipped.
-            let needs_ok = if always {
-                true
-            } else {
-                needs.iter().all(|n| succeeded.contains(n))
-            };
-
-            if !needs_ok {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("dependency skipped or failed".into()),
-                    )
-                    .await?;
-                changed.push(updated);
-                continue;
-            }
-
-            let ctx = crate::step_if::IfContext {
-                needs_succeeded: needs.iter().all(|n| succeeded.contains(n)),
-                env,
-            };
-            if !crate::step_if::eval_if(if_expr.as_deref(), &ctx) {
-                let updated = self
-                    .complete_step(
-                        s.id,
-                        StepStatus::Skipped,
-                        None,
-                        Some("if: condition false".into()),
-                    )
-                    .await?;
-                changed.push(updated);
-                continue;
-            }
-
-            let updated = sqlx::query_as::<_, StepRun>(
-                "UPDATE step_runs SET status = 'queued' WHERE id = $1 AND status = 'pending'
-                 RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                           retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                           started_at, finished_at",
-            )
-            .bind(s.id)
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(u) = updated {
-                changed.push(u);
+            if !progressed {
+                break;
             }
         }
 
-        // Finalize run status
-        let steps = self.list_step_runs(run_id).await?;
-        let all_terminal = steps.iter().all(|s| {
-            matches!(
-                s.status_enum(),
-                StepStatus::Succeeded
-                    | StepStatus::Failed
-                    | StepStatus::Cancelled
-                    | StepStatus::Skipped
-            )
-        });
-        if all_terminal {
+        if steps.iter().all(|s| s.status_enum().is_terminal()) {
             let any_failed = steps
                 .iter()
                 .any(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled));
@@ -951,10 +846,10 @@ impl Store {
             )
             .bind(run_id)
             .bind(status_str(status))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
-
+        tx.commit().await?;
         Ok(changed)
     }
 
@@ -1710,5 +1605,315 @@ fn step_status_str(s: StepStatus) -> &'static str {
         StepStatus::Failed => "failed",
         StepStatus::Cancelled => "cancelled",
         StepStatus::Skipped => "skipped",
+    }
+}
+
+const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
+     retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";
+
+async fn list_step_runs_on(conn: &mut sqlx::PgConnection, run_id: Uuid) -> Result<Vec<StepRun>> {
+    Ok(sqlx::query_as::<_, StepRun>(&format!(
+        "SELECT {STEP_RUN_COLS} FROM step_runs WHERE run_id = $1 ORDER BY step_id"
+    ))
+    .bind(run_id)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// Mark a step terminal and close its open attempt. With `expected`, the write only
+/// happens while the step is still in one of those statuses (returns `None` otherwise),
+/// so a concurrent lease or completion is never overwritten.
+async fn complete_step_on(
+    conn: &mut sqlx::PgConnection,
+    step_run_id: Uuid,
+    status: StepStatus,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    expected: Option<&[&str]>,
+) -> Result<Option<StepRun>> {
+    let guard = expected.map(|e| e.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let sr = sqlx::query_as::<_, StepRun>(&format!(
+        "UPDATE step_runs
+         SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
+         WHERE id = $1 AND ($5::text[] IS NULL OR status = ANY($5))
+         RETURNING {STEP_RUN_COLS}"
+    ))
+    .bind(step_run_id)
+    .bind(step_status_str(status))
+    .bind(exit_code)
+    .bind(&error)
+    .bind(guard)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if sr.is_some() {
+        finish_open_attempt_on(
+            conn,
+            step_run_id,
+            step_status_str(status),
+            exit_code,
+            error.as_deref(),
+        )
+        .await?;
+    }
+    Ok(sr)
+}
+
+async fn finish_open_attempt_on(
+    conn: &mut sqlx::PgConnection,
+    step_run_id: Uuid,
+    status: &str,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE step_attempts
+         SET finished_at = NOW(), status = $2, exit_code = $3, error = $4
+         WHERE id = (
+             SELECT id FROM step_attempts
+             WHERE step_run_id = $1 AND finished_at IS NULL
+             ORDER BY started_at DESC
+             LIMIT 1
+         )",
+    )
+    .bind(step_run_id)
+    .bind(status)
+    .bind(exit_code)
+    .bind(error)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    Skip(&'static str),
+    Queue,
+}
+
+/// Pure DAG bookkeeping for one pass over a run's steps: which pending/queued steps
+/// must be skipped because a dependency failed or was skipped, and which pending
+/// steps have all dependencies terminal and may be queued (subject to `if:`).
+/// Callers apply the result and re-plan until nothing changes.
+fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Transition)> {
+    use std::collections::HashSet;
+    let failed: HashSet<&str> = steps
+        .iter()
+        .filter(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled))
+        .map(|s| s.step_id.as_str())
+        .collect();
+    let succeeded: HashSet<&str> = steps
+        .iter()
+        .filter(|s| s.status_enum() == StepStatus::Succeeded)
+        .map(|s| s.step_id.as_str())
+        .collect();
+    let terminal: HashSet<&str> = steps
+        .iter()
+        .filter(|s| s.status_enum().is_terminal())
+        .map(|s| s.step_id.as_str())
+        .collect();
+    // `success()` is transitive (GitHub Actions semantics): a failure anywhere in a
+    // step's ancestry taints it, even through a succeeded `always()` step in between.
+    let mut tainted: HashSet<&str> = failed.clone();
+    loop {
+        let before = tainted.len();
+        for s in steps {
+            if !tainted.contains(s.step_id.as_str())
+                && s.needs_vec().iter().any(|n| tainted.contains(n.as_str()))
+            {
+                tainted.insert(s.step_id.as_str());
+            }
+        }
+        if tainted.len() == before {
+            break;
+        }
+    }
+
+    let mut plan = Vec::new();
+    for (idx, s) in steps.iter().enumerate() {
+        let needs = s.needs_vec();
+        match s.status_enum() {
+            StepStatus::Queued => {
+                // A queued step only sees a newly failed dependency after a cancel;
+                // `always()` steps stay queued, as they would have when first planned.
+                let (if_expr, _) = snapshot_step_if_env(snapshot_steps, &s.step_id);
+                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
+                    plan.push((idx, Transition::Skip("dependency failed")));
+                }
+            }
+            StepStatus::Pending => {
+                let (if_expr, env) = snapshot_step_if_env(snapshot_steps, &s.step_id);
+                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                // Fail-fast cascade — except for `always()` steps, which wait for their
+                // dependencies to finish and then run regardless of the outcome.
+                if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
+                    plan.push((idx, Transition::Skip("dependency failed")));
+                    continue;
+                }
+                if !needs.iter().all(|n| terminal.contains(n.as_str())) {
+                    continue;
+                }
+                let needs_succeeded = needs
+                    .iter()
+                    .all(|n| succeeded.contains(n.as_str()) && !tainted.contains(n.as_str()));
+                if !always && !needs_succeeded {
+                    plan.push((idx, Transition::Skip("dependency skipped or failed")));
+                    continue;
+                }
+                let ctx = crate::step_if::IfContext {
+                    needs_succeeded,
+                    env,
+                };
+                if !crate::step_if::eval_if(if_expr.as_deref(), &ctx) {
+                    plan.push((idx, Transition::Skip("if: condition false")));
+                } else {
+                    plan.push((idx, Transition::Queue));
+                }
+            }
+            _ => {}
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod propagate_tests {
+    use super::*;
+
+    fn step(id: &str, status: StepStatus, needs: &[&str]) -> StepRun {
+        StepRun {
+            id: Uuid::new_v4(),
+            run_id: Uuid::nil(),
+            step_id: id.into(),
+            step_name: id.into(),
+            status: step_status_str(status).into(),
+            image: None,
+            run_cmd: "true".into(),
+            labels: json!([]),
+            needs: json!(needs),
+            retries: 0,
+            attempt: 0,
+            agent_id: None,
+            lease_expires_at: None,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    fn apply(steps: &mut [StepRun], plan: &[(usize, Transition)]) {
+        for (idx, t) in plan {
+            steps[*idx].status = match t {
+                Transition::Skip(_) => "skipped".into(),
+                Transition::Queue => "queued".into(),
+            };
+        }
+    }
+
+    fn run_to_fixpoint(steps: &mut [StepRun], snap: &Value) -> usize {
+        let mut passes = 0;
+        loop {
+            let plan = plan_transitions(steps, snap);
+            if plan.is_empty() {
+                return passes;
+            }
+            apply(steps, &plan);
+            passes += 1;
+        }
+    }
+
+    #[test]
+    fn queues_when_all_needs_succeeded() {
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+        ];
+        let plan = plan_transitions(&steps, &json!([]));
+        assert_eq!(plan, vec![(1, Transition::Queue)]);
+        apply(&mut steps, &plan);
+        assert!(plan_transitions(&steps, &json!([])).is_empty());
+    }
+
+    #[test]
+    fn failure_cascades_through_a_chain_in_one_call() {
+        // A(failed) → B → C → D: the old per-pass code could leave D pending forever.
+        let mut steps = vec![
+            step("a", StepStatus::Failed, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+            step("d", StepStatus::Pending, &["c"]),
+        ];
+        run_to_fixpoint(&mut steps, &json!([]));
+        assert!(
+            steps[1..].iter().all(|s| s.status == "skipped"),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn always_runs_after_failure_and_success_gate_skips() {
+        let snap = json!([
+            {"id": "cleanup", "if": "always()"},
+            {"id": "deploy"}
+        ]);
+        let mut steps = vec![
+            step("build", StepStatus::Failed, &[]),
+            step("cleanup", StepStatus::Pending, &["build"]),
+            step("deploy", StepStatus::Pending, &["build"]),
+        ];
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[1].status, "queued");
+        assert_eq!(steps[2].status, "skipped");
+    }
+
+    #[test]
+    fn failure_is_transitive_through_a_succeeded_always_step() {
+        // build(failed) → cleanup(always, succeeded) → deploy(default) must NOT run;
+        // a further always() step after cleanup still does.
+        let snap = json!([
+            {"id": "cleanup", "if": "always()"},
+            {"id": "deploy"},
+            {"id": "notify", "if": "always()"}
+        ]);
+        let mut steps = vec![
+            step("build", StepStatus::Failed, &[]),
+            step("cleanup", StepStatus::Succeeded, &["build"]),
+            step("deploy", StepStatus::Pending, &["cleanup"]),
+            step("notify", StepStatus::Pending, &["cleanup"]),
+        ];
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[2].status, "skipped");
+        assert_eq!(steps[3].status, "queued");
+    }
+
+    #[test]
+    fn waits_while_a_need_is_still_running_and_skips_on_if_false() {
+        let snap = json!([{"id": "gated", "if": "never()"}]);
+        let mut steps = vec![
+            step("a", StepStatus::Running, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("gated", StepStatus::Pending, &[]),
+        ];
+        let plan = plan_transitions(&steps, &snap);
+        assert_eq!(plan, vec![(2, Transition::Skip("if: condition false"))]);
+        apply(&mut steps, &plan);
+        steps[0].status = "succeeded".into();
+        assert_eq!(
+            plan_transitions(&steps, &snap),
+            vec![(1, Transition::Queue)]
+        );
+    }
+
+    #[test]
+    fn queued_step_whose_dependency_failed_is_skipped() {
+        let steps = vec![
+            step("a", StepStatus::Cancelled, &[]),
+            step("b", StepStatus::Queued, &["a"]),
+        ];
+        assert_eq!(
+            plan_transitions(&steps, &json!([])),
+            vec![(1, Transition::Skip("dependency failed"))]
+        );
     }
 }

@@ -99,5 +99,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 ## Upgrades
 
 - Schema: sqlx migrations under `crates/fiber-core/migrations/` run on API boot  
+- Migration `007_indexes.sql` adds nine indexes (`step_runs`, `artifacts`, `log_lines`, `sessions`, `runs`, `step_attempts`). It runs at the first boot of the new version and holds a `SHARE` lock on each table while that index builds — writes to `log_lines` pause for the duration, which is seconds on a typical install. On a very large `log_lines` table, run retention first or apply the statements by hand with `CREATE INDEX CONCURRENTLY` before upgrading (the migration's `IF NOT EXISTS` then skips them).
+
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  
 - Agent tokens are hashes only — rotating requires distributing a new plaintext token
