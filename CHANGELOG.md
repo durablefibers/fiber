@@ -8,6 +8,30 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **GitHub commit statuses.** A webhook-triggered run reports `pending` when it starts and
+  `success` / `failure` / `error` when it finishes, under the context
+  `fiber/<pipeline name>`, so a pull request can require it as a check. Needs a token with
+  `repo:status`; without one nothing changes, and a status that cannot be posted never
+  fails a run. `FIBER_PUBLIC_URL` makes the status link to the run page.
+- **Pull requests from forks are contained.** Such a run is marked untrusted: it receives
+  no project secrets whatever its `secrets:` says, and its steps are offered only to
+  agents bound to that project, never to the global pool. Unknown provenance counts as
+  untrusted and a retry stays untrusted. This limits the blast radius rather than
+  sandboxing the code — the docs say plainly that these runs belong on a disposable,
+  project-dedicated agent.
+- Commit statuses are posted only with a **project** token (never the instance-wide
+  environment one) and only to the repository the pipeline's workspace points at, so a
+  project cannot aim the instance's credentials at someone else's repository. Webhook
+  `head_sha` / `head_ref` are validated before reaching `git`, which is also invoked with
+  `--`; a commit outside the shallow window is fetched in bounded steps and a run that
+  cannot check out its commit fails rather than building a different one.
+- **Runs record the commit they are for** (`head_sha`, `head_ref`, `pr_number`,
+  `repo_full_name`). The agent checks out that commit exactly, so a second push while a
+  run is queued no longer retargets it, and pull requests are fetched as
+  `refs/pull/<n>/head` from the base repository — which is what makes a **fork's pull
+  request** build at all. A retry re-runs, and reports against, the same commit.
+- `fiber.yml` at the repository root: Fiber's own gate, for dogfooding.
+
 - **CLI parity with the API.** `pipelines apply` pushes a `fiber.yml` (create or update,
   compiled locally first); `run --wait` / `--follow` block and exit with the run's outcome
   (0 succeeded, 1 failed, 3 timed out) so another CI system or a git hook can gate on it;

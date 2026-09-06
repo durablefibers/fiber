@@ -1,0 +1,67 @@
+# Fiber's own pipeline — the same gate CI runs, on a Fiber agent.
+#
+# Set it up once (see docs/triggers.md#dogfooding-this-repo):
+#   fiber pipelines apply fiber.yml --project-id $PROJECT_ID
+# then point a GitHub webhook with a secret at
+#   https://<your fiber>/api/projects/$PROJECT_ID/webhooks/github
+#
+# Needs an agent labelled os=linux with Docker. Every step runs in a container, which is
+# what makes building a pull request from a fork tolerable: that run gets no secrets and
+# only a project-scoped agent will pick it up, but the container is what keeps it away
+# from the agent's own environment. See docs/triggers.md#pull-requests-from-forks.
+name: fiber
+workspace:
+  repo: https://github.com/durablefibers/fiber.git
+  ref: main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+timeout_minutes: 45
+
+steps:
+  fmt:
+    run: cargo fmt --check
+    image: rust:1.97-bookworm
+    labels: [os=linux]
+    timeout_minutes: 5
+    secrets: []
+
+  clippy:
+    needs: [fmt]
+    run: cargo clippy -p fiber-api -p fiber-agent -p fiber-cli -p fiber-core -p fiber-scheduler -p fiber-durable -- -D warnings
+    image: rust:1.97-bookworm
+    labels: [os=linux]
+    timeout_minutes: 20
+    secrets: []
+
+  test:
+    needs: [fmt]
+    run: cargo test --workspace
+    image: rust:1.97-bookworm
+    labels: [os=linux]
+    timeout_minutes: 20
+    secrets: []
+
+  build:
+    needs: [clippy, test]
+    run: cargo build --release -p fiber-api -p fiber-agent -p fiber-cli
+    image: rust:1.97-bookworm
+    labels: [os=linux]
+    timeout_minutes: 25
+    secrets: []
+
+  web:
+    run: |
+      cd apps/web
+      corepack enable
+      pnpm install --frozen-lockfile
+      pnpm check
+      pnpm exec tsc --noEmit
+      pnpm test
+      pnpm build
+    image: node:22-bookworm
+    labels: [os=linux]
+    timeout_minutes: 15
+    secrets: []

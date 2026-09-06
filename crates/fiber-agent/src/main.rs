@@ -1289,7 +1289,12 @@ async fn upload_one_artifact(
     }
 }
 
-/// One network clone per run, shared by every step of that run on this agent.
+/// One network fetch per run, shared by every step of that run on this agent.
+///
+/// Fetch rather than clone: a pull request's head (`refs/pull/<n>/head`) is not a branch,
+/// and an exact commit has to be checked out after the ref is fetched — cloning with
+/// `--branch` can do neither. The base repository serves a PR head ref, so a fork's pull
+/// request builds without access to the fork.
 async fn prepare_reference_clone(
     reference: &Path,
     ws: &WorkspaceOffer,
@@ -1307,50 +1312,71 @@ async fn prepare_reference_clone(
     if reference.exists() {
         let _ = tokio::fs::remove_dir_all(reference).await;
     }
-    if let Some(parent) = reference.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    log("system", format!("cloning {} …", ws.repo));
-    let status = Command::new("git")
-        .args([
-            "clone",
-            "--branch",
-            &ws.git_ref,
-            "--single-branch",
-            "--depth",
-            "50",
-            &ws.repo,
-            &reference.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .status()
-        .await
-        .context("git clone")?;
-    if !status.success() {
-        log(
-            "system",
-            "branch clone failed; cloning default then checking out ref".into(),
-        );
-        let _ = tokio::fs::remove_dir_all(reference).await;
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "50",
-                &ws.repo,
-                &reference.to_string_lossy(),
-            ])
-            .kill_on_drop(true)
-            .status()
+    tokio::fs::create_dir_all(reference).await?;
+
+    let target = ws.sha.clone().unwrap_or_else(|| ws.git_ref.clone());
+    log("system", format!("fetching {} @ {target}", ws.repo));
+    run_git(reference, &["init", "--quiet"], log).await?;
+    run_git(reference, &["remote", "add", "origin", &ws.repo], log).await?;
+
+    // Depth 50 keeps the fetch small while leaving room to check out a commit slightly
+    // behind the ref tip (a push that lands while the run is queued).
+    // `--` so a ref or sha can never be read as a git option.
+    run_git(
+        reference,
+        &["fetch", "--depth", "50", "origin", "--", &ws.git_ref],
+        log,
+    )
+    .await
+    .with_context(|| format!("fetch {} from {}", ws.git_ref, ws.repo))?;
+
+    // `--` goes *after* the revision: before it, git reads the argument as a pathspec.
+    let checkout = match &ws.sha {
+        Some(sha) => run_git(reference, &["checkout", "--force", sha, "--"], log).await,
+        None => run_git(reference, &["checkout", "--force", "FETCH_HEAD", "--"], log).await,
+    };
+    if let Err(e) = checkout {
+        // Only a sha can be outside the shallow window. Deepen in bounded steps rather
+        // than pulling whole history, and never fall back to a different commit: a run
+        // that cannot build what it was asked to build must fail, not build something else.
+        let Some(sha) = &ws.sha else {
+            return Err(e);
+        };
+        let mut found = false;
+        for depth in ["500", "5000"] {
+            log(
+                "system",
+                format!("{sha} not in the shallow history; deepening to {depth}"),
+            );
+            if run_git(
+                reference,
+                &[
+                    "fetch",
+                    &format!("--depth={depth}"),
+                    "origin",
+                    "--",
+                    &ws.git_ref,
+                ],
+                log,
+            )
             .await
-            .context("git clone default")?;
-        if !status.success() {
-            bail!("git clone failed");
+            .is_err()
+            {
+                break;
+            }
+            if run_git(reference, &["checkout", "--force", sha, "--"], log)
+                .await
+                .is_ok()
+            {
+                found = true;
+                break;
+            }
         }
-        run_git(reference, &["checkout", "--force", &ws.git_ref], log).await?;
+        if !found {
+            bail!("commit {sha} is not reachable from {}", ws.git_ref);
+        }
     }
+
     if let Ok(mut g) = prepared.lock() {
         g.insert(run_id);
     }

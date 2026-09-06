@@ -27,7 +27,8 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_AGENT_STALE_SECS` | `45` | Offline threshold for heartbeats |
 | `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` | `60` | Per-attempt limit for steps without `timeout_minutes` |
 | `FIBER_STEP_TIMEOUT_GRACE_MINUTES` | `5` | Extra minutes the server waits past a step's limit before failing it itself (backstop for hung/old agents) |
-| `FIBER_GITHUB_TOKEN` | unset | Fallback for PR file API |
+| `FIBER_GITHUB_TOKEN` | unset | Fallback for the PR file API and commit statuses (needs `repo:status`) |
+| `FIBER_PUBLIC_URL` | unset | Public base URL of this Fiber; used to link commit statuses to the run page |
 | `FIBER_GITHUB_API_URL` | `https://api.github.com` | GitHub / GHE API base |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enable OTLP HTTP traces/metrics |
 | `FIBER_OTEL_ENDPOINT` | unset | Alias for OTEL endpoint |

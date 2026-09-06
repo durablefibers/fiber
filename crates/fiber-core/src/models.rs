@@ -51,6 +51,28 @@ pub struct Run {
     pub finished_at: Option<DateTime<Utc>>,
     /// The run this one re-ran, when it was created by a retry.
     pub retry_of: Option<Uuid>,
+    /// Commit under test, when a webhook triggered the run.
+    pub head_sha: Option<String>,
+    /// Branch, or `refs/pull/<n>/head` for a pull request.
+    pub head_ref: Option<String>,
+    pub pr_number: Option<i32>,
+    /// `owner/repo`, for reporting a commit status back.
+    pub repo_full_name: Option<String>,
+    /// The code being built came from outside the project (a fork's pull request), so it
+    /// receives no project secrets.
+    pub untrusted: bool,
+}
+
+/// What a webhook says a run is for. Carried onto the run so the agent checks out the
+/// exact commit and the result can be reported against it.
+#[derive(Debug, Clone, Default)]
+pub struct RunCommit {
+    pub head_sha: Option<String>,
+    pub head_ref: Option<String>,
+    pub pr_number: Option<i32>,
+    pub repo_full_name: Option<String>,
+    /// Set for a pull request opened from a fork: the code is not the project's own.
+    pub untrusted: bool,
 }
 
 impl Run {
