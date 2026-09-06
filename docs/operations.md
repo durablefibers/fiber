@@ -33,6 +33,40 @@ A run that stays `running` is one of:
 
 `GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
 
+## Images and releases
+
+Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and
+`fiber-agent` (tagged `X.Y.Z` and `X.Y`) and attaches agent + CLI binaries
+(`fiber-agent-<target>.tar.gz` with a `.sha256`) for linux x86_64/arm64 and macOS arm64 to the
+GitHub release. `scripts/install-agent.sh` consumes those assets. The tag must match the
+workspace version in `Cargo.toml` or the release fails before publishing anything.
+
+Before the first tag:
+
+- **The repository must be public** for the documented install paths to work. Release assets and
+  `raw.githubusercontent.com` URLs 404 for anonymous callers on a private repo, and GitHub-hosted
+  arm64 runners are free only on public repos — a private repo would queue that leg until it times out.
+- **Make the GHCR packages public once.** The first push creates each package private, whatever the
+  repository's visibility; flip it in the package settings or `docker pull` needs a token.
+
+The **web image is not published**: `VITE_FIBER_API_URL` is baked in at build time, so a generic
+image would only work for whoever's URL was compiled in. Build it per deployment:
+
+```bash
+docker build -f apps/web/Dockerfile.web --build-arg VITE_FIBER_API_URL=https://ci.example.com \
+  -t fiber-web apps/web
+```
+
+Container images build from one `deploy/Dockerfile`:
+
+```bash
+docker build -f deploy/Dockerfile --target fiber-api   -t fiber-api   .
+docker build -f deploy/Dockerfile --target fiber-agent -t fiber-agent .
+```
+
+Both share a cargo-chef dependency layer, so a source-only change does not rebuild the whole
+dependency graph. `CHANGELOG.md` records what each version contains.
+
 ## Health checks
 
 - `GET /health` — process up  

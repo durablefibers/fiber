@@ -21,7 +21,7 @@ use uuid::Uuid;
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Parser, Debug)]
-#[command(name = "fiber-agent")]
+#[command(name = "fiber-agent", version)]
 struct Args {
     #[arg(long, env = "FIBER_API_URL", default_value = "ws://127.0.0.1:18080")]
     api_url: String,
@@ -71,6 +71,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.token.trim().is_empty() {
+        error!("no agent token: set FIBER_AGENT_TOKEN (create one with `fiber agents create …`)");
+        std::process::exit(2);
+    }
     std::fs::create_dir_all(&args.workspace_dir)?;
     let labels: Vec<String> = args
         .labels

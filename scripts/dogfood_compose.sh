@@ -64,6 +64,26 @@ else
   fail "minio health"
 fi
 
+# A stack that cannot run a pipeline is not a working stack: mint an agent token,
+# start the containerised worker, and drive a real run end to end.
+echo "== pipeline through the compose agent =="
+AGENT_TOKEN=$(python3 "$ROOT/scripts/_compose_pipeline.py" create-agent || true)
+if [[ -z "$AGENT_TOKEN" ]]; then
+  fail "create compose agent"
+else
+  ok "created compose agent"
+  export FIBER_AGENT_TOKEN="$AGENT_TOKEN"
+  "${COMPOSE[@]}" --profile agent up -d --build fiber-agent
+  if python3 "$ROOT/scripts/_compose_pipeline.py" run-pipeline; then
+    ok "pipeline ran to success on the compose agent"
+  else
+    fail "pipeline on compose agent"
+    "${COMPOSE[@]}" logs --tail=40 fiber-agent || true
+  fi
+  "${COMPOSE[@]}" --profile agent rm -sf fiber-agent >/dev/null 2>&1 || true
+  python3 "$ROOT/scripts/_compose_pipeline.py" cleanup >/dev/null 2>&1 || true
+fi
+
 echo "---"
 if [[ $FAILS -gt 0 ]]; then
   echo "DOGFOOD_FAIL compose failures=$FAILS"

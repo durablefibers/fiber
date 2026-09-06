@@ -1,4 +1,4 @@
-.PHONY: help infra infra-minio down api api-s3 agent web cli build check fmt fmt-check clippy test test-rust test-web \
+.PHONY: help infra infra-minio down api api-s3 agent web cli build images check fmt fmt-check clippy test test-rust test-web \
 	dogfood dogfood-authz dogfood-pools dogfood-artifacts dogfood-s3 dogfood-compose \
 	login validate ready
 
@@ -13,6 +13,7 @@ help:
 	@echo "  build         cargo build workspace + fiber-cli"
 	@echo "  check         fmt --check + clippy -D warnings"
 	@echo "  test          cargo test --workspace + web vitest"
+	@echo "  images        Build fiber-api + fiber-agent container images"
 	@echo "  fmt           cargo fmt"
 	@echo "  clippy        cargo clippy"
 	@echo "  api           Run fiber-api on :18080 (source scripts/dev-env.sh)"
@@ -24,6 +25,7 @@ help:
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
 	@echo "  dogfood       All smoke scripts (authz, pools, artifacts, s3)"
+	@echo "  dogfood-compose  Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
 	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; web biome + tsc + vitest + build; docker build)"
@@ -39,6 +41,10 @@ down:
 
 build:
 	cargo build -p fiber-api -p fiber-agent -p fiber-cli
+
+images:
+	docker build -f deploy/Dockerfile --target fiber-api -t fiber-api:dev .
+	docker build -f deploy/Dockerfile --target fiber-agent -t fiber-agent:dev .
 
 fmt:
 	cargo fmt

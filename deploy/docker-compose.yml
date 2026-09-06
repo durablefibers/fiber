@@ -1,8 +1,18 @@
 name: fiber
 # Backing services bind to loopback only; put fiber-api / fiber-web behind TLS
 # (docs/operations.md#deployment). Settings come from deploy/.env — see deploy/.env.example.
+#
+# Networks: everything shares `backend`, except the agent, which sits alone with the API
+# on `agentnet`. Pipeline steps are repo-supplied shell, so an agent that could reach
+# fiber-postgres / fiber-redis / fiber-minio directly would hand every pipeline author the
+# control plane.
+networks:
+  backend:
+  agentnet:
+
 services:
   fiber-postgres:
+    networks: [backend]
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
@@ -21,6 +31,7 @@ services:
       retries: 10
 
   fiber-redis:
+    networks: [backend]
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--requirepass", "${FIBER_REDIS_PASSWORD:-fiber}"]
@@ -36,6 +47,7 @@ services:
       REDISCLI_AUTH: ${FIBER_REDIS_PASSWORD:-fiber}
 
   fiber-minio:
+    networks: [backend]
     image: minio/minio:latest
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
@@ -54,9 +66,11 @@ services:
       retries: 12
 
   fiber-api:
+    networks: [backend, agentnet]
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.api
+      dockerfile: deploy/Dockerfile
+      target: fiber-api
     restart: unless-stopped
     environment:
       FIBER_DATABASE_URL: postgres://fiber:${FIBER_POSTGRES_PASSWORD:-fiber}@fiber-postgres:5432/fiber
@@ -94,7 +108,44 @@ services:
       fiber-minio:
         condition: service_healthy
 
+  # Optional worker: `docker compose --profile agent up -d fiber-agent`.
+  # Needs FIBER_AGENT_TOKEN in deploy/.env — create one with
+  # `fiber agents create --name compose --labels os=linux` (instance admin).
+  # An empty token makes the agent exit 2 (a config error, not a crash) and say so in
+  # `docker compose logs fiber-agent`; Docker's restart backoff bounds the churn.
+  fiber-agent:
+    networks: [agentnet]
+    profiles: ["agent"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: fiber-agent
+    restart: unless-stopped
+    environment:
+      FIBER_API_URL: ws://fiber-api:8080
+      FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
+      FIBER_AGENT_NAME: ${FIBER_AGENT_NAME:-compose}
+      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
+      FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
+      RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
+      # `image:` steps need the docker CLI and a socket, which this image deliberately
+      # lacks — mounting /var/run/docker.sock grants root on the host. To allow them, build
+      # a variant with the CLI and add:
+      #   volumes: [/var/run/docker.sock:/var/run/docker.sock]
+      #   group_add: ["<host docker gid>"]
+      #   environment: FIBER_AGENT_USE_DOCKER=true
+    volumes:
+      - fiber_workspaces:/data/workspaces
+    # Reap step grandchildren that reparent to the agent when a process group is killed.
+    init: true
+    # Match the systemd unit: SIGTERM stops steps and lets the server requeue them.
+    stop_grace_period: 30s
+    depends_on:
+      fiber-api:
+        condition: service_healthy
+
   fiber-web:
+    networks: [backend]
     build:
       context: ../apps/web
       dockerfile: Dockerfile.web
@@ -110,3 +161,4 @@ volumes:
   fiber_pg:
   fiber_artifacts:
   fiber_minio:
+  fiber_workspaces:

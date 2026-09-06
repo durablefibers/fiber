@@ -62,6 +62,10 @@ Login is throttled per username: 10 failures within 10 minutes lock that usernam
 | `FIBER_AGENT_USE_DOCKER` | `true` | Docker vs host shell |
 | `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Per-run work dirs |
 
+Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned, mode `0640`);
+in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,
+`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`).
+
 ## fiber-cli / web
 
 | Variable | Default | Purpose |
