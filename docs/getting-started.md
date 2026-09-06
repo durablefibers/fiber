@@ -74,10 +74,12 @@ More: [CLI](./cli.md).
 ## Full Compose
 
 ```bash
+cp deploy/.env.example deploy/.env
+sed -i'' -e "s/^FIBER_SECRETS_KEY=.*/FIBER_SECRETS_KEY=$(openssl rand -hex 32)/" deploy/.env   # keep a backup of this key
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-Optional MinIO: uncomment `FIBER_S3_*` on `fiber-api` in Compose. See [Artifacts](./artifacts.md).
+Everything binds to `127.0.0.1` by default; see [operations → Deployment](./operations.md#deployment) for the reverse-proxy / TLS setup and how to expose it. MinIO artifacts are on by default in Compose. See [Artifacts](./artifacts.md).
 
 ## Next
 

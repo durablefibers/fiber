@@ -110,13 +110,16 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     });
     let mut ok = true;
 
+    // Detail goes to the log, not to unauthenticated callers (connection strings leak).
     if let Err(e) = sqlx::query("SELECT 1").execute(&state.store.pool).await {
         ok = false;
-        checks["postgres"] = json!(format!("error: {e}"));
+        tracing::error!(error = %e, "readiness: postgres");
+        checks["postgres"] = json!("error");
     }
     if let Err(e) = state.scheduler.redis_ping().await {
         ok = false;
-        checks["redis"] = json!(format!("error: {e}"));
+        tracing::error!(error = %e, "readiness: redis");
+        checks["redis"] = json!("error");
     }
 
     let body = json!({ "ok": ok, "service": "fiber-api", "checks": checks });
@@ -130,14 +133,43 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
+    let key = crate::login_guard::LoginGuard::key(&req.username);
+    if let Err(retry_after) = state.login_guard.check(&key) {
+        return Ok(too_many_logins(retry_after));
+    }
     let resp = state
         .store
         .login(&req.username, &req.password)
         .await
-        .map_err(ApiError::from)?
-        .ok_or(ApiError::Unauthorized)?;
-    Ok(Json(resp))
+        .map_err(ApiError::from)?;
+    match resp {
+        Some(resp) => {
+            state.login_guard.record_success(&key);
+            Ok(Json(resp).into_response())
+        }
+        None => {
+            if let Some(lock) = state.login_guard.record_failure(&key) {
+                tracing::warn!(username = %key, lock_secs = lock.as_secs(), "login locked out");
+            } else {
+                tracing::warn!(username = %key, "login failed");
+            }
+            Err(ApiError::Unauthorized)
+        }
+    }
+}
+
+fn too_many_logins(retry_after: std::time::Duration) -> axum::response::Response {
+    let secs = retry_after.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, secs.to_string())],
+        Json(json!({
+            "error": "too many failed logins; try again later",
+            "retry_after_secs": secs,
+        })),
+    )
+        .into_response()
 }
 
 async fn logout(
@@ -1402,7 +1434,8 @@ impl From<anyhow::Error> for ApiError {
         if msg.contains("forbidden") {
             ApiError::Forbidden
         } else {
-            ApiError::Internal(msg)
+            // Full cause chain: the log line is the only place this text now appears.
+            ApiError::Internal(format!("{e:#}"))
         }
     }
 }
@@ -1414,7 +1447,11 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::Internal(m) => {
+                // Never echo sqlx / Redis / anyhow chains to clients.
+                tracing::error!(error = %m, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }

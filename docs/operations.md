@@ -1,9 +1,31 @@
 # Operations
 
+## Deployment
+
+`deploy/docker-compose.yml` is the reference deployment. Its defaults are chosen so that `docker compose up` on a shared host does not expose anything by accident:
+
+- Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password (`FIBER_REDIS_PASSWORD`).
+- `fiber-api` (`18080`) and `fiber-web` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_WEB_BIND=0.0.0.0` only for a trusted network.
+- Every service has `restart: unless-stopped`; the API waits for Postgres, Redis, **and** MinIO health.
+- Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
+- Set `FIBER_ADMIN_PASSWORD` **before the first boot**: it is applied only when the users table is empty. For an existing instance, change the admin password through the API/UI instead. The API warns at boot while the configured value is the default `fiber`.
+
+Minimal Caddy front end (automatic TLS):
+
+```
+ci.example.com {
+    reverse_proxy /api/* 127.0.0.1:18080
+    reverse_proxy /ws/*  127.0.0.1:18080
+    reverse_proxy       127.0.0.1:3100
+}
+```
+
+Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
+
 ## Health checks
 
 - `GET /health` — process up  
-- `GET /ready` — Postgres + Redis reachable (Compose healthcheck uses this)
+- `GET /ready` — Postgres + Redis reachable (Compose healthcheck uses this). Failing checks report `"error"` only; the cause is in the API log.
 
 ## Retention / GC
 
@@ -63,7 +85,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 ### Artifacts & secrets key
 
 - Backup `FIBER_ARTIFACTS_DIR` **or** the S3/MinIO bucket (`fiber-artifacts`).
-- Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project secrets cannot be decrypted. Compose ships a **dev-only** sample key; replace before any real use.
+- Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project and webhook secrets cannot be decrypted. Compose reads it from `deploy/.env`; it is intentionally not committed anywhere.
 
 ### What to include
 

@@ -78,7 +78,7 @@ Postgres is **17-alpine**. Upgrading from 16: `down -v` then recreate.
 
 ```bash
 export FIBER_DATABASE_URL=postgres://fiber:fiber@127.0.0.1:15432/fiber
-export FIBER_REDIS_URL=redis://127.0.0.1:16379
+export FIBER_REDIS_URL=redis://:fiber@127.0.0.1:16379   # Compose Redis password (FIBER_REDIS_PASSWORD)
 export FIBER_SECRETS_KEY=$(openssl rand -hex 32)   # recommended
 cargo run -p fiber-api
 ```
@@ -104,11 +104,12 @@ cargo run -p fiber-cli -- agent --token "$FIBER_AGENT_TOKEN"
 ## Full Compose
 
 ```bash
+cp deploy/.env.example deploy/.env      # set FIBER_SECRETS_KEY (openssl rand -hex 32) and FIBER_ADMIN_PASSWORD
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-- UI: http://localhost:3100 · API: http://localhost:18080
-- Postgres **15432** · Redis **16379** · MinIO optional **19000**
+- UI: http://localhost:3100 · API: http://localhost:18080 (both loopback-only by default — see [operations](docs/operations.md#deployment) for TLS / exposure)
+- Postgres **15432** · Redis **16379** · MinIO **19000** (loopback-only)
 
 ## Workspace
 

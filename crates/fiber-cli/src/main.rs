@@ -28,12 +28,17 @@ enum Commands {
         #[arg(default_value = "fiber.yml")]
         path: PathBuf,
     },
-    /// Login and print a session token (also writes ~/.fiber/token)
+    /// Login and print a session token (also writes ~/.fiber/token, mode 0600)
     Login {
         #[arg(long, env = "FIBER_ADMIN_USER", default_value = "admin")]
         username: String,
-        #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = "fiber")]
-        password: String,
+        /// Password (default `fiber`). Prefer --password-stdin to keep it out of shell history.
+        /// Ignored when --password-stdin is given (so an exported FIBER_ADMIN_PASSWORD does not block it).
+        #[arg(long, env = "FIBER_ADMIN_PASSWORD")]
+        password: Option<String>,
+        /// Read the password from stdin (first line).
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Start a pipeline run
     Run { pipeline_id: String },
@@ -94,8 +99,12 @@ enum SecretsCmd {
     Set {
         project_id: String,
         key: String,
+        /// Secret value. Prefer --value-stdin to keep it out of shell history (stdin wins if both are given).
         #[arg(long)]
-        value: String,
+        value: Option<String>,
+        /// Read the value from stdin (first line, trailing newline stripped).
+        #[arg(long)]
+        value_stdin: bool,
     },
     Delete {
         project_id: String,
@@ -186,7 +195,16 @@ async fn main() -> Result<()> {
                 println!("  L{i}: {}", level.join(", "));
             }
         }
-        Commands::Login { username, password } => {
+        Commands::Login {
+            username,
+            password,
+            password_stdin,
+        } => {
+            let password = if password_stdin {
+                read_stdin_line().context("read password from stdin")?
+            } else {
+                password.unwrap_or_else(|| "fiber".to_string())
+            };
             let client = reqwest::Client::new();
             let resp: LoginResp = client
                 .post(format!("{base}/api/auth/login"))
@@ -280,7 +298,13 @@ async fn main() -> Result<()> {
                     project_id,
                     key,
                     value,
+                    value_stdin,
                 } => {
+                    let value = if value_stdin {
+                        read_stdin_line().context("read secret value from stdin")?
+                    } else {
+                        value.context("pass --value <v> or --value-stdin")?
+                    };
                     let v = api_json(
                         client
                             .post(format!("{base}/api/projects/{project_id}/secrets"))
@@ -518,10 +542,37 @@ fn dirs_token_home() -> PathBuf {
 }
 
 fn save_token(token: &str) -> Result<()> {
+    use std::io::Write;
     let dir = dirs_token_home();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(token_path(), token)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // The session token is a bearer credential: private dir, private file.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(token_path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Tighten a pre-existing file created with an older umask.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(token.as_bytes())?;
     Ok(())
+}
+
+fn read_stdin_line() -> Result<String> {
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    let s = s.trim_end_matches(['\r', '\n']).to_string();
+    if s.is_empty() {
+        anyhow::bail!("stdin was empty");
+    }
+    Ok(s)
 }
 
 fn load_token() -> Result<String> {

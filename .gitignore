@@ -20,3 +20,4 @@ apps/web/.output/
 # IDE
 .idea/
 .vscode/
+deploy/.env
