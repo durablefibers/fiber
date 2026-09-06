@@ -168,8 +168,36 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The release notes are this version's CHANGELOG section, not the whole file.
+      - name: release notes
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, pathlib
+          tag = os.environ["TAG"]
+          version = tag.lstrip("v")
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          pattern = re.compile(
+              r"^## \[" + re.escape(version) + r"\].*?(?=^## \[|\Z)",
+              re.M | re.S,
+          )
+          m = pattern.search(text)
+          if m:
+              body = m.group(0).strip()
+              # Drop the section heading; the release page already shows the version.
+              body = body.split("\n", 1)[1].strip()
+          else:
+              print(f"::warning::no CHANGELOG section for {version}; using the whole file")
+              body = text.strip()
+          repo = os.environ["REPO"]
+          body += f"\n\n---\n\nFull changelog: https://github.com/{repo}/blob/{tag}/CHANGELOG.md"
+          pathlib.Path("RELEASE_NOTES.md").write_text(body + "\n")
+          EOF
+
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
           files: dist/*
