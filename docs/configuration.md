@@ -12,7 +12,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_ARTIFACTS_DIR` | `./data/artifacts` | Local artifact root |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
 | `FIBER_ADMIN_PASSWORD` | `fiber` | Bootstrap admin password |
-| `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project secrets |
+| `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project **and webhook** secrets at rest |
 | `FIBER_S3_BUCKET` | unset | If set, use S3/MinIO backend |
 | `FIBER_S3_ENDPOINT` | `http://127.0.0.1:19000` | S3 API endpoint |
 | `FIBER_S3_PUBLIC_ENDPOINT` | = endpoint | Presign host agents can reach |

@@ -70,7 +70,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 | Data | Where |
 |---|---|
 | Runs, pipelines, memberships, sessions | Postgres |
-| Secret ciphertext | Postgres (`project_secrets`) — needs `FIBER_SECRETS_KEY` |
+| Secret ciphertext | Postgres (`project_secrets`, `webhook_secrets`) — needs `FIBER_SECRETS_KEY`. If the key is lost, re-enter project secrets and re-`PUT` webhook secrets (deliveries are rejected with 401 until then) |
 | Artifact blobs | Local dir or S3 |
 | Agent tokens | Not recoverable from DB (hashes only) — re-issue after restore |
 

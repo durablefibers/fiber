@@ -1434,18 +1434,18 @@ impl Store {
         secret: &str,
     ) -> Result<()> {
         let id = Uuid::new_v4();
-        sqlx::query("DELETE FROM webhook_secrets WHERE project_id = $1 AND provider = $2")
-            .bind(project_id)
-            .bind(provider)
-            .execute(&self.pool)
-            .await?;
+        // Encrypted at rest with FIBER_SECRETS_KEY, same as project secrets.
+        let stored = crate::secrets::encrypt_secret(secret)?;
         sqlx::query(
-            "INSERT INTO webhook_secrets (id, project_id, provider, secret) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO webhook_secrets (id, project_id, provider, secret)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (project_id, provider)
+             DO UPDATE SET secret = EXCLUDED.secret, created_at = NOW()",
         )
         .bind(id)
         .bind(project_id)
         .bind(provider)
-        .bind(secret)
+        .bind(stored)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1456,13 +1456,16 @@ impl Store {
         project_id: Uuid,
         provider: &str,
     ) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar::<_, String>(
+        let row: Option<(String,)> = sqlx::query_as(
             "SELECT secret FROM webhook_secrets WHERE project_id = $1 AND provider = $2",
         )
         .bind(project_id)
         .bind(provider)
         .fetch_optional(&self.pool)
-        .await?)
+        .await?;
+        // Rows written before encryption are plaintext; decrypt_secret passes those through.
+        row.map(|(v,)| crate::secrets::decrypt_secret(&v))
+            .transpose()
     }
 
     pub async fn ensure_admin_user(&self, username: &str, password: &str) -> Result<PublicUser> {

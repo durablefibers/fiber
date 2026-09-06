@@ -52,7 +52,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET/POST | `/api/projects/{id}/secrets` | admin |
 | DELETE | `/api/projects/{id}/secrets/{key}` | admin |
 | PUT | `/api/projects/{id}/webhooks/github` | admin — set HMAC secret |
-| POST | `/api/projects/{id}/webhooks/github` | GitHub (signature if configured) |
+| POST | `/api/projects/{id}/webhooks/github` | GitHub — **requires** a configured secret and a valid `X-Hub-Signature-256`; `401` otherwise |
 
 ## Agents (global)
 

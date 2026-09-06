@@ -1126,9 +1126,17 @@ async fn set_github_secret(
     Json(body): Json<SetSecret>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
+    // An empty key makes the HMAC publicly computable, which would silently turn the
+    // fail-closed webhook back into fail-open.
+    let secret = body.secret.trim();
+    if secret.is_empty() {
+        return Err(ApiError::BadRequest(
+            "webhook secret must not be empty".into(),
+        ));
+    }
     state
         .store
-        .upsert_webhook_secret(id, "github", &body.secret)
+        .upsert_webhook_secret(id, "github", secret)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
@@ -1140,19 +1148,30 @@ async fn github_webhook(
     headers: HeaderMap,
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
-    if let Some(secret) = state
+    // Fail closed: a project with no webhook secret configured accepts nothing.
+    // Otherwise anyone who guesses a project id can start runs (which execute
+    // repo-supplied shell with project secrets injected).
+    // A secret that cannot be read (FIBER_SECRETS_KEY missing or rotated) is treated as
+    // unconfigured: reject, and keep the reason in the server log only — this endpoint
+    // is unauthenticated, so it must not become a project-existence oracle.
+    let stored = state
         .store
         .get_webhook_secret(id, "github")
         .await
-        .map_err(ApiError::from)?
-    {
-        let sig = headers
-            .get("x-hub-signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !verify_github_sig(&secret, &body, sig) {
-            return Err(ApiError::Unauthorized);
-        }
+        .map_err(|e| {
+            tracing::error!(project_id = %id, error = %e, "github webhook secret unreadable");
+            ApiError::Unauthorized
+        })?;
+    let Some(secret) = stored.filter(|s| !s.is_empty()) else {
+        tracing::debug!(project_id = %id, "github webhook rejected: no secret configured");
+        return Err(ApiError::Unauthorized);
+    };
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_github_sig(&secret, &body, sig) {
+        return Err(ApiError::Unauthorized);
     }
 
     let event = headers

@@ -51,7 +51,9 @@ on:
 
 ## Webhook security
 
-`PUT /api/projects/{id}/webhooks/github` with `{ "secret": "…" }` stores the HMAC secret (admin+). When set, requests must include valid `X-Hub-Signature-256`.
+`PUT /api/projects/{id}/webhooks/github` with `{ "secret": "…" }` stores the HMAC secret (admin+). The secret is encrypted at rest with `FIBER_SECRETS_KEY` like project secrets, and there is exactly one per project and provider.
+
+Webhooks **fail closed**: until a secret is configured, every delivery to `POST /api/projects/{id}/webhooks/github` is rejected with `401`. Once set, requests must carry a valid `X-Hub-Signature-256` (HMAC-SHA256 of the raw body, `sha256=<hex>`), verified with a constant-time compare. Configure the same secret on the GitHub webhook, with content type **`application/json`** (form-encoded deliveries verify but are then rejected as invalid JSON). An empty secret is refused (`400`), since an empty HMAC key would be publicly computable.
 
 ## Manual runs
 

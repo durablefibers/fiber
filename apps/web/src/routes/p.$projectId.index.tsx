@@ -121,8 +121,12 @@ function ProjectPage() {
   }
 
   const saveWebhook = async () => {
+    if (!webhookSecret.trim()) {
+      setWebhookMsg("Webhook secret must not be empty.")
+      return
+    }
     try {
-      await api.setGithubSecret(projectId, webhookSecret)
+      await api.setGithubSecret(projectId, webhookSecret.trim())
       setWebhookMsg("Webhook secret saved.")
       setWebhookSecret("")
     } catch (e) {

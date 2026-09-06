@@ -2,10 +2,13 @@
 """Dogfood release-with-artifacts + path-filter webhook smoke."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import shutil
 import time
+import urllib.error
 import urllib.request
 
 API = "http://127.0.0.1:18080"
@@ -113,8 +116,33 @@ def main() -> None:
         "commits": [{"added": ["src/main.rs"], "modified": [], "removed": []}],
         "head_commit": {"added": ["src/main.rs"], "modified": [], "removed": []},
     }
-    r1 = req("POST", f"/api/projects/{pid}/webhooks/github", body=md_only, headers={"X-GitHub-Event": "push"})
-    r2 = req("POST", f"/api/projects/{pid}/webhooks/github", body=rust, headers={"X-GitHub-Event": "push"})
+    # Webhooks fail closed: unsigned / unconfigured deliveries are rejected.
+    def webhook(payload, secret=None):
+        raw = json.dumps(payload).encode()
+        h = {"X-GitHub-Event": "push"}
+        if secret is not None:
+            h["X-Hub-Signature-256"] = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        r = urllib.request.Request(
+            API + f"/api/projects/{pid}/webhooks/github", data=raw, headers={"Content-Type": "application/json", **h}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+
+    code, _ = webhook(rust)
+    assert code == 401, f"unsigned webhook should be rejected before a secret is set, got {code}"
+    wh_secret = "dogfood-webhook-secret"
+    req("PUT", f"/api/projects/{pid}/webhooks/github", token=token, body={"secret": wh_secret})
+    code, _ = webhook(rust)
+    assert code == 401, f"unsigned webhook should be rejected once a secret is set, got {code}"
+    code, _ = webhook(rust, secret="wrong-secret")
+    assert code == 401, f"badly signed webhook should be rejected, got {code}"
+    print("webhook unsigned/badly-signed rejected (401)")
+    c1, r1 = webhook(md_only, secret=wh_secret)
+    c2, r2 = webhook(rust, secret=wh_secret)
+    assert c1 == 200 and c2 == 200, (c1, c2)
     print("webhook md_only", r1)
     print("webhook rust", r2)
 
