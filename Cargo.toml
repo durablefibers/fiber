@@ -67,7 +67,11 @@ aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
 opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace", "metrics"] }
+# The SDK runs batch and periodic exporters on their own OS threads, with no Tokio
+# reactor, so the async reqwest client panics there and nothing is ever exported.
+# `reqwest-blocking-client` matches that threading model. Native roots for the same
+# reason the rest of the workspace uses them: a collector behind a private CA.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"] }
 tracing-opentelemetry = "0.33"
 
 [workspace.lints.clippy]

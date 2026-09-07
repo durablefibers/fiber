@@ -14,9 +14,12 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
+
+use tracing::Instrument;
+
+mod otel;
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -275,11 +278,10 @@ fn http_base(api_url: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("fiber_agent=info".parse()?))
-        .init();
-
     let args = Args::parse();
+    // Held to the end of main: dropping it flushes whatever has not been exported.
+    let _otel = otel::init(&args.name)?;
+
     if args.token.trim().is_empty() {
         error!("no agent token: set FIBER_AGENT_TOKEN (create one with `fiber agents create …`)");
         std::process::exit(2);
@@ -646,6 +648,13 @@ async fn execute_step(
     let run_dir = workspace_root.join(run_id.to_string());
     let work_dir = run_dir.join(step_run_id.to_string());
     workspaces.enter(run_id);
+    let span = tracing::info_span!(
+        "fiber.step",
+        run_id = %run_id,
+        step_run_id = %step_run_id,
+        kind = if image.is_some() { "docker" } else { "shell" },
+        outcome = tracing::field::Empty,
+    );
     let result = execute_step_inner(
         out_tx,
         agent_id,
@@ -669,10 +678,17 @@ async fn execute_step(
         exec,
         workspaces,
     )
+    // `.instrument`, not `span.enter()`: a guard held across an await point attributes
+    // whatever else the runtime schedules on this thread to this step.
+    .instrument(span.clone())
     .await;
     // Cancel, timeout and prep failures all land here: a leaked checkout per aborted
     // attempt would fill the disk faster than successful runs do.
     cleanup_workspace(workspaces, run_id, &run_dir, &work_dir, prepared).await;
+    // Measured from the offer, not from the first byte of output: queue-to-green is what
+    // anyone waiting on a build actually experiences.
+    span.record("outcome", otel::outcome_label(&result));
+    otel::record_step(&result, offered_at.elapsed().as_secs_f64(), image.is_some());
     result
 }
 

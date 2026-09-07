@@ -30,7 +30,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_GITHUB_TOKEN` | unset | Fallback for the PR file API and commit statuses (needs `repo:status`) |
 | `FIBER_PUBLIC_URL` | unset | Public base URL of this Fiber; used to link commit statuses to the run page |
 | `FIBER_GITHUB_API_URL` | `https://api.github.com` | GitHub / GHE API base |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enable OTLP HTTP traces/metrics |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Collector **base** URL; `/v1/traces` and `/v1/metrics` are appended |
 | `FIBER_OTEL_ENDPOINT` | unset | Alias for OTEL endpoint |
 | `FIBER_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset = the endpoint returns `404` |
 | `RUST_LOG` | — | Tracing filter |

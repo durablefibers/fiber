@@ -36,6 +36,20 @@ fn otlp_endpoint() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// OTLP over HTTP wants a per-signal URL, while `OTEL_EXPORTER_OTLP_ENDPOINT` is defined as
+/// a base — the SDK's `with_endpoint` takes the former, so the path has to be joined here.
+/// Without it every export lands on `/` and a collector answers 404.
+///
+/// A base that already names the signal is left alone, so a full URL also works.
+fn signal_endpoint(base: &str, signal: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with(signal) {
+        base.to_string()
+    } else {
+        format!("{base}/{signal}")
+    }
+}
+
 fn resource() -> Resource {
     Resource::builder()
         .with_service_name("fiber-api")
@@ -61,7 +75,7 @@ pub fn init() -> Result<OtelGuard> {
     let span_exporter = SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(endpoint.clone())
+        .with_endpoint(signal_endpoint(&endpoint, "v1/traces"))
         .build()
         .context("OTLP span exporter")?;
 
@@ -73,7 +87,7 @@ pub fn init() -> Result<OtelGuard> {
     let metric_exporter = MetricExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(endpoint.clone())
+        .with_endpoint(signal_endpoint(&endpoint, "v1/metrics"))
         .build()
         .context("OTLP metric exporter")?;
 
@@ -103,4 +117,32 @@ pub fn init() -> Result<OtelGuard> {
         tracer_provider: Some(tracer_provider),
         meter_provider: Some(meter_provider),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signal_endpoint;
+
+    #[test]
+    fn a_base_endpoint_gains_the_signal_path() {
+        assert_eq!(
+            signal_endpoint("http://collector:4318", "v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        // A trailing slash must not produce a doubled one.
+        assert_eq!(
+            signal_endpoint("http://collector:4318/", "v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+        // Someone who already gave the full signal URL keeps it.
+        assert_eq!(
+            signal_endpoint("http://collector:4318/v1/traces", "v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        // A collector behind a path prefix keeps the prefix.
+        assert_eq!(
+            signal_endpoint("http://gw/otlp", "v1/traces"),
+            "http://gw/otlp/v1/traces"
+        );
+    }
 }

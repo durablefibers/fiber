@@ -102,6 +102,28 @@ is `fiber_oldest_queued_step_age_seconds`: it climbs when no agent matches a ste
 which is otherwise invisible until someone notices a run sitting still. Steps held back by
 retry backoff are excluded, since they are waiting deliberately.
 
+## OpenTelemetry
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (or `FIBER_OTEL_ENDPOINT`) to a collector's **base** URL
+and both `fiber-api` and `fiber-agent` export traces and metrics over OTLP HTTP. The signal
+path is appended, so `http://collector:4318` becomes `/v1/traces` and `/v1/metrics`. A full
+signal URL is left as given.
+
+The agent is where steps actually run, so it is where the interesting numbers come from:
+
+| Signal | Name | Notes |
+|---|---|---|
+| Span | `fiber.step` | One per step execution, with `run_id`, `step_run_id`, `kind` (`docker` / `shell`) and `outcome` |
+| Counter | `fiber.agent.steps` | Steps finished, by `outcome` and `kind` |
+| Histogram | `fiber.agent.step.duration` | Seconds from offer to completion, workspace preparation and artifact transfer included |
+
+`outcome` is `succeeded`, `failed`, `cancelled`, `timed_out`, or `error`, matching what the
+run page shows. Every agent reports the same `service.name`, so `service.instance.id` is set
+from `--name`: "which worker is slow" is the question this data gets asked.
+
+Agent and API traces are not yet joined. The offer carries no trace context, so a step span
+is a root rather than a child of the run that produced it.
+
 ## Images and releases
 
 Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and

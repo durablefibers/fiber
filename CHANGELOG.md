@@ -6,7 +6,25 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenTelemetry export never worked.** The exporter is built with the async reqwest
+  client, but the SDK runs batch and periodic exporters on their own threads with no Tokio
+  reactor, so the first export panicked that thread and nothing ever reached a collector.
+  It now uses the blocking client, which matches that threading model. Separately,
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is defined as a base URL and was being used verbatim, so
+  every export went to `/` instead of `/v1/traces` — a real collector answers 404. The
+  signal path is now appended, and a full signal URL is still accepted. Native certificate
+  roots, so a collector behind a private CA works.
+
 ### Added
+
+- **The agent exports OpenTelemetry.** A `fiber.step` span per execution with `run_id`,
+  `step_run_id`, `kind` and `outcome`, plus a `fiber.agent.steps` counter and a
+  `fiber.agent.step.duration` histogram measured from offer to completion, both labelled by
+  outcome and by whether the step ran in a container. `service.instance.id` comes from the
+  agent's `--name`, since every agent reports the same service name. Agent and API traces
+  are not yet joined: the offer carries no trace context.
 
 - **`GET /metrics`**, Prometheus exposition of the queue, runs, agents, and durable fibers.
   Off until `FIBER_METRICS_TOKEN` is set, then requires it as a bearer token — the API is
