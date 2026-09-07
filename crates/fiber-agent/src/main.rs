@@ -476,6 +476,7 @@ async fn run_session(
                                 restore,
                                 timeout_minutes,
                                 secret_keys,
+                                traceparent,
                             }) => {
                                 info!(%step_id, %step_name, %run_id, "offered step");
                                 let _ = out_tx.send(AgentMessage::Claim { agent_id, step_run_id });
@@ -523,6 +524,7 @@ async fn run_session(
                                         &redactor,
                                         &exec,
                                         &workspaces,
+                                        traceparent.as_deref(),
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
@@ -644,6 +646,7 @@ async fn execute_step(
     redactor: &Redactor,
     exec: &ExecConfig,
     workspaces: &Workspaces,
+    traceparent: Option<&str>,
 ) -> Result<i32> {
     let run_dir = workspace_root.join(run_id.to_string());
     let work_dir = run_dir.join(step_run_id.to_string());
@@ -655,6 +658,9 @@ async fn execute_step(
         kind = if image.is_some() { "docker" } else { "shell" },
         outcome = tracing::field::Empty,
     );
+    // Join the server's trace when it sent one, so a run reads as one trace across both
+    // processes instead of a server span and an unrelated agent root.
+    otel::adopt_remote_parent(&span, traceparent);
     let result = execute_step_inner(
         out_tx,
         agent_id,

@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -50,6 +51,28 @@ pub async fn agent_ws(
 /// execution: editing the pipeline while a run is in flight must not change the
 /// workspace, command, artifacts or env an agent receives. Nothing here reads the
 /// live pipeline row.
+/// W3C `traceparent` for the current span, so the agent's execution span joins this trace.
+///
+/// Empty unless OpenTelemetry is on: the propagator is a no-op by default, and a span with
+/// no OTel context injects nothing. Returning `None` then is correct — a bogus traceparent
+/// would make the agent parent its work to a trace that does not exist.
+fn current_traceparent() -> Option<String> {
+    use opentelemetry::global;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let cx = tracing::Span::current().context();
+    let mut carrier = std::collections::HashMap::new();
+    global::get_text_map_propagator(|p| p.inject_context(&cx, &mut carrier));
+    let tp = carrier.remove("traceparent").filter(|v| !v.is_empty());
+    // Debug rather than info: this is how you find out why a run's spans did not join up,
+    // and it is noise otherwise.
+    tracing::debug!(
+        traceparent = tp.as_deref().unwrap_or("<none>"),
+        "offer trace context"
+    );
+    tp
+}
+
 async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     let mut env = vec![
         ("FIBER_RUN_ID".into(), step.run_id.to_string()),
@@ -139,6 +162,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         restore,
         timeout_minutes: Some(timeout_minutes.unwrap_or(default_minutes)),
         secret_keys,
+        traceparent: current_traceparent(),
     }
 }
 
@@ -387,7 +411,13 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                     .await;
                 let _ = state.store.touch_agent(agent_id).await;
                 if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let _ = tx.send(offer_for_step(&state, step).await);
+                    let span = tracing::info_span!(
+                        "fiber.offer",
+                        %agent_id,
+                        run_id = %step.run_id,
+                        step_id = %step.step_id,
+                    );
+                    let _ = tx.send(offer_for_step(&state, step).instrument(span).await);
                 }
             }
             AgentMessage::Heartbeat { agent_id: claimed } => {
@@ -415,7 +445,13 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                 let _ = state.store.touch_agent(agent_id).await;
                 let _ = state.scheduler.renew_leases(agent_id).await;
                 if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let _ = tx.send(offer_for_step(&state, step).await);
+                    let span = tracing::info_span!(
+                        "fiber.offer",
+                        %agent_id,
+                        run_id = %step.run_id,
+                        step_id = %step.step_id,
+                    );
+                    let _ = tx.send(offer_for_step(&state, step).instrument(span).await);
                 }
             }
             AgentMessage::Claim {

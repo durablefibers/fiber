@@ -248,6 +248,11 @@ pub enum ServerMessage {
         /// log lines; it does not otherwise treat them differently.
         #[serde(default)]
         secret_keys: Vec<String>,
+        /// W3C `traceparent` for the span that offered this step, so the agent's execution
+        /// span joins the server's trace instead of starting a root of its own. Absent
+        /// unless the server exports OpenTelemetry, and ignored by older agents.
+        #[serde(default)]
+        traceparent: Option<String>,
     },
     Cancel {
         step_run_id: Uuid,

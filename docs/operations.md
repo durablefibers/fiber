@@ -121,8 +121,12 @@ The agent is where steps actually run, so it is where the interesting numbers co
 run page shows. Every agent reports the same `service.name`, so `service.instance.id` is set
 from `--name`: "which worker is slow" is the question this data gets asked.
 
-Agent and API traces are not yet joined. The offer carries no trace context, so a step span
-is a root rather than a child of the run that produced it.
+The offer carries a W3C `traceparent`, so an agent's `fiber.step` is a child of the API's
+`fiber.offer` and a step reads as one trace across both processes. An agent that receives no
+trace context, because the server does not export, starts a root span as before.
+
+`RUST_LOG` raises or lowers this; `RUST_LOG=fiber_api=debug` logs the trace context of every
+offer, which is where to look when spans do not join up.
 
 ## Images and releases
 

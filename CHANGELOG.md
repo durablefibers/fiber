@@ -6,6 +6,20 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A step is one trace across both processes.** The offer carries a W3C `traceparent`, so
+  the agent's `fiber.step` span is a child of the API's `fiber.offer` rather than a root of
+  its own. The field is additive and older agents ignore it; an agent that receives no trace
+  context behaves as before.
+
+### Fixed
+
+- **`RUST_LOG` could not raise the log level.** Both binaries added a `fiber_api=info` /
+  `fiber_agent=info` directive on top of the environment filter, which overrode what
+  `RUST_LOG` said about that very crate, so `RUST_LOG=fiber_agent=debug` silently did
+  nothing. It is now a default, applied only when `RUST_LOG` is unset.
+
 ## [0.2.4] — 2026-09-07
 
 Observability. OpenTelemetry export worked in no previous version, and there is now a

@@ -47,7 +47,10 @@ fn otlp_endpoint() -> Option<String> {
 
 /// Install fmt logging always; add OTLP traces + metrics when an endpoint is configured.
 pub fn init(agent_name: &str) -> Result<OtelGuard> {
-    let filter = EnvFilter::from_default_env().add_directive("fiber_agent=info".parse()?);
+    // Only a default: `add_directive` on top of the env filter would override what
+    // RUST_LOG says about this crate, so `RUST_LOG=fiber_agent=debug` did nothing.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,fiber_agent=info"));
 
     let Some(endpoint) = otlp_endpoint() else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -117,6 +120,25 @@ fn signal_endpoint(base: &str, signal: &str) -> String {
     } else {
         format!("{base}/{signal}")
     }
+}
+
+/// Parent `span` to the trace the server sent in the offer's `traceparent`.
+///
+/// A no-op when there is none, or when OpenTelemetry is off and the propagator cannot
+/// extract anything: the span then stays a root, which is what it was before.
+pub fn adopt_remote_parent(span: &tracing::Span, traceparent: Option<&str>) {
+    use opentelemetry::global;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let Some(tp) = traceparent.filter(|t| !t.trim().is_empty()) else {
+        return;
+    };
+    let carrier: std::collections::HashMap<String, String> =
+        [("traceparent".to_string(), tp.to_string())].into();
+    tracing::debug!(traceparent = tp, "adopting the server's trace context");
+    let parent = global::get_text_map_propagator(|p| p.extract(&carrier));
+    // Returns the previous parent, which we have no use for.
+    let _ = span.set_parent(parent);
 }
 
 struct StepInstruments {
