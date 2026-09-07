@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-07
+
+Two correctness fixes found by running Fiber's own pipeline on Fiber. Anyone on `0.2.0`
+whose steps use `image:` wants this one.
+
 ### Fixed
 
 - **Docker steps no longer lose the image's `PATH`.** Step commands ran under `sh -lc`, and
