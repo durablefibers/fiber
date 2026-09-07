@@ -18,10 +18,13 @@ restore), and run ops (retry from UI/CLI/API, attempt-scoped logs, cursor pagina
 and next-run visibility, WS reconnect, and CLI parity). GitHub commit statuses, exact-commit
 checkout, and fork-PR containment landed with it.
 
+`v0.2.2` published the images for `linux/amd64` and `linux/arm64`, made them public, and
+pointed Compose at them, so a deployment no longer needs a build toolchain.
+
 | # | Item | Goal |
 |---|---|---|
 | 1 | **Dogfood on this repo** | Point a public Fiber at `durablefibers/fiber` with a webhook secret set, build `fiber.yml` on a labeled agent, require the commit status on pull requests, and fix what breaks under real push/PR traffic. Needs a public URL for the instance. |
-| 2 | **Publish the images** | `ghcr.io/durablefibers/fiber-api` and `fiber-agent` need a one-time package visibility flip after the first tagged release, and `docs/operations.md` should point at them instead of a local build. |
+| 2 | **Artifacts from a containerised agent** | The Compose agent is deliberately off the backend network, so it cannot reach MinIO and the presigned URL it is handed (`FIBER_S3_PUBLIC_ENDPOINT`, host-facing) resolves to the container itself. Every artifact upload from it fails. The agent should fall back to uploading through the API, which it can already reach, rather than the network boundary being relaxed. |
 
 ## Later
 

@@ -107,8 +107,12 @@ cargo run -p fiber-cli -- agent --token "$FIBER_AGENT_TOKEN"
 
 ```bash
 cp deploy/.env.example deploy/.env      # set FIBER_SECRETS_KEY (openssl rand -hex 32) and FIBER_ADMIN_PASSWORD
-docker compose -f deploy/docker-compose.yml up --build
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
 ```
+
+That runs the published `fiber-api` and `fiber-agent` images (amd64 and arm64); add
+`--build` to compile from this tree instead.
 
 Add a worker with `docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent`
 (set `FIBER_AGENT_TOKEN` in `deploy/.env` first), or attach another machine with
