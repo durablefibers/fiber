@@ -6,6 +6,17 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-07
+
+### Fixed
+
+- **The published images are multi-architecture.** `ghcr.io/durablefibers/fiber-api` and
+  `fiber-agent` carried only `linux/amd64`, so `docker run ghcr.io/durablefibers/fiber-agent`
+  failed outright on Apple Silicon, arm64 Linux, and Graviton with `no matching manifest for
+  linux/arm64`. Both now ship `linux/amd64` and `linux/arm64`, built on native runners rather
+  than under emulation, and joined into one manifest list per tag. The release binaries
+  already covered arm64; the images did not.
+
 ## [0.2.1] — 2026-09-07
 
 Two correctness fixes found by running Fiber's own pipeline on Fiber. Anyone on `0.2.0`
