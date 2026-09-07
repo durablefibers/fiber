@@ -319,4 +319,17 @@ pub struct MetricsSnapshot {
     /// Age of the oldest step waiting to be leased, in seconds. `None` when the queue is
     /// empty.
     pub oldest_queued_step_age_secs: Option<f64>,
+    /// How long finished attempts took to run.
+    pub step_duration: Histogram,
+    /// How long attempts waited to be leased.
+    pub queue_wait: Histogram,
+}
+
+/// A Prometheus histogram assembled from the database rather than counted in the process.
+#[derive(Debug, Default, Clone)]
+pub struct Histogram {
+    /// `(le, cumulative count)`, ascending. Excludes `+Inf`, which is `count`.
+    pub buckets: Vec<(f64, i64)>,
+    pub count: i64,
+    pub sum: f64,
 }

@@ -198,6 +198,35 @@ fn render_metrics(out: &mut String, m: &fiber_core::MetricsSnapshot) {
         "fiber_oldest_queued_step_age_seconds {}",
         m.oldest_queued_step_age_secs.unwrap_or(0.0)
     );
+
+    render_histogram(
+        out,
+        "fiber_step_queue_wait_seconds",
+        "Seconds an attempt waited to be leased, from the step becoming queued.",
+        &m.queue_wait,
+    );
+    render_histogram(
+        out,
+        "fiber_step_duration_seconds",
+        "Seconds an attempt spent running, workspace preparation and artifact transfer included.",
+        &m.step_duration,
+    );
+}
+
+/// A Prometheus histogram: cumulative `_bucket` series, then `_sum` and `_count`.
+fn render_histogram(out: &mut String, name: &str, help: &str, h: &fiber_core::Histogram) {
+    use std::fmt::Write;
+
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    for (le, n) in &h.buckets {
+        let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {n}");
+    }
+    // `+Inf` must always be present and equal to the count, or the series is not a
+    // histogram as far as Prometheus is concerned.
+    let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {}", h.count);
+    let _ = writeln!(out, "{name}_sum {}", h.sum);
+    let _ = writeln!(out, "{name}_count {}", h.count);
 }
 
 /// Escape a Prometheus label value. Statuses are ours, but a label that could carry a quote
@@ -1764,6 +1793,7 @@ mod tests {
             agents_online: 2,
             agents_total: 5,
             oldest_queued_step_age_secs: Some(12.5),
+            ..Default::default()
         };
         let mut out = String::new();
         render_metrics(&mut out, &m);
@@ -1792,9 +1822,47 @@ mod tests {
             "fiber_fibers",
             "fiber_agents",
             "fiber_oldest_queued_step_age_seconds",
+            "fiber_step_queue_wait_seconds",
+            "fiber_step_duration_seconds",
         ] {
             assert!(out.contains(&format!("# HELP {metric} ")), "{metric}");
             assert!(out.contains(&format!("# TYPE {metric} ")), "{metric}");
+        }
+    }
+
+    #[test]
+    fn histograms_are_cumulative_and_carry_an_inf_bucket() {
+        let m = fiber_core::MetricsSnapshot {
+            step_duration: fiber_core::Histogram {
+                buckets: vec![(1.0, 2), (5.0, 5), (30.0, 9)],
+                count: 11,
+                sum: 421.5,
+            },
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_metrics(&mut out, &m);
+
+        assert!(
+            out.contains(r#"fiber_step_duration_seconds_bucket{le="1"} 2"#),
+            "{out}"
+        );
+        assert!(out.contains(r#"fiber_step_duration_seconds_bucket{le="5"} 5"#));
+        assert!(out.contains(r#"fiber_step_duration_seconds_bucket{le="30"} 9"#));
+        // Two observations sit above the last finite bucket; +Inf must still be the total.
+        assert!(out.contains(r#"fiber_step_duration_seconds_bucket{le="+Inf"} 11"#));
+        assert!(out.contains("fiber_step_duration_seconds_sum 421.5"));
+        assert!(out.contains("fiber_step_duration_seconds_count 11"));
+
+        // Buckets must never decrease as `le` grows.
+        let mut last = 0i64;
+        for line in out
+            .lines()
+            .filter(|l| l.starts_with("fiber_step_duration_seconds_bucket"))
+        {
+            let n: i64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+            assert!(n >= last, "not cumulative: {line}");
+            last = n;
         }
     }
 

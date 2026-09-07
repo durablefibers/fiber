@@ -19,6 +19,12 @@ pub struct Store {
     pub pool: PgPool,
 }
 
+/// Bucket boundaries in seconds, for both step duration and queue wait. Chosen for CI:
+/// sub-second is noise, and anything past an hour is a stuck build rather than a slow one.
+const HISTOGRAM_BUCKETS: &[f64] = &[
+    1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
+
 impl Store {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -199,6 +205,42 @@ impl Store {
         }
     }
 
+    /// Bucket one expression into a Prometheus histogram.
+    ///
+    /// `width_bucket` does the counting in Postgres, so this is one row per bucket rather
+    /// than one per observation. The caller's `from_sql` must produce a single `v` column.
+    async fn histogram(&self, from_sql: &str) -> Result<Histogram> {
+        let rows: Vec<(i32, i64, f64)> = sqlx::query_as(&format!(
+            "SELECT width_bucket(v, $1::float8[])::int4, COUNT(*)::int8, COALESCE(SUM(v), 0)::float8 \
+             FROM ({from_sql}) t WHERE v IS NOT NULL AND v >= 0 GROUP BY 1"
+        ))
+        .bind(HISTOGRAM_BUCKETS)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut per_bucket = vec![0i64; HISTOGRAM_BUCKETS.len() + 1];
+        let mut count = 0i64;
+        let mut sum = 0.0;
+        for (idx, n, s) in rows {
+            // width_bucket returns 0 below the first threshold and len() above the last.
+            per_bucket[(idx as usize).min(HISTOGRAM_BUCKETS.len())] += n;
+            count += n;
+            sum += s;
+        }
+        // Prometheus buckets are cumulative: each `le` counts everything at or below it.
+        let mut running = 0i64;
+        let mut buckets = Vec::with_capacity(HISTOGRAM_BUCKETS.len());
+        for (i, le) in HISTOGRAM_BUCKETS.iter().enumerate() {
+            running += per_bucket[i];
+            buckets.push((*le, running));
+        }
+        Ok(Histogram {
+            buckets,
+            count,
+            sum,
+        })
+    }
+
     /// One database round of the numbers `/metrics` reports.
     ///
     /// Everything here is derived from the tables rather than counters held in this
@@ -231,6 +273,17 @@ impl Store {
         )
         .fetch_one(&self.pool)
         .await?;
+        // Both are per attempt, not per step: a step that was retried waited twice and ran
+        // twice, and averaging that away would hide exactly the runs worth looking at.
+        let step_duration = self
+            .histogram(
+                "SELECT EXTRACT(EPOCH FROM (finished_at - started_at))::float8 AS v \
+                 FROM step_attempts WHERE finished_at IS NOT NULL",
+            )
+            .await?;
+        let queue_wait = self
+            .histogram("SELECT queue_wait_seconds AS v FROM step_attempts")
+            .await?;
         Ok(MetricsSnapshot {
             step_runs,
             runs,
@@ -238,6 +291,8 @@ impl Store {
             agents_online,
             agents_total,
             oldest_queued_step_age_secs,
+            step_duration,
+            queue_wait,
         })
     }
 
@@ -514,7 +569,7 @@ impl Store {
         let requeued = sqlx::query_as::<_, StepRun>(
             "UPDATE step_runs
              SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
-                 error = NULL, exit_code = NULL, finished_at = NULL,
+                 error = NULL, exit_code = NULL, finished_at = NULL, queued_at = NOW(),
                  not_before = NOW() + make_interval(secs => $2)
              WHERE id = $1 AND status = 'running' AND agent_id = $3
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
@@ -608,8 +663,10 @@ impl Store {
             };
             sqlx::query(
                 "INSERT INTO step_runs
-                 (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries, error)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
+                  error, queued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                         CASE WHEN $5 = 'queued' THEN NOW() END)",
             )
             .bind(sid)
             .bind(run_id)
@@ -720,8 +777,9 @@ impl Store {
             sqlx::query(
                 "INSERT INTO step_runs
                  (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
-                  error, exit_code, started_at, finished_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                  error, exit_code, started_at, finished_at, queued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                         CASE WHEN $5 = 'queued' THEN NOW() END)",
             )
             .bind(sid)
             .bind(new_run_id)
@@ -883,8 +941,11 @@ impl Store {
         status: &str,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO step_attempts (id, step_run_id, attempt, agent_id, status)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO step_attempts
+                 (id, step_run_id, attempt, agent_id, status, queue_wait_seconds)
+             SELECT $1, $2, $3, $4, $5,
+                    EXTRACT(EPOCH FROM (NOW() - s.queued_at))::float8
+               FROM step_runs s WHERE s.id = $2",
         )
         .bind(Uuid::new_v4())
         .bind(step_run_id)
@@ -1023,7 +1084,8 @@ impl Store {
 
     pub async fn requeue_expired_leases(&self) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
+            "UPDATE step_runs
+             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL, queued_at = NOW()
              WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -1040,7 +1102,8 @@ impl Store {
 
     pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Vec<StepRun>> {
         let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs SET status = 'queued', agent_id = NULL, lease_expires_at = NULL
+            "UPDATE step_runs
+             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL, queued_at = NOW()
              WHERE agent_id = $1 AND status = 'running'
              RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
                        retries, attempt, agent_id, lease_expires_at, exit_code, error,
@@ -1103,7 +1166,7 @@ impl Store {
                     }
                     Transition::Queue => {
                         sqlx::query_as::<_, StepRun>(&format!(
-                            "UPDATE step_runs SET status = 'queued'
+                            "UPDATE step_runs SET status = 'queued', queued_at = NOW()
                              WHERE id = $1 AND status = 'pending'
                              RETURNING {STEP_RUN_COLS}"
                         ))
