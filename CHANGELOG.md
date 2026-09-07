@@ -6,6 +6,13 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Compose runs the published images.** `deploy/docker-compose.yml` pulls
+  `ghcr.io/durablefibers/fiber-api` and `fiber-agent` instead of building from the working
+  tree, so a deployment needs no Rust toolchain. `FIBER_VERSION` in `deploy/.env` picks the
+  tag and defaults to `latest`; `docker compose up --build` still builds locally.
+
 ## [0.2.2] — 2026-09-07
 
 ### Fixed

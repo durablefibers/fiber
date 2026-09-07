@@ -83,6 +83,24 @@ architecture and the two are joined into one manifest list, so `docker pull` pic
 one and no build runs under emulation. The manifest step prints the platforms it published,
 which is where to look if an image ever goes single-architecture again.
 
+### Running Compose on the published images
+
+`deploy/docker-compose.yml` uses `ghcr.io/durablefibers/fiber-api` and `fiber-agent`, so a
+deployment needs no build toolchain:
+
+```bash
+cp deploy/.env.example deploy/.env      # set FIBER_SECRETS_KEY and FIBER_ADMIN_PASSWORD
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`FIBER_VERSION` in `deploy/.env` picks the tag. It defaults to `latest`; pin an exact
+version for a reproducible deployment. To build from the working tree instead, add
+`--build`, which overrides the published image with a local one.
+
+`fiber-web` is still built locally, deliberately: its API URL is baked in at build time, so
+a generic image would only work for whoever's URL was compiled in.
+
 Before the first tag:
 
 - **The repository must be public** for the documented install paths to work. Release assets and

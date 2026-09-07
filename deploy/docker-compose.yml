@@ -67,6 +67,10 @@ services:
 
   fiber-api:
     networks: [backend, agentnet]
+    # Published image by default — `docker compose pull` fetches it, and it covers
+    # linux/amd64 and linux/arm64. Pin FIBER_VERSION in deploy/.env for a reproducible
+    # deployment. `docker compose up --build` still builds from this tree instead.
+    image: ghcr.io/durablefibers/fiber-api:${FIBER_VERSION:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -116,6 +120,7 @@ services:
   fiber-agent:
     networks: [agentnet]
     profiles: ["agent"]
+    image: ghcr.io/durablefibers/fiber-agent:${FIBER_VERSION:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
