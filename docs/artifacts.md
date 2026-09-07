@@ -6,6 +6,19 @@ not everything the run has produced, so a parallel sibling cannot drop files int
 
 Steps declare workspace-relative paths under `artifacts:`. After a **successful** step, the agent uploads each path. Later steps in the same run receive a `restore` list in their Offer and download those files into the workspace before `run`.
 
+### Agents that cannot reach object storage
+
+Presigned URLs name the storage endpoint as the outside world reaches it
+(`FIBER_S3_PUBLIC_ENDPOINT`), which is right for a browser and for an agent on the same
+network. An agent placed behind a boundary — the Compose agent runs on its own network,
+deliberately away from Postgres, Redis, and MinIO — cannot use that address.
+
+Such an agent falls back to the API, which it can reach by definition, since that is where
+its offers come from. Uploads go through `PUT /api/agent/steps/{id}/artifacts` and restores
+through `GET /api/agent/artifacts/{id}/download?via=api`. Both log a `system` line saying
+the presigned route was unreachable, so the slower path is visible rather than silent.
+Direct transfer is still tried first and still used wherever it works.
+
 ### When an upload fails
 
 A declared artifact that exists but could not be stored **fails the step** — an unreadable

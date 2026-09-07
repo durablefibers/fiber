@@ -1116,12 +1116,29 @@ async fn restore_artifacts(
             "system",
             format!("restoring artifact {} ({} bytes)", art.name, art.size),
         );
+        // A failure here is usually the 307 to object storage, not the API itself: the
+        // presigned URL names the storage endpoint as the outside world reaches it. Ask
+        // the API for the bytes instead, the same way the upload falls back.
         let resp = match client.get(&url).bearer_auth(token).send().await {
             Ok(r) => r,
             Err(e) => {
-                let msg = format!("RESTORE FAILED {}: network error: {e}", art.name);
-                log("system", msg.clone());
-                bail!("{msg}");
+                log(
+                    "system",
+                    format!("{}: fetching through the API ({e})", art.name),
+                );
+                match client
+                    .get(format!("{url}?via=api"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e2) => {
+                        let msg = format!("RESTORE FAILED {}: network error: {e2}", art.name);
+                        log("system", msg.clone());
+                        bail!("{msg}");
+                    }
+                }
             }
         };
         if !resp.status().is_success() {
@@ -1212,7 +1229,7 @@ async fn upload_artifacts(
                             &complete_url,
                             &proxy_url,
                             rel,
-                            bytes,
+                            bytes::Bytes::from(bytes),
                         )
                         .await
                         {
@@ -1239,6 +1256,13 @@ async fn upload_artifacts(
     failures
 }
 
+/// Store one artifact, returning how it got there.
+///
+/// The presigned URL points at object storage as the **outside world** reaches it
+/// (`FIBER_S3_PUBLIC_ENDPOINT`). An agent that cannot reach that address — a container kept
+/// off the storage network, or an agent behind a different boundary — falls back to sending
+/// the bytes through the API, which it can reach by definition, since that is where its
+/// offers come from. Isolating the agent should cost throughput, not artifacts.
 async fn upload_one_artifact(
     client: &reqwest::Client,
     token: &str,
@@ -1246,8 +1270,8 @@ async fn upload_one_artifact(
     complete_url: &str,
     proxy_url: &str,
     rel: &str,
-    bytes: Vec<u8>,
-) -> Result<&'static str, String> {
+    bytes: bytes::Bytes,
+) -> Result<String, String> {
     let size = bytes.len() as u64;
     let mode = match client
         .post(presign_url)
@@ -1275,14 +1299,15 @@ async fn upload_one_artifact(
             .get("stored_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("presign {rel}: missing stored_path"))?;
-        let put = client
-            .put(upload_url)
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|e| format!("s3 put {rel}: {e}"))?;
-        if !put.status().is_success() {
-            return Err(format!("s3 put {rel} failed: HTTP {}", put.status()));
+        // Cheap to clone: `Bytes` is refcounted, so the fallback costs no second copy.
+        let unreachable = match client.put(upload_url).body(bytes.clone()).send().await {
+            Ok(put) if put.status().is_success() => None,
+            Ok(put) => Some(format!("HTTP {}", put.status())),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(why) = unreachable {
+            let via = upload_via_proxy(client, token, proxy_url, rel, bytes).await?;
+            return Ok(format!("{via} (presigned upload unreachable: {why})"));
         }
         let done = client
             .post(complete_url)
@@ -1298,10 +1323,21 @@ async fn upload_one_artifact(
         if !done.status().is_success() {
             return Err(format!("complete {rel} failed: HTTP {}", done.status()));
         }
-        return Ok("presign");
+        return Ok("presign".into());
     }
 
-    // Local backend (or presign unavailable): proxy bytes through the API.
+    // Local backend, or object storage the API would rather proxy for.
+    upload_via_proxy(client, token, proxy_url, rel, bytes).await
+}
+
+/// Send the bytes through the API, which stores them with whatever backend it has.
+async fn upload_via_proxy(
+    client: &reqwest::Client,
+    token: &str,
+    proxy_url: &str,
+    rel: &str,
+    bytes: bytes::Bytes,
+) -> Result<String, String> {
     let resp = client
         .put(proxy_url)
         .bearer_auth(token)
@@ -1311,7 +1347,7 @@ async fn upload_one_artifact(
         .await
         .map_err(|e| format!("upload {rel} failed: {e}"))?;
     if resp.status().is_success() {
-        Ok("proxy")
+        Ok("proxy".into())
     } else {
         Err(format!("upload {rel} failed: HTTP {}", resp.status()))
     }

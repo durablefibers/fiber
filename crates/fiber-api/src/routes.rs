@@ -834,10 +834,20 @@ async fn agent_complete_artifact(
 /// Restore download. An agent may only read artifacts of runs in which it currently
 /// holds a running step (that is exactly the restore list it was offered); anything
 /// else is 404 so existence is not disclosed.
+#[derive(serde::Deserialize)]
+pub struct AgentDownloadQuery {
+    /// `via=api` streams the bytes through this process instead of redirecting to object
+    /// storage. Presigned URLs name the storage endpoint as the outside world reaches it,
+    /// which an agent kept off that network cannot use.
+    #[serde(default)]
+    via: Option<String>,
+}
+
 async fn agent_download_artifact(
     AuthAgent(agent): AuthAgent,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<AgentDownloadQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::Redirect;
     if !state
@@ -855,8 +865,10 @@ async fn agent_download_artifact(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
 
-    if let Ok(Some(url)) = state.artifacts.presign_get(&artifact.path, 600).await {
-        return Ok(Redirect::temporary(&url).into_response());
+    if q.via.as_deref() != Some("api") {
+        if let Ok(Some(url)) = state.artifacts.presign_get(&artifact.path, 600).await {
+            return Ok(Redirect::temporary(&url).into_response());
+        }
     }
 
     let bytes = state

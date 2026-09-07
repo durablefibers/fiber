@@ -80,7 +80,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path`; step must be **running and leased to this agent** |
 | POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }`; same lease check |
 | POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT; same lease check |
-| GET | `/api/agent/artifacts/{id}/download` | Restore download (may redirect). Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
+| GET | `/api/agent/artifacts/{id}/download` | Restore download. Redirects to object storage when it is configured; `?via=api` streams the bytes through the API instead, for an agent that cannot reach the storage endpoint. Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
 
 ## WebSockets
 
