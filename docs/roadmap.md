@@ -19,12 +19,13 @@ and next-run visibility, WS reconnect, and CLI parity). GitHub commit statuses, 
 checkout, and fork-PR containment landed with it.
 
 `v0.2.2` published the images for `linux/amd64` and `linux/arm64`, made them public, and
-pointed Compose at them, so a deployment no longer needs a build toolchain.
+pointed Compose at them, so a deployment no longer needs a build toolchain. `v0.2.3` let an
+agent that cannot reach object storage transfer artifacts through the API instead, which is
+what the containerised agent needs, and added `/metrics`.
 
 | # | Item | Goal |
 |---|---|---|
 | 1 | **Dogfood on this repo** | Point a public Fiber at `durablefibers/fiber` with a webhook secret set, build `fiber.yml` on a labeled agent, require the commit status on pull requests, and fix what breaks under real push/PR traffic. Needs a public URL for the instance. |
-| 2 | **Artifacts from a containerised agent** | The Compose agent is deliberately off the backend network, so it cannot reach MinIO and the presigned URL it is handed (`FIBER_S3_PUBLIC_ENDPOINT`, host-facing) resolves to the container itself. Every artifact upload from it fails. The agent should fall back to uploading through the API, which it can already reach, rather than the network boundary being relaxed. |
 
 ## Later
 
@@ -33,7 +34,7 @@ pointed Compose at them, so a deployment no longer needs a build toolchain.
 | **Pipeline YAML** | `env:`, `continue_on_error`, `working_directory`, `shell`, artifact globs, richer `if` (`failure()`, `&&`, `\|\|`), branch globs |
 | **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
 | **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
-| **Observability** | `/metrics`, OTel in the agent, JSON logs, request ids, supervised background loops surfaced in `/ready` |
+| **Observability** | OTel in the agent, JSON logs, request ids, supervised background loops surfaced in `/ready`; histograms for queue wait and step duration (`/metrics` ships gauges today) |
 | **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable web image so it can be published; build attestations for release assets |
 | **Sessions** | Password change, revoke-all, sliding expiry, tokens off the WS query string |
 | **SCM** | GitLab / Bitbucket webhooks; multibranch indexing |

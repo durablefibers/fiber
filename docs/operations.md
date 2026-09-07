@@ -70,6 +70,38 @@ A run that stays `running` is one of:
 
 `GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
 
+## Metrics
+
+`GET /metrics` serves Prometheus exposition. It is **off** until `FIBER_METRICS_TOKEN` is
+set, and then wants that token as a bearer credential: `404` when off, `401` when wrong.
+The API is reachable from the internet in a normal deployment and these figures describe
+your build volume, so it fails closed rather than defaulting to open the way an exporter on
+a private network would.
+
+```yaml
+scrape_configs:
+  - job_name: fiber
+    authorization:
+      credentials: <FIBER_METRICS_TOKEN>
+    static_configs:
+      - targets: ["ci.example.com"]
+```
+
+| Metric | Meaning |
+|---|---|
+| `fiber_build_info{version}` | The running version, always `1` |
+| `fiber_step_runs{status}` | Step runs by status — `queued` is the backlog |
+| `fiber_runs{status}` | Runs by status |
+| `fiber_fibers{status}` | Durable fibers by status |
+| `fiber_agents{state}` | Agents `online` / `offline` |
+| `fiber_oldest_queued_step_age_seconds` | How long the oldest leasable step has waited; `0` when the queue is empty |
+
+Every value is read from the database on scrape, not counted in the process, so a restart
+does not reset anything and two API replicas report the same figures. The one to alert on
+is `fiber_oldest_queued_step_age_seconds`: it climbs when no agent matches a step's labels,
+which is otherwise invisible until someone notices a run sitting still. Steps held back by
+retry backoff are excluded, since they are waiting deliberately.
+
 ## Images and releases
 
 Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and

@@ -6,6 +6,17 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /metrics`**, Prometheus exposition of the queue, runs, agents, and durable fibers.
+  Off until `FIBER_METRICS_TOKEN` is set, then requires it as a bearer token — the API is
+  internet-facing in a normal deployment and these figures describe your build volume, so it
+  fails closed. Values are read from the database on scrape rather than counted in the
+  process, so a restart resets nothing and two replicas agree.
+  `fiber_oldest_queued_step_age_seconds` is the one to alert on: it climbs when no agent
+  matches a step's labels, which was previously invisible until someone noticed a run
+  sitting still.
+
 ## [0.2.3] — 2026-09-07
 
 Artifacts work from a containerised agent, and Compose runs on the published images.
