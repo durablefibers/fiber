@@ -27,6 +27,7 @@ steps:
 | Field | Required | Notes |
 |---|---|---|
 | `name` | yes | Pipeline display name |
+| `env` | no | Environment for every step; see below |
 | `workspace` | no | Git clone into the step workspace |
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
@@ -45,6 +46,7 @@ In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `nam
 | `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts |
 | `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
 | `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |
+| `env` | `{}` | Environment for this step; overrides the pipeline's for the same name |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
 | `matrix` | — | Axis → values; expanded at compile time |
 | `if` | `success()` | Gate whether the step is queued |
@@ -57,6 +59,35 @@ publish:
   run: npm publish
   secrets: [NPM_TOKEN]     # only this one; other project secrets stay out
 ```
+
+### `env`
+
+Set it on the pipeline for every step, on a step for that step, or both:
+
+```yaml
+name: build
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+steps:
+  test:
+    run: cargo test
+    env:
+      RUST_LOG: debug        # wins over the pipeline's for this step only
+```
+
+**Precedence, least specific first:** pipeline `env`, then step `env`, then matrix bindings.
+A matrix binding wins because it is what says which cell is running — a step able to shadow
+`os` would make its own logs lie about what it built.
+
+Names must be usable as environment variables: letters, digits and underscore, not starting
+with a digit. `FIBER_*` is reserved, since the server sets `FIBER_RUN_ID` and friends there.
+Both rules are checked when the pipeline compiles, so a bad name is a validation error
+rather than a variable that silently never arrives.
+
+Values are not secret. They are stored in the pipeline definition, snapshotted onto every
+run, and visible to anyone who can read the project. Use project `secrets:` for anything
+that should not be.
 
 ## Matrix
 

@@ -23,6 +23,10 @@ pub enum DagError {
     EmptyMatrixAxis { step: String, axis: String },
     #[error("step `{0}` matrix expands to more than {MAX_MATRIX_CELLS} cells")]
     MatrixTooLarge(String),
+    #[error("step `{step}` env name `{name}` is not a usable environment variable name")]
+    BadEnvName { step: String, name: String },
+    #[error("step `{step}` env name `{name}` is reserved: FIBER_* is set by the server")]
+    ReservedEnvName { step: String, name: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
 }
@@ -256,6 +260,34 @@ fn expand_all(def: &PipelineDefinition) -> Result<Vec<ExpandedCell>, DagError> {
                 let env = matrix_env(&combo);
                 (id, name, combo, env)
             };
+            // Only what the pipeline author wrote is checked. The matrix generator emits
+            // FIBER_MATRIX_* itself, and the reservation exists to stop a user shadowing
+            // those, not to stop us setting them.
+            for (k, _) in def.env.iter().chain(step.env.iter()) {
+                if !is_usable_env_name(k) {
+                    return Err(DagError::BadEnvName {
+                        step: step.id.clone(),
+                        name: k.clone(),
+                    });
+                }
+                if k.starts_with("FIBER_") {
+                    return Err(DagError::ReservedEnvName {
+                        step: step.id.clone(),
+                        name: k.clone(),
+                    });
+                }
+            }
+            // Least specific first, so the later writer wins: the pipeline sets a baseline,
+            // the step narrows it, and the matrix binding is last because it is what says
+            // which cell this is — a step that could shadow it would make the logs lie.
+            let mut merged: Vec<(String, String)> = def
+                .env
+                .iter()
+                .chain(step.env.iter())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            merged.extend(env);
+            let env = dedupe_last_wins(merged);
             out.push(ExpandedCell {
                 id,
                 name,
@@ -311,6 +343,40 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
     Ok(combos)
 }
 
+/// A name a shell and `docker --env-file` will both accept.
+///
+/// Deliberately stricter than POSIX: no leading digit, and nothing outside
+/// `[A-Za-z0-9_]`. A name containing `=` or a newline is how an env-file line turns into
+/// something other than one assignment.
+fn is_usable_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Keep the last value for each key, preserving first-seen order.
+///
+/// The offer hands the agent a list, not a map, and the agent applies it in order — but
+/// docker's `--env-file` and a shell disagree about what a repeated key means, so the
+/// ambiguity is resolved here rather than left to whichever executor runs the step.
+fn dedupe_last_wins(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in pairs {
+        if !latest.contains_key(&k) {
+            order.push(k.clone());
+        }
+        latest.insert(k, v);
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let v = latest.remove(&k).unwrap_or_default();
+            (k, v)
+        })
+        .collect()
+}
+
 fn matrix_env(combo: &BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for (k, v) in combo {
@@ -344,6 +410,7 @@ pub fn definition_from_map(
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
     PipelineDefinition {
         name,
+        env: BTreeMap::new(),
         workspace: None,
         on: None,
         steps: ordered
@@ -356,6 +423,7 @@ pub fn definition_from_map(
                 image: s.image,
                 labels: s.labels,
                 retries: s.retries.unwrap_or(0),
+                env: s.env,
                 artifacts: s.artifacts,
                 matrix: s.matrix,
                 if_expr: s.if_expr,
@@ -370,6 +438,8 @@ pub fn definition_from_map(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDefinitionInput {
     pub name: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub needs: Vec<String>,
     pub run: Option<String>,
@@ -394,6 +464,8 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
     #[derive(Deserialize)]
     struct Raw {
         name: String,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
         #[serde(default)]
         workspace: Option<fiber_proto::WorkspaceConfig>,
         #[serde(default)]
@@ -425,6 +497,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
                     image: input.image,
                     labels: input.labels,
                     retries: input.retries.unwrap_or(0),
+                    env: input.env,
                     artifacts: input.artifacts,
                     matrix: input.matrix,
                     if_expr: input.if_expr,
@@ -439,6 +512,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
 
     Ok(PipelineDefinition {
         name: raw.name,
+        env: raw.env,
         workspace: raw.workspace,
         on: raw.on,
         steps,
@@ -451,6 +525,99 @@ mod tests {
     use super::*;
     use fiber_proto::StepDefinition;
 
+    fn env_pipeline(pipeline: &[(&str, &str)], step_env: &[(&str, &str)]) -> PipelineDefinition {
+        let mut s = step("a", &[], "echo");
+        s.env = step_env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        PipelineDefinition {
+            name: "p".into(),
+            env: pipeline
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            workspace: None,
+            on: None,
+            steps: vec![s],
+            timeout_minutes: None,
+        }
+    }
+
+    fn env_of(d: &PipelineDefinition) -> Vec<(String, String)> {
+        compile_definition(d).expect("compiles").steps[0]
+            .env
+            .clone()
+    }
+
+    #[test]
+    fn step_env_overrides_pipeline_env() {
+        let e = env_of(&env_pipeline(
+            &[("SHARED", "from-pipeline"), ("ONLY_PIPELINE", "p")],
+            &[("SHARED", "from-step"), ("ONLY_STEP", "s")],
+        ));
+        assert!(e.contains(&("SHARED".into(), "from-step".into())), "{e:?}");
+        assert!(e.contains(&("ONLY_PIPELINE".into(), "p".into())));
+        assert!(e.contains(&("ONLY_STEP".into(), "s".into())));
+        // One entry per name: a repeated key means different things to a shell and to
+        // docker --env-file, so it must not reach either.
+        assert_eq!(e.iter().filter(|(k, _)| k == "SHARED").count(), 1);
+    }
+
+    #[test]
+    fn a_matrix_binding_beats_both() {
+        let mut s = step("a", &[], "echo");
+        s.env = [("os".to_string(), "from-step".to_string())]
+            .into_iter()
+            .collect();
+        s.matrix = Some(
+            [("os".to_string(), vec!["linux".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        let d = PipelineDefinition {
+            name: "p".into(),
+            env: [("os".to_string(), "from-pipeline".to_string())]
+                .into_iter()
+                .collect(),
+            workspace: None,
+            on: None,
+            steps: vec![s],
+            timeout_minutes: None,
+        };
+        let e = compile_definition(&d).expect("compiles").steps[0]
+            .env
+            .clone();
+        assert!(e.contains(&("os".into(), "linux".into())), "{e:?}");
+        assert_eq!(e.iter().filter(|(k, _)| k == "os").count(), 1);
+    }
+
+    #[test]
+    fn unusable_env_names_fail_to_compile() {
+        for bad in ["has space", "has=equals", "has\nnewline", "1LEADING", ""] {
+            let d = env_pipeline(&[], &[(bad, "v")]);
+            assert!(
+                matches!(compile_definition(&d), Err(DagError::BadEnvName { .. })),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fiber_prefix_is_reserved() {
+        let d = env_pipeline(&[], &[("FIBER_RUN_ID", "spoofed")]);
+        assert!(matches!(
+            compile_definition(&d),
+            Err(DagError::ReservedEnvName { .. })
+        ));
+        // The check is on the merged set, so setting it on the pipeline is caught too.
+        let d = env_pipeline(&[("FIBER_ANYTHING", "x")], &[]);
+        assert!(matches!(
+            compile_definition(&d),
+            Err(DagError::ReservedEnvName { .. })
+        ));
+    }
+
     fn step(id: &str, needs: &[&str], run: &str) -> StepDefinition {
         StepDefinition {
             id: id.into(),
@@ -460,6 +627,7 @@ mod tests {
             image: None,
             labels: vec![],
             retries: 0,
+            env: BTreeMap::new(),
             artifacts: vec![],
             matrix: None,
             if_expr: None,
@@ -476,6 +644,7 @@ mod tests {
         b.secrets = Some(vec![]);
         let def = PipelineDefinition {
             name: "s".into(),
+            env: Default::default(),
             workspace: None,
             on: None,
             timeout_minutes: None,
@@ -495,6 +664,7 @@ mod tests {
         s.timeout_minutes = Some(0);
         let def = PipelineDefinition {
             name: "t".into(),
+            env: Default::default(),
             workspace: None,
             on: None,
             steps: vec![s.clone()],
@@ -530,6 +700,7 @@ mod tests {
     fn compiles_levels() {
         let def = PipelineDefinition {
             name: "demo".into(),
+            env: Default::default(),
             workspace: None,
             on: None,
             timeout_minutes: None,
@@ -549,6 +720,7 @@ mod tests {
     fn detects_cycle() {
         let def = PipelineDefinition {
             name: "bad".into(),
+            env: Default::default(),
             workspace: None,
             on: None,
             timeout_minutes: None,
@@ -565,6 +737,7 @@ mod tests {
         test.matrix = Some(matrix);
         let def = PipelineDefinition {
             name: "m".into(),
+            env: Default::default(),
             workspace: None,
             on: None,
             timeout_minutes: None,

@@ -45,6 +45,8 @@ export type Pipeline = {
 
 export type PipelineDefinition = {
   name: string
+  /** Environment for every step. A step's own `env` wins, and a matrix binding wins over both. */
+  env?: Record<string, string>
   workspace?: {
     repo: string
     ref?: string
@@ -78,6 +80,8 @@ export type StepDefinition = {
   image?: string
   labels?: string[]
   retries?: number
+  /** Environment for this step, overriding the pipeline's for the same name. */
+  env?: Record<string, string>
   artifacts?: string[]
   /** Axis → values; expanded into multiple step runs at compile time. */
   matrix?: Record<string, string[]>
@@ -481,6 +485,12 @@ export function statusColor(status: string): string {
 /** Export definition as fiber.yml-style YAML (map steps). */
 export function definitionToYaml(def: PipelineDefinition): string {
   const lines: string[] = [`name: ${yamlQuote(def.name)}`]
+  if (def.env && Object.keys(def.env).length) {
+    lines.push("env:")
+    for (const [k, v] of Object.entries(def.env)) {
+      lines.push(`  ${k}: ${yamlQuote(v)}`)
+    }
+  }
   if (def.workspace?.repo) {
     lines.push("workspace:")
     lines.push(`  repo: ${yamlQuote(def.workspace.repo)}`)
@@ -570,6 +580,12 @@ export function definitionToYaml(def: PipelineDefinition): string {
       lines.push("    matrix:")
       for (const [axis, values] of Object.entries(s.matrix)) {
         lines.push(`      ${axis}: [${values.map(yamlQuote).join(", ")}]`)
+      }
+    }
+    if (s.env && Object.keys(s.env).length) {
+      lines.push("    env:")
+      for (const [k, v] of Object.entries(s.env)) {
+        lines.push(`      ${k}: ${yamlQuote(v)}`)
       }
     }
     if (s.artifacts?.length) {
