@@ -1153,7 +1153,7 @@ dependencies = [
  "fiber-scheduler",
  "futures-util",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
