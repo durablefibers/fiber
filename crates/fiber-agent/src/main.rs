@@ -858,7 +858,10 @@ async fn execute_step_inner(
             cmd.env(k, v);
         }
         env_file = Some(file);
-        cmd.args([img, "sh", "-lc", run])
+        // `sh -c`, never `sh -lc`: a login shell sources /etc/profile, which on Debian
+        // resets PATH and throws away what the image put there — `rust:*` keeps cargo on
+        // /usr/local/cargo/bin, so `-l` turns a plain `cargo build` into "cargo: not found".
+        cmd.args([img, "sh", "-c", run])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -870,7 +873,9 @@ async fn execute_step_inner(
             format!("running on host shell in {}", work_dir.display()),
         );
         let mut cmd = Command::new("sh");
-        cmd.args(["-lc", run])
+        // Not `-lc`, for the same reason as the container: /etc/profile would overwrite
+        // the environment assembled just below, PATH included.
+        cmd.args(["-c", run])
             .current_dir(work_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
