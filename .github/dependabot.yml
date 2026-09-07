@@ -19,6 +19,12 @@ updates:
       web-dependencies:
         patterns: ["*"]
         update-types: [minor, patch]
+    ignore:
+      # Type definitions must describe the Node we actually run, which is 22 in CI, in
+      # fiber.yml, and in the web image. A newer major would type-check calls the runtime
+      # does not have.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

@@ -6,6 +6,13 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Web development dependencies: vitest 4 to 5, jsdom 28 to 30, and TypeScript 6 to 7.
+  `@types/node` stays on 22 to match the Node the project actually runs — CI, `fiber.yml`,
+  and the web image all use Node 22, and types a major ahead would accept calls the runtime
+  does not have. Dependabot is now told to skip that major.
+
 ### Added
 
 - **Queue-wait and step-duration histograms on `/metrics`.** `fiber_step_queue_wait_seconds`
