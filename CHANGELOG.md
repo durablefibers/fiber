@@ -6,6 +6,10 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-09-07
+
+Finishes the tracing work: a run now reads as one trace across the API and the agent.
+
 ### Added
 
 - **A step is one trace across both processes.** The offer carries a W3C `traceparent`, so
