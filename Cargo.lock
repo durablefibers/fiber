@@ -1202,7 +1202,7 @@ dependencies = [
  "chrono",
  "cron",
  "fiber-proto",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "globset",
  "hex",
  "password-hash",
