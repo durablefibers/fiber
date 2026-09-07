@@ -6,6 +6,14 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-09-07
+
+**Upgrading:** this release carries migration `012`, the first schema change since the
+project went public. It applies automatically when `fiber-api` starts, adds two nullable
+columns, and backfills `queued_at` for steps queued at that moment. There is nothing to run
+by hand and no downtime step, but an older `fiber-api` will refuse to start against the
+upgraded database, so roll the API forward rather than mixing versions.
+
 ### Changed
 
 - Web development dependencies: vitest 4 to 5, jsdom 28 to 30, and TypeScript 6 to 7.
