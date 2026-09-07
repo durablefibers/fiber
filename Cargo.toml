@@ -18,7 +18,7 @@ authors = ["Durable Fibers"]
 repository = "https://github.com/durablefibers/fiber"
 homepage = "https://github.com/durablefibers/fiber"
 readme = "README.md"
-rust-version = "1.97"
+rust-version = "1.98"
 
 [workspace.dependencies]
 fiber-proto = { path = "crates/fiber-proto" }
@@ -42,7 +42,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -50,16 +50,15 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 rand = "0.9"
-getrandom = "0.2"
+getrandom = "0.4"
 globset = "0.4"
 libc = "0.2"
 argon2 = { version = "0.5", features = ["std"] }
-password-hash = "0.5"
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 cron = "0.15"

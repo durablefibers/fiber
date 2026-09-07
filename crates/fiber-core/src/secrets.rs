@@ -6,7 +6,8 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow};
-use getrandom::getrandom;
+// `getrandom` was renamed `fill` in 0.3; same CSPRNG, same failure mode.
+use getrandom::fill as getrandom;
 use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
@@ -51,7 +52,11 @@ pub fn encrypt_secret(plaintext: &str) -> Result<String> {
     let Some(k) = key() else {
         return Ok(plaintext.to_string());
     };
-    let cipher = Aes256Gcm::new_from_slice(k).context("aes key")?;
+    let cipher = Aes256Gcm::new_from_slice(k)
+        // Formatted rather than `.context()`: whether this error implements
+        // std::error::Error depends on a transitive `std` feature that another crate
+        // happens to enable, which is not something to build on.
+        .map_err(|e| anyhow!("aes key: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     getrandom(&mut nonce_bytes).context("nonce rng")?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -79,7 +84,11 @@ pub fn decrypt_secret(stored: &str) -> Result<String> {
         return Err(anyhow!("ciphertext too short"));
     }
     let (nonce_bytes, ct) = raw.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(k).context("aes key")?;
+    let cipher = Aes256Gcm::new_from_slice(k)
+        // Formatted rather than `.context()`: whether this error implements
+        // std::error::Error depends on a transitive `std` feature that another crate
+        // happens to enable, which is not something to build on.
+        .map_err(|e| anyhow!("aes key: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let pt = cipher
         .decrypt(nonce, ct)

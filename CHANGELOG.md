@@ -6,6 +6,18 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Rust dependencies: `hmac` 0.13 with `sha2` 0.11 (they move in lockstep — 0.13 does not
+  build against 0.10), `getrandom` 0.4, `tower-http` 0.7, and the toolchain to 1.98 across
+  `rust-toolchain.toml`, `Cargo.toml`, the release workflow and the Dockerfile, which
+  Dependabot only bumps in one place. The unused direct `password-hash` dependency is gone;
+  the code reaches it through argon2's re-export.
+- AES errors are formatted rather than wrapped with `.context()`. Whether that type
+  implements `std::error::Error` depended on a `std` feature another crate happened to
+  enable, and moving to `sha2` 0.11 took it away — which broke `cargo test -p fiber-core`
+  while the workspace build still passed.
+
 ## [0.2.6] — 2026-09-07
 
 **Upgrading:** this release carries migration `012`, the first schema change since the
