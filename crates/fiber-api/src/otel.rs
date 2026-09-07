@@ -59,7 +59,10 @@ fn resource() -> Resource {
 
 /// Install fmt tracing always; add OTLP traces + metrics when an endpoint env var is set.
 pub fn init() -> Result<OtelGuard> {
-    let filter = EnvFilter::from_default_env().add_directive("fiber_api=info".parse()?);
+    // Only a default: `add_directive` on top of the env filter would override what
+    // RUST_LOG says about this crate, so `RUST_LOG=fiber_api=debug` did nothing.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,fiber_api=info"));
 
     let Some(endpoint) = otlp_endpoint() else {
         tracing_subscriber::fmt().with_env_filter(filter).init();

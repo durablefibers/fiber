@@ -34,7 +34,7 @@ what the containerised agent needs, and added `/metrics`.
 | **Pipeline YAML** | `env:`, `continue_on_error`, `working_directory`, `shell`, artifact globs, richer `if` (`failure()`, `&&`, `\|\|`), branch globs |
 | **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
 | **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
-| **Observability** | Trace context in the offer so agent spans join the API's run trace; JSON logs, request ids, supervised background loops surfaced in `/ready`; queue-wait histogram on `/metrics`, which ships gauges today |
+| **Observability** | JSON logs, request ids, supervised background loops surfaced in `/ready`; queue-wait and step-duration histograms on `/metrics`, which ships gauges today |
 | **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable web image so it can be published; build attestations for release assets |
 | **Sessions** | Password change, revoke-all, sliding expiry, tokens off the WS query string |
 | **SCM** | GitLab / Bitbucket webhooks; multibranch indexing |
