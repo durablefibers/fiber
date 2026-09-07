@@ -31,7 +31,7 @@ what the containerised agent needs, and added `/metrics`.
 
 | Area | Ideas |
 |---|---|
-| **Pipeline YAML** | `env:`, `continue_on_error`, `working_directory`, `shell`, artifact globs, richer `if` (`failure()`, `&&`, `\|\|`), branch globs |
+| **Pipeline YAML** | `continue_on_error`, `working_directory`, `shell`, artifact globs, richer `if` (`failure()`, `&&`, `\|\|`), branch globs |
 | **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
 | **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
 | **Observability** | JSON logs, request ids, supervised background loops surfaced in `/ready` |

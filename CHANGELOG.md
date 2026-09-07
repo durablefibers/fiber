@@ -6,6 +6,17 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`env:` in the pipeline schema**, on the pipeline for every step and on a step for that
+  step. Precedence runs least specific first: pipeline, then step, then matrix bindings —
+  a matrix binding wins because it is what says which cell is running, and a step able to
+  shadow it would make its own logs lie. Names must be usable as environment variables and
+  `FIBER_*` is reserved, both checked when the pipeline compiles, so a bad name is a `400`
+  rather than a variable that silently never arrives. Values are not secret: they live in
+  the definition and are snapshotted onto every run. `examples/env-vars.yml` is a worked
+  example.
+
 ## [0.2.7] — 2026-09-07
 
 Dependency maintenance, including the Rust toolchain and the database driver. No schema

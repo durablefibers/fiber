@@ -142,3 +142,32 @@ describe("request error handling", () => {
     expect(headers?.Authorization).toBe("Bearer fiber_sess_test")
   })
 })
+
+describe("definitionToYaml env", () => {
+  it("emits pipeline and step env, and quotes values that need it", () => {
+    const yaml = definitionToYaml({
+      name: "p",
+      env: { SHARED: "one", NEEDS_QUOTES: "a b" },
+      steps: [
+        {
+          id: "a",
+          name: "a",
+          needs: [],
+          run: "echo hi",
+          env: { STEP_ONLY: "two" },
+        },
+      ],
+    })
+    expect(yaml).toContain("env:\n  SHARED: one")
+    expect(yaml).toContain('NEEDS_QUOTES: "a b"')
+    expect(yaml).toContain("    env:\n      STEP_ONLY: two")
+  })
+
+  it("omits env entirely when there is none", () => {
+    const yaml = definitionToYaml({
+      name: "p",
+      steps: [{ id: "a", name: "a", needs: [], run: "echo" }],
+    })
+    expect(yaml).not.toContain("env:")
+  })
+})

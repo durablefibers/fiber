@@ -61,6 +61,9 @@ pub struct StepDefinition {
     pub labels: Vec<String>,
     #[serde(default = "default_retries")]
     pub retries: u32,
+    /// Environment for this step, overriding any key of the same name set on the pipeline.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
     /// Workspace-relative paths to upload as artifacts after a successful step.
     #[serde(default)]
     pub artifacts: Vec<String>,
@@ -139,6 +142,10 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineDefinition {
     pub name: String,
+    /// Environment for every step. A step's own `env` overrides a key set here, and a
+    /// matrix binding overrides both, since that is what says which cell is running.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default)]

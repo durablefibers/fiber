@@ -1,0 +1,27 @@
+# Environment on the pipeline and on a step.
+#
+# Precedence runs least specific to most: pipeline env, then step env, then matrix
+# bindings. Values here are not secret — they live in the pipeline definition and are
+# snapshotted onto every run. Use project secrets for anything that should not be.
+name: env-vars
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+
+steps:
+  build:
+    run: |
+      echo "colour: $CARGO_TERM_COLOR"
+      echo "log level: $RUST_LOG"
+    labels: [os=linux]
+
+  test:
+    needs: [build]
+    # Narrower than the pipeline's, for this step only.
+    env:
+      RUST_LOG: debug
+      RUST_BACKTRACE: "1"
+    run: |
+      echo "log level: $RUST_LOG"      # debug, not info
+      echo "backtrace: $RUST_BACKTRACE"
+    labels: [os=linux]
