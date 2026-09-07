@@ -43,5 +43,7 @@ export FIBER_AGENT_NAME="${FIBER_AGENT_NAME:-local}"
 export FIBER_AGENT_LABELS="${FIBER_AGENT_LABELS:-os=linux}"
 export FIBER_AGENT_CONCURRENCY="${FIBER_AGENT_CONCURRENCY:-1}"
 export VITE_FIBER_API_URL="${VITE_FIBER_API_URL:-http://127.0.0.1:18080}"
+# /metrics stays off unless you export a token yourself; it is not a dev default.
+export FIBER_METRICS_TOKEN="${FIBER_METRICS_TOKEN:-}"
 
 mkdir -p "$FIBER_ARTIFACTS_DIR" "$FIBER_AGENT_WORKSPACE_DIR"

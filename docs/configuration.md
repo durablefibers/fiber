@@ -32,6 +32,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_GITHUB_API_URL` | `https://api.github.com` | GitHub / GHE API base |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enable OTLP HTTP traces/metrics |
 | `FIBER_OTEL_ENDPOINT` | unset | Alias for OTEL endpoint |
+| `FIBER_METRICS_TOKEN` | unset | Bearer token for `GET /metrics`. Unset = the endpoint returns `404` |
 | `RUST_LOG` | — | Tracing filter |
 
 Login is throttled per username: 10 failures within 10 minutes lock that username for 60 s (`429` with `Retry-After`); after a lockout the count restarts, so the sustained ceiling is about 10 guesses per minute per username per API instance. Because the key is the username, anyone can keep a known username (including `admin`) locked — an accepted trade-off over IP keying, which is spoofable behind a proxy. Error responses never include database or Redis error text; details go to the API log.

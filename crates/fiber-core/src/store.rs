@@ -199,6 +199,48 @@ impl Store {
         }
     }
 
+    /// One database round of the numbers `/metrics` reports.
+    ///
+    /// Everything here is derived from the tables rather than counters held in this
+    /// process, so a restart does not reset them and two API replicas report the same
+    /// figures. Retention bounds every table involved.
+    pub async fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
+        let step_runs: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM step_runs GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        let runs: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM runs GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        let fibers: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM fibers GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        let (agents_online, agents_total): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*) FILTER (WHERE online), COUNT(*) FROM agents")
+                .fetch_one(&self.pool)
+                .await?;
+        // How long the oldest step that could be leased right now has been waiting. Steps
+        // held back by retry backoff are excluded: they are waiting on purpose, and
+        // counting them would make a healthy queue look starved.
+        let oldest_queued_step_age_secs: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(r.created_at)))::float8 \
+             FROM step_runs s JOIN runs r ON r.id = s.run_id \
+             WHERE s.status = 'queued' AND (s.not_before IS NULL OR s.not_before <= NOW())",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(MetricsSnapshot {
+            step_runs,
+            runs,
+            fibers,
+            agents_online,
+            agents_total,
+            oldest_queued_step_age_secs,
+        })
+    }
+
     pub async fn count_instance_admins(&self) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin")

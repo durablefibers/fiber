@@ -8,6 +8,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 |---|---|---|---|
 | GET | `/health` | no | Liveness |
 | GET | `/ready` | no | Postgres + Redis |
+| GET | `/metrics` | Prometheus exposition. Off unless `FIBER_METRICS_TOKEN` is set, then requires it as a bearer token; `404` when off, `401` when wrong |
 
 ## Auth
 

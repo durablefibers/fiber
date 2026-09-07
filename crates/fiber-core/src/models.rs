@@ -304,3 +304,19 @@ pub struct CreateUserRequest {
     pub username: String,
     pub password: String,
 }
+
+/// Counts behind the `/metrics` endpoint, read from the database in one pass.
+#[derive(Debug, Default, Clone)]
+pub struct MetricsSnapshot {
+    /// `(status, count)` over every step run.
+    pub step_runs: Vec<(String, i64)>,
+    /// `(status, count)` over every run.
+    pub runs: Vec<(String, i64)>,
+    /// `(status, count)` over every durable fiber.
+    pub fibers: Vec<(String, i64)>,
+    pub agents_online: i64,
+    pub agents_total: i64,
+    /// Age of the oldest step waiting to be leased, in seconds. `None` when the queue is
+    /// empty.
+    pub oldest_queued_step_age_secs: Option<f64>,
+}

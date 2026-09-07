@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
@@ -102,6 +103,109 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true, "service": "fiber-api" }))
+}
+
+/// Prometheus exposition of the queue, agents, runs, and fibers.
+///
+/// Off unless `FIBER_METRICS_TOKEN` is set, and then it wants that token as a bearer
+/// credential. This process is reachable from the internet in a normal deployment, and the
+/// figures here describe a customer's build volume, so it fails closed like the webhooks do
+/// rather than defaulting to open the way a private-network exporter would.
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(expected) = std::env::var("FIBER_METRICS_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    else {
+        return (StatusCode::NOT_FOUND, "metrics disabled\n").into_response();
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !constant_time_eq(presented.as_bytes(), expected.trim().as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+    }
+    let snapshot = match state.store.metrics_snapshot().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "metrics snapshot");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n").into_response();
+        }
+    };
+    let mut out = String::new();
+    render_metrics(&mut out, &snapshot);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+/// Prometheus text format. Kept separate from the handler so it can be tested without a
+/// database.
+fn render_metrics(out: &mut String, m: &fiber_core::MetricsSnapshot) {
+    use std::fmt::Write;
+
+    let _ = writeln!(out, "# HELP fiber_build_info Version of this fiber-api.");
+    let _ = writeln!(out, "# TYPE fiber_build_info gauge");
+    let _ = writeln!(
+        out,
+        "fiber_build_info{{version=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let _ = writeln!(out, "# HELP fiber_step_runs Step runs by status.");
+    let _ = writeln!(out, "# TYPE fiber_step_runs gauge");
+    for (status, n) in &m.step_runs {
+        let _ = writeln!(out, "fiber_step_runs{{status=\"{}\"}} {n}", esc(status));
+    }
+
+    let _ = writeln!(out, "# HELP fiber_runs Runs by status.");
+    let _ = writeln!(out, "# TYPE fiber_runs gauge");
+    for (status, n) in &m.runs {
+        let _ = writeln!(out, "fiber_runs{{status=\"{}\"}} {n}", esc(status));
+    }
+
+    let _ = writeln!(out, "# HELP fiber_fibers Durable fibers by status.");
+    let _ = writeln!(out, "# TYPE fiber_fibers gauge");
+    for (status, n) in &m.fibers {
+        let _ = writeln!(out, "fiber_fibers{{status=\"{}\"}} {n}", esc(status));
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP fiber_agents Registered agents by connectedness."
+    );
+    let _ = writeln!(out, "# TYPE fiber_agents gauge");
+    let _ = writeln!(out, "fiber_agents{{state=\"online\"}} {}", m.agents_online);
+    let _ = writeln!(
+        out,
+        "fiber_agents{{state=\"offline\"}} {}",
+        m.agents_total - m.agents_online
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP fiber_oldest_queued_step_age_seconds Age of the oldest step waiting to be leased. 0 when nothing is waiting."
+    );
+    let _ = writeln!(out, "# TYPE fiber_oldest_queued_step_age_seconds gauge");
+    let _ = writeln!(
+        out,
+        "fiber_oldest_queued_step_age_seconds {}",
+        m.oldest_queued_step_age_secs.unwrap_or(0.0)
+    );
+}
+
+/// Escape a Prometheus label value. Statuses are ours, but a label that could carry a quote
+/// or a newline would produce a file no scraper can parse.
+fn esc(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -1649,6 +1753,78 @@ mod tests {
         let sig = sign("k", body);
         assert!(!verify_github_sig("k", body, &sig[..sig.len() - 1]));
         assert!(!verify_github_sig("k", body, &format!("{sig}0")));
+    }
+
+    #[test]
+    fn metrics_render_is_parseable_exposition() {
+        let m = fiber_core::MetricsSnapshot {
+            step_runs: vec![("queued".into(), 3), ("running".into(), 1)],
+            runs: vec![("succeeded".into(), 10)],
+            fibers: vec![("pending".into(), 2)],
+            agents_online: 2,
+            agents_total: 5,
+            oldest_queued_step_age_secs: Some(12.5),
+        };
+        let mut out = String::new();
+        render_metrics(&mut out, &m);
+
+        assert!(out.contains("fiber_step_runs{status=\"queued\"} 3"));
+        assert!(out.contains("fiber_runs{status=\"succeeded\"} 10"));
+        assert!(out.contains("fiber_fibers{status=\"pending\"} 2"));
+        assert!(out.contains("fiber_agents{state=\"online\"} 2"));
+        // Offline is derived, not stored: total minus online.
+        assert!(out.contains("fiber_agents{state=\"offline\"} 3"));
+        assert!(out.contains("fiber_oldest_queued_step_age_seconds 12.5"));
+
+        // Every metric line must be `name value`, and every metric needs HELP and TYPE.
+        for line in out.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let (name, value) = line.rsplit_once(' ').expect("metric line has a value");
+            assert!(!name.is_empty(), "{line}");
+            value.parse::<f64>().unwrap_or_else(|_| panic!("{line}"));
+        }
+        for metric in [
+            "fiber_build_info",
+            "fiber_step_runs",
+            "fiber_runs",
+            "fiber_fibers",
+            "fiber_agents",
+            "fiber_oldest_queued_step_age_seconds",
+        ] {
+            assert!(out.contains(&format!("# HELP {metric} ")), "{metric}");
+            assert!(out.contains(&format!("# TYPE {metric} ")), "{metric}");
+        }
+    }
+
+    #[test]
+    fn empty_queue_reports_zero_rather_than_nothing() {
+        // A missing series and a zero series read very differently on a dashboard.
+        let mut out = String::new();
+        render_metrics(&mut out, &fiber_core::MetricsSnapshot::default());
+        assert!(out.contains("fiber_oldest_queued_step_age_seconds 0"));
+        assert!(out.contains("fiber_agents{state=\"offline\"} 0"));
+    }
+
+    #[test]
+    fn label_values_that_would_break_the_exposition_are_escaped() {
+        let m = fiber_core::MetricsSnapshot {
+            step_runs: vec![("od\"d\nstatus".into(), 1)],
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_metrics(&mut out, &m);
+        assert!(
+            out.contains(r#"fiber_step_runs{status="od\"d\nstatus"} 1"#),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.contains("fiber_step_runs{"))
+                .count(),
+            1
+        );
     }
 
     #[test]
