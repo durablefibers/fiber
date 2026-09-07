@@ -26,7 +26,6 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 argon2 = { workspace = true }
-password-hash = { workspace = true }
 aes-gcm = { workspace = true }
 zeroize = { workspace = true }
 getrandom = { workspace = true }
