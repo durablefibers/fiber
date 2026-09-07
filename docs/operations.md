@@ -73,10 +73,15 @@ A run that stays `running` is one of:
 ## Images and releases
 
 Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and
-`fiber-agent` (tagged `X.Y.Z` and `X.Y`) and attaches agent + CLI binaries
+`fiber-agent` (tagged `X.Y.Z`, `X.Y`, and `latest`) and attaches agent + CLI binaries
 (`fiber-agent-<target>.tar.gz` with a `.sha256`) for linux x86_64/arm64 and macOS arm64 to the
 GitHub release. `scripts/install-agent.sh` consumes those assets. The tag must match the
 workspace version in `Cargo.toml` or the release fails before publishing anything.
+
+Images cover `linux/amd64` and `linux/arm64`. Each architecture is built on a runner of that
+architecture and the two are joined into one manifest list, so `docker pull` picks the right
+one and no build runs under emulation. The manifest step prints the platforms it published,
+which is where to look if an image ever goes single-architecture again.
 
 Before the first tag:
 
