@@ -95,12 +95,31 @@ scrape_configs:
 | `fiber_fibers{status}` | Durable fibers by status |
 | `fiber_agents{state}` | Agents `online` / `offline` |
 | `fiber_oldest_queued_step_age_seconds` | How long the oldest leasable step has waited; `0` when the queue is empty |
+| `fiber_step_queue_wait_seconds` | Histogram: how long each attempt waited to be leased |
+| `fiber_step_duration_seconds` | Histogram: how long each attempt spent running |
 
 Every value is read from the database on scrape, not counted in the process, so a restart
 does not reset anything and two API replicas report the same figures. The one to alert on
 is `fiber_oldest_queued_step_age_seconds`: it climbs when no agent matches a step's labels,
 which is otherwise invisible until someone notices a run sitting still. Steps held back by
 retry backoff are excluded, since they are waiting deliberately.
+
+The two histograms answer the question a gauge cannot, which is whether things are getting
+worse:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(fiber_step_queue_wait_seconds_bucket[1h])))
+```
+
+Both are per **attempt**, not per step. A step that was retried waited twice and ran twice,
+and folding those together would hide exactly the runs worth looking at. Buckets run from
+one second to an hour; past that a build is stuck rather than slow, which is what
+`fiber_oldest_queued_step_age_seconds` is for.
+
+Queue wait is recorded on the attempt when it is leased, rather than derived later, because
+a requeue overwrites the step's `queued_at` and would otherwise rewrite the history of
+earlier attempts. Attempts from before this shipped have no wait recorded and are absent
+from the histogram rather than counted as zero.
 
 ## OpenTelemetry
 

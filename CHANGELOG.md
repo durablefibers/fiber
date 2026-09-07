@@ -6,6 +6,15 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Queue-wait and step-duration histograms on `/metrics`.** `fiber_step_queue_wait_seconds`
+  and `fiber_step_duration_seconds` make a p95 answerable; the gauges only ever showed the
+  current worst case. Both are per attempt, since a retried step waited twice and ran twice.
+  Migration `012` records when a step became leasable and stamps the wait onto the attempt
+  that picked it up, so a later requeue cannot rewrite an earlier attempt's history.
+  Attempts from before this have no wait recorded and are absent rather than counted as zero.
+
 ## [0.2.5] — 2026-09-07
 
 Finishes the tracing work: a run now reads as one trace across the API and the agent.
