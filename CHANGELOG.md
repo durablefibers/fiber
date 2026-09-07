@@ -8,6 +8,12 @@ minor versions may carry breaking changes.
 
 ### Fixed
 
+- **Docker steps no longer lose the image's `PATH`.** Step commands ran under `sh -lc`, and
+  a login shell sources `/etc/profile`, which on Debian resets `PATH` to a fixed default.
+  Anything the image put there was discarded, so `cargo` in `rust:*` (which lives on
+  `/usr/local/cargo/bin`) was simply not found and a plain `cargo fmt` step failed with
+  `sh: 1: cargo: not found`. Steps now run under `sh -c`, on the host as well, so the
+  environment the agent assembles is the environment the command sees.
 - **A failed artifact upload now fails the step.** A declared artifact that existed but
   could not be stored — unreadable, over the 64 MiB cap, an unsafe path, or a failed
   transfer — was logged and then ignored, so the step reported success and a later step
