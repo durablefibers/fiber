@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-09-07
+
+Dependency maintenance, including the Rust toolchain and the database driver. No schema
+change: migration `012` shipped in 0.2.6 and nothing has been added since.
+
 ### Changed
 
 - **sqlx 0.9.** Its new `SqlSafeStr` bound refuses a query string built at runtime unless it
