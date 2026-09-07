@@ -1,11 +1,16 @@
 use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml};
 use crate::models::*;
+// sqlx 0.9 refuses a runtime-built query string unless it is asserted safe. Every
+// interpolation in this file splices a column-list `const` — PIPELINE_COLS, AGENT_COLS,
+// RUN_COLS, STEP_RUN_COLS — and never caller data; values are always bind parameters.
+// Any new `AssertSqlSafe` here has to hold to that, or it is a SQL injection.
 use crate::schedule::{has_schedule, initial_due_from_definition, next_due_from_triggers};
 use crate::tokens::{generate_token, hash_token, slugify};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use fiber_proto::{PipelineDefinition, RunStatus, StepStatus};
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -210,10 +215,10 @@ impl Store {
     /// `width_bucket` does the counting in Postgres, so this is one row per bucket rather
     /// than one per observation. The caller's `from_sql` must produce a single `v` column.
     async fn histogram(&self, from_sql: &str) -> Result<Histogram> {
-        let rows: Vec<(i32, i64, f64)> = sqlx::query_as(&format!(
+        let rows: Vec<(i32, i64, f64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT width_bucket(v, $1::float8[])::int4, COUNT(*)::int8, COALESCE(SUM(v), 0)::float8 \
              FROM ({from_sql}) t WHERE v IS NOT NULL AND v >= 0 GROUP BY 1"
-        ))
+        )))
         .bind(HISTOGRAM_BUCKETS)
         .fetch_all(&self.pool)
         .await?;
@@ -379,7 +384,7 @@ impl Store {
         let q = format!(
             "SELECT {PIPELINE_COLS} FROM pipelines WHERE project_id = $1 ORDER BY updated_at DESC"
         );
-        Ok(sqlx::query_as::<_, Pipeline>(&q)
+        Ok(sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(project_id)
             .fetch_all(&self.pool)
             .await?)
@@ -402,7 +407,7 @@ impl Store {
              VALUES ($1, $2, $3, $4, $5)
              RETURNING {PIPELINE_COLS}"
         );
-        let pipeline = sqlx::query_as::<_, Pipeline>(&q)
+        let pipeline = sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(id)
             .bind(project_id)
             .bind(&req.name)
@@ -446,7 +451,7 @@ impl Store {
              WHERE id = $1
              RETURNING {PIPELINE_COLS}"
         );
-        let pipeline = sqlx::query_as::<_, Pipeline>(&q)
+        let pipeline = sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(pipeline_id)
             .bind(&name)
             .bind(&req.definition)
@@ -458,7 +463,7 @@ impl Store {
 
     pub async fn get_pipeline(&self, id: Uuid) -> Result<Option<Pipeline>> {
         let q = format!("SELECT {PIPELINE_COLS} FROM pipelines WHERE id = $1");
-        Ok(sqlx::query_as::<_, Pipeline>(&q)
+        Ok(sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
@@ -466,7 +471,7 @@ impl Store {
 
     pub async fn list_all_pipelines(&self) -> Result<Vec<Pipeline>> {
         let q = format!("SELECT {PIPELINE_COLS} FROM pipelines");
-        Ok(sqlx::query_as::<_, Pipeline>(&q)
+        Ok(sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .fetch_all(&self.pool)
             .await?)
     }
@@ -478,7 +483,7 @@ impl Store {
              WHERE next_due_at IS NOT NULL AND next_due_at <= $1
              ORDER BY next_due_at ASC"
         );
-        Ok(sqlx::query_as::<_, Pipeline>(&q)
+        Ok(sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(now)
             .fetch_all(&self.pool)
             .await?)
@@ -618,13 +623,13 @@ impl Store {
         // The run row and every step row land together: a half-inserted DAG would
         // otherwise "succeed" once its partial set of steps finished.
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(&format!(
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
                (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
                 head_sha, head_ref, pr_number, repo_full_name, untrusted)
              VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11)
              RETURNING {RUN_COLS}"
-        ))
+        )))
         .bind(run_id)
         .bind(pipeline_id)
         .bind(pipeline.project_id)
@@ -693,12 +698,12 @@ impl Store {
     }
 
     pub async fn get_run(&self, id: Uuid) -> Result<Option<Run>> {
-        Ok(
-            sqlx::query_as::<_, Run>(&format!("SELECT {RUN_COLS} FROM runs WHERE id = $1"))
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+            "SELECT {RUN_COLS} FROM runs WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// Re-run a finished run from **its own** definition snapshot, not the pipeline as it
@@ -726,13 +731,13 @@ impl Store {
 
         let new_run_id = Uuid::new_v4();
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(&format!(
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
                (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
               retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted)
              VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
              RETURNING {RUN_COLS}"
-        ))
+        )))
         .bind(new_run_id)
         .bind(original.pipeline_id)
         .bind(original.project_id)
@@ -855,14 +860,14 @@ impl Store {
         limit: i64,
         before: Option<Uuid>,
     ) -> Result<Vec<Run>> {
-        Ok(sqlx::query_as::<_, Run>(&format!(
+        Ok(sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM runs
                  WHERE project_id = $1
                    AND ($3::uuid IS NULL OR (created_at, id) < (
                          SELECT created_at, id FROM runs WHERE id = $3))
                  ORDER BY created_at DESC, id DESC
                  LIMIT $2"
-        ))
+        )))
         .bind(project_id)
         .bind(limit)
         .bind(before)
@@ -1129,9 +1134,9 @@ impl Store {
     /// after commit.
     pub async fn propagate_after_step(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(&format!(
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM runs WHERE id = $1 FOR UPDATE"
-        ))
+        )))
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -1165,11 +1170,11 @@ impl Store {
                         .await?
                     }
                     Transition::Queue => {
-                        sqlx::query_as::<_, StepRun>(&format!(
+                        sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
                             "UPDATE step_runs SET status = 'queued', queued_at = NOW()
                              WHERE id = $1 AND status = 'pending'
                              RETURNING {STEP_RUN_COLS}"
-                        ))
+                        )))
                         .bind(id)
                         .fetch_optional(&mut *tx)
                         .await?
@@ -1247,10 +1252,10 @@ impl Store {
             )
             .await?;
         }
-        let run = sqlx::query_as::<_, Run>(&format!(
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "UPDATE runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1
                  RETURNING {RUN_COLS}"
-        ))
+        )))
         .bind(run_id)
         .fetch_one(&self.pool)
         .await?;
@@ -1296,13 +1301,13 @@ impl Store {
     ) -> Result<Vec<LogLine>> {
         const COLS: &str = "id, run_id, step_run_id, stream, data, seq, created_at, attempt";
         if let Some(after) = after_id {
-            return Ok(sqlx::query_as::<_, LogLine>(&format!(
+            return Ok(sqlx::query_as::<_, LogLine>(AssertSqlSafe(format!(
                 "SELECT {COLS} FROM log_lines
                  WHERE step_run_id = $1 AND id > $2
                    AND ($3::int IS NULL OR attempt = $3)
                  ORDER BY id
                  LIMIT $4"
-            ))
+            )))
             .bind(step_run_id)
             .bind(after)
             .bind(attempt)
@@ -1310,12 +1315,12 @@ impl Store {
             .fetch_all(&self.pool)
             .await?);
         }
-        let mut tail = sqlx::query_as::<_, LogLine>(&format!(
+        let mut tail = sqlx::query_as::<_, LogLine>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM log_lines
              WHERE step_run_id = $1 AND ($2::int IS NULL OR attempt = $2)
              ORDER BY id DESC
              LIMIT $3"
-        ))
+        )))
         .bind(step_run_id)
         .bind(attempt)
         .bind(limit)
@@ -1478,11 +1483,11 @@ impl Store {
         let token = generate_token();
         let token_hash = hash_token(&token);
         let concurrency = req.concurrency.unwrap_or(1) as i32;
-        let agent = sqlx::query_as::<_, Agent>(&format!(
+        let agent = sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
             "INSERT INTO agents (id, project_id, name, labels, concurrency, token_hash)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING {AGENT_COLS}"
-        ))
+        )))
         .bind(id)
         .bind(req.project_id)
         .bind(&req.name)
@@ -1497,30 +1502,30 @@ impl Store {
     /// List agents. When `project_filter` is set, returns that project's agents plus globals.
     pub async fn list_agents(&self, project_filter: Option<Uuid>) -> Result<Vec<Agent>> {
         if let Some(pid) = project_filter {
-            Ok(sqlx::query_as::<_, Agent>(&format!(
+            Ok(sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
                 "SELECT {AGENT_COLS} FROM agents
                  WHERE project_id IS NULL OR project_id = $1
                  ORDER BY project_id NULLS LAST, created_at DESC"
-            ))
+            )))
             .bind(pid)
             .fetch_all(&self.pool)
             .await?)
         } else {
-            Ok(sqlx::query_as::<_, Agent>(&format!(
+            Ok(sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
                 "SELECT {AGENT_COLS} FROM agents ORDER BY created_at DESC"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await?)
         }
     }
 
     pub async fn get_agent(&self, id: Uuid) -> Result<Option<Agent>> {
-        Ok(
-            sqlx::query_as::<_, Agent>(&format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1"))
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
+            "SELECT {AGENT_COLS} FROM agents WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn update_agent(&self, id: Uuid, req: UpdateAgentRequest) -> Result<Agent> {
@@ -1543,11 +1548,11 @@ impl Store {
             .concurrency
             .map(|c| c.max(1) as i32)
             .unwrap_or(existing.concurrency);
-        Ok(sqlx::query_as::<_, Agent>(&format!(
+        Ok(sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
             "UPDATE agents SET name = $2, labels = $3, concurrency = $4
              WHERE id = $1
              RETURNING {AGENT_COLS}"
-        ))
+        )))
         .bind(id)
         .bind(&name)
         .bind(json!(labels))
@@ -1571,11 +1576,11 @@ impl Store {
         };
         let token = generate_token();
         let token_hash = hash_token(&token);
-        let agent = sqlx::query_as::<_, Agent>(&format!(
+        let agent = sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
             "UPDATE agents SET token_hash = $2, online = FALSE
              WHERE id = $1
              RETURNING {AGENT_COLS}"
-        ))
+        )))
         .bind(id)
         .bind(&token_hash)
         .fetch_one(&self.pool)
@@ -1585,9 +1590,9 @@ impl Store {
 
     pub async fn agent_by_token(&self, token: &str) -> Result<Option<Agent>> {
         let hash = hash_token(token);
-        Ok(sqlx::query_as::<_, Agent>(&format!(
+        Ok(sqlx::query_as::<_, Agent>(AssertSqlSafe(format!(
             "SELECT {AGENT_COLS} FROM agents WHERE token_hash = $1"
-        ))
+        )))
         .bind(hash)
         .fetch_optional(&self.pool)
         .await?)
@@ -2030,9 +2035,9 @@ const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";
 
 async fn list_step_runs_on(conn: &mut sqlx::PgConnection, run_id: Uuid) -> Result<Vec<StepRun>> {
-    Ok(sqlx::query_as::<_, StepRun>(&format!(
+    Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
         "SELECT {STEP_RUN_COLS} FROM step_runs WHERE run_id = $1 ORDER BY step_id"
-    ))
+    )))
     .bind(run_id)
     .fetch_all(conn)
     .await?)
@@ -2050,12 +2055,12 @@ async fn complete_step_on(
     expected: Option<&[&str]>,
 ) -> Result<Option<StepRun>> {
     let guard = expected.map(|e| e.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    let sr = sqlx::query_as::<_, StepRun>(&format!(
+    let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
         "UPDATE step_runs
          SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
          WHERE id = $1 AND ($5::text[] IS NULL OR status = ANY($5))
          RETURNING {STEP_RUN_COLS}"
-    ))
+    )))
     .bind(step_run_id)
     .bind(step_status_str(status))
     .bind(exit_code)

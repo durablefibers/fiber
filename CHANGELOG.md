@@ -8,6 +8,14 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **sqlx 0.9.** Its new `SqlSafeStr` bound refuses a query string built at runtime unless it
+  is explicitly asserted safe, which forced an audit of all 25 sites in `store.rs` that
+  build SQL with `format!`. Every one splices only a column-list `const`; every value was
+  already a bind parameter. Nothing had to change but the assertions, and `store.rs` now
+  carries a note saying what any future `AssertSqlSafe` there has to hold to. The one
+  genuinely dynamic helper takes `&'static str`, so the compiler — not a comment — stops a
+  caller passing runtime data into it.
+
 - Rust dependencies: `hmac` 0.13 with `sha2` 0.11 (they move in lockstep — 0.13 does not
   build against 0.10), `getrandom` 0.4, `tower-http` 0.7, and the toolchain to 1.98 across
   `rust-toolchain.toml`, `Cargo.toml`, the release workflow and the Dockerfile, which
