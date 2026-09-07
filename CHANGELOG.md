@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-09-07
+
+Artifacts work from a containerised agent, and Compose runs on the published images.
+
+### Fixed
+
+- **A containerised agent can produce and consume artifacts again.** The Compose agent runs
+  on its own network, away from Postgres, Redis, and MinIO, so it could not reach the
+  presigned URL the API handed it — that URL names the storage endpoint as the host reaches
+  it, which inside a container is the container. Every artifact upload from it failed, and
+  restores failed on the matching redirect. The agent now falls back to transferring through
+  the API, which it can reach by definition. Direct transfer is still tried first, and the
+  fallback logs why it engaged. `GET /api/agent/artifacts/{id}/download` accepts `?via=api`
+  to stream bytes instead of redirecting.
+
 ### Changed
 
 - **Compose runs the published images.** `deploy/docker-compose.yml` pulls
