@@ -59,7 +59,7 @@ getrandom = "0.2"
 globset = "0.4"
 libc = "0.2"
 argon2 = { version = "0.5", features = ["std"] }
-password-hash = "0.5"
+password-hash = "0.6"
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 cron = "0.15"
