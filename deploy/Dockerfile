@@ -4,7 +4,7 @@
 #   docker build -f deploy/Dockerfile --target fiber-agent .
 # cargo-chef gives the dependency graph its own layer, so editing crates/ does not
 # rebuild aws-sdk-s3 / sqlx / opentelemetry every time.
-FROM rust:1.97-bookworm AS chef
+FROM rust:1.98-bookworm AS chef
 WORKDIR /app
 RUN cargo install cargo-chef --locked --version "^0.1"
 
