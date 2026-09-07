@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-09-07
+
+Observability. OpenTelemetry export worked in no previous version, and there is now a
+Prometheus endpoint and instrumentation on the agent, where steps actually run.
+
 ### Fixed
 
 - **OpenTelemetry export never worked.** The exporter is built with the async reqwest
