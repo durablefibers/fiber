@@ -56,6 +56,20 @@ impl FiberRegistry {
             .cloned()
     }
 
+    /// Registered task names, sorted. What `GET /api/fibers/tasks` serves, so the UI offers
+    /// what this build actually has rather than a list copied into the frontend.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .handlers
+            .read()
+            .expect("registry lock")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.handlers
             .read()

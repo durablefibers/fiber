@@ -393,6 +393,10 @@ export const api = {
     a.click()
     URL.revokeObjectURL(url)
   },
+  /** Durable task names this server has registered. */
+  listFiberTasks: () =>
+    request<{ tasks: string[] }>("/api/fibers/tasks").then((r) => r.tasks),
+
   listFibers: (projectId: string) =>
     request<DurableFiber[]>(`/api/projects/${projectId}/fibers`),
   createFiber: (

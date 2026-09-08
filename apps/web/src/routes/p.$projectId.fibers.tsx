@@ -18,17 +18,20 @@ export const Route = createFileRoute("/p/$projectId/fibers")({
   component: ProjectFibersPage,
 })
 
-const TASKS = [
-  { name: "ping", hint: '{"message":"hello"}' },
-  { name: "sleep_demo", hint: '{"seconds":3}' },
-  { name: "interval_task", hint: '{"interval_seconds":60}' },
-] as const
+/// Example input per task, for the ones this build ships. A task the server registers that
+/// is not listed here still appears in the picker; it just starts with an empty input.
+const INPUT_HINTS: Record<string, string> = {
+  ping: '{"message":"hello"}',
+  sleep_demo: '{"seconds":3}',
+  interval_task: '{"interval_seconds":60}',
+}
 
 function ProjectFibersPage() {
   const { projectId } = Route.useParams()
   const [projectName, setProjectName] = useState<string>()
   const [fibers, setFibers] = useState<DurableFiber[]>([])
-  const [task, setTask] = useState<string>("ping")
+  const [tasks, setTasks] = useState<string[]>([])
+  const [task, setTask] = useState<string>("")
   const [input, setInput] = useState('{"message":"hello"}')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -36,6 +39,18 @@ function ProjectFibersPage() {
   useEffect(() => {
     void api.getProject(projectId).then((p) => setProjectName(p.name))
   }, [projectId])
+
+  // The server decides what it can run; the page asks rather than assuming.
+  useEffect(() => {
+    void api
+      .listFiberTasks()
+      .then((names) => {
+        setTasks(names)
+        setTask((current) => current || names[0] || "")
+        if (names[0] && INPUT_HINTS[names[0]]) setInput(INPUT_HINTS[names[0]])
+      })
+      .catch(() => setTasks([]))
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -99,13 +114,12 @@ function ProjectFibersPage() {
               onChange={(e) => {
                 const next = e.target.value
                 setTask(next)
-                const preset = TASKS.find((t) => t.name === next)
-                if (preset) setInput(preset.hint)
+                setInput(INPUT_HINTS[next] ?? "{}")
               }}
             >
-              {TASKS.map((t) => (
-                <option key={t.name} value={t.name}>
-                  {t.name}
+              {tasks.map((name) => (
+                <option key={name} value={name}>
+                  {name}
                 </option>
               ))}
             </select>
