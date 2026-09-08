@@ -73,6 +73,29 @@ fn current_traceparent() -> Option<String> {
     tp
 }
 
+/// A workspace-relative path that cannot climb out of it. Mirrors the compile-time check in
+/// `fiber-core`; kept here so a snapshot written by an older or edited definition still
+/// cannot send an agent outside its workspace.
+fn is_contained_relative_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('\\')
+        && !p.contains(':')
+        && !p.split(['/', '\\']).any(|seg| seg == "..")
+}
+
+/// A bare program name, not a command line.
+fn is_bare_program_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && s != "."
+        && s != ".."
+}
+
 async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     let mut env = vec![
         ("FIBER_RUN_ID".into(), step.run_id.to_string()),
@@ -81,6 +104,8 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     let mut artifacts = Vec::new();
     let mut workspace = None;
     let mut timeout_minutes = None;
+    let mut working_directory = None;
+    let mut shell = None;
     let mut secret_keys = Vec::new();
     let mut needs_closure = None;
     match state.store.get_run(step.run_id).await {
@@ -104,6 +129,19 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
                         .get("timeout_minutes")
                         .and_then(|v| v.as_u64())
                         .map(|m| m as u32);
+                    // Re-checked here rather than trusted from the snapshot: it was
+                    // validated when the pipeline compiled, but a snapshot is a stored
+                    // document and this is the last point before it reaches an agent.
+                    working_directory = s
+                        .get("working_directory")
+                        .and_then(|v| v.as_str())
+                        .filter(|d| is_contained_relative_path(d))
+                        .map(str::to_string);
+                    shell = s
+                        .get("shell")
+                        .and_then(|v| v.as_str())
+                        .filter(|sh| is_bare_program_name(sh))
+                        .map(str::to_string);
                     // Absent (or null) = every project secret; a list = only those names.
                     secret_allow = s
                         .get("secrets")
@@ -161,6 +199,8 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         artifacts,
         restore,
         timeout_minutes: Some(timeout_minutes.unwrap_or(default_minutes)),
+        working_directory,
+        shell,
         secret_keys,
         traceparent: current_traceparent(),
     }

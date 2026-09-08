@@ -27,6 +27,10 @@ pub enum DagError {
     BadEnvName { step: String, name: String },
     #[error("step `{step}` env name `{name}` is reserved: FIBER_* is set by the server")]
     ReservedEnvName { step: String, name: String },
+    #[error("step `{step}` working_directory `{path}` must stay inside the workspace")]
+    BadWorkingDirectory { step: String, path: String },
+    #[error("step `{step}` shell `{shell}` must be a bare program name")]
+    BadShell { step: String, shell: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
 }
@@ -59,6 +63,12 @@ pub struct CompiledStep {
     /// Copied from definition `secrets:` — `None` means every project secret.
     #[serde(default)]
     pub secrets: Option<Vec<String>>,
+    /// Copied from definition `working_directory:`, validated to stay in the workspace.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Copied from definition `shell:`.
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +225,8 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             env: cell.env.clone(),
             if_expr: cell.template.if_expr.clone(),
             timeout_minutes: cell.template.timeout_minutes,
+            working_directory: cell.template.working_directory.clone(),
+            shell: cell.template.shell.clone(),
             secrets: cell.template.secrets.clone(),
         });
     }
@@ -276,6 +288,22 @@ fn expand_all(def: &PipelineDefinition) -> Result<Vec<ExpandedCell>, DagError> {
                         name: k.clone(),
                     });
                 }
+            }
+            if let Some(wd) = &step.working_directory
+                && !is_contained_relative_path(wd)
+            {
+                return Err(DagError::BadWorkingDirectory {
+                    step: step.id.clone(),
+                    path: wd.clone(),
+                });
+            }
+            if let Some(sh) = &step.shell
+                && !is_bare_program_name(sh)
+            {
+                return Err(DagError::BadShell {
+                    step: step.id.clone(),
+                    shell: sh.clone(),
+                });
             }
             // Least specific first, so the later writer wins: the pipeline sets a baseline,
             // the step narrows it, and the matrix binding is last because it is what says
@@ -341,6 +369,33 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
         }
     }
     Ok(combos)
+}
+
+/// A path that stays inside the workspace when joined to it.
+///
+/// Rejects absolute paths, `..` in any position, and Windows-style roots. The agent checks
+/// again before it uses the value — this is the early, legible failure, not the boundary.
+fn is_contained_relative_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('\\')
+        && !p.contains(':')
+        && !p.split(['/', '\\']).any(|seg| seg == "..")
+}
+
+/// A program name, not a command line.
+///
+/// `bash` yes, `/bin/bash` or `bash -e` no. Keeping it a bare name means the agent invokes
+/// `<shell> -c <run>` predictably, and the image decides which binary that resolves to.
+fn is_bare_program_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && s != "."
+        && s != ".."
 }
 
 /// A name a shell and `docker --env-file` will both accept.
@@ -424,6 +479,8 @@ pub fn definition_from_map(
                 labels: s.labels,
                 retries: s.retries.unwrap_or(0),
                 env: s.env,
+                working_directory: s.working_directory,
+                shell: s.shell,
                 artifacts: s.artifacts,
                 matrix: s.matrix,
                 if_expr: s.if_expr,
@@ -440,6 +497,10 @@ pub struct StepDefinitionInput {
     pub name: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
     #[serde(default)]
     pub needs: Vec<String>,
     pub run: Option<String>,
@@ -498,6 +559,8 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
                     labels: input.labels,
                     retries: input.retries.unwrap_or(0),
                     env: input.env,
+                    working_directory: input.working_directory,
+                    shell: input.shell,
                     artifacts: input.artifacts,
                     matrix: input.matrix,
                     if_expr: input.if_expr,
@@ -604,6 +667,76 @@ mod tests {
     }
 
     #[test]
+    fn a_working_directory_cannot_leave_the_workspace() {
+        for bad in ["/etc", "../outside", "sub/../../outside", "C:\\windows", ""] {
+            let mut st = step("a", &[], "echo");
+            st.working_directory = Some(bad.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(
+                matches!(
+                    compile_definition(&d),
+                    Err(DagError::BadWorkingDirectory { .. })
+                ),
+                "accepted {bad:?}"
+            );
+        }
+        // A plain subdirectory is fine, including a nested one.
+        for good in ["apps/web", "sub", "a/b/c"] {
+            let mut st = step("a", &[], "echo");
+            st.working_directory = Some(good.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn shell_must_be_a_bare_program_name() {
+        for bad in ["/bin/bash", "bash -e", "bash;rm", "", ".."] {
+            let mut st = step("a", &[], "echo");
+            st.shell = Some(bad.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(
+                matches!(compile_definition(&d), Err(DagError::BadShell { .. })),
+                "accepted {bad:?}"
+            );
+        }
+        for good in ["bash", "sh", "zsh", "python3"] {
+            let mut st = step("a", &[], "echo");
+            st.shell = Some(good.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
     fn the_fiber_prefix_is_reserved() {
         let d = env_pipeline(&[], &[("FIBER_RUN_ID", "spoofed")]);
         assert!(matches!(
@@ -628,6 +761,8 @@ mod tests {
             labels: vec![],
             retries: 0,
             env: BTreeMap::new(),
+            working_directory: None,
+            shell: None,
             artifacts: vec![],
             matrix: None,
             if_expr: None,

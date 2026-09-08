@@ -477,6 +477,8 @@ async fn run_session(
                                 timeout_minutes,
                                 secret_keys,
                                 traceparent,
+                                working_directory,
+                                shell,
                             }) => {
                                 info!(%step_id, %step_name, %run_id, "offered step");
                                 let _ = out_tx.send(AgentMessage::Claim { agent_id, step_run_id });
@@ -525,6 +527,8 @@ async fn run_session(
                                         &exec,
                                         &workspaces,
                                         traceparent.as_deref(),
+                                        working_directory.as_deref(),
+                                        shell.as_deref(),
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
@@ -647,6 +651,8 @@ async fn execute_step(
     exec: &ExecConfig,
     workspaces: &Workspaces,
     traceparent: Option<&str>,
+    working_directory: Option<&str>,
+    shell: Option<&str>,
 ) -> Result<i32> {
     let run_dir = workspace_root.join(run_id.to_string());
     let work_dir = run_dir.join(step_run_id.to_string());
@@ -683,6 +689,8 @@ async fn execute_step(
         redactor,
         exec,
         workspaces,
+        working_directory,
+        shell,
     )
     // `.instrument`, not `span.enter()`: a guard held across an await point attributes
     // whatever else the runtime schedules on this thread to this step.
@@ -721,6 +729,8 @@ async fn execute_step_inner(
     redactor: &Redactor,
     exec: &ExecConfig,
     workspaces: &Workspaces,
+    working_directory: Option<&str>,
+    shell: Option<&str>,
 ) -> Result<i32> {
     // One sequence for system/stdout/stderr so the server's `ORDER BY seq` interleaves
     // streams in emission order (the old per-stream bases collided after 1000 lines).
@@ -802,6 +812,47 @@ async fn execute_step_inner(
     let container_name = format!("fiber-step-{}", Uuid::new_v4());
     let mut docker_container: Option<String> = None;
     // Kept alive until the child exits: dropping it deletes the file docker reads.
+    // The server validated these and validated them again when building the offer. The
+    // agent is the last place that can be wrong about them, and it is the one that would
+    // actually leave the workspace, so it checks too.
+    let subdir = working_directory
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .filter(|d| is_contained_relative_path(d));
+    if working_directory.is_some() && subdir.is_none() {
+        bail!("working_directory is not a path inside the workspace");
+    }
+    let shell_prog = shell
+        .map(str::trim)
+        .filter(|sh| !sh.is_empty())
+        .filter(|sh| is_bare_program_name(sh))
+        .unwrap_or("sh");
+    if shell.is_some() && shell.map(str::trim) != Some(shell_prog) {
+        bail!("shell must be a bare program name");
+    }
+    let host_cwd = match subdir {
+        Some(d) => {
+            let full = work_dir.join(d);
+            // Belt and braces: resolve and confirm it is still under the workspace, which
+            // catches a symlink the repository itself planted.
+            let root = tokio::fs::canonicalize(work_dir)
+                .await
+                .unwrap_or_else(|_| work_dir.to_path_buf());
+            match tokio::fs::canonicalize(&full).await {
+                Ok(real) if real.starts_with(&root) => real,
+                Ok(_) => bail!("working_directory resolves outside the workspace"),
+                Err(e) => bail!("working_directory {d}: {e}"),
+            }
+        }
+        None => work_dir.to_path_buf(),
+    };
+    if let Some(d) = subdir {
+        log("system", format!("working directory: {d}"));
+    }
+    if shell_prog != "sh" {
+        log("system", format!("shell: {shell_prog}"));
+    }
+
     let mut env_file: Option<tempfile::NamedTempFile> = None;
     let mut child = if let Some(img) = image.filter(|i| !i.is_empty()).filter(|_| exec.use_docker) {
         let mount = format!("{}:/workspace", work_dir.display());
@@ -811,15 +862,14 @@ async fn execute_step_inner(
         );
         docker_container = Some(container_name.clone());
         let mut cmd = Command::new("docker");
+        cmd.args(["run", "--rm", "--name", &container_name, "-v", &mount]);
+        let container_cwd = match subdir {
+            Some(d) => format!("/workspace/{d}"),
+            None => "/workspace".to_string(),
+        };
         cmd.args([
-            "run",
-            "--rm",
-            "--name",
-            &container_name,
-            "-v",
-            &mount,
             "-w",
-            "/workspace",
+            &container_cwd,
             // A step cannot gain privileges beyond the user it starts as.
             "--security-opt",
             "no-new-privileges",
@@ -883,7 +933,7 @@ async fn execute_step_inner(
         // `sh -c`, never `sh -lc`: a login shell sources /etc/profile, which on Debian
         // resets PATH and throws away what the image put there — `rust:*` keeps cargo on
         // /usr/local/cargo/bin, so `-l` turns a plain `cargo build` into "cargo: not found".
-        cmd.args([img, "sh", "-c", run])
+        cmd.args([img, shell_prog, "-c", run])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -892,13 +942,13 @@ async fn execute_step_inner(
     } else {
         log(
             "system",
-            format!("running on host shell in {}", work_dir.display()),
+            format!("running on host shell in {}", host_cwd.display()),
         );
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new(shell_prog);
         // Not `-lc`, for the same reason as the container: /etc/profile would overwrite
         // the environment assembled just below, PATH included.
         cmd.args(["-c", run])
-            .current_dir(work_dir)
+            .current_dir(&host_cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1060,6 +1110,28 @@ fn write_env_file(
     }
     file.flush()?;
     Ok((file, deferred))
+}
+
+/// A workspace-relative path that cannot climb out of it. The server checks this twice
+/// already; this is the copy that guards the process actually being spawned.
+fn is_contained_relative_path(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('\\')
+        && !p.contains(':')
+        && !p.split(['/', '\\']).any(|seg| seg == "..")
+}
+
+/// A bare program name, not a command line: `bash`, never `/bin/bash` or `bash -e`.
+fn is_bare_program_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && s != "."
+        && s != ".."
 }
 
 /// Stop a step: the container (if any) first, then the client's process group.

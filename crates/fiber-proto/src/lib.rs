@@ -64,6 +64,15 @@ pub struct StepDefinition {
     /// Environment for this step, overriding any key of the same name set on the pipeline.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Directory to run in, relative to the workspace root. Artifact paths stay relative to
+    /// the root, not to this, so moving a step's `working_directory` does not silently
+    /// change what it publishes.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Interpreter for `run`, invoked as `<shell> -c`. Default `sh`. It has to exist in the
+    /// image, or on the host for a shell step.
+    #[serde(default)]
+    pub shell: Option<String>,
     /// Workspace-relative paths to upload as artifacts after a successful step.
     #[serde(default)]
     pub artifacts: Vec<String>,
@@ -251,6 +260,13 @@ pub enum ServerMessage {
         /// the server independently fails it after a grace period. Absent from old servers.
         #[serde(default)]
         timeout_minutes: Option<u32>,
+        /// Directory to run in, relative to the workspace root. Validated server-side to
+        /// stay inside it; the agent checks again before use.
+        #[serde(default)]
+        working_directory: Option<String>,
+        /// Interpreter for `run`. Absent means `sh`.
+        #[serde(default)]
+        shell: Option<String>,
         /// Which `env` entries are project secrets. The agent redacts their values from
         /// log lines; it does not otherwise treat them differently.
         #[serde(default)]
