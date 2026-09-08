@@ -6,6 +6,12 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-07
+
+Pipeline schema. Three additive step fields, no schema change and nothing to do on upgrade
+beyond running the new version. Existing pipelines are unaffected: every field defaults to
+what the previous behaviour already was.
+
 ### Added
 
 - **`continue_on_error:` on a step.** The failure is still recorded — the run page shows the
