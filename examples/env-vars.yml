@@ -36,3 +36,10 @@ steps:
       echo "building in $PWD"
       echo "bash ${BASH_VERSION%%.*}"
     labels: [os=linux]
+
+  # Advisory: report the problem without blocking the build. The step still shows as
+  # failed on the run page; it just does not fail the run or skip what depends on it.
+  lint:
+    continue_on_error: true
+    run: exit 1
+    labels: [os=linux]
