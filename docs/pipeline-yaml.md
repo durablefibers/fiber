@@ -47,6 +47,8 @@ In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `nam
 | `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
 | `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |
 | `env` | `{}` | Environment for this step; overrides the pipeline's for the same name |
+| `working_directory` | workspace root | Run in this subdirectory. Must stay inside the workspace — absolute paths and `..` are rejected when the pipeline compiles. **`artifacts` paths stay relative to the workspace root**, so moving a step's `working_directory` does not silently change what it publishes |
+| `shell` | `sh` | Interpreter for `run`, invoked as `<shell> -c`. A bare program name only: `bash` yes, `/bin/bash` or `bash -e` no. It has to exist in the `image`, or on the host for a shell step |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
 | `matrix` | — | Axis → values; expanded at compile time |
 | `if` | `success()` | Gate whether the step is queued |

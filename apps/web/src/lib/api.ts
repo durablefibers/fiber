@@ -82,6 +82,10 @@ export type StepDefinition = {
   retries?: number
   /** Environment for this step, overriding the pipeline's for the same name. */
   env?: Record<string, string>
+  /** Run in this directory, relative to the workspace root. Artifact paths stay root-relative. */
+  working_directory?: string
+  /** Interpreter for `run`, invoked as `<shell> -c`. Default `sh`. */
+  shell?: string
   artifacts?: string[]
   /** Axis → values; expanded into multiple step runs at compile time. */
   matrix?: Record<string, string[]>
@@ -582,6 +586,10 @@ export function definitionToYaml(def: PipelineDefinition): string {
         lines.push(`      ${axis}: [${values.map(yamlQuote).join(", ")}]`)
       }
     }
+    if (s.working_directory) {
+      lines.push(`    working_directory: ${yamlQuote(s.working_directory)}`)
+    }
+    if (s.shell) lines.push(`    shell: ${yamlQuote(s.shell)}`)
     if (s.env && Object.keys(s.env).length) {
       lines.push("    env:")
       for (const [k, v] of Object.entries(s.env)) {

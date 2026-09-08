@@ -25,3 +25,14 @@ steps:
       echo "log level: $RUST_LOG"      # debug, not info
       echo "backtrace: $RUST_BACKTRACE"
     labels: [os=linux]
+
+  # A monorepo step: run somewhere else in the tree, under a different interpreter.
+  # `artifacts` stays relative to the workspace root, not to working_directory.
+  web:
+    needs: [build]
+    working_directory: apps/web
+    shell: bash
+    run: |
+      echo "building in $PWD"
+      echo "bash ${BASH_VERSION%%.*}"
+    labels: [os=linux]

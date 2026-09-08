@@ -8,6 +8,14 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **`working_directory:` and `shell:` on a step.** Run somewhere else in the tree, or under
+  a different interpreter than `sh`. `artifacts` paths stay relative to the workspace root
+  rather than to `working_directory`, so moving a step does not silently change what it
+  publishes. A directory must stay inside the workspace and a shell must be a bare program
+  name; both are rejected when the pipeline compiles, again when the offer is built from the
+  snapshot, and once more by the agent before it spawns anything — the agent additionally
+  resolves the path, which catches a symlink the repository itself planted.
+
 - **`env:` in the pipeline schema**, on the pipeline for every step and on a step for that
   step. Precedence runs least specific first: pipeline, then step, then matrix bindings —
   a matrix binding wins because it is what says which cell is running, and a step able to
