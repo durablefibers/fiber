@@ -14,6 +14,9 @@ pub enum FiberOutcome {
     Suspended,
     Failed,
     Retry,
+    /// A person cancelled it while the handler was running. The handler's result is
+    /// discarded rather than overwriting their decision.
+    Cancelled,
 }
 
 /// Execute (or resume) one fiber the caller has already claimed via
@@ -49,7 +52,9 @@ pub async fn run_fiber(
             record.error = None;
             record.wake_at = None;
             record.heartbeat_at = None;
-            store.save(&record).await?;
+            if !store.save(&record).await? {
+                return Ok(FiberOutcome::Cancelled);
+            }
             Ok(FiberOutcome::Completed)
         }
         Err(e) => {
@@ -60,7 +65,9 @@ pub async fn run_fiber(
                 record.wake_at = Some(wake_at);
                 record.heartbeat_at = None;
                 // Preserve data/sleeps_done from ctx (already in record.state)
-                store.save(&record).await?;
+                if !store.save(&record).await? {
+                    return Ok(FiberOutcome::Cancelled);
+                }
                 return Ok(FiberOutcome::Suspended);
             }
             record.error = Some(format!("{e:#}"));

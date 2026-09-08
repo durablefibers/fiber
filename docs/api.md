@@ -71,6 +71,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | Method | Path | Min role |
 |---|---|---|
 | GET/POST | `/api/projects/{id}/fibers` | reader / writer |
+| GET | `/api/fibers/tasks` | any authenticated user — durable task names this build registered |
 | GET | `/api/fibers/{id}` | reader |
 | POST | `/api/fibers/{id}/cancel` | writer |
 

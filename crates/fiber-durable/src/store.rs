@@ -32,7 +32,7 @@ impl FiberStore {
             FiberStatus::Pending => Some(Utc::now()),
             FiberStatus::Suspended => Some(record.wake_at.unwrap_or_else(Utc::now)),
             FiberStatus::Running => Some(record.heartbeat_at.unwrap_or_else(Utc::now)),
-            FiberStatus::Completed | FiberStatus::Failed => None,
+            FiberStatus::Completed | FiberStatus::Failed | FiberStatus::Cancelled => None,
         };
         match due {
             Some(d) => self.due.record(record.project_id, d),
@@ -154,16 +154,21 @@ impl FiberStore {
         })
     }
 
-    pub async fn save(&self, record: &FiberRecord) -> Result<()> {
+    /// Persist a fiber, unless a person has cancelled it in the meantime.
+    ///
+    /// Returns whether the write applied. The engine holds a record from before the handler
+    /// ran, so an unguarded save would resurrect a fiber someone stopped mid-flight and
+    /// report it completed — the cancel would appear to do nothing.
+    pub async fn save(&self, record: &FiberRecord) -> Result<bool> {
         let state_json = serde_json::to_value(&FiberState {
             steps: Default::default(),
             data: record.state.data.clone(),
             sleeps_done: record.state.sleeps_done,
         })?;
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE fibers SET status = $2, state = $3, result = $4, error = $5,
                  attempts = $6, wake_at = $7, heartbeat_at = $8, updated_at = NOW()
-             WHERE id = $1",
+             WHERE id = $1 AND status <> 'cancelled'",
         )
         .bind(record.id)
         .bind(record.status.as_str())
@@ -175,12 +180,16 @@ impl FiberStore {
         .bind(record.heartbeat_at)
         .execute(&self.pool)
         .await?;
-        self.record_due(record);
-        Ok(())
+        let applied = res.rows_affected() > 0;
+        if applied {
+            self.record_due(record);
+        }
+        Ok(applied)
     }
 
     pub async fn save_checkpoint(&self, record: &FiberRecord) -> Result<()> {
-        self.save(record).await
+        self.save(record).await?;
+        Ok(())
     }
 
     pub async fn append_step(
@@ -257,8 +266,8 @@ impl FiberStore {
         if record.status.terminal() {
             return Ok(Some(record));
         }
-        record.status = FiberStatus::Failed;
-        record.error = Some("cancelled".into());
+        record.status = FiberStatus::Cancelled;
+        record.error = None;
         record.wake_at = None;
         record.heartbeat_at = None;
         self.save(&record).await?;
@@ -336,7 +345,8 @@ impl Durability for FiberStore {
     }
 
     async fn save(&self, record: &FiberRecord) -> anyhow::Result<()> {
-        FiberStore::save(self, record).await
+        FiberStore::save(self, record).await?;
+        Ok(())
     }
 
     async fn claim_ready(

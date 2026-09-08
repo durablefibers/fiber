@@ -11,6 +11,9 @@ pub enum FiberStatus {
     Suspended,
     Completed,
     Failed,
+    /// Stopped by a person. Distinct from `Failed`, which is the task's own outcome — a
+    /// dashboard that cannot tell them apart cannot answer "is anything actually broken".
+    Cancelled,
 }
 
 impl FiberStatus {
@@ -21,6 +24,7 @@ impl FiberStatus {
             Self::Suspended => "suspended",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -30,12 +34,13 @@ impl FiberStatus {
             "suspended" => Self::Suspended,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
             _ => Self::Pending,
         }
     }
 
     pub fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 

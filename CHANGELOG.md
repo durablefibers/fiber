@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /api/fibers/tasks`**, the durable task names this build registered. The Fibers page
+  asks for that instead of carrying its own copy of the list, which went stale the moment a
+  task was added or removed.
+
+### Fixed
+
+- **Cancelling a durable fiber works, and says so.** A cancel was recorded as `failed` with
+  the message `cancelled`, which a dashboard cannot tell apart from a task that actually
+  broke; there is now a `cancelled` status. It was also possible for the engine to overwrite
+  it: the record it holds predates the handler running, so finishing would resurrect a fiber
+  someone had stopped and report it completed. Cancel is now terminal, so the poller does not
+  pick it up again, and a save is rejected outright if the row has been cancelled meanwhile.
+
 ## [0.3.0] — 2026-09-07
 
 Pipeline schema. Three additive step fields, no schema change and nothing to do on upgrade

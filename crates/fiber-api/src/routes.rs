@@ -87,6 +87,7 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}/fibers",
             get(list_fibers).post(create_fiber),
         )
+        .route("/api/fibers/tasks", get(list_fiber_tasks))
         .route("/api/fibers/{id}", get(get_fiber))
         .route("/api/fibers/{id}/cancel", post(cancel_fiber))
         .route("/api/agents", get(list_agents).post(create_agent))
@@ -1125,6 +1126,18 @@ async fn get_fiber(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(fiber))
+}
+
+/// Durable task names this build has registered.
+///
+/// Any authenticated user: it is a list of what the server can run, not project data. The
+/// UI offered a list copied into the frontend before this existed, which went stale the
+/// moment a task was added or removed.
+async fn list_fiber_tasks(
+    AuthUser(_user): AuthUser,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    Json(json!({ "tasks": state.fiber_scheduler.registry().names() }))
 }
 
 async fn cancel_fiber(
