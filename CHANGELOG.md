@@ -8,6 +8,14 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **`continue_on_error:` on a step.** The failure is still recorded — the run page shows the
+  step red, with its exit code and logs — but it does not fail the run and dependents run
+  rather than being skipped, so a green run can contain a red step. Tolerance does not
+  travel: a dependent that fails for its own reasons still cascades. A cancel is never
+  tolerated, since that is an operator stopping the run rather than the step's own outcome.
+  For gating, a tolerated failure counts as success, so a dependent's default `success()`
+  passes.
+
 - **`working_directory:` and `shell:` on a step.** Run somewhere else in the tree, or under
   a different interpreter than `sh`. `artifacts` paths stay relative to the workspace root
   rather than to `working_directory`, so moving a step does not silently change what it

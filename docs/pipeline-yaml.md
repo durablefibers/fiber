@@ -49,6 +49,7 @@ In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `nam
 | `env` | `{}` | Environment for this step; overrides the pipeline's for the same name |
 | `working_directory` | workspace root | Run in this subdirectory. Must stay inside the workspace — absolute paths and `..` are rejected when the pipeline compiles. **`artifacts` paths stay relative to the workspace root**, so moving a step's `working_directory` does not silently change what it publishes |
 | `shell` | `sh` | Interpreter for `run`, invoked as `<shell> -c`. A bare program name only: `bash` yes, `/bin/bash` or `bash -e` no. It has to exist in the `image`, or on the host for a shell step |
+| `continue_on_error` | `false` | The step's failure is recorded but does not fail the run, and its dependents still run. See below |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
 | `matrix` | — | Axis → values; expanded at compile time |
 | `if` | `success()` | Gate whether the step is queued |
@@ -90,6 +91,32 @@ rather than a variable that silently never arrives.
 Values are not secret. They are stored in the pipeline definition, snapshotted onto every
 run, and visible to anyone who can read the project. Use project `secrets:` for anything
 that should not be.
+
+### `continue_on_error`
+
+```yaml
+lint:
+  run: cargo clippy
+  continue_on_error: true     # advisory: report it, do not block the build
+build:
+  needs: [lint]
+  run: cargo build            # runs even when lint failed
+```
+
+The step is **still recorded as failed** — the run page shows it red and the attempt keeps
+its exit code and logs. What changes is what that failure does to everything else: it does
+not fail the run, and dependents are queued rather than skipped. So a green run can contain
+a red step, which is the point.
+
+Two limits worth knowing:
+
+- **Tolerance does not travel.** If a tolerated step's dependent fails on its own, that
+  failure cascades normally. The flag covers one step's outcome, not the chain below it.
+- **A cancel is never tolerated.** `continue_on_error` is about the step's own result; an
+  operator stopping the run is not that, and still stops everything downstream.
+
+For gating, a tolerated failure counts as success, so a dependent's default `success()`
+passes. Anything else would let the step queue and then skip anyway.
 
 ## Matrix
 

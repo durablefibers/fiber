@@ -73,6 +73,10 @@ pub struct StepDefinition {
     /// image, or on the host for a shell step.
     #[serde(default)]
     pub shell: Option<String>,
+    /// Let the run carry on when this step fails: the step is still recorded as failed, but
+    /// it does not fail the run and its dependents still go ahead.
+    #[serde(default)]
+    pub continue_on_error: bool,
     /// Workspace-relative paths to upload as artifacts after a successful step.
     #[serde(default)]
     pub artifacts: Vec<String>,

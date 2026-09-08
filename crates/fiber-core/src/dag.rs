@@ -69,6 +69,9 @@ pub struct CompiledStep {
     /// Copied from definition `shell:`.
     #[serde(default)]
     pub shell: Option<String>,
+    /// Copied from definition `continue_on_error:`.
+    #[serde(default)]
+    pub continue_on_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +230,7 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             timeout_minutes: cell.template.timeout_minutes,
             working_directory: cell.template.working_directory.clone(),
             shell: cell.template.shell.clone(),
+            continue_on_error: cell.template.continue_on_error,
             secrets: cell.template.secrets.clone(),
         });
     }
@@ -481,6 +485,7 @@ pub fn definition_from_map(
                 env: s.env,
                 working_directory: s.working_directory,
                 shell: s.shell,
+                continue_on_error: s.continue_on_error,
                 artifacts: s.artifacts,
                 matrix: s.matrix,
                 if_expr: s.if_expr,
@@ -501,6 +506,8 @@ pub struct StepDefinitionInput {
     pub working_directory: Option<String>,
     #[serde(default)]
     pub shell: Option<String>,
+    #[serde(default)]
+    pub continue_on_error: bool,
     #[serde(default)]
     pub needs: Vec<String>,
     pub run: Option<String>,
@@ -561,6 +568,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
                     env: input.env,
                     working_directory: input.working_directory,
                     shell: input.shell,
+                    continue_on_error: input.continue_on_error,
                     artifacts: input.artifacts,
                     matrix: input.matrix,
                     if_expr: input.if_expr,
@@ -763,6 +771,7 @@ mod tests {
             env: BTreeMap::new(),
             working_directory: None,
             shell: None,
+            continue_on_error: false,
             artifacts: vec![],
             matrix: None,
             if_expr: None,

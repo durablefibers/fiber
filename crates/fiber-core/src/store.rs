@@ -1192,9 +1192,12 @@ impl Store {
         }
 
         if steps.iter().all(|s| s.status_enum().is_terminal()) {
-            let any_failed = steps
-                .iter()
-                .any(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled));
+            let tolerated = snapshot_tolerated(&snapshot_steps);
+            let any_failed = steps.iter().any(|s| match s.status_enum() {
+                StepStatus::Cancelled => true,
+                StepStatus::Failed => !tolerated.contains(&s.step_id),
+                _ => false,
+            });
             let status = if any_failed {
                 RunStatus::Failed
             } else {
@@ -1973,6 +1976,24 @@ pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {
     Ok(serde_json::from_value(value.clone())?)
 }
 
+/// Step ids the snapshot marks `continue_on_error`.
+///
+/// Read from the snapshot rather than a column: the snapshot is what governs this
+/// execution, so editing the pipeline mid-run cannot change whether a failure is tolerated.
+fn snapshot_tolerated(steps: &Value) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Some(arr) = steps.as_array() {
+        for s in arr {
+            if s.get("continue_on_error").and_then(Value::as_bool) == Some(true)
+                && let Some(id) = s.get("id").and_then(|v| v.as_str())
+            {
+                out.insert(id.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn snapshot_step_if_env(steps: &Value, step_id: &str) -> (Option<String>, Vec<(String, String)>) {
     let Some(arr) = steps.as_array() else {
         return (None, vec![]);
@@ -2119,14 +2140,26 @@ enum Transition {
 /// Callers apply the result and re-plan until nothing changes.
 fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Transition)> {
     use std::collections::HashSet;
+    // `continue_on_error` means the failure is recorded but not propagated: the step's own
+    // row still says failed, and everything downstream proceeds as if it had not. A cancel
+    // is never tolerated — that is an operator stopping the run, not the step's own outcome.
+    let tolerated = snapshot_tolerated(snapshot_steps);
     let failed: HashSet<&str> = steps
         .iter()
-        .filter(|s| matches!(s.status_enum(), StepStatus::Failed | StepStatus::Cancelled))
+        .filter(|s| match s.status_enum() {
+            StepStatus::Cancelled => true,
+            StepStatus::Failed => !tolerated.contains(&s.step_id),
+            _ => false,
+        })
         .map(|s| s.step_id.as_str())
         .collect();
     let succeeded: HashSet<&str> = steps
         .iter()
-        .filter(|s| s.status_enum() == StepStatus::Succeeded)
+        .filter(|s| match s.status_enum() {
+            StepStatus::Succeeded => true,
+            StepStatus::Failed => tolerated.contains(&s.step_id),
+            _ => false,
+        })
         .map(|s| s.step_id.as_str())
         .collect();
     let terminal: HashSet<&str> = steps
@@ -2322,6 +2355,81 @@ mod propagate_tests {
         assert_eq!(plan, vec![(2, Transition::Skip("if: condition false"))]);
         apply(&mut steps, &plan);
         steps[0].status = "succeeded".into();
+        assert_eq!(
+            plan_transitions(&steps, &snap),
+            vec![(1, Transition::Queue)]
+        );
+    }
+
+    #[test]
+    fn a_tolerated_failure_does_not_block_dependents() {
+        let snap = json!([
+            {"id": "lint", "continue_on_error": true},
+            {"id": "build"}
+        ]);
+        let mut steps = vec![
+            step("lint", StepStatus::Failed, &[]),
+            step("build", StepStatus::Pending, &["lint"]),
+        ];
+        // Without the flag this same shape skips `build`.
+        assert_eq!(
+            plan_transitions(&steps, &json!([{"id": "lint"}, {"id": "build"}])),
+            vec![(1, Transition::Skip("dependency failed"))]
+        );
+        assert_eq!(
+            plan_transitions(&steps, &snap),
+            vec![(1, Transition::Queue)]
+        );
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[1].status, "queued");
+        // The failure is still on the record: tolerating it is not hiding it.
+        assert_eq!(steps[0].status, "failed");
+    }
+
+    #[test]
+    fn tolerance_does_not_travel_down_the_chain() {
+        // `build` is tolerated; `test` fails for its own reasons and must still cascade.
+        let snap = json!([
+            {"id": "build", "continue_on_error": true},
+            {"id": "test"},
+            {"id": "deploy"}
+        ]);
+        let mut steps = vec![
+            step("build", StepStatus::Failed, &[]),
+            step("test", StepStatus::Failed, &["build"]),
+            step("deploy", StepStatus::Pending, &["test"]),
+        ];
+        run_to_fixpoint(&mut steps, &snap);
+        assert_eq!(steps[2].status, "skipped");
+    }
+
+    #[test]
+    fn a_cancel_is_never_tolerated() {
+        // continue_on_error is about the step's own outcome. An operator stopping the run
+        // is not that, and must still stop everything downstream.
+        let snap = json!([{"id": "a", "continue_on_error": true}, {"id": "b"}]);
+        let steps = vec![
+            step("a", StepStatus::Cancelled, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+        ];
+        assert_eq!(
+            plan_transitions(&steps, &snap),
+            vec![(1, Transition::Skip("dependency failed"))]
+        );
+    }
+
+    #[test]
+    fn a_tolerated_failure_satisfies_a_success_gate() {
+        // `success()` is the default gate, and it is transitive. A tolerated failure has to
+        // count as success there, or the flag would let a step queue and then skip anyway.
+        let snap = json!([
+            {"id": "flaky", "continue_on_error": true},
+            {"id": "after", "if": "success()"}
+        ]);
+        let steps = vec![
+            step("flaky", StepStatus::Failed, &[]),
+            step("after", StepStatus::Pending, &["flaky"]),
+        ];
         assert_eq!(
             plan_transitions(&steps, &snap),
             vec![(1, Transition::Queue)]
