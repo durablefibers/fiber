@@ -121,6 +121,25 @@ a requeue overwrites the step's `queued_at` and would otherwise rewrite the hist
 earlier attempts. Attempts from before this shipped have no wait recorded and are absent
 from the histogram rather than counted as zero.
 
+## Background loops
+
+Seven loops do the work between requests: `reclaim`, `schedules`, `events`, `agent_cmds`,
+`fibers`, `github_status`, and `retention`. Each is supervised — a panic restarts it with
+backoff rather than killing that task silently while the process stays up.
+
+`/ready` reports them. `"loops": "ok"` when all are running; otherwise it lists the ones
+that are down and the endpoint returns `503`, so a load balancer takes the instance out
+rather than leaving it accepting traffic it cannot act on:
+
+```json
+{"checks": {"loops": ["schedules"], "postgres": "ok", "redis": "ok"}, "ok": false}
+```
+
+`/metrics` carries `fiber_background_loop_up{loop=...}` and
+`fiber_background_loop_restarts_total{loop=...}`. **The restart counter is the one to
+alert on.** A loop that keeps coming back is failing repeatedly, and because it recovers,
+nothing else will tell you.
+
 ## OpenTelemetry
 
 Set `OTEL_EXPORTER_OTLP_ENDPOINT` (or `FIBER_OTEL_ENDPOINT`) to a collector's **base** URL

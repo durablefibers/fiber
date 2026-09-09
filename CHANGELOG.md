@@ -6,6 +6,17 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The background loops are supervised.** `reclaim`, `schedules`, `events`, `agent_cmds`,
+  `fibers`, `github_status` and `retention` were spawned bare, so a panic in one killed that
+  task while the process stayed up and `/ready` kept answering `ok` — leases quietly stopped
+  being reclaimed, or schedules stopped firing, with nothing to say so. Each is now restarted
+  with backoff, `/ready` lists any that are down and fails, and `/metrics` exposes
+  `fiber_background_loop_up` and `fiber_background_loop_restarts_total`. The restart counter
+  is the one to alert on: a loop that keeps recovering is failing repeatedly and nothing else
+  would tell you.
+
 ## [0.3.1] — 2026-09-08
 
 Durable fibers: task discovery, and cancel that means it. No schema change.

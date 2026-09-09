@@ -136,6 +136,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl Into
     };
     let mut out = String::new();
     render_metrics(&mut out, &snapshot);
+    render_loop_health(&mut out, &state.loop_health.snapshot());
     (
         [(
             header::CONTENT_TYPE,
@@ -214,6 +215,40 @@ fn render_metrics(out: &mut String, m: &fiber_core::MetricsSnapshot) {
     );
 }
 
+/// Background loop liveness. Restarts are cumulative and survive nothing but the process,
+/// which is the honest shape: a restarted API has genuinely lost that history.
+fn render_loop_health(
+    out: &mut String,
+    loops: &std::collections::BTreeMap<&'static str, crate::supervisor::LoopState>,
+) {
+    use std::fmt::Write;
+
+    let _ = writeln!(
+        out,
+        "# HELP fiber_background_loop_up Whether a supervised background loop is running."
+    );
+    let _ = writeln!(out, "# TYPE fiber_background_loop_up gauge");
+    for (name, st) in loops {
+        let _ = writeln!(
+            out,
+            "fiber_background_loop_up{{loop=\"{name}\"}} {}",
+            u8::from(st.running)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP fiber_background_loop_restarts_total Times a supervised loop had to be restarted."
+    );
+    let _ = writeln!(out, "# TYPE fiber_background_loop_restarts_total counter");
+    for (name, st) in loops {
+        let _ = writeln!(
+            out,
+            "fiber_background_loop_restarts_total{{loop=\"{name}\"}} {}",
+            st.restarts
+        );
+    }
+}
+
 /// A Prometheus histogram: cumulative `_bucket` series, then `_sum` and `_count`.
 fn render_histogram(out: &mut String, name: &str, help: &str, h: &fiber_core::Histogram) {
     use std::fmt::Write;
@@ -255,6 +290,16 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         ok = false;
         tracing::error!(error = %e, "readiness: redis");
         checks["redis"] = json!("error");
+    }
+    // A dead scheduler loop leaves the process answering requests while nothing is
+    // reclaimed or scheduled. Saying `ok` through that is the failure this reports.
+    let down = state.loop_health.down();
+    if down.is_empty() {
+        checks["loops"] = json!("ok");
+    } else {
+        ok = false;
+        tracing::error!(loops = ?down, "readiness: background loops down");
+        checks["loops"] = json!(down);
     }
 
     let body = json!({ "ok": ok, "service": "fiber-api", "checks": checks });
