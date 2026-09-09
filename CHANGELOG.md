@@ -6,6 +6,15 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release assets were non-deterministic.** The publish job downloaded every workflow
+  artifact, which swept in the build records the image jobs upload. Whether they appeared
+  depended on which job finished first, so a release sometimes carried four stray
+  `.dockerbuild` files and sometimes did not — and one of them being zero-length failed a
+  publish outright. It now takes only the binary artifacts, refuses to publish an empty or
+  zero-length asset, and the image jobs no longer produce build records at all.
+
 ## [0.3.1] — 2026-09-08
 
 Durable fibers: task discovery, and cancel that means it. No schema change.
