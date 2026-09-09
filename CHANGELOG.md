@@ -6,6 +6,10 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-08
+
+Durable fibers: task discovery, and cancel that means it. No schema change.
+
 ### Added
 
 - **`GET /api/fibers/tasks`**, the durable task names this build registered. The Fibers page
