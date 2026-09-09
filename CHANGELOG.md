@@ -6,6 +6,10 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-08
+
+Two fixes for failures that were previously invisible. No schema change.
+
 ### Fixed
 
 - **The background loops are supervised.** `reclaim`, `schedules`, `events`, `agent_cmds`,
