@@ -9,6 +9,7 @@ mod otel;
 mod retention;
 mod routes;
 mod state;
+mod supervisor;
 mod ws;
 
 use anyhow::Result;
@@ -83,41 +84,65 @@ async fn main() -> Result<()> {
     tasks::register_builtin_tasks(&registry);
     let fiber_scheduler = Arc::new(FiberScheduler::new(fiber_store, registry));
 
-    let reclaim = scheduler.clone();
-    tokio::spawn(async move {
-        reclaim.reclaim_loop().await;
-    });
-    let schedules = scheduler.clone();
-    tokio::spawn(async move {
-        schedules.schedule_loop().await;
-    });
-    let events_bus = scheduler.clone();
-    let redis_url = args.redis_url.clone();
-    tokio::spawn(async move {
-        events_bus.events_loop(redis_url).await;
-    });
-    let status_store = store.clone();
-    let status_scheduler = scheduler.clone();
-    tokio::spawn(async move {
-        github_status::report_loop(status_store, status_scheduler).await;
-    });
-    let agent_cmds = scheduler.clone();
-    let redis_url = args.redis_url.clone();
-    tokio::spawn(async move {
-        agent_cmds.agent_cmds_loop(redis_url).await;
-    });
-    let fibers = fiber_scheduler.clone();
-    tokio::spawn(async move {
-        fibers.run_loop().await;
-    });
+    // Supervised, not bare: a panic in any of these used to kill that task while the
+    // process stayed up and `/ready` kept saying ok.
+    let health = supervisor::LoopHealth::new();
+    {
+        let s = scheduler.clone();
+        supervisor::supervise("reclaim", health.clone(), move || {
+            let s = s.clone();
+            async move { s.reclaim_loop().await }
+        });
+    }
+    {
+        let s = scheduler.clone();
+        supervisor::supervise("schedules", health.clone(), move || {
+            let s = s.clone();
+            async move { s.schedule_loop().await }
+        });
+    }
+    {
+        let s = scheduler.clone();
+        let url = args.redis_url.clone();
+        supervisor::supervise("events", health.clone(), move || {
+            let (s, url) = (s.clone(), url.clone());
+            async move { s.events_loop(url).await }
+        });
+    }
+    {
+        let st = store.clone();
+        let s = scheduler.clone();
+        supervisor::supervise("github_status", health.clone(), move || {
+            let (st, s) = (st.clone(), s.clone());
+            async move { github_status::report_loop(st, s).await }
+        });
+    }
+    {
+        let s = scheduler.clone();
+        let url = args.redis_url.clone();
+        supervisor::supervise("agent_cmds", health.clone(), move || {
+            let (s, url) = (s.clone(), url.clone());
+            async move { s.agent_cmds_loop(url).await }
+        });
+    }
+    {
+        let f = fiber_scheduler.clone();
+        supervisor::supervise("fibers", health.clone(), move || {
+            let f = f.clone();
+            async move { f.run_loop().await }
+        });
+    }
 
     let artifacts = ArtifactBackend::from_env(&args.artifacts_dir).await?;
     let retention_cfg = retention::RetentionConfig::from_env();
-    let retention_store = store.clone();
-    let retention_artifacts = artifacts.clone();
-    tokio::spawn(async move {
-        retention::retention_loop(retention_store, retention_artifacts, retention_cfg).await;
-    });
+    {
+        let st = store.clone();
+        let a = artifacts.clone();
+        supervisor::supervise("retention", health.clone(), move || {
+            let (st, a, cfg) = (st.clone(), a.clone(), retention_cfg.clone());
+            async move { retention::retention_loop(st, a, cfg).await }
+        });
+    }
 
     let state = AppState {
         store,
@@ -125,6 +150,7 @@ async fn main() -> Result<()> {
         fiber_scheduler,
         artifacts,
         login_guard: Arc::new(login_guard::LoginGuard::new()),
+        loop_health: health,
     };
 
     if args.admin_password == "fiber" {
