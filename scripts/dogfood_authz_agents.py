@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-API = "http://127.0.0.1:18080"
+# Honour FIBER_API_URL. Hardcoding this made the script silently test whatever was on
+# 18080 — which, when you are running a second API on another port to check a change,
+# is the old build, and the smoke passes without having tested anything you wrote.
+API = os.environ.get("FIBER_API_URL", "http://127.0.0.1:18080").rstrip("/")
 FAILS = 0
 
 
@@ -180,6 +184,56 @@ def main() -> int:
     reader_id = next(m["user_id"] for m in members2 if m.get("username") == "dogfood_reader")
     code, rm = req("DELETE", f"/api/projects/{pid}/members/{reader_id}", token=admin)
     check("remove reader member", code == 200 and rm.get("ok"), rm)
+
+    # --- Account: own password, and revoking sessions -------------------------------
+    # A throwaway user, so a failure here cannot lock anyone out of the dev instance.
+    pw_user, pw_first, pw_second = "dogfood_pw", "initial-pass-1", "changed-pass-2"
+    req("POST", "/api/users", token=admin, body={"username": pw_user, "password": pw_first})
+
+    def login(password: str):
+        code, body = req("POST", "/api/auth/login", body={"username": pw_user, "password": password})
+        return code, (body or {}).get("token")
+
+    code, t1 = login(pw_first)
+    if code != 200:
+        # A re-run: the password was changed last time round.
+        code, t1 = login(pw_second)
+        pw_first, pw_second = pw_second, pw_first
+    check("login as the password test user", code == 200 and bool(t1), code)
+    _, t2 = login(pw_first)
+
+    code, _ = req("POST", "/api/auth/password", token=t1,
+                  body={"current_password": "wrong", "new_password": "some-long-password"})
+    check("wrong current password is refused", code == 401, code)
+
+    code, _ = req("POST", "/api/auth/password", token=t1,
+                  body={"current_password": pw_first, "new_password": "short"})
+    check("too-short new password is refused", code == 400, code)
+
+    code, _ = req("POST", "/api/auth/password", token=t1,
+                  body={"current_password": pw_first, "new_password": pw_second})
+    check("password change succeeds", code == 200, code)
+
+    code, _ = req("GET", "/api/auth/me", token=t1)
+    check("the session that changed it survives", code == 200, code)
+    code, _ = req("GET", "/api/auth/me", token=t2)
+    check("other sessions are dropped by a password change", code == 401, code)
+    code, _ = login(pw_first)
+    check("the old password no longer works", code == 401, code)
+    code, t3 = login(pw_second)
+    check("the new password works", code == 200 and bool(t3), code)
+
+    _, t4 = login(pw_second)
+    code, revoked = req("DELETE", "/api/auth/sessions", token=t3)
+    check("revoke reports what it removed", code == 200 and revoked.get("revoked", 0) >= 1, revoked)
+    code, _ = req("GET", "/api/auth/me", token=t3)
+    check("the caller's session survives a revoke", code == 200, code)
+    code, _ = req("GET", "/api/auth/me", token=t4)
+    check("other sessions are revoked", code == 401, code)
+    code, _ = req("GET", "/api/auth/me", token=admin)
+    check("another user's session is untouched", code == 200, code)
+    code, _ = req("DELETE", "/api/auth/sessions")
+    check("revoke needs authentication", code == 401, code)
 
     print("---")
     if FAILS:

@@ -1888,6 +1888,69 @@ impl Store {
         .await?)
     }
 
+    /// Change a user's own password, verifying the current one first.
+    ///
+    /// Every other session is dropped: a password change is what someone does when they
+    /// think a credential is compromised, and leaving the old sessions alive would make it
+    /// useless for that. The caller's own session survives, so changing a password does not
+    /// log you out of the page you did it from.
+    pub async fn change_password(
+        &self,
+        user_id: Uuid,
+        current: &str,
+        new_password: &str,
+        keep_token: &str,
+    ) -> Result<bool> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(stored) = stored else {
+            return Ok(false);
+        };
+        if !crate::tokens::verify_password(current, &stored) {
+            return Ok(false);
+        }
+        let hash = crate::tokens::hash_password(new_password);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(&hash)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2")
+            .bind(user_id)
+            .bind(crate::tokens::hash_token(keep_token))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Drop every session for a user except, optionally, the one making the request.
+    ///
+    /// Returns how many were removed. The remedy for a leaked token: without it the only
+    /// option is waiting out the expiry.
+    pub async fn revoke_sessions(&self, user_id: Uuid, keep_token: Option<&str>) -> Result<u64> {
+        let res = match keep_token {
+            Some(t) => {
+                sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2")
+                    .bind(user_id)
+                    .bind(crate::tokens::hash_token(t))
+                    .execute(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(res.rows_affected())
+    }
+
     pub async fn logout(&self, token: &str) -> Result<()> {
         let hash = crate::tokens::hash_token(token);
         sqlx::query("DELETE FROM sessions WHERE token_hash = $1")

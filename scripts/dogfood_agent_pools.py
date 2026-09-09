@@ -10,7 +10,10 @@ import time
 import urllib.error
 import urllib.request
 
-API = "http://127.0.0.1:18080"
+# Honour FIBER_API_URL. Hardcoding this made the script silently test whatever was on
+# 18080 — which, when you are running a second API on another port to check a change,
+# is the old build, and the smoke passes without having tested anything you wrote.
+API = os.environ.get("FIBER_API_URL", "http://127.0.0.1:18080").rstrip("/")
 FAILS = 0
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
