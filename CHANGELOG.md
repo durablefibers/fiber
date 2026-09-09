@@ -16,6 +16,12 @@ minor versions may carry breaking changes.
   `fiber_background_loop_up` and `fiber_background_loop_restarts_total`. The restart counter
   is the one to alert on: a loop that keeps recovering is failing repeatedly and nothing else
   would tell you.
+- **Release assets were non-deterministic.** The publish job downloaded every workflow
+  artifact, which swept in the build records the image jobs upload. Whether they appeared
+  depended on which job finished first, so a release sometimes carried four stray
+  `.dockerbuild` files and sometimes did not — and one of them being zero-length failed a
+  publish outright. It now takes only the binary artifacts, refuses to publish an empty or
+  zero-length asset, and the image jobs no longer produce build records at all.
 
 ## [0.3.1] — 2026-09-08
 

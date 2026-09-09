@@ -17,6 +17,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # Build records are a debugging aid we do not use, and they were ending up attached to
+  # releases as `.dockerbuild` files.
+  DOCKER_BUILD_RECORD_UPLOAD: false
+  DOCKER_BUILD_SUMMARY: false
 
 jobs:
   # A tag can point at a commit that never went through `main`, so re-run the gate here
@@ -220,7 +224,11 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          # Prefixed so `publish` can ask for exactly these. It downloaded everything
+          # before, which swept in the build records the image jobs upload — whether they
+          # appeared depended on which job finished first, so a release sometimes carried
+          # four stray `.dockerbuild` files and sometimes did not.
+          name: binaries-${{ matrix.target }}
           path: |
             fiber-agent-${{ matrix.target }}.tar.gz
             fiber-agent-${{ matrix.target }}.tar.gz.sha256
@@ -239,7 +247,18 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: binaries-*
           merge-multiple: true
+
+      - name: only the release assets, nothing else
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # A zero-length asset is what made the last publish fail outright, and an empty
+          # dist would silently publish a release with no binaries at all.
+          [ -n "$(ls -A dist)" ] || { echo "no binaries downloaded" >&2; exit 1; }
+          find dist -type f -empty -print -exec false {} + || {
+            echo "refusing to publish an empty asset" >&2; exit 1; }
 
       # The release notes are this version's CHANGELOG section, not the whole file.
       - name: release notes
