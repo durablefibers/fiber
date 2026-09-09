@@ -64,3 +64,18 @@ Project secrets (`POST/GET/DELETE /api/projects/{id}/secrets`) inject as env var
 - At rest: AES-GCM when `FIBER_SECRETS_KEY` is 64 hex chars; otherwise plaintext (dev warning)
 - Admins+ only to list/mutate
 - Special: `GITHUB_TOKEN` / `FIBER_GITHUB_TOKEN` used for PR file listing — see [Triggers](./triggers.md)
+
+## Accounts
+
+Changing a password is something you do to your **own** account: `POST /api/auth/password`,
+with the current password. An instance admin manages the admin flag through
+`PUT /api/users/{id}` and cannot set anyone's password — being able to would mean being able
+to take over an account silently, which is a different power from managing one.
+
+A password change drops every **other** session for that user, because a password change is
+what someone does when they think a credential is compromised. The session that made the
+change survives, so it does not log you out of the page you did it from.
+
+`DELETE /api/auth/sessions` does the same without changing the password, for when a token
+leaks rather than a password. Before this existed the only remedy was waiting out the
+14-day expiry.

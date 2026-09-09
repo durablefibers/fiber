@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Change your own password, and revoke your sessions.** `POST /api/auth/password` takes
+  the current password and drops every other session for that user, since a password change
+  is what someone does when they believe a credential is compromised. `DELETE
+  /api/auth/sessions` does the revocation alone, for a leaked token — previously the only
+  remedy was waiting out the 14-day expiry. Neither is something an admin can do to someone
+  else's account.
+
+### Fixed
+
+- **The dogfood scripts ignored `FIBER_API_URL`.** All four hardcoded `127.0.0.1:18080`, so
+  running one against a second API on another port — exactly what you do to check a change —
+  silently tested whatever was already on 18080 and passed without exercising the new build.
+
 ## [0.3.2] — 2026-09-08
 
 Two fixes for failures that were previously invisible. No schema change.

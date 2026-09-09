@@ -17,6 +17,8 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | POST | `/api/auth/login` | `{ username, password }` → `{ token, user, expires_at }` (`user.is_admin` = instance admin) |
 | POST | `/api/auth/logout` | Invalidate session |
 | GET | `/api/auth/me` | Current user |
+| POST | `/api/auth/password` | session — change your own password. Requires the current one; drops your other sessions. `401` if either the session or the current password is wrong, `400` if the new one is under 8 characters |
+| DELETE | `/api/auth/sessions` | session — revoke your other sessions. The one making the request survives; returns `{revoked: n}` |
 
 ## Projects & members
 

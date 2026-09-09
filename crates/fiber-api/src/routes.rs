@@ -29,6 +29,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/auth/password", post(change_password))
+        .route("/api/auth/sessions", axum::routing::delete(revoke_sessions))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/projects/{id}", get(get_project))
         .route(
@@ -360,6 +362,58 @@ async fn logout(
         let _ = state.store.logout(&token).await;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+/// Change your own password. Requires the current one, and drops your other sessions.
+///
+/// Deliberately not something an admin can do to someone else: `PUT /api/users/{id}` sets
+/// the admin flag and nothing more. An admin who could set passwords could take over an
+/// account silently, which is a different power from managing one.
+async fn change_password(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Same floor the bootstrap admin password gets. Long enough to be worth argon2.
+    if req.new_password.chars().count() < 8 {
+        return Err(ApiError::BadRequest(
+            "new password must be at least 8 characters".into(),
+        ));
+    }
+    let token = crate::auth::bearer_from_headers(&headers).unwrap_or_default();
+    let ok = state
+        .store
+        .change_password(user.id, &req.current_password, &req.new_password, &token)
+        .await
+        .map_err(ApiError::from)?;
+    if !ok {
+        // Same shape as a failed login: saying which half was wrong tells an attacker
+        // holding a stolen session whether they have guessed the password.
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Drop every other session for the caller. The session making the request survives.
+async fn revoke_sessions(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let token = crate::auth::bearer_from_headers(&headers);
+    let revoked = state
+        .store
+        .revoke_sessions(user.id, token.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "revoked": revoked })))
 }
 
 async fn me(AuthUser(user): AuthUser) -> impl IntoResponse {
