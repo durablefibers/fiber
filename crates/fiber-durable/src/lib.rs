@@ -7,6 +7,7 @@
 pub mod context;
 pub mod durability;
 pub mod engine;
+pub mod http_task;
 pub mod registry;
 pub mod scheduler;
 pub mod store;
