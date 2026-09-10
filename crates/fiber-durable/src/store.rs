@@ -219,6 +219,18 @@ impl FiberStore {
         Ok(())
     }
 
+    /// Mark a running fiber alive.
+    ///
+    /// Guarded on `running` so it cannot revive a fiber someone cancelled, and so a late
+    /// tick from a finished step does not stamp a terminal row.
+    pub async fn touch_heartbeat(&self, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE fibers SET heartbeat_at = NOW() WHERE id = $1 AND status = 'running'")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Ready: pending, suspended with wake_at <= now, or running with stale heartbeat.
     /// Atomically claim up to 50 ready fibers: pending, suspended-and-due, or running
     /// with a stale heartbeat. The claim flips them to `running`, bumps `attempts`, and
@@ -233,7 +245,14 @@ impl FiberStore {
     pub async fn claim_ready(&self, stale_after_secs: i64, limit: i64) -> Result<Vec<FiberRecord>> {
         let rows = sqlx::query_as::<_, FiberRow>(
             "UPDATE fibers
-             SET status = 'running', attempts = attempts + 1, heartbeat_at = NOW(),
+             SET status = 'running',
+                 -- Only a stale `running` row counts: that is an execution that vanished
+                 -- without reporting, so nobody else will count it. A `pending` first run
+                 -- has not failed yet, and a `suspended` row waking from a durable sleep is
+                 -- the same attempt continuing — counting those made a fiber that sleeps
+                 -- three times exhaust its retries while working perfectly.
+                 attempts = attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END,
+                 heartbeat_at = NOW(),
                  wake_at = NULL, updated_at = NOW()
              WHERE id IN (
                  SELECT id FROM fibers

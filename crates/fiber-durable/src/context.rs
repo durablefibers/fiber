@@ -5,6 +5,10 @@ use serde_json::Value;
 use std::future::Future;
 use thiserror::Error;
 
+/// Well inside the poller's staleness threshold, so a tick can be missed without the fiber
+/// looking dead.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug, Error)]
 #[error("fiber suspended until {wake_at}")]
 pub struct FiberSuspended {
@@ -46,7 +50,25 @@ impl FiberContext {
         if let Some(existing) = self.state.steps.get(key) {
             return Ok(existing.clone());
         }
-        let result = f().await?;
+        // A step is a single opaque await. Nothing inside it touches the heartbeat, so a
+        // step lasting longer than the staleness threshold used to look like a crashed
+        // fiber and get claimed and run a second time by another sweep. An `http_request`
+        // with a 300-second timeout reaches that in one call.
+        let beat = tokio::spawn({
+            let store = self.store.clone();
+            let id = self.record.id;
+            async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_EVERY).await;
+                    if let Err(e) = store.touch_heartbeat(id).await {
+                        tracing::warn!(fiber_id = %id, error = %e, "fiber heartbeat failed");
+                    }
+                }
+            }
+        });
+        let result = f().await;
+        beat.abort();
+        let result = result?;
         self.state.steps.insert(key.to_string(), result.clone());
         self.record.heartbeat_at = Some(Utc::now());
         self.store

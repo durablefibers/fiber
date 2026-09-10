@@ -6,6 +6,19 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A durable step lasting over a minute was executed twice.** The heartbeat was written
+  only when a step finished, so a step outliving the 60-second staleness threshold looked
+  like a crashed fiber and was claimed and run again by the next sweep. A step now
+  heartbeats every 15 seconds while it runs. The `http_request` task, whose timeout reaches
+  300 seconds, made this trivially reachable.
+- **Waking from a sleep no longer spends a retry.** Claiming a fiber incremented `attempts`,
+  and a wake from a durable sleep is a claim, so a fiber that slept three times hit the
+  limit and failed while working perfectly — a task with its own retries could not use them.
+  `attempts` now counts failures and crash-reclaims, which is what the retry budget was
+  always about.
+
 ### Changed
 
 - **Tokens are off the WebSocket query string.** `/ws/agent` takes
