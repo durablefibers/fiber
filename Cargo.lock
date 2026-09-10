@@ -1091,7 +1091,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fiber-agent"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-api"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-credential-types",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-cli"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-durable"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-proto"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-scheduler"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",

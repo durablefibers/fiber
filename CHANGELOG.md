@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-09
+
+Durable fibers become useful, and accounts get the two operations they were missing.
+No schema change.
+
 ### Added
 
 - **An `http_request` durable task.** Call a URL with retries that survive a restart: the
@@ -17,9 +22,6 @@ minor versions may carry breaking changes.
   metadata. Private, loopback, link-local, unique-local and CGNAT addresses are refused, all
   resolved addresses are checked rather than the first, and redirects are not followed.
   `FIBER_HTTP_TASK_ALLOW_PRIVATE=1` lifts it, as an operator's decision.
-
-### Added
-
 - **Change your own password, and revoke your sessions.** `POST /api/auth/password` takes
   the current password and drops every other session for that user, since a password change
   is what someone does when they believe a credential is compromised. `DELETE
