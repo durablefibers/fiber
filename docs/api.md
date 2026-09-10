@@ -90,7 +90,16 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 
 | Path | Auth | Notes |
 |---|---|---|
-| `/ws/agent?token=` | agent token | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
-| `/ws/runs/{id}?token=` | session token | Live run/step/log events |
+| `/ws/agent` | `Authorization: Bearer <agent token>` | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
+| `/ws/runs/{id}` | `Sec-WebSocket-Protocol: fiber.token.<session token>` | Live run/step/log events. The server echoes the protocol to complete the handshake |
+
+Both still accept `?token=`, so an agent older than the server keeps working, but the query
+string is deprecated: a URL ends up in proxy and server access logs and a token has no
+business being there. An agent token leases steps and receives project secrets. The API logs
+a warning when one arrives that way.
+
+A browser cannot set headers on a WebSocket, which is why the run event stream uses a
+subprotocol rather than `Authorization`. Ordinary access-log formats record the request line
+but not arbitrary headers, so this keeps the token out of them.
 
 Message shapes: `crates/fiber-proto`.
