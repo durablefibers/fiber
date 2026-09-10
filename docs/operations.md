@@ -70,6 +70,19 @@ A run that stays `running` is one of:
 
 `GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
 
+## Step logs
+
+A step's output is stored line by line, capped at `FIBER_STEP_LOG_MAX_LINES` (50,000) per
+**attempt**. Past the cap the lines are dropped and one `system` line says so, because
+silence looks like a step that stopped producing output. A retry is a new attempt with its
+own budget. `0` disables the cap, for whoever would rather risk the disk than lose output.
+
+Truncation never fails a step: losing the tail of a log is not a build failure.
+
+Reading is already bounded — `GET /api/steps/{id}/logs` returns the newest lines by default
+and pages with `?after_id=`. Writing is still one insert per line, which the cap bounds
+rather than removes; batching them is worth doing when a real instance shows it matters.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus exposition. It is **off** until `FIBER_METRICS_TOKEN` is
