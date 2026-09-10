@@ -464,10 +464,17 @@ export const api = {
       `/api/projects/${projectId}/secrets/${encodeURIComponent(key)}`,
       { method: "DELETE" }
     ),
-  runEventsUrl: (runId: string) => {
+  runEventsUrl: (runId: string) => `${wsBase()}/ws/runs/${runId}`,
+  /**
+   * The session token, as a WebSocket subprotocol.
+   *
+   * A browser cannot set headers on a WebSocket, and a token in the URL ends up in proxy
+   * and server access logs. `Sec-WebSocket-Protocol` is the one place left, and the server
+   * echoes the value back to complete the handshake.
+   */
+  runEventsProtocols: (): string[] => {
     const token = getToken()
-    const base = `${wsBase()}/ws/runs/${runId}`
-    return token ? `${base}?token=${encodeURIComponent(token)}` : base
+    return token ? [`fiber.token.${token}`] : []
   },
   apiUrl: API_URL,
 }

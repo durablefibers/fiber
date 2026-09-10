@@ -6,6 +6,16 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Tokens are off the WebSocket query string.** `/ws/agent` takes
+  `Authorization: Bearer`, and `/ws/runs/{id}` takes the session token as a
+  `Sec-WebSocket-Protocol` value, since a browser cannot set headers on a WebSocket. A URL
+  ends up in proxy and server access logs; an agent token, which leases steps and receives
+  project secrets, has no business being there. Both endpoints still accept `?token=` so an
+  agent older than the server keeps working, and the API logs a warning when one arrives
+  that way — but upgrade the server before the agents, not the other way round.
+
 ## [0.4.0] — 2026-09-09
 
 Durable fibers become useful, and accounts get the two operations they were missing.

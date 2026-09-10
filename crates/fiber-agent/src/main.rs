@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::http::header;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
 use url::Url;
@@ -385,14 +386,24 @@ async fn run_session(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
-    let mut url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
-    url.query_pairs_mut().append_pair("token", &args.token);
+    let url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
+    // The token goes in a header, not the query string: a URL ends up in proxy and server
+    // access logs, and this token leases steps and receives project secrets. Servers older
+    // than this still accept `?token=`, so an old server and a new agent do not connect —
+    // upgrade the server first.
+    let request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        url.as_str(),
+    )
+    .map(|mut r| {
+        if let Ok(v) = format!("Bearer {}", args.token).parse() {
+            r.headers_mut().insert(header::AUTHORIZATION, v);
+        }
+        r
+    })
+    .context("build websocket request")?;
 
-    // Never log the token-bearing URL.
     info!(api = %args.api_url, "connecting");
-    let (ws, _) = connect_async(url.as_str())
-        .await
-        .context("connect websocket")?;
+    let (ws, _) = connect_async(request).await.context("connect websocket")?;
     let (mut sink, mut stream) = ws.split();
 
     let mut agent_id = Uuid::nil();

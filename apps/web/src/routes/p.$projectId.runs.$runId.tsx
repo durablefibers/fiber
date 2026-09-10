@@ -229,7 +229,7 @@ function RunPage() {
 
     const connect = () => {
       if (closed) return
-      ws = new WebSocket(api.runEventsUrl(runId))
+      ws = new WebSocket(api.runEventsUrl(runId), api.runEventsProtocols())
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data as string) as {

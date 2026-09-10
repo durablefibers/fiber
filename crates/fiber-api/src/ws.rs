@@ -2,6 +2,7 @@ use crate::artifacts::ArtifactBackend;
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use fiber_core::models::StepRun;
 use fiber_proto::{
@@ -17,17 +18,32 @@ use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct AgentQs {
-    pub token: String,
+    /// Deprecated. A query string ends up in proxy and server access logs, where an agent
+    /// token — which leases steps and receives project secrets — has no business being.
+    /// Kept so an agent older than this server can still connect.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 pub async fn agent_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(qs): Query<AgentQs>,
 ) -> impl IntoResponse {
+    let from_header = crate::auth::bearer_from_headers(&headers);
+    if from_header.is_none() && qs.token.is_some() {
+        warn!(
+            "agent authenticated with a token in the query string; upgrade the agent so it \
+             sends an Authorization header instead"
+        );
+    }
+    let Some(token) = from_header.or_else(|| qs.token.clone()) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
     // 401 is fatal for the agent (it exits rather than retrying a revoked token), so a
     // store error must not be mistaken for one.
-    let agent = match state.store.agent_by_token(&qs.token).await {
+    let agent = match state.store.agent_by_token(&token).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
@@ -41,7 +57,7 @@ pub async fn agent_ws(
                 .into_response();
         }
     };
-    let token_hash = fiber_core::tokens::hash_token(&qs.token);
+    let token_hash = fiber_core::tokens::hash_token(&token);
     ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash))
 }
 
@@ -635,16 +651,38 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 
 #[derive(Deserialize)]
 pub struct RunEventsQs {
-    pub token: String,
+    /// Deprecated, same reason as the agent socket: a URL is logged, a subprotocol is not.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// The session token a browser sent as a WebSocket subprotocol.
+///
+/// A browser cannot set headers on a WebSocket, so `Sec-WebSocket-Protocol` is the only
+/// place a token can travel that is not the URL. Query strings end up in proxy and server
+/// access logs; this does not.
+fn token_from_subprotocol(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("sec-websocket-protocol")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("fiber.token.").map(str::to_string))
 }
 
 pub async fn run_events_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
+    headers: HeaderMap,
     Query(qs): Query<RunEventsQs>,
 ) -> impl IntoResponse {
-    let user = match state.store.user_by_session_token(&qs.token).await {
+    let via_subprotocol = token_from_subprotocol(&headers);
+    let Some(token) = via_subprotocol.clone().or_else(|| qs.token.clone()) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    let user = match state.store.user_by_session_token(&token).await {
         Ok(Some(u)) => u,
         _ => {
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
@@ -671,6 +709,12 @@ pub async fn run_events_ws(
     {
         return (axum::http::StatusCode::FORBIDDEN, "forbidden").into_response();
     }
+    // The client offered a subprotocol, so the handshake has to name it back. Without
+    // this the browser closes the socket immediately.
+    let ws = match &via_subprotocol {
+        Some(t) => ws.protocols([format!("fiber.token.{t}")]),
+        None => ws,
+    };
     ws.on_upgrade(move |socket| handle_run_events(socket, state, run_id))
 }
 
