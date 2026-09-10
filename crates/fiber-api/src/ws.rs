@@ -421,6 +421,11 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
     let _ = state.store.set_agent_online(agent_id, true).await;
     // Log a spoofed agent_id once per session, not once per log line.
     let mut spoof_logged = false;
+    // Lines already stored per (step, attempt), so the cap costs a counter rather than a
+    // `SELECT COUNT(*)` on every line. Kept per session: a step's output goes to one agent
+    // connection, and a retry is a new attempt with its own budget.
+    let mut logged: HashMap<(Uuid, i32), u64> = HashMap::new();
+    let log_cap = step_log_cap();
 
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
@@ -525,6 +530,24 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
                 if let Some(step) = owned_step(&state, agent_id, step_run_id).await {
+                    // A runaway step could otherwise write until the disk filled. Past the
+                    // cap the lines are dropped, with one line saying so — silence would
+                    // look like the step stopped producing output.
+                    let seen = logged.entry((step_run_id, step.attempt)).or_insert(0);
+                    *seen += 1;
+                    let (data, stream_name) = if *seen > log_cap {
+                        continue;
+                    } else if *seen == log_cap {
+                        (
+                            format!(
+                                "log truncated at {log_cap} lines for this attempt \
+                                 (FIBER_STEP_LOG_MAX_LINES); the step is still running"
+                            ),
+                            "system".to_string(),
+                        )
+                    } else {
+                        (data, stream_name)
+                    };
                     if let Ok(line) = state
                         .store
                         .append_log(
@@ -654,6 +677,17 @@ pub struct RunEventsQs {
     /// Deprecated, same reason as the agent socket: a URL is logged, a subprotocol is not.
     #[serde(default)]
     pub token: Option<String>,
+}
+
+/// Lines stored per step attempt before the rest are dropped.
+///
+/// `0` disables the cap, for whoever would rather risk the disk than lose output.
+fn step_log_cap() -> u64 {
+    std::env::var("FIBER_STEP_LOG_MAX_LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(|n: u64| if n == 0 { u64::MAX } else { n })
+        .unwrap_or(50_000)
 }
 
 /// The session token a browser sent as a WebSocket subprotocol.

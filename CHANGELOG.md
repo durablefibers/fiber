@@ -6,6 +6,14 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A per-attempt cap on stored step logs**, `FIBER_STEP_LOG_MAX_LINES`, default 50,000.
+  Reading was bounded by pagination, but writing had no ceiling: a runaway step could fill
+  the disk. Past the cap lines are dropped and one `system` line says so, since silence
+  looks like a step that stopped producing output. A retry gets its own budget, truncation
+  never fails a step, and `0` disables it.
+
 ### Fixed
 
 - **A durable step lasting over a minute was executed twice.** The heartbeat was written
