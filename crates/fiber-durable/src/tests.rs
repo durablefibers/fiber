@@ -93,3 +93,13 @@ fn failure_outcome_retries_until_max_attempts() {
     assert_eq!(failure_outcome(1, 1), FiberOutcome::Failed);
     assert_eq!(failure_outcome(1, 0), FiberOutcome::Failed);
 }
+
+#[test]
+fn a_failure_spends_an_attempt_and_the_budget_is_exhausted_by_failures() {
+    // With the claim no longer counting resumes, `attempts` is a count of failures. Three
+    // failures with a maximum of three must be the point it stops, not sooner.
+    use crate::engine::{FiberOutcome, failure_outcome};
+    assert_eq!(failure_outcome(1, 3), FiberOutcome::Retry);
+    assert_eq!(failure_outcome(2, 3), FiberOutcome::Retry);
+    assert_eq!(failure_outcome(3, 3), FiberOutcome::Failed);
+}

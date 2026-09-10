@@ -72,6 +72,9 @@ pub async fn run_fiber(
             }
             record.error = Some(format!("{e:#}"));
             record.heartbeat_at = None;
+            // The claim no longer counts a resume, so the failure counts itself. This is
+            // the event the retry budget is actually about.
+            record.attempts += 1;
             let outcome = failure_outcome(record.attempts, max_attempts);
             match outcome {
                 FiberOutcome::Failed => {

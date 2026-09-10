@@ -83,6 +83,13 @@ Optional `wake_at` (RFC3339) on create starts the fiber suspended until due.
   any fiber, so during a rolling upgrade a fiber naming a task only the new version has will
   fail on an old one with `no durable task handler registered`. Finish the rollout before
   creating fibers that use a newly added task  
+- **A step heartbeats while it runs**, every 15 seconds, so one lasting longer than the
+  60-second staleness threshold is not mistaken for a crashed fiber and executed a second
+  time. This matters most for `http_request`, whose timeout can reach 300 seconds  
+- **`attempts` counts failures, not claims.** Waking from a durable sleep continues the same
+  attempt; only a genuine failure, or a `running` fiber found stale after a crash, spends
+  one. Counting resumes meant a fiber that slept three times exhausted its retries while
+  working perfectly  
 - **Cancel wins.** It is terminal, so the poller does not pick the fiber up again, and a
   save from a handler that was already running is rejected rather than overwriting the
   decision. A cancelled fiber stays cancelled even if its work would have succeeded  
