@@ -8,6 +8,18 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **An `http_request` durable task.** Call a URL with retries that survive a restart: the
+  wait between attempts is a suspension, not a held task. 5xx, 429 and connection errors are
+  retried, a 4xx is not, and each attempt carries an `Idempotency-Key` of
+  `<fiber id>:<attempt>` so a receiver can make at-least-once delivery harmless. This is the
+  first task driven entirely from user input, so it is the first with a threat model: it
+  makes the **API** issue the request, and the API can see the backend network and cloud
+  metadata. Private, loopback, link-local, unique-local and CGNAT addresses are refused, all
+  resolved addresses are checked rather than the first, and redirects are not followed.
+  `FIBER_HTTP_TASK_ALLOW_PRIVATE=1` lifts it, as an operator's decision.
+
+### Added
+
 - **Change your own password, and revoke your sessions.** `POST /api/auth/password` takes
   the current password and drops every other session for that user, since a password change
   is what someone does when they believe a credential is compromised. `DELETE

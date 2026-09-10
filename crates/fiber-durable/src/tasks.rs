@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-/// Register demo handlers: `ping`, `sleep_demo`, and `interval_task`.
+/// Register the built-in handlers: `http_request`, plus the `ping`, `sleep_demo` and
+/// `interval_task` demos.
 pub fn register_builtin_tasks(registry: &FiberRegistry) {
     registry.register_fn("ping", |ctx| {
         let input = ctx.input.clone();
@@ -20,6 +21,7 @@ pub fn register_builtin_tasks(registry: &FiberRegistry) {
         }
     });
 
+    registry.register("http_request", crate::http_task::HttpRequestTask);
     registry.register("sleep_demo", SleepDemo);
     registry.register("interval_task", IntervalTask);
 }

@@ -93,6 +93,8 @@ services:
       # Empty = plaintext at rest (fiber-api warns at boot).
       FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}
       FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
+      # Let the http_request fiber task reach private addresses. Off by default.
+      FIBER_HTTP_TASK_ALLOW_PRIVATE: ${FIBER_HTTP_TASK_ALLOW_PRIVATE:-0}
       # Bearer token for /metrics. Empty = the endpoint is off.
       FIBER_METRICS_TOKEN: ${FIBER_METRICS_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-info,fiber_api=info}
