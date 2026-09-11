@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-11
+
+Two durable-runtime bugs that the `http_request` task made reachable, and tokens off the
+WebSocket query string. No schema change.
+
 ### Added
 
 - **A per-attempt cap on stored step logs**, `FIBER_STEP_LOG_MAX_LINES`, default 50,000.
@@ -13,6 +18,16 @@ minor versions may carry breaking changes.
   the disk. Past the cap lines are dropped and one `system` line says so, since silence
   looks like a step that stopped producing output. A retry gets its own budget, truncation
   never fails a step, and `0` disables it.
+
+### Changed
+
+- **Tokens are off the WebSocket query string.** `/ws/agent` takes
+  `Authorization: Bearer`, and `/ws/runs/{id}` takes the session token as a
+  `Sec-WebSocket-Protocol` value, since a browser cannot set headers on a WebSocket. A URL
+  ends up in proxy and server access logs; an agent token, which leases steps and receives
+  project secrets, has no business being there. Both endpoints still accept `?token=` so an
+  agent older than the server keeps working, and the API logs a warning when one arrives
+  that way — but upgrade the server before the agents, not the other way round.
 
 ### Fixed
 
@@ -26,16 +41,6 @@ minor versions may carry breaking changes.
   limit and failed while working perfectly — a task with its own retries could not use them.
   `attempts` now counts failures and crash-reclaims, which is what the retry budget was
   always about.
-
-### Changed
-
-- **Tokens are off the WebSocket query string.** `/ws/agent` takes
-  `Authorization: Bearer`, and `/ws/runs/{id}` takes the session token as a
-  `Sec-WebSocket-Protocol` value, since a browser cannot set headers on a WebSocket. A URL
-  ends up in proxy and server access logs; an agent token, which leases steps and receives
-  project secrets, has no business being there. Both endpoints still accept `?token=` so an
-  agent older than the server keeps working, and the API logs a warning when one arrives
-  that way — but upgrade the server before the agents, not the other way round.
 
 ## [0.4.0] — 2026-09-09
 
