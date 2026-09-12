@@ -115,10 +115,21 @@ pub async fn run_once(
     let deleted = store.delete_runs(&ids).await?;
 
     let candidates: Vec<String> = paths.iter().cloned().collect();
-    let still_referenced = store
-        .artifact_paths_still_referenced(&candidates)
-        .await
-        .unwrap_or_default();
+    // A failure here must not read as "nothing references these". `unwrap_or_default`
+    // made an empty result out of a transient error, and every candidate blob then looked
+    // unreferenced — deleting artifacts that a surviving retry still points at. Leaking a
+    // few blobs until someone reconciles them is the better failure.
+    let still_referenced = match store.artifact_paths_still_referenced(&candidates).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            warn!(
+                error = %e,
+                candidates = candidates.len(),
+                "could not check artifact references; keeping every blob this tick"
+            );
+            return Ok(deleted);
+        }
+    };
     let mut removed = 0usize;
     for path in unreferenced_blobs(&paths, &still_referenced) {
         match artifacts.delete(path).await {
