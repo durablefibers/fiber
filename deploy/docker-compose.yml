@@ -93,6 +93,8 @@ services:
       # Empty = plaintext at rest (fiber-api warns at boot).
       FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}
       FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
+      # Delete terminal durable fibers older than this many days. 0 disables.
+      FIBER_RETENTION_FIBER_DAYS: ${FIBER_RETENTION_FIBER_DAYS:-7}
       # Lines stored per step attempt before the rest are dropped. 0 disables it.
       FIBER_STEP_LOG_MAX_LINES: ${FIBER_STEP_LOG_MAX_LINES:-50000}
       # Let the http_request fiber task reach private addresses. Off by default.

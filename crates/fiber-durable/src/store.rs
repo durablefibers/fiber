@@ -219,6 +219,29 @@ impl FiberStore {
         Ok(())
     }
 
+    /// Delete terminal fibers finished before `cutoff`, newest-first up to `limit`.
+    ///
+    /// Returns how many went. `fiber_steps` cascades from `fibers`, so the memoized step
+    /// results go with them — those are the bulk, one row per step of every fiber ever run.
+    ///
+    /// Only terminal statuses: a suspended fiber sleeping for a month is not old, it is
+    /// waiting, and deleting it would silently cancel work someone scheduled.
+    pub async fn delete_terminal_before(&self, cutoff: DateTime<Utc>, limit: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "DELETE FROM fibers WHERE id IN (
+                 SELECT id FROM fibers
+                 WHERE status IN ('completed', 'failed', 'cancelled')
+                   AND updated_at < $1
+                 ORDER BY updated_at ASC
+                 LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Mark a running fiber alive.
     ///
     /// Guarded on `running` so it cannot revive a fiber someone cancelled, and so a late
