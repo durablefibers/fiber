@@ -16,6 +16,8 @@ const EVENTS_CHANNEL: &str = "fiber:events";
 /// the one holding the agent's socket delivers them.
 const AGENT_CMDS_CHANNEL: &str = "fiber:agent_cmds";
 const LEASE_SECS: i64 = 300;
+/// Ceiling on the per-attempt retry backoff, so a high `retries` cannot park a step for hours.
+const MAX_RETRY_BACKOFF_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct Scheduler {
@@ -39,6 +41,24 @@ pub struct AgentPresence {
     pub inflight: u32,
     /// `None` = global pool.
     pub project_id: Option<Uuid>,
+}
+
+impl AgentPresence {
+    /// Take a concurrency slot if one is free. Check and increment are one operation so
+    /// two concurrent offers for the same agent cannot both pass the cap.
+    pub fn try_reserve_slot(&mut self) -> bool {
+        if self.inflight >= self.concurrency {
+            return false;
+        }
+        self.inflight += 1;
+        true
+    }
+
+    /// Give a slot back. Saturating: a duplicate release must not wrap to u32::MAX and
+    /// hand the agent unlimited concurrency.
+    pub fn release_slot(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+    }
 }
 
 /// Envelope on `fiber:agent_cmds`.
@@ -445,9 +465,10 @@ impl Scheduler {
         let agent_labels = {
             let mut agents = self.agents.write().await;
             match agents.get_mut(&agent_id) {
-                Some(a) if a.inflight >= a.concurrency => return Ok(None),
                 Some(a) => {
-                    a.inflight += 1;
+                    if !a.try_reserve_slot() {
+                        return Ok(None);
+                    }
                     a.labels.clone()
                 }
                 None => {
@@ -460,7 +481,7 @@ impl Scheduler {
         if !matches!(leased, Ok(Some(_))) {
             let mut agents = self.agents.write().await;
             if let Some(a) = agents.get_mut(&agent_id) {
-                a.inflight = a.inflight.saturating_sub(1);
+                a.release_slot();
             }
         }
         leased
@@ -515,7 +536,7 @@ impl Scheduler {
         };
 
         // Ignore late completes after cancel / reclaim / re-lease to another agent.
-        if current.status_enum() != StepStatus::Running || current.agent_id != Some(agent_id) {
+        if !completion_is_current(current.status_enum(), current.agent_id, agent_id) {
             debug!(
                 %step_run_id,
                 status = %current.status,
@@ -529,12 +550,11 @@ impl Scheduler {
         {
             let mut agents = self.agents.write().await;
             if let Some(a) = agents.get_mut(&agent_id) {
-                a.inflight = a.inflight.saturating_sub(1);
+                a.release_slot();
             }
         }
 
-        if status == StepStatus::Failed && current.attempt <= current.retries {
-            let backoff_secs = 2u64.pow(current.attempt.max(1) as u32).min(60);
+        if let Some(backoff_secs) = retry_plan(status, current.attempt, current.retries) {
             info!(
                 step = %current.step_id,
                 attempt = current.attempt,
@@ -772,18 +792,46 @@ pub struct TimeoutConfig {
 
 impl TimeoutConfig {
     pub fn from_env() -> Self {
-        let read = |k: &str, d: i64| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .filter(|v| *v >= 1)
-                .unwrap_or(d)
-        };
+        let read = |k: &str, d: i64| timeout_minutes_or(std::env::var(k).ok().as_deref(), d);
         Self {
             default_minutes: read("FIBER_STEP_TIMEOUT_DEFAULT_MINUTES", 60),
             grace_minutes: read("FIBER_STEP_TIMEOUT_GRACE_MINUTES", 5),
         }
     }
+}
+
+/// Whether a `StepComplete` from `reporting_agent` still applies to the row as stored.
+///
+/// CI steps are at-least-once: a lease can expire, the step be requeued, and a second
+/// agent lease it — all while the first agent is still running and about to report. Its
+/// report must be dropped, or it would overwrite the live attempt's outcome. Pure so the
+/// cases can be enumerated without a database.
+fn completion_is_current(
+    current: StepStatus,
+    row_agent: Option<Uuid>,
+    reporting_agent: Uuid,
+) -> bool {
+    current == StepStatus::Running && row_agent == Some(reporting_agent)
+}
+
+/// `Some(backoff_seconds)` when a finished step should be requeued for another attempt.
+///
+/// Only a failure retries — a cancel is a person's decision and a success is done. The
+/// backoff doubles per attempt and is capped, and lands on the row as `not_before` so it
+/// survives a restart and is honoured by every instance.
+fn retry_plan(status: StepStatus, attempt: i32, retries: i32) -> Option<u64> {
+    if status != StepStatus::Failed || attempt > retries {
+        return None;
+    }
+    Some(2u64.pow(attempt.max(1) as u32).min(MAX_RETRY_BACKOFF_SECS))
+}
+
+/// Read a positive minute count, falling back to `default` for absent, unparseable, or
+/// non-positive values. A zero or negative timeout would fail every step immediately.
+fn timeout_minutes_or(raw: Option<&str>, default: i64) -> i64 {
+    raw.and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(default)
 }
 
 fn labels_match(agent: &[String], required: &[String]) -> bool {
@@ -796,6 +844,177 @@ fn labels_match(agent: &[String], required: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn presence(concurrency: u32, inflight: u32) -> AgentPresence {
+        AgentPresence {
+            labels: vec![],
+            concurrency,
+            inflight,
+            project_id: None,
+        }
+    }
+
+    // --- concurrency slots ------------------------------------------------------------
+
+    #[test]
+    fn an_agent_reserves_up_to_its_concurrency_and_no_further() {
+        let mut a = presence(2, 0);
+        assert!(a.try_reserve_slot());
+        assert!(a.try_reserve_slot());
+        assert!(!a.try_reserve_slot(), "the cap must hold");
+        assert_eq!(a.inflight, 2, "a refused reservation must not count");
+    }
+
+    #[test]
+    fn a_zero_concurrency_agent_is_never_offered_work() {
+        // An agent that reported concurrency 0 (or was drained) takes nothing.
+        let mut a = presence(0, 0);
+        assert!(!a.try_reserve_slot());
+        assert_eq!(a.inflight, 0);
+    }
+
+    #[test]
+    fn releasing_a_slot_lets_the_next_offer_through() {
+        let mut a = presence(1, 0);
+        assert!(a.try_reserve_slot());
+        assert!(!a.try_reserve_slot());
+        a.release_slot();
+        assert!(a.try_reserve_slot(), "the freed slot is reusable");
+    }
+
+    #[test]
+    fn a_duplicate_release_cannot_wrap_into_unlimited_concurrency() {
+        // StepComplete can arrive twice (at-least-once). An unsaturated subtract would
+        // wrap u32 to ~4 billion and lift the cap entirely.
+        let mut a = presence(1, 0);
+        a.release_slot();
+        a.release_slot();
+        assert_eq!(a.inflight, 0);
+        assert!(a.try_reserve_slot());
+        assert!(
+            !a.try_reserve_slot(),
+            "the cap still holds after the wrap attempt"
+        );
+    }
+
+    // --- late completes ---------------------------------------------------------------
+
+    #[test]
+    fn the_leaseholder_completing_a_running_step_is_accepted() {
+        let agent = Uuid::new_v4();
+        assert!(completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            agent
+        ));
+    }
+
+    #[test]
+    fn a_report_from_an_agent_that_no_longer_holds_the_step_is_dropped() {
+        // The lease expired, the step was requeued, and another agent now owns it. The
+        // original agent finishing late must not overwrite the live attempt.
+        let old_agent = Uuid::new_v4();
+        let new_agent = Uuid::new_v4();
+        assert!(!completion_is_current(
+            StepStatus::Running,
+            Some(new_agent),
+            old_agent
+        ));
+    }
+
+    #[test]
+    fn a_report_for_a_step_that_already_finished_is_dropped() {
+        let agent = Uuid::new_v4();
+        for status in [
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+            StepStatus::Queued,
+            StepStatus::Pending,
+        ] {
+            assert!(
+                !completion_is_current(status, Some(agent), agent),
+                "{status:?} must not accept a completion"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_for_a_step_with_no_leaseholder_is_dropped() {
+        // Reclaim clears agent_id; a report arriving in that window has nothing to close.
+        assert!(!completion_is_current(
+            StepStatus::Running,
+            None,
+            Uuid::new_v4()
+        ));
+    }
+
+    // --- retry policy -----------------------------------------------------------------
+
+    #[test]
+    fn only_a_failure_retries() {
+        for status in [
+            StepStatus::Succeeded,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ] {
+            assert_eq!(retry_plan(status, 1, 3), None, "{status:?} must not retry");
+        }
+        assert!(retry_plan(StepStatus::Failed, 1, 3).is_some());
+    }
+
+    #[test]
+    fn a_step_with_no_retries_configured_fails_on_its_first_attempt() {
+        assert_eq!(retry_plan(StepStatus::Failed, 1, 0), None);
+    }
+
+    #[test]
+    fn retries_are_spent_one_per_attempt_and_then_stop() {
+        // retries = 2 means attempts 1 and 2 requeue; attempt 3 is terminal.
+        assert!(retry_plan(StepStatus::Failed, 1, 2).is_some());
+        assert!(retry_plan(StepStatus::Failed, 2, 2).is_some());
+        assert_eq!(retry_plan(StepStatus::Failed, 3, 2), None);
+        assert_eq!(retry_plan(StepStatus::Failed, 99, 2), None);
+    }
+
+    #[test]
+    fn the_backoff_doubles_per_attempt_and_is_capped() {
+        assert_eq!(retry_plan(StepStatus::Failed, 1, 99), Some(2));
+        assert_eq!(retry_plan(StepStatus::Failed, 2, 99), Some(4));
+        assert_eq!(retry_plan(StepStatus::Failed, 3, 99), Some(8));
+        assert_eq!(retry_plan(StepStatus::Failed, 6, 99), Some(60), "capped");
+        // The cap also keeps 2^attempt from overflowing on a large retries value.
+        assert_eq!(
+            retry_plan(StepStatus::Failed, 40, 99),
+            Some(MAX_RETRY_BACKOFF_SECS)
+        );
+    }
+
+    #[test]
+    fn a_zeroth_attempt_still_waits_before_retrying() {
+        // attempt is 1-based in practice; `.max(1)` guards 2^0 = 1 second, which would be
+        // a near-instant hot loop against whatever just failed.
+        assert_eq!(retry_plan(StepStatus::Failed, 0, 3), Some(2));
+    }
+
+    // --- timeout config ---------------------------------------------------------------
+
+    #[test]
+    fn a_timeout_falls_back_when_unset_or_unusable() {
+        assert_eq!(timeout_minutes_or(None, 60), 60);
+        assert_eq!(timeout_minutes_or(Some(""), 60), 60);
+        assert_eq!(timeout_minutes_or(Some("soon"), 60), 60);
+        // Zero or negative would time every step out immediately.
+        assert_eq!(timeout_minutes_or(Some("0"), 60), 60);
+        assert_eq!(timeout_minutes_or(Some("-5"), 60), 60);
+    }
+
+    #[test]
+    fn a_usable_timeout_is_taken_as_given() {
+        assert_eq!(timeout_minutes_or(Some("1"), 60), 1);
+        assert_eq!(timeout_minutes_or(Some("120"), 60), 120);
+    }
 
     #[test]
     fn agent_command_round_trips() {

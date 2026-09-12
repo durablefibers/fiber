@@ -25,7 +25,11 @@ Login defaults: **admin / fiber**.
 
 ### Tests
 
-Rust tests are pure unit tests (no DB/Redis needed) living in `#[cfg(test)]` modules in `fiber-core` (`dag`, `due_index`, `path_filter`, `schedule`, `secrets`, `step_if`, `tokens`), `fiber-api` (`routes` webhook signatures, `artifact_util`), and `fiber-durable/src/tests.rs`. `make test` runs all of them plus the web vitest suite.
+Rust tests are pure unit tests (no DB/Redis needed) living in `#[cfg(test)]` modules across all seven crates: `fiber-core` (`dag`, `due_index`, `path_filter`, `roles`, `schedule`, `secrets`, `step_if`, `store` DAG propagation + snapshot readers, `tokens`), `fiber-api` (`artifacts` key mapping, `artifact_util`, `auth`, `github`, `login_guard`, `otel`, `retention`, `routes` webhook signatures + metrics + the router authz audit, `supervisor`, `ws`), `fiber-proto` (wire tags and `serde(default)` forward-compat), `fiber-agent` (log redaction, env files, workspace refcount), `fiber-cli` (download filenames, token file permissions), `fiber-scheduler` (lease/retry/concurrency decisions), and `fiber-durable` (`src/tests.rs`, `src/context_tests.rs`, `http_task`). `make test` runs all of them plus the web vitest suite.
+
+Anything needing Postgres is tested one of three ways. **Extract the decision** into a pure function and test that — `store::plan_transitions` for DAG propagation, `scheduler::{completion_is_current,retry_plan}` for lease and retry semantics, `retention::unreferenced_blobs` for which artifact blobs are safe to delete, `secrets::{encrypt_with,decrypt_with}` for the cipher. **Drive a trait double** — `FiberContext` takes an `Arc<dyn FiberPersistence>`, so step memoization, the sleep ordinal, and checkpointing are testable without a database. **Audit the source** — `routes::tests` reads its own `include_str!("routes.rs")` to assert every routed handler passes through `access.rs` (convention 8) or is listed in `UNGATED_BY_DESIGN` with a reason, and `apps/web/src/lib/wire-drift.test.ts` reads `fiber-proto` to assert the hand-mirrored TypeScript has not drifted (convention 9).
+
+New tests should be able to fail: when adding one, check it by breaking the thing it covers and confirming it goes red.
 
 ```bash
 cargo test --workspace

@@ -1,8 +1,9 @@
-use crate::store::FiberStore;
+use crate::persistence::FiberPersistence;
 use crate::types::{FiberRecord, FiberState};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::future::Future;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Well inside the poller's staleness threshold, so a tick can be missed without the fiber
@@ -19,13 +20,13 @@ pub struct FiberSuspended {
 pub struct FiberContext {
     pub record: FiberRecord,
     pub input: Value,
-    store: FiberStore,
+    store: Arc<dyn FiberPersistence>,
     state: FiberState,
     sleep_i: i32,
 }
 
 impl FiberContext {
-    pub fn new(record: FiberRecord, store: FiberStore) -> Self {
+    pub fn new(record: FiberRecord, store: Arc<dyn FiberPersistence>) -> Self {
         let input = record.input.clone();
         let state = record.state.clone();
         Self {
@@ -120,8 +121,10 @@ impl FiberContext {
         Ok(record.id)
     }
 
-    pub fn store(&self) -> &FiberStore {
-        &self.store
+    /// A handle to the store that outlives a borrow of the context, so a handler can use
+    /// it inside a `step` closure (which holds `&mut self`).
+    pub fn persistence(&self) -> Arc<dyn FiberPersistence> {
+        Arc::clone(&self.store)
     }
 
     async fn checkpoint(&mut self) -> anyhow::Result<()> {

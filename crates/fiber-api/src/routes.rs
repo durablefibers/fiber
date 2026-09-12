@@ -1855,6 +1855,253 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+
+    //! Static audit of the router's own source. Convention 8 says every project-scoped
+    //! handler goes through `access.rs`; a handler that resolves an id and proceeds
+    //! without a role check is a security bug, not a style issue. Because the gate lives
+    //! inside the handler body rather than in a layer, nothing but reading the code
+    //! catches a missing one — and a real request test would need Postgres. So the test
+    //! reads the code.
+
+    /// The router and every handler, as compiled into this binary.
+    const SRC: &str = include_str!("routes.rs");
+
+    /// Handlers deliberately not behind a project role gate, each with the reason it is
+    /// safe. Adding a handler to this list is the moment to think hard; adding one
+    /// *without* thinking makes the test fail instead.
+    const UNGATED_BY_DESIGN: &[(&str, &str)] = &[
+        ("health", "liveness probe, no data"),
+        ("ready", "readiness probe, no data"),
+        (
+            "metrics",
+            "gated by its own bearer token, not a project role",
+        ),
+        ("login", "mints the session; no user yet"),
+        ("logout", "revokes the caller's own session"),
+        ("me", "returns the caller's own user"),
+        ("change_password", "acts on the caller's own account"),
+        ("revoke_sessions", "revokes the caller's own sessions"),
+        (
+            "list_projects",
+            "filtered to the caller's memberships by the query itself",
+        ),
+        ("create_project", "no project exists yet to be a member of"),
+        (
+            "parse_yaml",
+            "pure validation of a posted document; touches no stored data",
+        ),
+        (
+            "list_fiber_tasks",
+            "the static list of registered task names",
+        ),
+        (
+            "github_webhook",
+            "authenticated by HMAC signature, not a session",
+        ),
+        ("agent_ws", "authenticated by agent token at the handshake"),
+        (
+            "run_events_ws",
+            "gates on the run inside the handler after upgrade",
+        ),
+        (
+            "agent_upload_artifact",
+            "AuthAgent; scoped to a step leased to that agent",
+        ),
+        (
+            "agent_presign_artifact",
+            "AuthAgent; scoped to a step leased to that agent",
+        ),
+        (
+            "agent_complete_artifact",
+            "AuthAgent; scoped to a step leased to that agent",
+        ),
+        (
+            "agent_download_artifact",
+            "AuthAgent; scoped to a step leased to that agent",
+        ),
+    ];
+
+    /// `(name, body)` for every `async fn` declared at the top level of this file.
+    fn handlers() -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        let mut rest = SRC;
+        while let Some(at) = rest.find("\nasync fn ") {
+            let after = &rest[at + "\nasync fn ".len()..];
+            let name_end = after.find('(').expect("an async fn has an argument list");
+            let name = &after[..name_end];
+            let body_end = after.find("\nasync fn ").unwrap_or(after.len());
+            out.push((name, &after[..body_end]));
+            rest = after;
+        }
+        assert!(
+            out.len() > 40,
+            "expected the whole HTTP surface, got {}",
+            out.len()
+        );
+        out
+    }
+
+    fn router_block() -> &'static str {
+        let start = SRC.find("pub fn router(").expect("router");
+        let end = SRC[start..].find("\nasync fn ").expect("end of router") + start;
+        &SRC[start..end]
+    }
+
+    /// HTTP methods this handler is wired to, empty if it is not routed at all.
+    fn methods_for(handler: &str) -> Vec<&'static str> {
+        let router = router_block();
+        ["get", "post", "put", "patch", "delete"]
+            .into_iter()
+            .filter(|m| router.contains(&format!("{m}({handler})")))
+            .collect()
+    }
+
+    /// Every handler the router wires up, including ones defined in another module
+    /// (`ws.rs`). Walking the router rather than this file's `async fn`s is what stops a
+    /// handler from escaping the audit by living elsewhere.
+    fn routed_handler_names() -> Vec<&'static str> {
+        let router = router_block();
+        let mut out: Vec<&'static str> = Vec::new();
+        for verb in ["get(", "post(", "put(", "patch(", "delete("] {
+            let mut rest = router;
+            while let Some(at) = rest.find(verb) {
+                let after = &rest[at + verb.len()..];
+                if let Some(close) = after.find(')') {
+                    let name = &after[..close];
+                    let plausible = !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                    if plausible {
+                        out.push(name);
+                    }
+                }
+                rest = after;
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        assert!(
+            out.len() > 40,
+            "expected the whole routed surface, got {}: {out:?}",
+            out.len()
+        );
+        out
+    }
+
+    /// The handler's body, when it is defined in this file. `None` means it lives in
+    /// another module and this audit cannot read it — which is why such handlers have to
+    /// be justified in `UNGATED_BY_DESIGN` explicitly.
+    fn body_of(handler: &str) -> Option<&'static str> {
+        handlers()
+            .into_iter()
+            .find(|(n, _)| *n == handler)
+            .map(|(_, b)| b)
+    }
+
+    fn is_gated(body: &str) -> bool {
+        body.contains("require_project")
+            || body.contains("require_pipeline")
+            || body.contains("require_run")
+            || body.contains("require_step")
+            || body.contains("require_artifact")
+            || body.contains("require_fiber")
+            || body.contains("require_instance_admin")
+            || body.contains("require_agent_manage")
+            || body.contains("require_agent_scope")
+    }
+
+    #[test]
+    fn every_routed_handler_is_gated_or_listed_as_deliberately_ungated() {
+        let allowed: Vec<&str> = UNGATED_BY_DESIGN.iter().map(|(n, _)| *n).collect();
+        let mut ungated = Vec::new();
+        for name in routed_handler_names() {
+            if allowed.contains(&name) {
+                continue;
+            }
+            // A handler defined outside this file cannot be read here, so it counts as
+            // ungated until someone justifies it.
+            match body_of(name) {
+                Some(body) if is_gated(body) => continue,
+                _ => ungated.push(name),
+            }
+        }
+        assert!(
+            ungated.is_empty(),
+            "these routed handlers reach the store with no role gate and no documented \
+             reason — add the `access.rs` call, or justify it in UNGATED_BY_DESIGN: {ungated:?}"
+        );
+    }
+
+    #[test]
+    fn a_handler_that_takes_an_id_and_a_session_always_resolves_a_role() {
+        // The dangerous shape: an authenticated caller naming someone else's resource by
+        // id. Anything matching it must consult access.rs.
+        let allowed: Vec<&str> = UNGATED_BY_DESIGN.iter().map(|(n, _)| *n).collect();
+        let mut unchecked = Vec::new();
+        for (name, body) in handlers() {
+            let takes_session = body.contains("AuthUser");
+            let takes_id = body.contains("Path(") && body.contains("Uuid");
+            if takes_session && takes_id && !is_gated(body) && !allowed.contains(&name) {
+                unchecked.push(name);
+            }
+        }
+        assert!(
+            unchecked.is_empty(),
+            "id-addressed handlers with no role check: {unchecked:?}"
+        );
+    }
+
+    #[test]
+    fn a_mutating_project_route_never_settles_for_reader() {
+        // Reader is read-only by definition; a POST/PUT/DELETE gated on it would let any
+        // member of a project change it.
+        let mut too_weak = Vec::new();
+        for (name, body) in handlers() {
+            let mutating = methods_for(name)
+                .iter()
+                .any(|m| matches!(*m, "post" | "put" | "patch" | "delete"));
+            if !mutating {
+                continue;
+            }
+            if body.contains("ProjectRole::Reader") {
+                too_weak.push(name);
+            }
+        }
+        assert!(
+            too_weak.is_empty(),
+            "mutating routes gated only on Reader: {too_weak:?}"
+        );
+    }
+
+    #[test]
+    fn the_ungated_allowlist_has_no_stale_entries() {
+        // A handler that was deleted or has since grown a gate should leave the list, so
+        // the list keeps meaning something.
+        let still_needed: Vec<&str> = routed_handler_names()
+            .into_iter()
+            .filter(|n| !body_of(n).map(is_gated).unwrap_or(false))
+            .collect();
+        let stale: Vec<&str> = UNGATED_BY_DESIGN
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| !still_needed.contains(n))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "UNGATED_BY_DESIGN lists handlers that no longer need to be there: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn every_ungated_entry_carries_a_reason() {
+        for (name, reason) in UNGATED_BY_DESIGN {
+            assert!(
+                reason.len() > 10,
+                "{name} is exempted without a real justification"
+            );
+        }
+    }
     use super::*;
 
     fn sign(secret: &str, body: &str) -> String {

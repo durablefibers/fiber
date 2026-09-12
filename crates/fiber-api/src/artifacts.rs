@@ -266,3 +266,86 @@ fn s3_key_from_stored(stored: &str, bucket: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("bad artifact path"))?;
     Ok(format!("artifacts/{run}/{step}/{name}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s3_backend(bucket: &str) -> ArtifactBackend {
+        // Building a client performs no I/O, so the key helpers are testable offline.
+        let client = s3_client("http://127.0.0.1:19000", "us-east-1", "ak", "sk");
+        ArtifactBackend::S3 {
+            presign_client: client.clone(),
+            client,
+            bucket: bucket.to_string(),
+        }
+    }
+
+    #[test]
+    fn object_key_is_run_then_step_then_leaf() {
+        assert_eq!(
+            ArtifactBackend::object_key("run1", "step1", "dist.tgz"),
+            "artifacts/run1/step1/dist.tgz"
+        );
+    }
+
+    #[test]
+    fn stored_path_reflects_the_backend() {
+        let key = ArtifactBackend::object_key("r", "s", "a.txt");
+        let local = ArtifactBackend::Local {
+            root: PathBuf::from("/var/fiber/data"),
+        };
+        assert_eq!(
+            local.stored_path_for_key(&key),
+            "/var/fiber/data/artifacts/r/s/a.txt"
+        );
+        assert_eq!(
+            s3_backend("fiber").stored_path_for_key(&key),
+            "s3://fiber/artifacts/r/s/a.txt"
+        );
+    }
+
+    #[test]
+    fn an_s3_url_round_trips_back_to_its_key() {
+        let key = ArtifactBackend::object_key("r", "s", "a.txt");
+        let stored = s3_backend("fiber").stored_path_for_key(&key);
+        assert_eq!(s3_key_from_stored(&stored, "fiber").unwrap(), key);
+    }
+
+    #[test]
+    fn a_raw_key_is_accepted_unchanged() {
+        assert_eq!(
+            s3_key_from_stored("artifacts/r/s/a.txt", "fiber").unwrap(),
+            "artifacts/r/s/a.txt"
+        );
+    }
+
+    #[test]
+    fn a_legacy_local_path_is_rebuilt_from_its_last_three_segments() {
+        // Rows written before the S3 backend store an absolute filesystem path.
+        assert_eq!(
+            s3_key_from_stored("/var/fiber/data/artifacts/r/s/a.txt", "fiber").unwrap(),
+            "artifacts/r/s/a.txt"
+        );
+    }
+
+    #[test]
+    fn a_url_for_another_bucket_is_not_silently_reused() {
+        // Falling through to the legacy branch would hand back a key that resolves
+        // inside *our* bucket; only the trailing three segments are kept, so the
+        // mismatch must not read as a valid s3:// URL for this bucket.
+        let other = "s3://someone-elses/artifacts/r/s/a.txt";
+        assert_eq!(
+            s3_key_from_stored(other, "fiber").unwrap(),
+            "artifacts/r/s/a.txt",
+            "legacy fallback keeps run/step/name and drops the foreign bucket"
+        );
+    }
+
+    #[test]
+    fn a_path_too_shallow_to_carry_run_and_step_is_refused() {
+        assert!(s3_key_from_stored("a.txt", "fiber").is_err());
+        assert!(s3_key_from_stored("s/a.txt", "fiber").is_err());
+        assert!(s3_key_from_stored("", "fiber").is_err());
+    }
+}
