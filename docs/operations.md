@@ -70,6 +70,22 @@ A run that stays `running` is one of:
 
 `GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
 
+## Retention
+
+One loop purges expired sessions, terminal runs with their artifact blobs, and terminal
+durable fibers. Each part has its own switch and `0` turns that part off; the loop still
+ticks, so turning one off does not stop the others.
+
+| Setting | Default | Removes |
+|---|---|---|
+| `FIBER_RETENTION_DAYS` | `30` | Terminal runs, keeping the newest `FIBER_RETENTION_KEEP_RUNS` per pipeline |
+| `FIBER_RETENTION_FIBER_DAYS` | `7` | Terminal durable fibers, and their memoized steps by cascade |
+
+Fibers have a shorter default than runs because they are usually a notification that either
+worked or did not, where a run is a build someone may want to look back at. **A suspended
+fiber is never deleted, however old its row looks** — one sleeping for a month is waiting,
+not stale, and removing it would silently cancel work someone scheduled.
+
 ## Step logs
 
 A step's output is stored line by line, capped at `FIBER_STEP_LOG_MAX_LINES` (50,000) per

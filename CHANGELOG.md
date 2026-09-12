@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Terminal durable fibers are cleaned up**, `FIBER_RETENTION_FIBER_DAYS`, default 7.
+  Retention covered runs, artifacts and sessions; the `fibers` table grew forever. Memoized
+  steps go with them by cascade. A **suspended** fiber is never touched however old its row
+  looks: one sleeping for a month is waiting, not stale, and deleting it would silently
+  cancel scheduled work.
+
+### Fixed
+
+- **Retention did nothing but purge sessions when `FIBER_RETENTION_DAYS=0`.** The disabled
+  path looped separately and never reached the tick, so anything else retention grew to
+  cover was silently skipped in that configuration. There is one loop now, and each part
+  decides for itself whether it is switched on.
+
 ## [0.4.1] — 2026-09-11
 
 Two durable-runtime bugs that the `http_request` task made reachable, and tokens off the

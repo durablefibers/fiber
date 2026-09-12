@@ -138,9 +138,15 @@ async fn main() -> Result<()> {
     {
         let st = store.clone();
         let a = artifacts.clone();
+        let retention_fibers = fiber_scheduler.store().clone();
         supervisor::supervise("retention", health.clone(), move || {
-            let (st, a, cfg) = (st.clone(), a.clone(), retention_cfg.clone());
-            async move { retention::retention_loop(st, a, cfg).await }
+            let (st, a, f, cfg) = (
+                st.clone(),
+                a.clone(),
+                retention_fibers.clone(),
+                retention_cfg.clone(),
+            );
+            async move { retention::retention_loop(st, a, f, cfg).await }
         });
     }
 

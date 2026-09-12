@@ -43,6 +43,7 @@ export FIBER_AGENT_NAME="${FIBER_AGENT_NAME:-local}"
 export FIBER_AGENT_LABELS="${FIBER_AGENT_LABELS:-os=linux}"
 export FIBER_AGENT_CONCURRENCY="${FIBER_AGENT_CONCURRENCY:-1}"
 export VITE_FIBER_API_URL="${VITE_FIBER_API_URL:-http://127.0.0.1:18080}"
+export FIBER_RETENTION_FIBER_DAYS="${FIBER_RETENTION_FIBER_DAYS:-7}"
 export FIBER_STEP_LOG_MAX_LINES="${FIBER_STEP_LOG_MAX_LINES:-50000}"
 # The http_request fiber task stays restricted in dev too, so what you test matches
 # what an operator gets.

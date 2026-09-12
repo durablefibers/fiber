@@ -1,4 +1,5 @@
-//! Background retention / GC for finished runs, artifact blobs, and sessions.
+//! Background retention / GC for finished runs, artifact blobs, durable fibers and
+//! sessions.
 
 use crate::artifacts::ArtifactBackend;
 use anyhow::Result;
@@ -19,6 +20,10 @@ pub struct RetentionConfig {
     pub batch: i64,
     /// Loop sleep between ticks.
     pub interval: StdDuration,
+    /// Delete terminal fibers older than this many days. `0` disables. Separate from
+    /// `days`: a run is a build someone may want to look back at, while a fiber is usually
+    /// a notification that either worked or did not.
+    pub fiber_days: u64,
 }
 
 impl RetentionConfig {
@@ -39,11 +44,16 @@ impl RetentionConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600);
+        let fiber_days = std::env::var("FIBER_RETENTION_FIBER_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7);
         Self {
             days,
             keep_per_pipeline,
             batch: batch.max(1),
             interval: StdDuration::from_secs(interval_secs.max(60)),
+            fiber_days,
         }
     }
 
@@ -55,11 +65,27 @@ impl RetentionConfig {
 pub async fn run_once(
     store: &Store,
     artifacts: &ArtifactBackend,
+    fibers: &fiber_durable::FiberStore,
     cfg: &RetentionConfig,
 ) -> Result<u64> {
     let sessions = store.purge_expired_sessions().await.unwrap_or(0);
     if sessions > 0 {
         info!(sessions, "purged expired sessions");
+    }
+
+    // Independent of the run cutoff: `fibers` has no artifact blobs to reconcile and its
+    // own retention period, so it runs whether or not run retention is on.
+    if cfg.fiber_days > 0 {
+        let cutoff = Utc::now() - Duration::days(cfg.fiber_days as i64);
+        match fibers.delete_terminal_before(cutoff, cfg.batch).await {
+            Ok(n) if n > 0 => info!(
+                fibers = n,
+                days = cfg.fiber_days,
+                "retention purged terminal fibers"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "fiber retention failed (continuing)"),
+        }
     }
 
     if !cfg.enabled() {
@@ -117,26 +143,25 @@ pub async fn run_once(
     Ok(deleted)
 }
 
-pub async fn retention_loop(store: Store, artifacts: ArtifactBackend, cfg: RetentionConfig) {
-    if !cfg.enabled() {
-        info!("retention disabled (FIBER_RETENTION_DAYS=0)");
-        // Still purge sessions occasionally.
-        loop {
-            let _ = store.purge_expired_sessions().await;
-            tokio::time::sleep(cfg.interval).await;
-        }
-    } else {
-        info!(
-            days = cfg.days,
-            keep = cfg.keep_per_pipeline,
-            batch = cfg.batch,
-            interval_secs = cfg.interval.as_secs(),
-            "retention GC enabled"
-        );
-    }
-
+pub async fn retention_loop(
+    store: Store,
+    artifacts: ArtifactBackend,
+    fibers: fiber_durable::FiberStore,
+    cfg: RetentionConfig,
+) {
+    // One loop, and `run_once` decides what is switched on. The disabled branch used to
+    // loop separately, purging only sessions and never reaching the tick — so anything
+    // added to retention later silently did not run when FIBER_RETENTION_DAYS was 0.
+    info!(
+        runs_days = cfg.days,
+        keep = cfg.keep_per_pipeline,
+        fiber_days = cfg.fiber_days,
+        batch = cfg.batch,
+        interval_secs = cfg.interval.as_secs(),
+        "retention GC configured (0 days = that part is off)"
+    );
     loop {
-        if let Err(e) = run_once(&store, &artifacts, &cfg).await {
+        if let Err(e) = run_once(&store, &artifacts, &fibers, &cfg).await {
             warn!(error = %e, "retention tick failed");
         }
         tokio::time::sleep(cfg.interval).await;
