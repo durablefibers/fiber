@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke: full Compose stack (postgres, redis, minio, api, web).
+# Smoke: full Compose stack (postgres, redis, minio, api, ui).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT/deploy/docker-compose.yml")
@@ -17,7 +17,7 @@ echo "== compose build + up =="
 docker compose -p deploy -f "$ROOT/deploy/docker-compose.yml" stop fiber-postgres fiber-redis 2>/dev/null || true
 pkill -x fiber-api 2>/dev/null || true
 "${COMPOSE[@]}" up -d --build fiber-postgres fiber-redis fiber-minio
-"${COMPOSE[@]}" up -d --build fiber-api fiber-web
+"${COMPOSE[@]}" up -d --build fiber-api fiber-ui
 
 echo "== wait ready =="
 READY=0
@@ -42,7 +42,7 @@ else
   fail "api /health"
 fi
 
-# Compose starts fiber-web only once fiber-api is healthy, so this check runs the
+# Compose starts fiber-ui only once fiber-api is healthy, so this check runs the
 # instant nginx's container appears — before it has bound the port. The API check above
 # retries and this one did not, which on a cold runner lost the race by ~50ms.
 CODE=000
@@ -54,10 +54,10 @@ for i in $(seq 1 30); do
   sleep 2
 done
 if [[ "$CODE" == "200" ]]; then
-  ok "web :3100 HTTP $CODE"
+  ok "ui :3100 HTTP $CODE"
 else
-  fail "web :3100 HTTP $CODE"
-  "${COMPOSE[@]}" logs --tail=40 fiber-web || true
+  fail "ui :3100 HTTP $CODE"
+  "${COMPOSE[@]}" logs --tail=40 fiber-ui || true
 fi
 
 LOGIN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \

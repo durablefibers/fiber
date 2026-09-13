@@ -86,6 +86,37 @@ function Field({
   )
 }
 
+/** `KEY=value` lines in, a record out. Empty and comment lines are dropped. */
+function parseEnv(text: string): Record<string, string> | undefined {
+  const out: Record<string, string> = {}
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    const eq = trimmed.indexOf("=")
+    if (eq <= 0) continue
+    out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim()
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+function formatEnv(env?: Record<string, string>): string {
+  if (!env) return ""
+  return Object.entries(env)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n")
+}
+
+/**
+ * `secrets` is three-state on the wire: absent means every project secret (the
+ * compatibility default), `[]` means none, and a list narrows. A single text box
+ * cannot say "absent" and "empty" apart, so the mode is picked explicitly.
+ */
+function secretsMode(value?: string[]): "all" | "none" | "some" {
+  if (value === undefined) return "all"
+  if (value.length === 0) return "none"
+  return "some"
+}
+
 function PipelineEditorPage() {
   const { projectId, pipelineId } = Route.useParams()
   const { step: stepSearch } = Route.useSearch()
@@ -157,7 +188,13 @@ function PipelineEditorPage() {
       (selected.artifacts?.length ?? 0) > 0 ||
       (selected.labels?.length ?? 0) > 0 ||
       Boolean(selected.if) ||
-      Boolean(selected.matrix)
+      Boolean(selected.matrix) ||
+      Boolean(selected.env) ||
+      Boolean(selected.shell) ||
+      Boolean(selected.working_directory) ||
+      Boolean(selected.continue_on_error) ||
+      selected.timeout_minutes !== undefined ||
+      selected.secrets !== undefined
     setShowAdvanced(advanced)
   }, [selected?.id])
 
@@ -683,6 +720,32 @@ function PipelineEditorPage() {
                       className="font-mono text-xs"
                     />
                   </Field>
+                  <Field label="PR types" hint="opened, synchronize, reopened">
+                    <Input
+                      value={(definition?.on?.pull_request?.types ?? []).join(
+                        ", "
+                      )}
+                      onChange={(e) => {
+                        if (!definition) return
+                        const types = e.target.value
+                          .split(",")
+                          .map((x) => x.trim())
+                          .filter(Boolean)
+                        setDefinition({
+                          ...definition,
+                          on: {
+                            ...definition.on,
+                            pull_request: {
+                              ...definition.on?.pull_request,
+                              types: types.length ? types : undefined,
+                            },
+                          },
+                        })
+                      }}
+                      placeholder="opened, synchronize"
+                      className="font-mono text-xs"
+                    />
+                  </Field>
                   <Field
                     label="Interval"
                     hint={
@@ -730,6 +793,44 @@ function PipelineEditorPage() {
                       }}
                       placeholder="0 */15 * * * *"
                       className="font-mono text-xs"
+                    />
+                  </Field>
+                </section>
+
+                <section className="space-y-3">
+                  <h2 className="font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+                    Defaults
+                  </h2>
+                  <Field label="Env" hint="every step · a step's own env wins">
+                    <Textarea
+                      className="min-h-20 font-mono text-xs"
+                      value={formatEnv(definition?.env)}
+                      onChange={(e) => {
+                        if (!definition) return
+                        setDefinition({
+                          ...definition,
+                          env: parseEnv(e.target.value),
+                        })
+                      }}
+                      placeholder={"CARGO_TERM_COLOR=always\nCI=1"}
+                    />
+                  </Field>
+                  <Field label="Run timeout" hint="minutes · whole run">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={definition?.timeout_minutes ?? ""}
+                      onChange={(e) => {
+                        if (!definition) return
+                        const v = e.target.value
+                          ? Number(e.target.value)
+                          : undefined
+                        setDefinition({
+                          ...definition,
+                          timeout_minutes: v && v > 0 ? v : undefined,
+                        })
+                      }}
+                      placeholder="unlimited"
                     />
                   </Field>
                 </section>
@@ -962,21 +1063,148 @@ function PipelineEditorPage() {
                               }
                             />
                           </Field>
-                          <Field label="Artifacts">
+                          <Field label="Timeout" hint="minutes">
                             <Input
-                              value={(selected.artifacts ?? []).join(", ")}
+                              type="number"
+                              min={0}
+                              value={selected.timeout_minutes ?? ""}
                               onChange={(e) =>
                                 updateSelected({
-                                  artifacts: e.target.value
+                                  timeout_minutes: e.target.value
+                                    ? Number(e.target.value)
+                                    : undefined,
+                                })
+                              }
+                              placeholder="60"
+                            />
+                          </Field>
+                        </div>
+                        <Field label="Artifacts" hint="comma-separated paths">
+                          <Input
+                            value={(selected.artifacts ?? []).join(", ")}
+                            onChange={(e) =>
+                              updateSelected({
+                                artifacts: e.target.value
+                                  .split(",")
+                                  .map((x) => x.trim())
+                                  .filter(Boolean),
+                              })
+                            }
+                            placeholder="out/*.tgz"
+                          />
+                        </Field>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Field label="Shell" hint="run as <shell> -c">
+                            <Input
+                              value={selected.shell ?? ""}
+                              onChange={(e) =>
+                                updateSelected({
+                                  shell: e.target.value.trim() || undefined,
+                                })
+                              }
+                              placeholder="sh"
+                            />
+                          </Field>
+                          <Field label="Working dir">
+                            <Input
+                              value={selected.working_directory ?? ""}
+                              onChange={(e) =>
+                                updateSelected({
+                                  working_directory:
+                                    e.target.value.trim() || undefined,
+                                })
+                              }
+                              placeholder="apps/ui"
+                              className="font-mono text-xs"
+                            />
+                          </Field>
+                        </div>
+                        <Field label="Env" hint="KEY=value per line">
+                          <Textarea
+                            className="min-h-20 font-mono text-xs"
+                            value={formatEnv(selected.env)}
+                            onChange={(e) =>
+                              updateSelected({ env: parseEnv(e.target.value) })
+                            }
+                            placeholder={"RUST_LOG=debug\nCI=1"}
+                          />
+                        </Field>
+                        <div className="space-y-2">
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="font-medium text-[11px] text-muted-foreground uppercase tracking-wide">
+                              Secrets
+                            </span>
+                            <span className="text-[10px] text-muted-foreground/70">
+                              project secrets as env
+                            </span>
+                          </div>
+                          <div className="flex gap-1">
+                            {(
+                              [
+                                ["all", "All"],
+                                ["none", "None"],
+                                ["some", "Pick"],
+                              ] as const
+                            ).map(([mode, label]) => (
+                              <button
+                                key={mode}
+                                type="button"
+                                onClick={() =>
+                                  updateSelected({
+                                    secrets:
+                                      mode === "all"
+                                        ? undefined
+                                        : mode === "none"
+                                          ? []
+                                          : (selected.secrets ?? []),
+                                  })
+                                }
+                                className={cn(
+                                  "flex-1 rounded-md border px-2 py-1 font-medium text-[11px] transition",
+                                  secretsMode(selected.secrets) === mode
+                                    ? "border-sky-400/40 bg-sky-500/15 text-sky-200"
+                                    : "border-border/60 text-muted-foreground hover:text-foreground"
+                                )}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                          {secretsMode(selected.secrets) === "some" ? (
+                            <Input
+                              value={(selected.secrets ?? []).join(", ")}
+                              onChange={(e) =>
+                                updateSelected({
+                                  secrets: e.target.value
                                     .split(",")
                                     .map((x) => x.trim())
                                     .filter(Boolean),
                                 })
                               }
-                              placeholder="out/*.tgz"
+                              placeholder="NPM_TOKEN, AWS_KEY"
+                              className="font-mono text-xs"
                             />
-                          </Field>
+                          ) : null}
                         </div>
+                        <label className="flex items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            className="size-3.5 accent-sky-500"
+                            checked={Boolean(selected.continue_on_error)}
+                            onChange={(e) =>
+                              updateSelected({
+                                continue_on_error:
+                                  e.target.checked || undefined,
+                              })
+                            }
+                          />
+                          <span>
+                            Continue on error
+                            <span className="ml-1.5 text-muted-foreground">
+                              failure is recorded but does not block dependents
+                            </span>
+                          </span>
+                        </label>
                       </div>
                     ) : null}
                   </div>

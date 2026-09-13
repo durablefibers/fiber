@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn status_wire_spellings_are_snake_case_and_stable() {
-        // apps/web/src/lib/api.ts compares against these strings by hand (convention 9);
+        // apps/ui/src/lib/api.ts compares against these strings by hand (convention 9);
         // renaming a variant without updating it there is silent until runtime.
         assert_eq!(
             serde_json::to_value(StepStatus::Succeeded).unwrap(),

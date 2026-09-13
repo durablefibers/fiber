@@ -17,7 +17,9 @@ import { Route as PProjectIdRouteImport } from './routes/p.$projectId'
 import { Route as PProjectIdIndexRouteImport } from './routes/p.$projectId.index'
 import { Route as PProjectIdAgentsRouteImport } from './routes/p.$projectId.agents'
 import { Route as PProjectIdFibersRouteImport } from './routes/p.$projectId.fibers'
+import { Route as PProjectIdSettingsRouteImport } from './routes/p.$projectId.settings'
 import { Route as PProjectIdPipelinesPipelineIdRouteImport } from './routes/p.$projectId.pipelines.$pipelineId'
+import { Route as PProjectIdRunsIndexRouteImport } from './routes/p.$projectId.runs.index'
 import { Route as PProjectIdRunsRunIdRouteImport } from './routes/p.$projectId.runs.$runId'
 
 const IndexRoute = IndexRouteImport.update({
@@ -60,12 +62,22 @@ const PProjectIdFibersRoute = PProjectIdFibersRouteImport.update({
   path: '/fibers',
   getParentRoute: () => PProjectIdRoute,
 } as any)
+const PProjectIdSettingsRoute = PProjectIdSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => PProjectIdRoute,
+} as any)
 const PProjectIdPipelinesPipelineIdRoute =
   PProjectIdPipelinesPipelineIdRouteImport.update({
     id: '/pipelines/$pipelineId',
     path: '/pipelines/$pipelineId',
     getParentRoute: () => PProjectIdRoute,
   } as any)
+const PProjectIdRunsIndexRoute = PProjectIdRunsIndexRouteImport.update({
+  id: '/runs/',
+  path: '/runs/',
+  getParentRoute: () => PProjectIdRoute,
+} as any)
 const PProjectIdRunsRunIdRoute = PProjectIdRunsRunIdRouteImport.update({
   id: '/runs/$runId',
   path: '/runs/$runId',
@@ -80,9 +92,11 @@ export interface FileRoutesByFullPath {
   '/p/$projectId': typeof PProjectIdRouteWithChildren
   '/p/$projectId/agents': typeof PProjectIdAgentsRoute
   '/p/$projectId/fibers': typeof PProjectIdFibersRoute
+  '/p/$projectId/settings': typeof PProjectIdSettingsRoute
   '/p/$projectId/': typeof PProjectIdIndexRoute
   '/p/$projectId/pipelines/$pipelineId': typeof PProjectIdPipelinesPipelineIdRoute
   '/p/$projectId/runs/$runId': typeof PProjectIdRunsRunIdRoute
+  '/p/$projectId/runs/': typeof PProjectIdRunsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -91,9 +105,11 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRoute
   '/p/$projectId/agents': typeof PProjectIdAgentsRoute
   '/p/$projectId/fibers': typeof PProjectIdFibersRoute
+  '/p/$projectId/settings': typeof PProjectIdSettingsRoute
   '/p/$projectId': typeof PProjectIdIndexRoute
   '/p/$projectId/pipelines/$pipelineId': typeof PProjectIdPipelinesPipelineIdRoute
   '/p/$projectId/runs/$runId': typeof PProjectIdRunsRunIdRoute
+  '/p/$projectId/runs': typeof PProjectIdRunsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -104,9 +120,11 @@ export interface FileRoutesById {
   '/p/$projectId': typeof PProjectIdRouteWithChildren
   '/p/$projectId/agents': typeof PProjectIdAgentsRoute
   '/p/$projectId/fibers': typeof PProjectIdFibersRoute
+  '/p/$projectId/settings': typeof PProjectIdSettingsRoute
   '/p/$projectId/': typeof PProjectIdIndexRoute
   '/p/$projectId/pipelines/$pipelineId': typeof PProjectIdPipelinesPipelineIdRoute
   '/p/$projectId/runs/$runId': typeof PProjectIdRunsRunIdRoute
+  '/p/$projectId/runs/': typeof PProjectIdRunsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -118,9 +136,11 @@ export interface FileRouteTypes {
     | '/p/$projectId'
     | '/p/$projectId/agents'
     | '/p/$projectId/fibers'
+    | '/p/$projectId/settings'
     | '/p/$projectId/'
     | '/p/$projectId/pipelines/$pipelineId'
     | '/p/$projectId/runs/$runId'
+    | '/p/$projectId/runs/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -129,9 +149,11 @@ export interface FileRouteTypes {
     | '/settings'
     | '/p/$projectId/agents'
     | '/p/$projectId/fibers'
+    | '/p/$projectId/settings'
     | '/p/$projectId'
     | '/p/$projectId/pipelines/$pipelineId'
     | '/p/$projectId/runs/$runId'
+    | '/p/$projectId/runs'
   id:
     | '__root__'
     | '/'
@@ -141,9 +163,11 @@ export interface FileRouteTypes {
     | '/p/$projectId'
     | '/p/$projectId/agents'
     | '/p/$projectId/fibers'
+    | '/p/$projectId/settings'
     | '/p/$projectId/'
     | '/p/$projectId/pipelines/$pipelineId'
     | '/p/$projectId/runs/$runId'
+    | '/p/$projectId/runs/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -212,11 +236,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PProjectIdFibersRouteImport
       parentRoute: typeof PProjectIdRoute
     }
+    '/p/$projectId/settings': {
+      id: '/p/$projectId/settings'
+      path: '/settings'
+      fullPath: '/p/$projectId/settings'
+      preLoaderRoute: typeof PProjectIdSettingsRouteImport
+      parentRoute: typeof PProjectIdRoute
+    }
     '/p/$projectId/pipelines/$pipelineId': {
       id: '/p/$projectId/pipelines/$pipelineId'
       path: '/pipelines/$pipelineId'
       fullPath: '/p/$projectId/pipelines/$pipelineId'
       preLoaderRoute: typeof PProjectIdPipelinesPipelineIdRouteImport
+      parentRoute: typeof PProjectIdRoute
+    }
+    '/p/$projectId/runs/': {
+      id: '/p/$projectId/runs/'
+      path: '/runs'
+      fullPath: '/p/$projectId/runs/'
+      preLoaderRoute: typeof PProjectIdRunsIndexRouteImport
       parentRoute: typeof PProjectIdRoute
     }
     '/p/$projectId/runs/$runId': {
@@ -232,17 +270,21 @@ declare module '@tanstack/react-router' {
 interface PProjectIdRouteChildren {
   PProjectIdAgentsRoute: typeof PProjectIdAgentsRoute
   PProjectIdFibersRoute: typeof PProjectIdFibersRoute
+  PProjectIdSettingsRoute: typeof PProjectIdSettingsRoute
   PProjectIdIndexRoute: typeof PProjectIdIndexRoute
   PProjectIdPipelinesPipelineIdRoute: typeof PProjectIdPipelinesPipelineIdRoute
   PProjectIdRunsRunIdRoute: typeof PProjectIdRunsRunIdRoute
+  PProjectIdRunsIndexRoute: typeof PProjectIdRunsIndexRoute
 }
 
 const PProjectIdRouteChildren: PProjectIdRouteChildren = {
   PProjectIdAgentsRoute: PProjectIdAgentsRoute,
   PProjectIdFibersRoute: PProjectIdFibersRoute,
+  PProjectIdSettingsRoute: PProjectIdSettingsRoute,
   PProjectIdIndexRoute: PProjectIdIndexRoute,
   PProjectIdPipelinesPipelineIdRoute: PProjectIdPipelinesPipelineIdRoute,
   PProjectIdRunsRunIdRoute: PProjectIdRunsRunIdRoute,
+  PProjectIdRunsIndexRoute: PProjectIdRunsIndexRoute,
 }
 
 const PProjectIdRouteWithChildren = PProjectIdRoute._addFileChildren(

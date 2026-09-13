@@ -15,7 +15,7 @@ Fiber's DX contract is explicit (`.claude/rules/dx.md`): **`make help` is the en
 1. `README.md` — can they get from clone to a running stack without reading source? Do the commands work in the order given?
 2. `make help` — does every listed target exist, and does every non-obvious target appear in help?
 3. `source scripts/dev-env.sh` — does it set everything the processes actually read? Cross-check against `.env.example` and against every clap `env = "FIBER_*"` and `std::env::var` call in `crates/`. A variable read by code but absent from both files is a DX bug.
-4. `make infra && make api && make web` — is anything undocumented required (a running agent, a token, a key)?
+4. `make infra && make api && make ui` — is anything undocumented required (a running agent, a token, a key)?
 5. First change — is the gate discoverable, and does `make check` match CI exactly?
 6. First test — can they run one test without a database? They should be able to; the Rust tests are pure.
 

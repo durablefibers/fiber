@@ -10,7 +10,7 @@ You own Fiber's build, packaging, and deployment surface.
 
 ## Territory
 
-`deploy/docker-compose.yml`, `deploy/Dockerfile.api`, `deploy/Dockerfile.web`, `deploy/nginx.conf`, `.github/workflows/ci.yml`, `Makefile`, `scripts/dev-env.sh`, `apps/web/Dockerfile.web`, the `.dockerignore` files.
+`deploy/docker-compose.yml`, `deploy/Dockerfile.api`, `deploy/Dockerfile.ui`, `deploy/nginx.conf`, `.github/workflows/ci.yml`, `Makefile`, `scripts/dev-env.sh`, `apps/ui/Dockerfile.ui`, the `.dockerignore` files.
 
 ## Fixed facts
 
@@ -19,15 +19,15 @@ Ports are deliberately non-default to avoid colliding with whatever else is on t
 | Service | Port |
 |---|---|
 | API | 18080 |
-| Web (dev) | 3100 |
+| UI (dev) | 3100 |
 | Postgres | 15432 |
 | Redis | 16379 |
 | MinIO API / console | 19000 / 19001 |
 
 - Postgres is **17-alpine**. A volume created by 16 will not start under 17; the documented recovery destroys data, so never run it yourself — tell the user.
-- Compose service names are `fiber-postgres`, `fiber-redis`, `fiber-minio`, `fiber-api`, `fiber-web`. The `fiber-` prefix is mandatory (`.claude/rules/naming.md`).
+- Compose service names are `fiber-postgres`, `fiber-redis`, `fiber-minio`, `fiber-api`, `fiber-ui`. The `fiber-` prefix is mandatory (`.claude/rules/naming.md`).
 - The Compose healthcheck uses `GET /ready` (Postgres + Redis reachable). `/health` is liveness only.
-- CI is two jobs: `check` (fmt, clippy `-D warnings` across all six crates, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`) and `web` (pnpm + Node, `pnpm install --frozen-lockfile`, `pnpm exec tsc --noEmit`). `RUSTFLAGS: -Dwarnings` is set in the workflow env.
+- CI is two jobs: `check` (fmt, clippy `-D warnings` across all six crates, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`) and `ui` (pnpm + Node, `pnpm install --frozen-lockfile`, `pnpm exec tsc --noEmit`). `RUSTFLAGS: -Dwarnings` is set in the workflow env.
 - `fiber-api` applies migrations on boot, so rolling an image forward rolls the schema forward. Migrations must stay compatible with the *previous* image for the duration of a rolling deploy.
 - Redis carries only the `fiber:events` fan-out; Postgres leases are the source of truth. Multiple API replicas are fine; each agent holds a WS to one replica.
 

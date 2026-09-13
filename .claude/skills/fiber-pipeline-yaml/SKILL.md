@@ -67,4 +67,4 @@ Diagnose in this order:
 
 ## Changing the schema
 
-Adding a field is three-sided: `fiber-proto` (`StepDefinition` / `PipelineDefinition`), the compiler in `fiber-core/src/dag.rs` (and `step_if.rs` for conditions), and `apps/web/src/lib/api.ts`, which mirrors these types by hand. Then document it in `docs/pipeline-yaml.md` and add an example to `examples/` that `fiber-cli validate` accepts.
+Adding a field is three-sided: `fiber-proto` (`StepDefinition` / `PipelineDefinition`), the compiler in `fiber-core/src/dag.rs` (and `step_if.rs` for conditions), and `apps/ui/src/lib/api.ts`, which mirrors these types by hand. Then document it in `docs/pipeline-yaml.md` and add an example to `examples/` that `fiber-cli validate` accepts.

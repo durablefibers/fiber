@@ -1,5 +1,5 @@
 name: fiber
-# Backing services bind to loopback only; put fiber-api / fiber-web behind TLS
+# Backing services bind to loopback only; put fiber-api / fiber-ui behind TLS
 # (docs/operations.md#deployment). Settings come from deploy/.env — see deploy/.env.example.
 #
 # Networks: everything shares `backend`, except the agent, which sits alone with the API
@@ -160,16 +160,16 @@ services:
       fiber-api:
         condition: service_healthy
 
-  fiber-web:
+  fiber-ui:
     networks: [backend]
     build:
-      context: ../apps/web
-      dockerfile: Dockerfile.web
+      context: ../apps/ui
+      dockerfile: Dockerfile.ui
       args:
         VITE_FIBER_API_URL: ${VITE_FIBER_API_URL:-http://localhost:18080}
     restart: unless-stopped
     ports:
-      - "${FIBER_WEB_BIND:-127.0.0.1}:3100:80"
+      - "${FIBER_UI_BIND:-127.0.0.1}:3100:80"
     depends_on:
       fiber-api:
         condition: service_healthy

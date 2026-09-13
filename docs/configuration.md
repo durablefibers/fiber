@@ -51,8 +51,8 @@ Login is throttled per username: 10 failures within 10 minutes lock that usernam
 | `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY` | `fiber` / `fiberfiber` | MinIO root + API credentials |
 | `FIBER_S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:19000` | Presign host for agents/browsers |
 | `FIBER_CORS_ORIGINS` | `http://localhost:3100,http://127.0.0.1:3100` | See above |
-| `FIBER_API_BIND` / `FIBER_WEB_BIND` | `127.0.0.1` | Host interface for `18080` / `3100`; set `0.0.0.0` only without a reverse proxy |
-| `VITE_FIBER_API_URL` | `http://localhost:18080` | Baked into the web bundle |
+| `FIBER_API_BIND` / `FIBER_UI_BIND` | `127.0.0.1` | Host interface for `18080` / `3100`; set `0.0.0.0` only without a reverse proxy |
+| `VITE_FIBER_API_URL` | `http://localhost:18080` | Baked into the UI bundle |
 | `RUST_LOG` | `info,fiber_api=info` | API log filter |
 
 ## fiber-agent
@@ -78,10 +78,10 @@ Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned,
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,
 `FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`).
 
-## fiber-cli / web
+## fiber-cli / ui
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `FIBER_API_URL` | `http://127.0.0.1:18080` | CLI API base |
 | `FIBER_TOKEN` | ~/.fiber/token | Session token |
-| `VITE_FIBER_API_URL` | `http://127.0.0.1:18080` | Web UI API base at build/dev time |
+| `VITE_FIBER_API_URL` | `http://127.0.0.1:18080` | UI API base at build/dev time |

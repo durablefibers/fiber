@@ -2,7 +2,7 @@
 name: fiber-api-endpoint
 description: End-to-end procedure for adding or changing an HTTP endpoint in fiber-api — router wiring, role gate, store query, response type, the hand-mirrored TypeScript client, and the docs. Use when adding a route, changing a response shape, or when an endpoint exists in Rust but the UI cannot see it.
 license: Apache-2.0
-compatibility: Requires the durablefibers repository checkout, Rust stable, and pnpm for the web client half.
+compatibility: Requires the durablefibers repository checkout, Rust stable, and pnpm for the UI client half.
 metadata:
   author: durablefibers
   version: "1.0"
@@ -58,7 +58,7 @@ Agent-facing endpoints use the `AuthAgent` extractor instead — never accept a 
 
 Add the `.route(...)` line in the same block, keeping the existing path style: `/api/projects/{id}/…` for project-scoped collections, `/api/<entity>/{id}` for direct entity access.
 
-## 4. TypeScript client — `apps/web/src/lib/api.ts`
+## 4. TypeScript client — `apps/ui/src/lib/api.ts`
 
 This file hand-mirrors the Rust types. There is no codegen; drift is silent until runtime. Add the type and the fetch function together, matching the serde field names exactly (snake_case as serialized). Auth is the bearer session token; the WS origin derives from `VITE_FIBER_API_URL`.
 
@@ -70,7 +70,7 @@ Add the route with method, path, auth (session vs agent token), minimum role, an
 
 ```bash
 make check                                   # fmt + clippy -D warnings
-cd apps/web && pnpm exec tsc --noEmit        # the CI web gate
+cd apps/ui && pnpm exec tsc --noEmit        # the CI UI gate
 make ready                                   # API up?
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/...
 ```

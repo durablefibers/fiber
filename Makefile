@@ -1,4 +1,4 @@
-.PHONY: help infra infra-minio down api api-s3 agent web cli build images check fmt fmt-check clippy test test-rust test-web \
+.PHONY: help infra infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy test test-rust test-ui \
 	smoke smoke-authz smoke-pools smoke-artifacts smoke-s3 smoke-compose \
 	login validate ready
 
@@ -12,14 +12,14 @@ help:
 	@echo "  down          Stop Compose services"
 	@echo "  build         cargo build workspace + fiber-cli"
 	@echo "  check         fmt --check + clippy -D warnings"
-	@echo "  test          cargo test --workspace + web vitest"
+	@echo "  test          cargo test --workspace + ui vitest"
 	@echo "  images        Build fiber-api + fiber-agent container images"
 	@echo "  fmt           cargo fmt"
 	@echo "  clippy        cargo clippy"
 	@echo "  api           Run fiber-api on :18080 (source scripts/dev-env.sh)"
 	@echo "  api-s3        Same with FIBER_USE_S3=1 (needs infra-minio)"
 	@echo "  agent         Run fiber-agent (needs FIBER_AGENT_TOKEN)"
-	@echo "  web           pnpm dev in apps/web (:3100)"
+	@echo "  ui            pnpm dev in apps/ui (:3100)"
 	@echo "  cli           cargo run -p fiber-cli -- …  (ARGS='login')"
 	@echo "  login         fiber-cli login (writes ~/.fiber/token)"
 	@echo "  validate      Validate examples/fiber.yml"
@@ -28,7 +28,7 @@ help:
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
-	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; web biome + tsc + vitest + build; docker build)"
+	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; ui biome + tsc + vitest + build; docker build)"
 
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis
@@ -54,13 +54,13 @@ clippy:
 
 check: fmt-check clippy
 
-test: test-rust test-web
+test: test-rust test-ui
 
 test-rust:
 	cargo test --workspace
 
-test-web:
-	cd apps/web && pnpm test
+test-ui:
+	cd apps/ui && pnpm test
 
 fmt-check:
 	cargo fmt --check
@@ -84,8 +84,8 @@ agent:
 	esac; \
 	cargo run -p fiber-agent
 
-web:
-	cd apps/web && pnpm install && VITE_FIBER_API_URL=http://127.0.0.1:18080 pnpm dev
+ui:
+	cd apps/ui && pnpm install && VITE_FIBER_API_URL=http://127.0.0.1:18080 pnpm dev
 
 cli:
 	cargo run -p fiber-cli -- $(ARGS)

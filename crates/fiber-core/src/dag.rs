@@ -696,7 +696,7 @@ mod tests {
             );
         }
         // A plain subdirectory is fine, including a nested one.
-        for good in ["apps/web", "sub", "a/b/c"] {
+        for good in ["apps/ui", "sub", "a/b/c"] {
             let mut st = step("a", &[], "echo");
             st.working_directory = Some(good.to_string());
             let d = PipelineDefinition {

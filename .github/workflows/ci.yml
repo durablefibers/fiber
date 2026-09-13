@@ -41,11 +41,11 @@ jobs:
       - name: build
         run: cargo build -p fiber-api -p fiber-agent -p fiber-cli
 
-  web:
+  ui:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: apps/web
+        working-directory: apps/ui
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -55,7 +55,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: apps/web/pnpm-lock.yaml
+          cache-dependency-path: apps/ui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - name: biome
         run: pnpm check
@@ -89,11 +89,11 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: build fiber-web image
+      - name: build fiber-ui image
         uses: docker/build-push-action@v7
         with:
-          context: apps/web
-          file: apps/web/Dockerfile.web
+          context: apps/ui
+          file: apps/ui/Dockerfile.ui
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -52,9 +52,9 @@ steps:
     timeout_minutes: 25
     secrets: []
 
-  web:
+  ui:
     run: |
-      cd apps/web
+      cd apps/ui
       corepack enable
       pnpm install --frozen-lockfile
       pnpm check

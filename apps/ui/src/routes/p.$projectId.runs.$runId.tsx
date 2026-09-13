@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router"
 import { Ban, Copy, Download, ExternalLink, RotateCw } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react"
+import { toast } from "sonner"
 import { AppShell } from "@/components/app-shell"
 import { DagCanvas } from "@/components/dag-canvas"
 import { Badge } from "@/components/ui/badge"
@@ -15,6 +16,7 @@ import {
   type StepRun,
   statusColor,
 } from "@/lib/api"
+import { parseMatrixBindings } from "@/lib/dag-layout"
 
 export const Route = createFileRoute("/p/$projectId/runs/$runId")({
   validateSearch: (search: Record<string, unknown>): { step?: string } => ({
@@ -78,11 +80,12 @@ function RunPage() {
   )
   const [error, setError] = useState<string | null>(null)
   const [followLogs, setFollowLogs] = useState(true)
+  const [logFilter, setLogFilter] = useState("")
+  const [wrapLogs, setWrapLogs] = useState(true)
   const [copied, setCopied] = useState(false)
   const [tick, setTick] = useState(0)
   const stepsRef = useRef(steps)
   const selectedRef = useRef(selected)
-  const logEndRef = useRef<HTMLDivElement | null>(null)
   const logViewportRef = useRef<HTMLDivElement | null>(null)
   stepsRef.current = steps
   selectedRef.current = selected
@@ -97,34 +100,75 @@ function RunPage() {
     })
   }
 
+  /**
+   * The canvas is built from the run's `step_runs`, not from the definition snapshot.
+   * The snapshot holds what the author wrote; `step_runs` hold the compiled DAG, which
+   * is what actually ran — so a matrix step appears as its real cells, with their own
+   * statuses, needs and logs, instead of one node whose status never resolves.
+   */
   const definition = useMemo<PipelineDefinition | null>(() => {
-    if (!run) return null
-    const snap = run.definition_snapshot as {
-      name?: string
-      steps?: Array<{
-        id: string
-        name: string
-        needs: string[]
-        run: string
-        image?: string
-        labels?: string[]
-        artifacts?: string[]
-      }>
+    const snap = run?.definition_snapshot as
+      | {
+          name?: string
+          steps?: Array<{
+            id: string
+            name?: string
+            artifacts?: string[]
+            matrix?: Record<string, string[]>
+            if?: string
+            continue_on_error?: boolean
+          }>
+        }
+      | undefined
+    const name = snap?.name ?? "run"
+    if (steps.length === 0) return null
+
+    const authored = snap?.steps ?? []
+    /**
+     * Find the step the author wrote for a compiled step id. Matrix cells are
+     * `<stepId>__<axis>_<value>`, so an id that is not itself authored belongs to the
+     * *longest* authored id it extends — ids `build` and `build__docs` can both prefix
+     * `build__docs__os_linux`, and only the longer one is its real parent.
+     */
+    const authoredFor = (stepId: string) => {
+      const exact = authored.find((a) => a.id === stepId)
+      if (exact) return exact
+      let best: (typeof authored)[number] | undefined
+      for (const a of authored) {
+        if (!stepId.startsWith(`${a.id}__`)) continue
+        if (!best || a.id.length > best.id.length) best = a
+      }
+      return best
     }
-    if (!snap?.steps) return null
+
     return {
-      name: snap.name ?? "run",
-      steps: snap.steps.map((s) => ({
-        id: s.id,
-        name: s.name,
-        needs: s.needs ?? [],
-        run: s.run,
-        image: s.image,
-        labels: s.labels,
-        artifacts: s.artifacts,
-      })),
+      name,
+      steps: steps.map((s) => {
+        const src = authoredFor(s.step_id)
+        // The compiler renders a cell's bindings into the step name as `name (os: linux)`.
+        const cell = src?.matrix
+          ? /^(.*?)\s*\(([^()]*)\)\s*$/.exec(s.step_name)
+          : null
+        const bindings = cell
+          ? parseMatrixBindings(cell[2], Object.keys(src?.matrix ?? {}))
+          : {}
+        const bound = Object.keys(bindings).length > 0
+        return {
+          id: s.step_id,
+          name: cell && bound ? cell[1] : s.step_name,
+          needs: s.needs ?? [],
+          run: s.run_cmd,
+          image: s.image,
+          labels: s.labels,
+          retries: s.retries,
+          artifacts: src?.artifacts,
+          matrix: bound ? bindings : undefined,
+          if: src?.if,
+          continue_on_error: src?.continue_on_error,
+        }
+      }),
     }
-  }, [run])
+  }, [run, steps])
 
   const statuses = useMemo(() => {
     const m: Record<string, string> = {}
@@ -146,6 +190,21 @@ function RunPage() {
 
   const showingStepOnly =
     !!selectedStep && artifacts.some((a) => a.step_run_id === selectedStep.id)
+
+  const shownLogs = useMemo(() => {
+    const needle = logFilter.trim().toLowerCase()
+    if (!needle) return logs
+    return logs.filter((l) => l.toLowerCase().includes(needle))
+  }, [logs, logFilter])
+
+  const copyLogs = async () => {
+    try {
+      await navigator.clipboard.writeText(shownLogs.join("\n"))
+      toast.success(`Copied ${shownLogs.length} lines`)
+    } catch {
+      toast.error("Clipboard unavailable")
+    }
+  }
 
   const restoreFailures = useMemo(
     () =>
@@ -373,8 +432,12 @@ function RunPage() {
 
   useEffect(() => {
     if (!followLogs) return
-    logEndRef.current?.scrollIntoView({ block: "end" })
-  }, [logs, followLogs])
+    // Scroll the log viewport itself rather than `scrollIntoView`, which walks up to
+    // the nearest scrollable ancestor — when the panes stack on a narrow screen that
+    // is the page, and following the tail would drag the canvas out of view.
+    const el = logViewportRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [shownLogs, followLogs])
 
   const onLogScroll = () => {
     const el = logViewportRef.current
@@ -443,6 +506,9 @@ function RunPage() {
   const pipelineName =
     (run?.definition_snapshot as { name?: string } | undefined)?.name ??
     "Pipeline"
+  // Cancel and retry both require Writer (routes.rs: require_run(.., Writer)). Offering
+  // them to a reader only produces a 403 after the click.
+  const canRun = project !== null && project.role !== "reader"
 
   return (
     <AppShell projectId={projectId} projectName={project?.name}>
@@ -503,7 +569,7 @@ function RunPage() {
             })()}
           </div>
         </div>
-        {isActiveStatus(run?.status) ? (
+        {!canRun ? null : isActiveStatus(run?.status) ? (
           <Button variant="outline" onClick={() => void cancel()}>
             <Ban className="size-4" />
             Cancel
@@ -526,9 +592,15 @@ function RunPage() {
       {error ? (
         <p className="px-6 pt-3 text-destructive text-sm">{error}</p>
       ) : null}
-      <div className="grid min-h-0 flex-1 grid-cols-[1.1fr_0.9fr]">
-        <div className="flex min-h-0 flex-col">
-          <div className="min-h-[360px] flex-1 p-4">
+      {/*
+        `min-h-0` is what lets the two panes scroll independently side by side, but it
+        also zeroes their contribution to grid row sizing — stacked in one column the
+        rows would split the height evenly and the content would spill over the pane
+        below. So the panes only go min-height-0 once they are actually side by side.
+      */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-[1.1fr_0.9fr] lg:overflow-hidden">
+        <div className="flex flex-col lg:min-h-0">
+          <div className="h-[380px] shrink-0 p-4 lg:h-auto lg:min-h-[360px] lg:flex-1">
             {definition ? (
               <DagCanvas
                 definition={definition}
@@ -600,24 +672,32 @@ function RunPage() {
             )}
           </div>
         </div>
-        <aside className="flex min-h-0 flex-col border-border/70 border-l">
-          <div className="flex gap-1 overflow-x-auto border-border/60 border-b p-2">
+        <aside className="flex flex-col border-border/70 border-t lg:min-h-0 lg:border-t-0 lg:border-l">
+          <div className="flex max-h-28 shrink-0 flex-wrap gap-1 overflow-y-auto border-border/60 border-b p-2">
             {steps.map((s) => (
               <button
                 key={s.id}
                 type="button"
                 onClick={() => selectStep(s.id)}
-                className={`rounded-md px-2 py-1 text-xs ${
-                  selected === s.id ? "bg-sky-500/15" : "hover:bg-muted"
+                title={`${s.step_name} · ${s.status}`}
+                className={`max-w-full truncate rounded-md px-2 py-1 text-xs transition ${
+                  selected === s.id
+                    ? "bg-sky-500/15 text-sky-100"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
                 }`}
               >
                 <span
-                  className="mr-1 inline-block size-1.5 rounded-full"
+                  className="mr-1 inline-block size-1.5 rounded-full align-middle"
                   style={{ background: statusColor(s.status) }}
                 />
                 {s.step_name}
               </button>
             ))}
+            {steps.length === 0 ? (
+              <span className="px-1 py-1 text-muted-foreground text-xs">
+                No steps.
+              </span>
+            ) : null}
           </div>
           {selectedStep ? (
             <div className="space-y-1.5 border-border/60 border-b px-3 py-2 text-[11px] text-muted-foreground">
@@ -762,8 +842,40 @@ function RunPage() {
               ) : null}
             </div>
           ) : null}
-          <div className="flex items-center justify-between border-border/60 border-b px-3 py-1.5">
-            <span className="text-[11px] text-muted-foreground">Logs</span>
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-border/60 border-b px-3 py-1.5">
+            <span className="text-[11px] text-muted-foreground">
+              Logs
+              {logFilter ? (
+                <span className="ml-1 tabular-nums">
+                  {shownLogs.length}/{logs.length}
+                </span>
+              ) : logs.length ? (
+                <span className="ml-1 tabular-nums">{logs.length}</span>
+              ) : null}
+            </span>
+            <input
+              value={logFilter}
+              onChange={(e) => setLogFilter(e.target.value)}
+              placeholder="Filter…"
+              aria-label="Filter log lines"
+              className="h-6 min-w-0 flex-1 rounded border border-border/60 bg-transparent px-2 text-[11px] outline-none focus:border-sky-500/50"
+            />
+            <button
+              type="button"
+              className="text-[11px] text-muted-foreground hover:text-foreground"
+              onClick={() => setWrapLogs((v) => !v)}
+              title="Toggle line wrapping"
+            >
+              {wrapLogs ? "wrap" : "nowrap"}
+            </button>
+            <button
+              type="button"
+              className="text-[11px] text-muted-foreground hover:text-foreground"
+              onClick={() => void copyLogs()}
+              title="Copy visible lines"
+            >
+              copy
+            </button>
             <button
               type="button"
               className="text-[11px] text-muted-foreground hover:text-foreground"
@@ -775,21 +887,26 @@ function RunPage() {
           <div
             ref={logViewportRef}
             onScroll={onLogScroll}
-            className="min-h-0 flex-1 overflow-auto bg-[oklch(0.12_0.01_260)] p-3 font-mono text-[11px] leading-relaxed"
+            className={`min-h-[240px] flex-1 overflow-auto bg-[oklch(0.12_0.01_260)] p-3 font-mono text-[11px] leading-relaxed lg:min-h-0 ${
+              wrapLogs ? "" : "whitespace-nowrap"
+            }`}
           >
             {logs.length === 0 ? (
               <span className="text-white/30">Waiting for logs…</span>
+            ) : shownLogs.length === 0 ? (
+              <span className="text-white/30">
+                No lines match “{logFilter}”.
+              </span>
             ) : (
-              logs.map((l, i) => (
+              shownLogs.map((l, i) => (
                 <div
                   key={i}
-                  className={`whitespace-pre-wrap ${logLineClass(l)}`}
+                  className={`${wrapLogs ? "whitespace-pre-wrap" : "whitespace-pre"} ${logLineClass(l)}`}
                 >
                   {l}
                 </div>
               ))
             )}
-            <div ref={logEndRef} />
           </div>
         </aside>
       </div>

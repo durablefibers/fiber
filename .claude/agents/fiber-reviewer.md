@@ -13,7 +13,7 @@ Start with `git diff` (and `git diff --stat`) to see what actually changed. Revi
 ## Checklist, ordered by how often it actually bites here
 
 1. **Replay safety.** CI steps and durable fiber steps are at-least-once. Does any new effect on the execution path break under a second run — non-idempotent writes, counters, external calls, file appends, "create if not exists" that actually throws?
-2. **Wire-type drift.** Did `fiber-proto` change without the matching update in `fiber-api`, `fiber-agent`, `fiber-cli`, and `apps/web/src/lib/api.ts`? `api.ts` mirrors Rust types by hand — check it explicitly whenever a serialized shape moves.
+2. **Wire-type drift.** Did `fiber-proto` change without the matching update in `fiber-api`, `fiber-agent`, `fiber-cli`, and `apps/ui/src/lib/api.ts`? `api.ts` mirrors Rust types by hand — check it explicitly whenever a serialized shape moves.
 3. **Authorization.** Every project-scoped handler must gate through `access.rs` with a defensible minimum role (`reader` < `writer` < `admin` < `owner`). Flag any handler that takes an id, resolves a project, and proceeds without `require_*`. Mutations must be `writer` or above.
 4. **Migrations.** New schema must be a *new* numbered file in `crates/fiber-core/migrations/`. Any edit to an already-committed migration is a hard failure — sqlx checksums them at boot. Check that new columns are nullable or defaulted, since migrations run against existing databases on upgrade.
 5. **Snapshot immutability.** The run's stored definition governs that execution. Flag execution-path reads of live pipeline rows.

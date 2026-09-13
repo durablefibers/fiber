@@ -31,7 +31,7 @@ Equivalent manual env: `source scripts/dev-env.sh` then `cargo run -p fiber-api`
 ## 3. Web UI
 
 ```bash
-cd apps/web && pnpm install
+cd apps/ui && pnpm install
 VITE_FIBER_API_URL=http://127.0.0.1:18080 pnpm dev
 ```
 

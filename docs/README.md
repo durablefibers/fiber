@@ -1,10 +1,11 @@
 # Fiber docs
 
-Self-hosted, canvas-first CI. Rust control plane (`fiber-api`), agents (`fiber-agent`), web UI (`apps/web`), and optional durable background tasks (`fiber-durable`).
+Self-hosted, canvas-first CI. Rust control plane (`fiber-api`), agents (`fiber-agent`), web UI (`apps/ui`), and optional durable background tasks (`fiber-durable`).
 
 | Doc | Contents |
 |---|---|
 | [Getting started](./getting-started.md) | Local stack, first pipeline, agent |
+| [Web UI](./ui.md) | Pages, the canvas, the pipeline editor, the run page |
 | [Development](./development.md) | Make targets, ports, `scripts/dev-env.sh` |
 | [Architecture](./architecture.md) | Components, data flow, durability model |
 | [Pipeline YAML](./pipeline-yaml.md) | `fiber.yml` schema, matrix, `if`, examples |

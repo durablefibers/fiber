@@ -246,7 +246,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers ?? {}),
     },
   })
-  if (res.status === 401 && !path.startsWith("/api/auth/login")) {
+  // A 401 normally means the session is gone, so drop the token and bounce to login.
+  // Two endpoints answer 401 about the *credentials in the body* instead, with a
+  // perfectly good session: login itself, and changing your own password (which
+  // deliberately does not say whether the session or the current password was wrong).
+  // Signing the user out because they mistyped their old password would be absurd.
+  const authsOwnCredentials =
+    path.startsWith("/api/auth/login") || path.startsWith("/api/auth/password")
+  if (res.status === 401 && !authsOwnCredentials) {
     setToken(null)
     if (
       typeof window !== "undefined" &&
@@ -274,7 +281,22 @@ export const api = {
   logout: () =>
     request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   me: () => request<PublicUser>("/api/auth/me"),
+  /** Change your own password. The server drops every other session on success. */
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ ok: boolean }>("/api/auth/password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  /** Sign out everywhere else. The session making the call survives. */
+  revokeSessions: () =>
+    request<{ revoked: number }>("/api/auth/sessions", { method: "DELETE" }),
   listUsers: () => request<PublicUser[]>("/api/users"),
+  /** Instance admins only. Project owners invite through addMember instead. */
+  createUser: (username: string, password: string) =>
+    request<PublicUser>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
   setUserAdmin: (id: string, is_admin: boolean) =>
     request<PublicUser>(`/api/users/${id}`, {
       method: "PUT",

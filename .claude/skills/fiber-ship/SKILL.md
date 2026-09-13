@@ -2,7 +2,7 @@
 name: fiber-ship
 description: The pre-commit and pre-PR gate for Fiber — run the exact checks CI runs, audit the change against the repo's invariants, and confirm docs and config landed with the code. Use before committing, before opening a PR, or whenever asked whether a change is ready.
 license: Apache-2.0
-compatibility: Requires the durablefibers checkout, Rust stable, and pnpm for the web gate.
+compatibility: Requires the durablefibers checkout, Rust stable, and pnpm for the UI gate.
 metadata:
   author: durablefibers
   version: "1.0"
@@ -23,10 +23,10 @@ make check                                    # cargo fmt --check + clippy -D wa
 cargo test -p fiber-core -p fiber-durable     # pure unit tests, no DB needed
 ```
 
-If `apps/web` changed:
+If `apps/ui` changed:
 
 ```bash
-cd apps/web && pnpm exec tsc --noEmit && pnpm check && pnpm test
+cd apps/ui && pnpm exec tsc --noEmit && pnpm check && pnpm test
 ```
 
 `make check` and `pnpm exec tsc --noEmit` are byte-identical to `.github/workflows/ci.yml`. A change that needs a "just this once" exception to either is not ready.
@@ -38,7 +38,7 @@ Report the real output. If something fails, fix it — do not describe it as a p
 Read `git diff` and answer each, out loud:
 
 - **Replay.** Does any new effect on the execution path survive running twice? Steps and fibers are at-least-once.
-- **Wire drift.** Did a `fiber-proto` type change? Then `fiber-api`, `fiber-agent`, `fiber-cli`, and `apps/web/src/lib/api.ts` all need checking — the last one mirrors Rust types by hand.
+- **Wire drift.** Did a `fiber-proto` type change? Then `fiber-api`, `fiber-agent`, `fiber-cli`, and `apps/ui/src/lib/api.ts` all need checking — the last one mirrors Rust types by hand.
 - **Authorization.** Does every new project-scoped handler gate through `access.rs` at a defensible minimum role?
 - **Migrations.** Is the schema change a *new* numbered file? Are new columns nullable or defaulted?
 - **Snapshot.** Does the execution path read the run's stored definition rather than live pipeline rows?
@@ -50,7 +50,7 @@ A change is incomplete without these:
 
 | If you changed… | These must change too |
 |---|---|
-| A route | `docs/api.md`, and `apps/web/src/lib/api.ts` if the UI consumes it |
+| A route | `docs/api.md`, and `apps/ui/src/lib/api.ts` if the UI consumes it |
 | An env var | `.env.example`, `scripts/dev-env.sh`, `docs/configuration.md`, `deploy/docker-compose.yml` if containerized |
 | A `make` target | `make help` text, `docs/development.md` |
 | Pipeline YAML schema | `docs/pipeline-yaml.md`, an `examples/*.yml` that validates |

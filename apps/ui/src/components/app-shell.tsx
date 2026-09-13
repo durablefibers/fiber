@@ -3,9 +3,11 @@ import {
   Activity,
   Box,
   FolderKanban,
+  ListChecks,
   LogOut,
   Orbit,
   Settings,
+  Sliders,
   Workflow,
 } from "lucide-react"
 import { useEffect, useState } from "react"
@@ -177,6 +179,36 @@ export function AppShell({
                     </SidebarMenuItem>
                     <SidebarMenuItem>
                       <SidebarMenuButton
+                        tooltip="Runs"
+                        isActive={pathname.startsWith(`/p/${projectId}/runs`)}
+                        render={
+                          <Link
+                            to="/p/$projectId/runs"
+                            params={{ projectId }}
+                          />
+                        }
+                      >
+                        <ListChecks />
+                        <span>Runs</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
+                        tooltip="Project agents"
+                        isActive={pathname.startsWith(`/p/${projectId}/agents`)}
+                        render={
+                          <Link
+                            to="/p/$projectId/agents"
+                            params={{ projectId }}
+                          />
+                        }
+                      >
+                        <Box />
+                        <span>Agents</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
                         tooltip="Durable fibers"
                         isActive={pathname.startsWith(`/p/${projectId}/fibers`)}
                         render={
@@ -188,6 +220,23 @@ export function AppShell({
                       >
                         <Orbit />
                         <span>Fibers</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton
+                        tooltip="Project settings"
+                        isActive={pathname.startsWith(
+                          `/p/${projectId}/settings`
+                        )}
+                        render={
+                          <Link
+                            to="/p/$projectId/settings"
+                            params={{ projectId }}
+                          />
+                        }
+                      >
+                        <Sliders />
+                        <span>Settings</span>
                       </SidebarMenuButton>
                     </SidebarMenuItem>
                   </SidebarMenu>

@@ -26,13 +26,13 @@ make infra         # Postgres + Redis
 make build         # api + agent + cli
 make api           # fiber-api :18080
 make api-s3        # fiber-api with MinIO
-make web           # UI :3100
+make ui            # UI :3100
 make agent         # needs FIBER_AGENT_TOKEN
 make login         # session → ~/.fiber/token
 make validate      # examples/fiber.yml
 make check         # fmt --check + clippy -D warnings
 make images        # build the fiber-api / fiber-agent container images
-make test          # cargo test --workspace + apps/web vitest
+make test          # cargo test --workspace + apps/ui vitest
 make smoke           # authz + pools + artifacts smokes
 make smoke-s3        # MinIO presign (api-s3 running)
 make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
@@ -46,7 +46,7 @@ Login defaults: **admin** / **fiber**.
 | Service | Host |
 |---|---|
 | API | 18080 |
-| Web (dev) | 3100 |
+| UI (dev) | 3100 |
 | Postgres | 15432 |
 | Redis | 16379 |
 | MinIO API / console | 19000 / 19001 |
@@ -60,7 +60,7 @@ Product prefix is **`fiber`** / `FIBER_*` — see `.claude/rules/naming.md`. Nev
 | Path | Role |
 |---|---|
 | `crates/fiber-*` | Control plane, agent, CLI, durable runtime |
-| `apps/web` | TanStack Start UI |
+| `apps/ui` | TanStack Start UI |
 | `deploy/` | Compose + Dockerfiles |
 | `scripts/` | Smoke scripts + `dev-env.sh` |
 | `docs/` | User + ops docs |
@@ -70,13 +70,13 @@ Product prefix is **`fiber`** / `FIBER_*` — see `.claude/rules/naming.md`. Nev
 
 ```bash
 make check   # cargo fmt --check + clippy -D warnings
-make test    # cargo test --workspace, then apps/web vitest
-cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # web lint/format, types, build
+make test    # cargo test --workspace, then apps/ui vitest
+cd apps/ui && pnpm check && pnpm exec tsc --noEmit && pnpm build   # ui lint/format, types, build
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`: Rust fmt, clippy (`-D warnings`), `cargo test --workspace`, build; `apps/web` Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`; and a `docker build` of `deploy/Dockerfile` and `apps/web/Dockerfile.web`. The Rust toolchain is pinned by `rust-toolchain.toml` (kept in step with `deploy/Dockerfile`).
+GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`: Rust fmt, clippy (`-D warnings`), `cargo test --workspace`, build; `apps/ui` Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`; and a `docker build` of `deploy/Dockerfile` and `apps/ui/Dockerfile.ui`. The Rust toolchain is pinned by `rust-toolchain.toml` (kept in step with `deploy/Dockerfile`).
 
-Web unit tests live next to their modules as `src/**/*.test.ts(x)` and run under `vitest.config.ts` (jsdom; `src/test-setup.ts` installs an in-memory `localStorage`).
+UI unit tests live next to their modules as `src/**/*.test.ts(x)` and run under `vitest.config.ts` (jsdom; `src/test-setup.ts` installs an in-memory `localStorage`).
 
 ## Agent tips
 

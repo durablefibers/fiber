@@ -12,7 +12,7 @@ Self-hosted, canvas-first Jenkins alternative. Rust control plane, TypeScript UI
 make help
 make infra          # Postgres + Redis
 make api            # :18080  (or make api-s3 after make infra-minio)
-make web            # :3100
+make ui             # :3100
 make login
 ```
 
@@ -90,7 +90,7 @@ API: **http://127.0.0.1:18080**. Login **admin** / **fiber**.
 ### 3. Web UI
 
 ```bash
-cd apps/web && pnpm install && VITE_FIBER_API_URL=http://127.0.0.1:18080 pnpm dev
+cd apps/ui && pnpm install && VITE_FIBER_API_URL=http://127.0.0.1:18080 pnpm dev
 ```
 
 Open http://localhost:3100
@@ -125,7 +125,7 @@ Add a worker with `docker compose -f deploy/docker-compose.yml --profile agent u
 
 ```
 docs/                  # product documentation
-apps/web/
+apps/ui/
 crates/fiber-api/
 crates/fiber-core/
 crates/fiber-scheduler/

@@ -18,7 +18,7 @@ The repo directory is `durablefibers`; nothing inside it is. Crates `fiber-*`, b
 
 ## 2. `make check` is the gate
 
-`cargo fmt --check` + `cargo clippy -D warnings` across all six crates — byte-identical to CI. For `apps/web`, `pnpm exec tsc --noEmit` is the CI gate and `pnpm check` (Biome) is the formatter. There is no ESLint or Prettier here.
+`cargo fmt --check` + `cargo clippy -D warnings` across all six crates — byte-identical to CI. For `apps/ui`, `pnpm exec tsc --noEmit` is the CI gate and `pnpm check` (Biome) is the formatter. There is no ESLint or Prettier here.
 
 `collapsible_if` is allowed workspace-wide because edition 2024 let-chains make it fire constantly on protocol code. Do not "fix" those.
 
@@ -48,7 +48,7 @@ Every query is `sqlx::query_as::<_, T>` or `sqlx::query` with bind parameters. T
 
 ## 9. Serialized shapes are three-sided
 
-`fiber-proto` types are consumed by `fiber-api`, `fiber-agent`, `fiber-cli`, **and** `apps/web/src/lib/api.ts`, which mirrors them by hand with no codegen. Change one side and the drift is silent until runtime. Grep all four when a wire type moves.
+`fiber-proto` types are consumed by `fiber-api`, `fiber-agent`, `fiber-cli`, **and** `apps/ui/src/lib/api.ts`, which mirrors them by hand with no codegen. Change one side and the drift is silent until runtime. Grep all four when a wire type moves.
 
 ## Environment variables
 
@@ -58,8 +58,8 @@ A new `FIBER_*` variable lands in four places in the same change: `.env.example`
 
 - Never kill agents by argv pattern — the pattern matches shells whose command line contains the binary path, including this session's parent. Use `pgrep -x fiber-agent` and `kill <pid>`.
 - Never destroy the Compose volumes to "reset" — that deletes every run, artifact, user, and secret. `make down` stops containers and keeps data.
-- `data/` (workspaces, artifacts), `apps/web/dist/`, `target/`, and `apps/web/src/routeTree.gen.ts` are generated. Do not hand-edit them.
+- `data/` (workspaces, artifacts), `apps/ui/dist/`, `target/`, and `apps/ui/src/routeTree.gen.ts` are generated. Do not hand-edit them.
 
 ## Ports
 
-API 18080 · web 3100 · Postgres 15432 · Redis 16379 · MinIO 19000/19001. Deliberately non-default; do not normalize them.
+API 18080 · UI 3100 · Postgres 15432 · Redis 16379 · MinIO 19000/19001. Deliberately non-default; do not normalize them.

@@ -31,7 +31,7 @@
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/fmt-web.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/fmt-ui.sh"
           },
           {
             "type": "command",

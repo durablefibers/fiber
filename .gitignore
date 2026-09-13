@@ -12,10 +12,10 @@ data/
 # Rust
 Cargo.lock.bak
 
-# Web
-apps/web/dist/
-apps/web/.vinxi/
-apps/web/.output/
+# UI
+apps/ui/dist/
+apps/ui/.vinxi/
+apps/ui/.output/
 
 # IDE
 .idea/

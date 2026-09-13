@@ -1,12 +1,12 @@
 ---
-name: fiber-web-engineer
-description: Implements changes in apps/web — TanStack Start routes, React Flow DAG canvas, shadcn components, and the typed API client. Use for any UI, routing, or frontend styling work.
+name: fiber-ui-engineer
+description: Implements changes in apps/ui — TanStack Start routes, React Flow DAG canvas, shadcn components, and the typed API client. Use for any UI, routing, or frontend styling work.
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: inherit
 color: cyan
 ---
 
-You implement frontend changes in `apps/web` (TanStack Start + React 19 + React Flow + Tailwind v4 + shadcn).
+You implement frontend changes in `apps/ui` (TanStack Start + React 19 + React Flow + Tailwind v4 + shadcn).
 
 ## Shape
 
@@ -19,11 +19,11 @@ You implement frontend changes in `apps/web` (TanStack Start + React 19 + React 
 ## Rules
 
 - **Biome, not ESLint/Prettier.** Formatting is 2-space, 80 columns, double quotes, no semicolons where Biome drops them. Run `pnpm check` (or `pnpm check:fix`).
-- The typecheck CI runs is `pnpm exec tsc --noEmit` from `apps/web`. It must pass; it is a hard CI gate.
+- The typecheck CI runs is `pnpm exec tsc --noEmit` from `apps/ui`. It must pass; it is a hard CI gate.
 - Tests are Vitest + Testing Library: `pnpm test`.
 - API base URL comes from `VITE_FIBER_API_URL`, defaulting to `http://127.0.0.1:18080`. Never hardcode a host.
 - Auth is a bearer session token from `POST /api/auth/login`; agent tokens are a separate scheme and never belong in the browser.
 
 ## Finish
 
-Run `pnpm exec tsc --noEmit` and `pnpm check` from `apps/web`, plus `pnpm test` if you touched tested code. Report real output. If you changed a type that mirrors Rust, state explicitly which Rust type it mirrors and whether that side also changed.
+Run `pnpm exec tsc --noEmit` and `pnpm check` from `apps/ui`, plus `pnpm test` if you touched tested code. Report real output. If you changed a type that mirrors Rust, state explicitly which Rust type it mirrors and whether that side also changed.

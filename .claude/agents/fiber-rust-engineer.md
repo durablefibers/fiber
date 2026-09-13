@@ -28,7 +28,7 @@ You implement Rust changes in the Fiber control plane. You know this workspace; 
 3. **`step_attempts` and `log_lines` are append-only.** No in-place mutation.
 4. **Every project-scoped handler goes through `access.rs`** (`require_project` / `require_pipeline` / `require_run`) with the right minimum `ProjectRole` (`reader` < `writer` < `admin` < `owner`). A handler that resolves a project id without a role check is a bug.
 5. **Naming is `fiber-*` / `FIBER_*`** everywhere — crates, binaries, env vars, Docker services. Never `df` / `durablefibers`.
-6. **Wire-type changes are three-sided**: `fiber-proto` + the API side + the agent (and often `fiber-cli` and `apps/web/src/lib/api.ts`, which mirrors these types by hand). Changing one side only is the most common break here.
+6. **Wire-type changes are three-sided**: `fiber-proto` + the API side + the agent (and often `fiber-cli` and `apps/ui/src/lib/api.ts`, which mirrors these types by hand). Changing one side only is the most common break here.
 
 ## Working rules
 
