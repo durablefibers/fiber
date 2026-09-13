@@ -1,5 +1,5 @@
-import { createFileRoute } from "@tanstack/react-router"
-import { KeyRound, Users, Webhook } from "lucide-react"
+import { createFileRoute, useRouter } from "@tanstack/react-router"
+import { KeyRound, TriangleAlert, Users, Webhook } from "lucide-react"
 import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { AppShell } from "@/components/app-shell"
@@ -47,6 +47,7 @@ function Card({
 
 function ProjectSettingsPage() {
   const { projectId } = Route.useParams()
+  const router = useRouter()
   const [project, setProject] = useState<Project | null>(null)
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [secrets, setSecrets] = useState<SecretMeta[]>([])
@@ -56,6 +57,8 @@ function ProjectSettingsPage() {
   const [secretKey, setSecretKey] = useState("")
   const [secretValue, setSecretValue] = useState("")
   const [webhookSecret, setWebhookSecret] = useState("")
+  const [confirmName, setConfirmName] = useState("")
+  const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const canAdmin = project?.role === "admin" || project?.role === "owner"
@@ -153,6 +156,27 @@ function ProjectSettingsPage() {
       toast.success("Webhook secret saved.")
     } catch (e) {
       fail(e, "Could not save webhook secret")
+    }
+  }
+
+  // The API gate is the owner role; typing the name is the guard against deleting the
+  // wrong project, the same bargain GitHub makes.
+  const deleteProject = async () => {
+    if (!project || confirmName !== project.name) return
+    setDeleting(true)
+    try {
+      const res = await api.deleteProject(projectId)
+      const extra = [
+        res.cancelled_runs ? `${res.cancelled_runs} run(s) cancelled` : null,
+        res.blobs_deleted ? `${res.blobs_deleted} artifact(s) removed` : null,
+      ]
+        .filter(Boolean)
+        .join(", ")
+      toast.success(`Deleted ${project.name}${extra ? ` — ${extra}` : ""}`)
+      await router.navigate({ to: "/" })
+    } catch (e) {
+      fail(e, "Could not delete project")
+      setDeleting(false)
     }
   }
 
@@ -343,6 +367,42 @@ function ProjectSettingsPage() {
                 rejected.
               </p>
             </Card>
+          ) : null}
+
+          {isOwner ? (
+            <section className="rounded-xl border border-destructive/40 bg-destructive/5 p-5 lg:col-span-2">
+              <div className="flex items-start gap-3">
+                <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-destructive/15 text-destructive">
+                  <TriangleAlert className="size-4" />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="font-medium text-sm">Delete this project</h2>
+                  <p className="mt-0.5 text-muted-foreground text-xs">
+                    Removes every pipeline, run, log line, artifact, secret,
+                    member, durable fiber, and project-scoped agent. Runs still
+                    in flight are cancelled first. This cannot be undone.
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <Input
+                  className="max-w-[260px]"
+                  placeholder={`Type “${project?.name ?? ""}” to confirm`}
+                  aria-label="Type the project name to confirm deletion"
+                  value={confirmName}
+                  onChange={(e) => setConfirmName(e.target.value)}
+                />
+                <Button
+                  variant="destructive"
+                  disabled={
+                    deleting || !project || confirmName !== project.name
+                  }
+                  onClick={() => void deleteProject()}
+                >
+                  {deleting ? "Deleting…" : "Delete project"}
+                </Button>
+              </div>
+            </section>
           ) : null}
         </div>
       </div>

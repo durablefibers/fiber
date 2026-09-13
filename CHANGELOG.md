@@ -8,6 +8,26 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **`DELETE /api/projects/{id}`**, owner only. Nothing could remove a project, so smoke
+  runs and abandoned experiments accumulated forever — one path-filter webhook in a
+  well-used instance now matches dozens of leftover pipelines. Runs still in flight are
+  cancelled first, so agents are told to stop while their rows still exist; then the
+  cascade takes pipelines, runs, step runs, attempts, log lines, artifact rows, members,
+  secrets, the webhook secret, durable fibers, and project-scoped agents. Artifact
+  **blobs** are collected before the delete and removed afterwards if nothing else
+  references them: retention only ever considers blobs belonging to runs it deletes
+  itself, so a blob whose last row vanished would otherwise be leaked for good. Returns
+  `{ok, cancelled_runs, runs_deleted, blobs_deleted}`. The UI exposes it in project
+  settings behind typing the project name. Runs are deleted 100 at a time rather than in
+  one statement — anyone can create a project and fill it with runs, and an unbounded
+  cascade would hold a write transaction and a pool connection for as long as the project
+  is large. Deleting the seeded **showcase** project is not permanent —
+  `ensure_showcase` recreates it on the next `fiber-api` boot.
+- **An index on `runs.retry_of`** (migration 013). The self-reference added in 009 is
+  `ON DELETE SET NULL` with no index, so Postgres enforced it with a per-deleted-row
+  `UPDATE runs SET retry_of = NULL WHERE retry_of = $1` that scanned the whole table.
+  Deleting runs was quadratic in the size of the instance; retention paid it a little at
+  a time, and project deletion would have paid it all at once.
 - **Account and user management in the UI.** `POST /api/auth/password`,
   `DELETE /api/auth/sessions` and `POST /api/users` existed on the server but nothing in the
   UI reached them. Settings now changes your own password, signs out your other sessions,
@@ -52,6 +72,19 @@ minor versions may carry breaking changes.
 
 ### Fixed
 
+- **A shared agent permanently lost a concurrency slot when a step's rows vanished under
+  it.** `on_step_complete` returned early for a step it could no longer find, before the
+  block that gives the slot back, so the in-memory `inflight` counter never came down. A
+  *global* agent — one serving every project — running a step of a project that was then
+  deleted would lose capacity until it reconnected. The release decision is now
+  `releases_slot`, a pure function with the cases enumerated in tests.
+- **A deleted agent could re-register itself into the global pool.** The `/ws/agent`
+  `Hello` arm read the agent's row to decide its pool scope but flattened a missing row
+  into `None`, which is also how a *global* agent is spelled. A project-scoped agent
+  whose row had just been cascade-deleted could therefore replay `Hello` on its still-open
+  socket and land in the pool that is offered every project's steps. Nothing read that
+  field for authorization, so it was not exploitable — it is now a closed session instead
+  of a silent promotion.
 - **A run's canvas showed nothing for a matrix step.** It was built from the definition
   snapshot, which holds the step as the author wrote it, while statuses and logs are keyed by
   the compiled cell ids (`build__os_linux`). The node's status never resolved and clicking it

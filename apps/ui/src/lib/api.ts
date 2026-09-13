@@ -309,6 +309,18 @@ export const api = {
       body: JSON.stringify({ name }),
     }),
   getProject: (id: string) => request<Project>(`/api/projects/${id}`),
+  /**
+   * Delete a project and everything under it — pipelines, runs, logs, artifacts,
+   * secrets, members, fibers, and project-scoped agents. Owner only, irreversible.
+   * Active runs are cancelled first; the counts say what the server did.
+   */
+  deleteProject: (id: string) =>
+    request<{
+      ok: boolean
+      cancelled_runs: number
+      runs_deleted: number
+      blobs_deleted: number
+    }>(`/api/projects/${id}`, { method: "DELETE" }),
   listMembers: (projectId: string) =>
     request<ProjectMember[]>(`/api/projects/${projectId}/members`),
   addMember: (
