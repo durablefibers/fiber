@@ -102,14 +102,14 @@ jobs:
   # pipeline. This brings the whole Compose stack up and drives one through a
   # containerised agent — the only check here that exercises the SQL, the WebSocket
   # protocol, and the agent together.
-  dogfood:
+  smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - name: compose smoke
-        run: bash scripts/dogfood_compose.sh
+        run: bash scripts/smoke_compose.sh
       - name: compose logs
         if: failure()
         # The same throwaway values the smoke exports, so compose can interpolate the

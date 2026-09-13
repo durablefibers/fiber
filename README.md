@@ -60,12 +60,12 @@ cargo run -p fiber-cli -- agents rotate $AGENT_ID
 
 Full walkthrough: [docs/getting-started.md](./docs/getting-started.md).
 
-### Dogfood smokes
+### Smoke scripts
 
 ```bash
-python3 scripts/dogfood_authz_agents.py   # roles + agent CRUD/rotate
-python3 scripts/dogfood_artifacts.py      # artifacts + path filters (needs agent)
-python3 scripts/dogfood_s3_presign.py     # MinIO presign (needs MinIO + FIBER_S3_*)
+python3 scripts/smoke_authz_agents.py   # roles + agent CRUD/rotate
+python3 scripts/smoke_artifacts.py      # artifacts + path filters (needs agent)
+python3 scripts/smoke_s3_presign.py     # MinIO presign (needs MinIO + FIBER_S3_*)
 ```
 
 ### 1. Infrastructure
@@ -141,7 +141,7 @@ Naming: `fiber-*` / `FIBER_*` — see `.claude/rules/naming.md`.
 ## Contributing
 
 Issues and pull requests are welcome. [CONTRIBUTING.md](./CONTRIBUTING.md) covers the local
-setup, the gate every change has to pass (`make check`, `make test`, and the dogfood smokes),
+setup, the gate every change has to pass (`make check`, `make test`, and the smoke scripts),
 and the handful of invariants — at-least-once steps, the immutable run snapshot, append-only
 migrations — that a patch has to respect.
 

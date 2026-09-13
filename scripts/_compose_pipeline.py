@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helpers for dogfood_compose.sh: mint an agent, run one pipeline, clean up."""
+"""Helpers for smoke_compose.sh: mint an agent, run one pipeline, clean up."""
 from __future__ import annotations
 
 import json
@@ -9,8 +9,8 @@ import urllib.error
 import urllib.request
 
 API = "http://127.0.0.1:18080"
-AGENT_NAME = "compose-dogfood"
-PIPELINE_NAME = "compose-dogfood"
+AGENT_NAME = "compose-smoke"
+PIPELINE_NAME = "compose-smoke"
 
 
 def req(method: str, path: str, token: str | None = None, body: dict | None = None):
@@ -58,7 +58,7 @@ def run_pipeline() -> int:
                 "id": "hello",
                 "name": "hello",
                 "needs": [],
-                "run": "echo compose-dogfood-ok",
+                "run": "echo compose-smoke-ok",
                 "labels": ["os=linux"],
                 "timeout_minutes": 5,
             }
@@ -85,7 +85,7 @@ def run_pipeline() -> int:
         print("compose agent never came online", file=sys.stderr)
         return 1
 
-    started = req("POST", f"/api/pipelines/{pipeline['id']}/runs", token, {"trigger": "dogfood"})
+    started = req("POST", f"/api/pipelines/{pipeline['id']}/runs", token, {"trigger": "smoke"})
     run_id = (started.get("run") or started)["id"]
     for _ in range(120):
         detail = req("GET", f"/api/runs/{run_id}", token)
@@ -99,7 +99,7 @@ def run_pipeline() -> int:
 
     step = detail["steps"][0]
     logs = [line["data"] for line in req("GET", f"/api/steps/{step['id']}/logs", token)]
-    if status != "succeeded" or "compose-dogfood-ok" not in logs:
+    if status != "succeeded" or "compose-smoke-ok" not in logs:
         print(f"run={status} step={step['status']} error={step.get('error')} logs={logs[-5:]}",
               file=sys.stderr)
         return 1

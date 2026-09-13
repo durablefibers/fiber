@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dogfood S3/MinIO artifact presign: upload via PUT URL, restore next step, s3:// paths."""
+"""Smoke: S3/MinIO artifact presign — upload via PUT URL, restore next step, s3:// paths."""
 from __future__ import annotations
 
 import json
@@ -66,11 +66,11 @@ def start_agent(agent_token: str) -> subprocess.Popen:
             "FIBER_API_URL": "ws://127.0.0.1:18080",
             "FIBER_AGENT_USE_DOCKER": "false",
             "FIBER_AGENT_LABELS": "os=linux",
-            "FIBER_AGENT_NAME": "s3-dogfood",
+            "FIBER_AGENT_NAME": "s3-smoke",
             "FIBER_AGENT_WORKSPACE_DIR": WS_DIR,
         }
     )
-    log = open("/tmp/fiber-agent-s3-dogfood.log", "w")
+    log = open("/tmp/fiber-agent-s3-smoke.log", "w")
     return subprocess.Popen(
         [os.path.join(ROOT, "target/debug/fiber-agent")],
         cwd=ROOT,
@@ -95,7 +95,7 @@ def main() -> int:
         "POST",
         "/api/projects",
         token=admin,
-        body={"name": "S3 Dogfood", "slug": f"s3-dogfood-{int(time.time())}"},
+        body={"name": "S3 Smoke", "slug": f"s3-smoke-{int(time.time())}"},
     )
     check("create project", code in (200, 201) and "id" in proj, proj)
     pid = proj["id"]
@@ -140,7 +140,7 @@ def main() -> int:
         "/api/agents",
         token=admin,
         body={
-            "name": "s3-dogfood",
+            "name": "s3-smoke",
             "labels": ["os=linux"],
             "concurrency": 1,
             "project_id": pid,
@@ -173,7 +173,7 @@ def main() -> int:
         "POST",
         f"/api/pipelines/{pipe['id']}/runs",
         token=admin,
-        body={"trigger": "dogfood:s3"},
+        body={"trigger": "smoke:s3"},
     )
     check("start run", code in (200, 201) and "run" in started, started)
     rid = started["run"]["id"]
@@ -285,9 +285,9 @@ def main() -> int:
 
     print("---")
     if FAILS:
-        print(f"DOGFOOD_FAIL failures={FAILS}")
+        print(f"SMOKE_FAIL failures={FAILS}")
         return 1
-    print("DOGFOOD_OK s3-presign")
+    print("SMOKE_OK s3-presign")
     return 0
 
 

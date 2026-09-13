@@ -12,7 +12,7 @@ needs more than unit tests — see CONTRIBUTING.md.
 - [ ] `make check`
 - [ ] `make test`
 - [ ] `apps/web`: `pnpm check`, `pnpm exec tsc --noEmit`, `pnpm test`
-- [ ] `make dogfood` against a live stack
+- [ ] `make smoke` against a live stack
 - [ ] Manual check (say what):
 
 ## Checklist

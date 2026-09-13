@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dogfood release-with-artifacts + path-filter webhook smoke."""
+"""Smoke: release-with-artifacts + path-filter webhook."""
 from __future__ import annotations
 
 import hashlib
@@ -49,7 +49,7 @@ def main() -> None:
     pipe = next(p for p in pipes if "release" in p["name"].lower())
     print("pipeline", pipe["id"], pipe["name"])
 
-    run = req("POST", f"/api/pipelines/{pipe['id']}/runs", token=token, body={"trigger": "dogfood:artifacts"})
+    run = req("POST", f"/api/pipelines/{pipe['id']}/runs", token=token, body={"trigger": "smoke:artifacts"})
     rid = run["run"]["id"]
     print("run", rid)
 
@@ -136,7 +136,7 @@ def main() -> None:
 
     code, _ = webhook(rust)
     assert code == 401, f"unsigned webhook should be rejected before a secret is set, got {code}"
-    wh_secret = "dogfood-webhook-secret"
+    wh_secret = "smoke-webhook-secret"
     req("PUT", f"/api/projects/{pid}/webhooks/github", token=token, body={"secret": wh_secret})
     code, _ = webhook(rust)
     assert code == 401, f"unsigned webhook should be rejected once a secret is set, got {code}"
@@ -183,7 +183,7 @@ def main() -> None:
     print(f"log_hits restore={restore_hits} upload={upload_hits}")
     assert upload_hits >= 2, "expected HTTP uploads from build/sign"
     assert restore_hits >= 1, "expected at least one restore after workspace wipe"
-    print("DOGFOOD_OK")
+    print("SMOKE_OK")
 
 
 if __name__ == "__main__":

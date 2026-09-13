@@ -63,13 +63,13 @@ Presign uses a **separate SigV4 client** bound to the public endpoint (host rewr
 
 `deploy/docker-compose.yml` enables MinIO for `fiber-api` by default (`FIBER_S3_*` + `depends_on: fiber-minio`). Host-run API: `make api-s3` after `make infra-minio`.
 
-### Local MinIO dogfood
+### Local MinIO smoke
 
 ```bash
 make infra-minio
 # other terminal:
 make api-s3
-python3 scripts/dogfood_s3_presign.py
+python3 scripts/smoke_s3_presign.py
 ```
 
 The API creates the bucket on boot if missing. Downloads are **307** to a presigned GET URL — clients must not forward the session `Authorization` header to MinIO.

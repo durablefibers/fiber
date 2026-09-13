@@ -49,10 +49,10 @@ A green build proves nothing about the wire. Run a real step through:
 make infra && make api                                    # terminal 1
 cargo run -p fiber-cli -- agents create ...               # get a token
 FIBER_AGENT_TOKEN=... make agent                          # terminal 2
-make dogfood-artifacts                                    # exercises offer -> exec -> logs -> artifact
+make smoke-artifacts                                    # exercises offer -> exec -> logs -> artifact
 ```
 
-`DOGFOOD_OK` is the pass condition. To check backward compatibility explicitly, run an agent built from the previous commit against the new API.
+`SMOKE_OK` is the pass condition. To check backward compatibility explicitly, run an agent built from the previous commit against the new API.
 
 ## Two constraints to remember
 

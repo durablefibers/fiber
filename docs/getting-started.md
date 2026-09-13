@@ -53,7 +53,7 @@ Run the worker (token shown once at create/rotate):
 ```bash
 export FIBER_AGENT_TOKEN=…          # from register response
 export FIBER_API_URL=ws://127.0.0.1:18080
-export FIBER_AGENT_USE_DOCKER=false # shell executor for local dogfood
+export FIBER_AGENT_USE_DOCKER=false # shell executor for the local smokes
 cargo run -p fiber-agent
 ```
 

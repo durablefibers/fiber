@@ -18,5 +18,5 @@ mig="$(ls crates/fiber-core/migrations/*.sql 2>/dev/null | tail -1 | xargs -r ba
 
 echo "Fiber stack: api=$api web=$web postgres=$pg redis=$redis fiber-agent processes=$agents"
 echo "Latest migration: ${mig:-none}. Gate before finishing: make check (cargo fmt --check + clippy -D warnings)."
-[ "$pg" = "down" ] && echo "Postgres is down — 'make infra' before running the API, dogfood smokes, or anything DB-backed."
+[ "$pg" = "down" ] && echo "Postgres is down — 'make infra' before running the API, smoke scripts, or anything DB-backed."
 exit 0

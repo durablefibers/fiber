@@ -21,3 +21,7 @@ apps/web/.output/
 .idea/
 .vscode/
 deploy/.env
+
+# Python bytecode from the smoke scripts
+__pycache__/
+*.pyc
