@@ -17,11 +17,17 @@ the `fiber-ui` Compose service in a deployment). It talks to `fiber-api` at
 | `/p/{project}/pipelines/{pipeline}` | The pipeline editor — canvas plus inspector |
 | `/p/{project}/agents` | Agents dedicated to this project |
 | `/p/{project}/fibers` | Durable fibers for this project |
-| `/p/{project}/settings` | Members, project secrets, and the GitHub webhook |
+| `/p/{project}/settings` | Members, project secrets, the GitHub webhook, and deleting the project |
 
 Project-scoped pages appear in the sidebar under the project's name. Instance-wide
 concerns (the global agent pool, your account, users) stay in the top group — a
 project's secrets and members are never in the global Settings page.
+
+Deleting a project is owner-only and irreversible: it takes every pipeline, run, log
+line, artifact, secret, member, durable fiber, and project-scoped agent with it, and
+cancels anything still running first. The button unlocks only once you type the
+project's name. The seeded **showcase** project comes back on the next `fiber-api`
+boot, so deleting it is a reset rather than a removal.
 
 ## The canvas
 

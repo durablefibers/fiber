@@ -42,6 +42,7 @@ Why: a global agent's token leases steps — and receives the injected secrets �
 - Fresh installs: the bootstrap user is the first instance admin. Existing installs: nobody is promoted by the migration; at boot, `fiber-api` promotes the user named by `FIBER_ADMIN_USER` **only while the instance has no admin at all** (a recovery path — it is never re-applied on every boot, so a demotion sticks and a squatted username gains nothing). If no admin exists and `FIBER_ADMIN_USER` matches no user, the API logs an error telling you to point it at an existing username.
 - The last instance admin cannot be demoted (`PUT /api/users/{id}` → 400; enforced inside the UPDATE, so concurrent demotions cannot race to zero).
 - Project admins still invite users via `POST /api/projects/{id}/members` with a `password` — that path is project-scoped and unchanged.
+- **Owner is the only role that can delete a project** (`DELETE /api/projects/{id}`). Instance admins get no exemption: like every project-scoped route, it requires membership. The showcase project is reseeded on the next `fiber-api` boot if you delete it.
 - `PublicUser` (login response, `/api/auth/me`, `GET /api/users`) carries `is_admin` so the UI can hide the global-agent form. Project member lists do not expose it.
 
 ## Members API

@@ -32,7 +32,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/password", post(change_password))
         .route("/api/auth/sessions", axum::routing::delete(revoke_sessions))
         .route("/api/projects", get(list_projects).post(create_project))
-        .route("/api/projects/{id}", get(get_project))
+        .route(
+            "/api/projects/{id}",
+            get(get_project).delete(delete_project),
+        )
         .route(
             "/api/projects/{id}/members",
             get(list_members).post(add_member),
@@ -443,6 +446,148 @@ async fn create_project(
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(project)))
+}
+
+/// How many runs are deleted per statement. Matches retention's batch: the cascade
+/// reaches step runs, attempts, log lines and artifact rows, so one unbounded `DELETE`
+/// would hold a write transaction and a pool connection for as long as the project is
+/// large — an authenticated denial of service, since anyone can create a project and
+/// fill it with runs.
+const PROJECT_DELETE_BATCH: i64 = 100;
+
+/// Delete a project and everything under it. Owner only, and irreversible.
+///
+/// No confirmation token on the wire: the role *is* the gate, matching every other
+/// destructive route here, and the UI asks the operator to type the project name.
+/// Instance admins are not exempt from membership — consistent with every other
+/// project-scoped route (see `access.rs`).
+///
+/// The order is deliberate:
+///
+/// 1. Drop the sockets of agents dedicated to this project. They are about to be
+///    cascade-deleted, and every other path that invalidates an agent row
+///    (`delete_agent`, `rotate_agent_token`) disconnects first so the old session
+///    cannot keep leasing.
+/// 2. Cancel runs an agent is actually holding a step of, so those agents are told to
+///    stop and release their slots while the rows still exist.
+/// 3. Delete the runs in batches, taking each batch's artifact blob paths in the same
+///    transaction. Retention only ever considers blobs belonging to runs it deletes
+///    itself and never sweeps the backend for orphans, so a blob whose last row went
+///    without being listed here is leaked for good.
+/// 4. Delete the project. What is left for the cascade is small and fixed.
+async fn delete_project(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::access::require_project(&state, &user, id, ProjectRole::Owner).await?;
+
+    for agent_id in state
+        .store
+        .project_agent_ids(id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        state
+            .scheduler
+            .force_disconnect_agent(agent_id, "project deleted")
+            .await;
+    }
+
+    let leased = state
+        .store
+        .leased_run_ids_for_project(id)
+        .await
+        .map_err(ApiError::from)?;
+    for run_id in &leased {
+        // Best effort: a run that reached a terminal status between the query and here
+        // is already where we want it, and must not block the delete.
+        if let Err(e) = state
+            .scheduler
+            .cancel_run_with_reason(*run_id, Some("project deleted"))
+            .await
+        {
+            tracing::warn!(%run_id, error = %e, "could not cancel run before project delete");
+        }
+    }
+
+    let mut runs_deleted = 0usize;
+    let mut blobs_deleted = 0usize;
+    loop {
+        let batch = state
+            .store
+            .run_ids_for_project(id, PROJECT_DELETE_BATCH)
+            .await
+            .map_err(ApiError::from)?;
+        if batch.is_empty() {
+            break;
+        }
+        runs_deleted += batch.len();
+        let paths = state
+            .store
+            .delete_runs_returning_artifact_paths(&batch)
+            .await
+            .map_err(ApiError::from)?;
+        blobs_deleted += gc_artifact_blobs(&state, paths).await;
+    }
+
+    if !state
+        .store
+        .delete_project(id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    tracing::info!(
+        project_id = %id,
+        by = %user.username,
+        cancelled_runs = leased.len(),
+        runs_deleted,
+        blobs_deleted,
+        "project deleted"
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "cancelled_runs": leased.len(),
+        "runs_deleted": runs_deleted,
+        "blobs_deleted": blobs_deleted,
+    })))
+}
+
+/// Remove the blobs among `paths` that no surviving artifact row points at. Returns how
+/// many went.
+///
+/// Same rule retention follows: if the reference check fails, keep every blob. A
+/// transient error must not read as "nothing points at these" and delete artifacts a
+/// surviving retry still needs. Leaked bytes beat lost ones.
+async fn gc_artifact_blobs(state: &AppState, paths: Vec<String>) -> usize {
+    if paths.is_empty() {
+        return 0;
+    }
+    let still = match state.store.artifact_paths_still_referenced(&paths).await {
+        Ok(still) => still,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                candidates = paths.len(),
+                "could not check artifact references; keeping every blob"
+            );
+            return 0;
+        }
+    };
+    // Reuse retention's selection so there is one implementation of "safe to delete",
+    // and it is the one its tests cover.
+    let candidates: std::collections::BTreeSet<String> = paths.into_iter().collect();
+    let mut removed = 0usize;
+    for path in crate::retention::unreferenced_blobs(&candidates, &still) {
+        match state.artifacts.delete(path).await {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(%path, error = %e, "artifact blob delete failed"),
+        }
+    }
+    removed
 }
 
 async fn get_project(

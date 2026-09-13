@@ -530,9 +530,23 @@ impl Scheduler {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<Option<fiber_core::StepRun>> {
-        let current = match self.store.get_step_run(step_run_id).await? {
-            Some(s) => s,
-            None => return Ok(None),
+        let found = self.store.get_step_run(step_run_id).await?;
+
+        // Decide about the slot before anything returns: a step whose rows were deleted
+        // under the agent still has to give its slot back.
+        if releases_slot(
+            found.as_ref().map(|s| (s.status_enum(), s.agent_id)),
+            agent_id,
+        ) {
+            let mut agents = self.agents.write().await;
+            if let Some(a) = agents.get_mut(&agent_id) {
+                a.release_slot();
+            }
+        }
+
+        let Some(current) = found else {
+            debug!(%step_run_id, "step complete for a row that no longer exists");
+            return Ok(None);
         };
 
         // Ignore late completes after cancel / reclaim / re-lease to another agent.
@@ -543,15 +557,6 @@ impl Scheduler {
                 "ignoring late step complete"
             );
             return Ok(None);
-        }
-
-        // Only a completion for a step this agent really holds releases a slot;
-        // otherwise spamming StepComplete would lift the concurrency cap.
-        {
-            let mut agents = self.agents.write().await;
-            if let Some(a) = agents.get_mut(&agent_id) {
-                a.release_slot();
-            }
         }
 
         if let Some(backoff_secs) = retry_plan(status, current.attempt, current.retries) {
@@ -814,6 +819,25 @@ fn completion_is_current(
     current == StepStatus::Running && row_agent == Some(reporting_agent)
 }
 
+/// Whether a `StepComplete` should give the reporting agent its concurrency slot back.
+///
+/// `None` means the step row is gone — the run was deleted under a live agent, which
+/// happens when a project is deleted while one of its steps is running on a *global*
+/// agent that outlives it. The agent really did hold that slot, so it has to come back;
+/// leaving it taken permanently shrinks a shared agent's capacity until it reconnects.
+///
+/// The trade is that an agent could spam completions for ids that never existed and
+/// saturate its own counter to zero, taking more work than its `concurrency` allows.
+/// That is self-inflicted load on a host the agent already runs arbitrary pipeline shell
+/// on, and `release_slot` is saturating so it cannot wrap — whereas the leak is
+/// permanent and reachable by any project owner against an agent shared with others.
+fn releases_slot(current: Option<(StepStatus, Option<Uuid>)>, reporting_agent: Uuid) -> bool {
+    match current {
+        None => true,
+        Some((status, row_agent)) => completion_is_current(status, row_agent, reporting_agent),
+    }
+}
+
 /// `Some(backoff_seconds)` when a finished step should be requeued for another attempt.
 ///
 /// Only a failure retries — a cancel is a person's decision and a success is done. The
@@ -948,6 +972,54 @@ mod tests {
             None,
             Uuid::new_v4()
         ));
+    }
+
+    // --- slot release -----------------------------------------------------------------
+
+    #[test]
+    fn a_step_whose_rows_were_deleted_still_gives_its_slot_back() {
+        // Deleting a project cancels and removes its runs. A step of that project
+        // running on a *global* agent — which survives the project — reports into
+        // nothing; the agent held the slot and must get it back, or a shared agent
+        // silently loses capacity until it reconnects.
+        assert!(releases_slot(None, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn the_leaseholder_finishing_its_own_step_gives_the_slot_back() {
+        let agent = Uuid::new_v4();
+        assert!(releases_slot(
+            Some((StepStatus::Running, Some(agent))),
+            agent
+        ));
+    }
+
+    #[test]
+    fn a_late_report_does_not_give_back_a_slot_it_no_longer_holds() {
+        // The lease moved to another agent. Releasing here would let the original agent
+        // take work beyond its cap while still running the step it was reporting on.
+        let old_agent = Uuid::new_v4();
+        let new_agent = Uuid::new_v4();
+        assert!(!releases_slot(
+            Some((StepStatus::Running, Some(new_agent))),
+            old_agent
+        ));
+    }
+
+    #[test]
+    fn a_report_for_an_already_finished_step_does_not_release_again() {
+        let agent = Uuid::new_v4();
+        for status in [
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ] {
+            assert!(
+                !releases_slot(Some((status, Some(agent))), agent),
+                "{status:?} already released its slot once"
+            );
+        }
     }
 
     // --- retry policy -----------------------------------------------------------------

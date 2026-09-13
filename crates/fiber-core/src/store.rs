@@ -371,6 +371,99 @@ impl Store {
         .await?)
     }
 
+    /// Runs of this project that an agent is currently holding a step of.
+    ///
+    /// Only these need cancelling before a project is deleted: cancelling is how an
+    /// agent is *told* to stop, and a queued or pending run has nobody to tell. Scanning
+    /// every non-terminal run instead would put an unbounded, attacker-sized loop of
+    /// per-run round trips inside one HTTP request.
+    pub async fn leased_run_ids_for_project(&self, project_id: Uuid) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT DISTINCT r.id FROM runs r
+               JOIN step_runs s ON s.run_id = r.id
+              WHERE r.project_id = $1
+                AND s.agent_id IS NOT NULL
+                AND s.status IN ('running', 'queued')",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Agents dedicated to this project. They are cascade-deleted with it, so their live
+    /// sockets must be dropped first.
+    pub async fn project_agent_ids(&self, project_id: Uuid) -> Result<Vec<Uuid>> {
+        Ok(
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE project_id = $1")
+                .bind(project_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// One page of this project's run ids, oldest first.
+    pub async fn run_ids_for_project(&self, project_id: Uuid, limit: i64) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM runs WHERE project_id = $1 ORDER BY created_at LIMIT $2",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Delete these runs and return the artifact blob paths they referenced.
+    ///
+    /// Both halves are one transaction, and the runs are locked before their artifact
+    /// rows are read. Reading the paths first and deleting afterwards leaves a window in
+    /// which an upload — a presigned PUT minted up to ten minutes earlier, say — inserts
+    /// an artifact row whose blob is then never seen again by anything. Holding the lock
+    /// makes that insert wait for the delete, which then removes it by cascade.
+    ///
+    /// The caller decides which of the returned paths are safe to remove; a retry shares
+    /// its predecessor's artifact rows, so a path here may still be referenced elsewhere.
+    pub async fn delete_runs_returning_artifact_paths(
+        &self,
+        run_ids: &[Uuid],
+    ) -> Result<Vec<String>> {
+        if run_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM runs WHERE id = ANY($1) FOR UPDATE")
+            .bind(run_ids)
+            .execute(&mut *tx)
+            .await?;
+        // `path <> ''` matches retention's guard: an empty path is not a blob, and
+        // handing one to the artifact backend asks it to delete the store's root.
+        let paths = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT path FROM artifacts WHERE run_id = ANY($1) AND path <> ''",
+        )
+        .bind(run_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM runs WHERE id = ANY($1)")
+            .bind(run_ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(paths)
+    }
+
+    /// Delete a project and whatever is left hanging off it. `false` means no such project.
+    ///
+    /// Callers delete the runs in batches first — this statement's cascade is otherwise
+    /// unbounded. What remains here is small and fixed per project: pipelines, members,
+    /// secrets, the webhook secret, durable fibers, and project-scoped agents, by
+    /// `ON DELETE CASCADE` (migrations 001, 002, 004).
+    pub async fn delete_project(&self, project_id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn get_project_by_slug(&self, slug: &str) -> Result<Option<Project>> {
         Ok(sqlx::query_as::<_, Project>(
             "SELECT id, name, slug, created_at FROM projects WHERE slug = $1",

@@ -173,7 +173,7 @@ fn partition_retention_rows(
 /// blob: deleting by run alone would break the surviving run's download. Anything still
 /// referenced is kept, and an empty `still_referenced` means everything goes — which is
 /// why the caller must distinguish "nothing references these" from "the query failed".
-fn unreferenced_blobs<'a>(
+pub(crate) fn unreferenced_blobs<'a>(
     candidates: &'a BTreeSet<String>,
     still_referenced: &[String],
 ) -> Vec<&'a String> {

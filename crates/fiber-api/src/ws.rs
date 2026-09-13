@@ -454,13 +454,18 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                 }
                 info!(%agent_id, %name, ?labels, "agent hello");
                 // Reload from DB so pool scope is authoritative (not client-supplied).
-                let project_id = state
-                    .store
-                    .get_agent(agent_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|a| a.project_id);
+                // A missing row ends the session rather than defaulting: `.flatten()`
+                // into `and_then(project_id)` made "agent deleted" indistinguishable from
+                // "global agent", so a deleted project-scoped agent would re-register
+                // itself into the *global* pool — and the global pool is offered every
+                // project's steps, with their secrets.
+                let Ok(Some(agent_row)) = state.store.get_agent(agent_id).await else {
+                    let _ = tx.send(ServerMessage::Error {
+                        message: "agent no longer exists".into(),
+                    });
+                    break;
+                };
+                let project_id = agent_row.project_id;
                 state
                     .scheduler
                     .register_agent(agent_id, labels, concurrency, project_id)
