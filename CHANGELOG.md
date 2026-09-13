@@ -49,6 +49,19 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **The smokes clean up after themselves.** `smoke-pools` and `smoke-s3` delete the
+  projects they create, and the path-filter half of `smoke-artifacts` now runs in a
+  project of its own instead of adding a `paths-test` pipeline to the seeded showcase on
+  every run — one instance had reached 31 of them, so a single webhook started 31 runs
+  and the assertions had to settle for "ours is somewhere in the set". They are now
+  equalities, and the smoke no longer leaves a webhook secret on showcase. A *failing*
+  smoke keeps its project: the pipelines, runs and logs inside are the only record of
+  what went wrong.
+- **`make smoke` runs `smoke-pools` last.** It terminates every `fiber-agent` on the host
+  before starting its own, so running it second left `smoke-artifacts` with no agent and
+  the combined target failed every time. `smoke-artifacts` now also checks for an online
+  agent up front and says so, rather than waiting ninety seconds to report
+  `run failed: running`.
 - **`apps/web` is now `apps/ui`.** The directory, the package, the Docker image and its
   `Dockerfile.ui`, the `fiber-ui` Compose service, the `FIBER_UI_BIND` variable, the CI job,
   and `make ui` (was `make web`). A deployment pinned to `FIBER_WEB_BIND` or driving the

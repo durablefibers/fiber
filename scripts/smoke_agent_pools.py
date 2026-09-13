@@ -84,6 +84,21 @@ def start_agent(token: str, name: str, log_path: str) -> subprocess.Popen:
     )
 
 
+def drop_projects(token: str, project_ids: list[str]) -> None:
+    """Delete the projects this run created, so repeated smokes do not pile up.
+
+    Only on a pass. A failed smoke leaves them behind on purpose: the project is the
+    only record of what happened, and deleting it takes the pipelines, runs, logs and
+    artifacts needed to work out why with it.
+    """
+    for pid in project_ids:
+        code, body = req("DELETE", f"/api/projects/{pid}", token=token)
+        if code == 200:
+            print(f"cleaned up project {pid}")
+        else:
+            print(f"WARN  could not delete project {pid}: {code} {body}")
+
+
 def main() -> int:
     code, ready = req("GET", "/ready")
     check("ready", code == 200 and ready.get("ok") is True, ready)
@@ -251,7 +266,9 @@ def main() -> int:
     print("---")
     if FAILS:
         print(f"SMOKE_FAIL failures={FAILS}")
+        print(f"kept projects for inspection: {pid_a} {pid_b}")
         return 1
+    drop_projects(admin, [pid_a, pid_b])
     print("SMOKE_OK agent-pools")
     return 0
 

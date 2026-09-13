@@ -24,7 +24,7 @@ help:
 	@echo "  login         fiber-cli login (writes ~/.fiber/token)"
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
-	@echo "  smoke         All smoke scripts (authz, pools, artifacts, s3)"
+	@echo "  smoke         authz + artifacts + pools (needs an agent; pools kills them last)"
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
@@ -115,5 +115,7 @@ smoke-s3:
 smoke-compose:
 	bash scripts/smoke_compose.sh
 
-smoke: smoke-authz smoke-pools smoke-artifacts
+# Order matters: smoke-pools terminates every fiber-agent on the host before starting
+# its own, so anything needing the agent you already have must run before it.
+smoke: smoke-authz smoke-artifacts smoke-pools
 	@echo "Run smoke-s3 / smoke-compose separately as needed"
