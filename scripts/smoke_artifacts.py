@@ -40,6 +40,17 @@ def main() -> None:
     login = req("POST", "/api/auth/login", body={"username": "admin", "password": "fiber"})
     token = login["token"]
 
+    # This smoke drives a real pipeline, so it needs an agent already online — it does
+    # not start one. Without this check the failure is a 90-second wait ending in
+    # "run failed: running", which says nothing about the cause.
+    agents = req("GET", "/api/agents", token=token)
+    online = [a for a in agents if a.get("online")]
+    assert online, (
+        "no agent is online; start one (see docs/development.md) before smoke-artifacts. "
+        "Note `make smoke-pools` terminates every agent on the host."
+    )
+    print("agents online", [a.get("name") for a in online])
+
     projects = req("GET", "/api/projects", token=token)
     project = next(p for p in projects if p.get("slug") == "showcase" or "showcase" in p.get("name", "").lower())
     pid = project["id"]
@@ -76,10 +87,22 @@ def main() -> None:
     print("artifacts", json.dumps(arts, indent=2))
     print("FINAL", status)
 
-    # Path filter pipeline
+    # Path filters get a project of their own. Creating the pipeline in the seeded
+    # showcase left one behind on every run — a well-used instance ended up firing 31
+    # pipelines per webhook — and set a webhook secret on showcase that nothing removed.
+    # A dedicated project also makes the assertions exact instead of "is ours in the set".
+    paths_project = req(
+        "POST",
+        "/api/projects",
+        token=token,
+        body={"name": "Paths Smoke", "slug": f"paths-smoke-{int(time.time())}"},
+    )
+    paths_pid = paths_project["id"]
+    print("paths project", paths_pid)
+
     created = req(
         "POST",
-        f"/api/projects/{pid}/pipelines",
+        f"/api/projects/{paths_pid}/pipelines",
         token=token,
         body={
             "name": "paths-test",
@@ -126,7 +149,7 @@ def main() -> None:
         if secret is not None:
             h["X-Hub-Signature-256"] = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
         r = urllib.request.Request(
-            API + f"/api/projects/{pid}/webhooks/github", data=raw, headers={"Content-Type": "application/json", **h}, method="POST"
+            API + f"/api/projects/{paths_pid}/webhooks/github", data=raw, headers={"Content-Type": "application/json", **h}, method="POST"
         )
         try:
             with urllib.request.urlopen(r, timeout=30) as resp:
@@ -137,7 +160,7 @@ def main() -> None:
     code, _ = webhook(rust)
     assert code == 401, f"unsigned webhook should be rejected before a secret is set, got {code}"
     wh_secret = "smoke-webhook-secret"
-    req("PUT", f"/api/projects/{pid}/webhooks/github", token=token, body={"secret": wh_secret})
+    req("PUT", f"/api/projects/{paths_pid}/webhooks/github", token=token, body={"secret": wh_secret})
     code, _ = webhook(rust)
     assert code == 401, f"unsigned webhook should be rejected once a secret is set, got {code}"
     code, _ = webhook(rust, secret="wrong-secret")
@@ -161,8 +184,10 @@ def main() -> None:
     rust_pipes = set(pipeline_ids_for_runs(r2.get("started", [])))
     print("md pipelines", md_pipes)
     print("rust pipelines", rust_pipes)
-    assert paths_id not in md_pipes, "paths-test should NOT fire on README-only push"
-    assert paths_id in rust_pipes, "paths-test should fire on src/** push"
+    # The project holds exactly one pipeline, so these are equalities rather than
+    # "ours is somewhere in the set".
+    assert md_pipes == set(), f"README-only push should start nothing, started {md_pipes}"
+    assert rust_pipes == {paths_id}, f"src/** push should start only paths-test, started {rust_pipes}"
     assert status == "succeeded", f"run failed: {status}"
     names = {a.get("name") for a in arts}
     assert names & {"out/VERSION", "out/release.tar", "out/release.tar.sig"} or any(
@@ -183,6 +208,12 @@ def main() -> None:
     print(f"log_hits restore={restore_hits} upload={upload_hits}")
     assert upload_hits >= 2, "expected HTTP uploads from build/sign"
     assert restore_hits >= 1, "expected at least one restore after workspace wipe"
+
+    # Only on a pass: a failed smoke keeps its project, because the pipelines, runs and
+    # logs inside it are the only record of what went wrong. Every assert above raises,
+    # so reaching here means the run was green.
+    deleted = req("DELETE", f"/api/projects/{paths_pid}", token=token)
+    print("cleaned up paths project", paths_pid, deleted)
     print("SMOKE_OK")
 
 

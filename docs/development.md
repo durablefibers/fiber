@@ -33,7 +33,7 @@ make validate      # examples/fiber.yml
 make check         # fmt --check + clippy -D warnings
 make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace + apps/ui vitest
-make smoke           # authz + pools + artifacts smokes
+make smoke           # authz + artifacts + pools (pools last: it kills every agent)
 make smoke-s3        # MinIO presign (api-s3 running)
 make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
 make ready         # GET /ready

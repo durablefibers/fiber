@@ -27,9 +27,11 @@ curl -sf -m 1 http://127.0.0.1:18080/ready >/dev/null 2>&1 && echo "api: ready" 
 | `make smoke-artifacts` | artifact upload/restore, path filters | infra + API + running agent |
 | `make smoke-s3` | MinIO presign upload/restore/download | `make infra-minio`, `make api-s3`, built agent |
 | `make smoke-compose` | full `up --build` | Docker, ports free |
-| `make smoke` | authz + pools + artifacts | infra + API + agent |
+| `make smoke` | authz + artifacts + pools, in that order | infra + API + agent |
 
 **Pass means the literal string `SMOKE_OK` on stdout.** A zero exit without that marker is a failure.
+
+A passing smoke deletes the projects it created; a failing one keeps them, because the pipelines, runs and logs inside are the only record of what went wrong. `smoke-pools` runs last in `make smoke` because it terminates every `fiber-agent` on the host before starting its own.
 
 ## Triage order
 

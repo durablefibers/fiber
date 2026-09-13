@@ -80,6 +80,16 @@ def start_agent(agent_token: str) -> subprocess.Popen:
     )
 
 
+def drop_projects(token: str, project_ids: list[str]) -> None:
+    """Delete the projects this run created. Only on a pass — see smoke_agent_pools."""
+    for pid in project_ids:
+        code, body = req("DELETE", f"/api/projects/{pid}", token=token)
+        if code == 200:
+            print(f"cleaned up project {pid}")
+        else:
+            print(f"WARN  could not delete project {pid}: {code} {body}")
+
+
 def main() -> int:
     code, ready = req("GET", "/ready")
     check("ready", code == 200 and ready.get("ok") is True, ready)
@@ -286,7 +296,9 @@ def main() -> int:
     print("---")
     if FAILS:
         print(f"SMOKE_FAIL failures={FAILS}")
+        print(f"kept project for inspection: {pid}")
         return 1
+    drop_projects(admin, [pid])
     print("SMOKE_OK s3-presign")
     return 0
 
