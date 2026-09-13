@@ -60,11 +60,11 @@ A change is incomplete without these:
 
 ## 4. End-to-end when the change warrants it
 
-Unit tests do not cover the API, scheduler, agent, or artifact path. For changes there, run the relevant dogfood smoke and confirm `DOGFOOD_OK` — see the `fiber-dogfood` skill.
+Unit tests do not cover the API, scheduler, agent, or artifact path. For changes there, run the relevant smoke script and confirm `SMOKE_OK` — see the `fiber-smoke` skill.
 
 ## 5. Commit
 
-Only when asked. Branch first if on `main`. Message: what changed and why, in the imperative, matching the existing log style (`Ship Compose dogfood, run attempt UX, and ops backup notes.`).
+Only when asked. Branch first if on `main`. Message: what changed and why, in the imperative, matching the existing log style (`Ship Compose smoke, run attempt UX, and ops backup notes.`).
 
 ## Report honestly
 

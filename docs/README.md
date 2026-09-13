@@ -16,7 +16,7 @@ Self-hosted, canvas-first CI. Rust control plane (`fiber-api`), agents (`fiber-a
 | [Durable fibers](./durable-fibers.md) | Control-plane `step` / `stash` / `sleep` tasks |
 | [Configuration](./configuration.md) | Environment variables |
 | [HTTP & WebSocket API](./api.md) | Routes and auth |
-| [Operations](./operations.md) | Health, retention, OTel, dogfood |
+| [Operations](./operations.md) | Health, retention, OTel, smokes |
 | [Roadmap](./roadmap.md) | Later: GitLab, Vault/OIDC, cloud agents, plugins |
 
 Product overview and quick start also live in the root [README](../README.md). Examples: [`examples/`](../examples/).

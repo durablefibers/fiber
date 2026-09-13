@@ -290,17 +290,17 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `FIBER_OTEL_ENDPOINT` to an OTLP HTTP colle
 
 Agent presence (labels, concurrency, in-flight counts) is per replica: an agent is offered steps by the replica it is connected to. Redis is not a queue — queued steps live in Postgres and are pulled on each agent heartbeat.
 
-## Dogfood scripts
+## Smoke scripts
 
 ```bash
-python3 scripts/dogfood_authz_agents.py   # roles + agent CRUD/rotate
-python3 scripts/dogfood_agent_pools.py    # project-scoped vs global agents
-python3 scripts/dogfood_artifacts.py      # artifacts + path filters
-python3 scripts/dogfood_s3_presign.py     # MinIO presign upload/restore/download
-bash scripts/dogfood_compose.sh           # full compose up --build smoke
+python3 scripts/smoke_authz_agents.py   # roles + agent CRUD/rotate
+python3 scripts/smoke_agent_pools.py    # project-scoped vs global agents
+python3 scripts/smoke_artifacts.py      # artifacts + path filters
+python3 scripts/smoke_s3_presign.py     # MinIO presign upload/restore/download
+bash scripts/smoke_compose.sh           # full compose up --build smoke
 ```
 
-Expect `DOGFOOD_OK` on success.
+Expect `SMOKE_OK` on success.
 
 ## Backups
 

@@ -28,11 +28,11 @@ Changes to the API, scheduler, agent, or artifact path are not covered by unit t
 the end-to-end smokes against a live stack instead:
 
 ```bash
-make dogfood            # authz, agent pools, artifacts
-make dogfood-compose    # the whole stack, including a pipeline on a containerised agent
+make smoke            # authz, agent pools, artifacts
+make smoke-compose    # the whole stack, including a pipeline on a containerised agent
 ```
 
-They print `DOGFOOD_OK`. A change that touches execution and has not been through one of
+They print `SMOKE_OK`. A change that touches execution and has not been through one of
 them is not finished.
 
 ## Things that will get a patch sent back

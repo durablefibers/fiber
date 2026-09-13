@@ -40,4 +40,4 @@ Ports are deliberately non-default to avoid colliding with whatever else is on t
 
 ## Finish
 
-Validate what you can actually run: `docker compose -f deploy/docker-compose.yml config` for Compose edits, `make check` for anything touching Rust build flags. For a full smoke, `bash scripts/dogfood_compose.sh` (prints `DOGFOOD_OK`) — it does a real `up --build`, so say so before starting it.
+Validate what you can actually run: `docker compose -f deploy/docker-compose.yml config` for Compose edits, `make check` for anything touching Rust build flags. For a full smoke, `bash scripts/smoke_compose.sh` (prints `SMOKE_OK`) — it does a real `up --build`, so say so before starting it.

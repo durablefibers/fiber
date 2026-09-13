@@ -97,8 +97,8 @@ fi
 
 echo "---"
 if [[ $FAILS -gt 0 ]]; then
-  echo "DOGFOOD_FAIL compose failures=$FAILS"
+  echo "SMOKE_FAIL compose failures=$FAILS"
   exit 1
 fi
-echo "DOGFOOD_OK compose"
+echo "SMOKE_OK compose"
 exit 0

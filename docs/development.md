@@ -33,9 +33,9 @@ make validate      # examples/fiber.yml
 make check         # fmt --check + clippy -D warnings
 make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace + apps/web vitest
-make dogfood       # authz + pools + artifacts smokes
-make dogfood-compose  # full Compose stack incl. a real pipeline on the containerised agent
-make dogfood-s3    # MinIO presign (api-s3 running)
+make smoke           # authz + pools + artifacts smokes
+make smoke-s3        # MinIO presign (api-s3 running)
+make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
 make ready         # GET /ready
 ```
 
@@ -62,7 +62,7 @@ Product prefix is **`fiber`** / `FIBER_*` — see `.claude/rules/naming.md`. Nev
 | `crates/fiber-*` | Control plane, agent, CLI, durable runtime |
 | `apps/web` | TanStack Start UI |
 | `deploy/` | Compose + Dockerfiles |
-| `scripts/` | Dogfood smokes + `dev-env.sh` |
+| `scripts/` | Smoke scripts + `dev-env.sh` |
 | `docs/` | User + ops docs |
 | `examples/` | Sample `fiber.yml` |
 
@@ -80,4 +80,4 @@ Web unit tests live next to their modules as `src/**/*.test.ts(x)` and run under
 
 ## Agent tips
 
-Prefer `make` / `scripts/dev-env.sh` over ad-hoc env in shell one-liners. Do **not** `pkill -f fiber-agent` — that can match parent shells whose argv mentions the binary; kill by PID of `./target/debug/fiber-agent` only (see dogfood scripts).
+Prefer `make` / `scripts/dev-env.sh` over ad-hoc env in shell one-liners. Do **not** `pkill -f fiber-agent` — that can match parent shells whose argv mentions the binary; kill by PID of `./target/debug/fiber-agent` only (see smoke scripts).

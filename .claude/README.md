@@ -32,7 +32,7 @@ Claude loads a skill when the task matches its description; you can also invoke 
 | `fiber-durable-task` | Writing `fiber-durable` tasks; step/stash/sleep and checkpoint semantics |
 | `fiber-agent-protocol` | Changing `fiber-proto` without breaking deployed agents |
 | `fiber-security-review` | The security checklist, tuned to a CI system that runs untrusted code by design |
-| `fiber-dogfood` | Running the smokes and triaging failures to a crate |
+| `fiber-smoke` | Running the smokes and triaging failures to a crate |
 | `fiber-docs-sync` | Auditing `docs/` against the code that is its source of truth |
 | `fiber-ops-runbook` | Operating a live deployment: health, retention, OTel, stuck runs, backups |
 
@@ -47,7 +47,7 @@ Delegate work that needs its own context. Claude routes on the `description`, or
 | `fiber-migration-engineer` | inherit | Schema changes: migration + model + store query |
 | `fiber-devops` | inherit | Compose, Dockerfiles, CI workflow, ports, deploys |
 | `fiber-docs-syncer` | inherit | Fixes docs drift against the code |
-| `fiber-dogfood-runner` | inherit | Runs the smokes, triages to a cause |
+| `fiber-smoke-runner` | inherit | Runs the smokes, triages to a cause |
 | `fiber-reviewer` | opus | Reviews a diff against the real invariants (read-only) |
 | `fiber-security-reviewer` | opus | Auth, secrets, tokens, webhooks, artifacts (read-only) |
 | `fiber-dx-reviewer` | sonnet | Onboarding friction and the five files that drift (read-only) |

@@ -69,7 +69,7 @@ def start_agent(token: str, name: str, log_path: str) -> subprocess.Popen:
             "FIBER_AGENT_TOKEN": token,
             "FIBER_API_URL": "ws://127.0.0.1:18080",
             "FIBER_AGENT_USE_DOCKER": "false",
-            "FIBER_AGENT_LABELS": "os=linux,pool=dogfood",
+            "FIBER_AGENT_LABELS": "os=linux,pool=smoke",
             "FIBER_AGENT_NAME": name,
             "FIBER_AGENT_WORKSPACE_DIR": os.path.join(ROOT, "data", "workspaces"),
         }
@@ -119,7 +119,7 @@ def main() -> int:
                 "name": "hi",
                 "needs": [],
                 "run": "echo pool-ok",
-                "labels": ["os=linux", "pool=dogfood"],
+                "labels": ["os=linux", "pool=smoke"],
             }
         ],
     }
@@ -145,7 +145,7 @@ def main() -> int:
         token=admin,
         body={
             "name": "scoped-a",
-            "labels": ["os=linux", "pool=dogfood"],
+            "labels": ["os=linux", "pool=smoke"],
             "concurrency": 1,
             "project_id": pid_a,
         },
@@ -220,7 +220,7 @@ def main() -> int:
         token=admin,
         body={
             "name": "global-pool",
-            "labels": ["os=linux", "pool=dogfood"],
+            "labels": ["os=linux", "pool=smoke"],
             "concurrency": 1,
         },
     )
@@ -250,9 +250,9 @@ def main() -> int:
 
     print("---")
     if FAILS:
-        print(f"DOGFOOD_FAIL failures={FAILS}")
+        print(f"SMOKE_FAIL failures={FAILS}")
         return 1
-    print("DOGFOOD_OK agent-pools")
+    print("SMOKE_OK agent-pools")
     return 0
 
 

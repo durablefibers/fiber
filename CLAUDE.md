@@ -39,12 +39,12 @@ cd apps/web && pnpm test                  # vitest (src/**/*.test.ts, jsdom)
 cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # what CI runs for the web app
 ```
 
-End-to-end coverage is the **dogfood smokes**, not integration tests — they drive the live API and print `DOGFOOD_OK`:
+End-to-end coverage is the **smoke scripts**, not integration tests — they drive the live API and print `SMOKE_OK`:
 
 ```bash
-make dogfood                # authz + agent pools + artifacts (needs infra + api running)
-make dogfood-s3             # needs infra-minio + api-s3 + a built fiber-agent
-make dogfood-compose        # full `compose up --build` smoke
+make smoke                # authz + agent pools + artifacts (needs infra + api running)
+make smoke-s3             # needs infra-minio + api-s3 + a built fiber-agent
+make smoke-compose        # full `compose up --build` smoke
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy (`-D warnings`), `cargo test --workspace`, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`, `apps/web` Biome + `tsc --noEmit` + vitest + `pnpm build`, and a `docker build` of both images.
@@ -83,7 +83,7 @@ Start run snapshots the pipeline definition onto the run (immutable for that exe
 
 - Adding schema: new numbered file in `crates/fiber-core/migrations/` (never edit an applied one); it runs on `fiber-api` boot.
 - `collapsible_if` is workspace-allowed in clippy — edition 2024 let-chains make it noisy on protocol code.
-- Never `pkill -f fiber-agent`: it matches parent shells whose argv mentions the binary path. Kill by PID of `./target/debug/fiber-agent` (see the dogfood scripts).
+- Never `pkill -f fiber-agent`: it matches parent shells whose argv mentions the binary path. Kill by PID of `./target/debug/fiber-agent` (see the smoke scripts).
 - Postgres in Compose is 17-alpine; upgrading from a 16 volume requires `down -v`.
 - `data/` holds local dev artifacts and agent git workspaces — generated, not source.
 - Secrets are encrypted at rest only when `FIBER_SECRETS_KEY` (64 hex chars) is set: `openssl rand -hex 32`.

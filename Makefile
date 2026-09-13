@@ -1,5 +1,5 @@
 .PHONY: help infra infra-minio down api api-s3 agent web cli build images check fmt fmt-check clippy test test-rust test-web \
-	dogfood dogfood-authz dogfood-pools dogfood-artifacts dogfood-s3 dogfood-compose \
+	smoke smoke-authz smoke-pools smoke-artifacts smoke-s3 smoke-compose \
 	login validate ready
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
@@ -24,8 +24,8 @@ help:
 	@echo "  login         fiber-cli login (writes ~/.fiber/token)"
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
-	@echo "  dogfood       All smoke scripts (authz, pools, artifacts, s3)"
-	@echo "  dogfood-compose  Full Compose stack + a pipeline on the containerised agent"
+	@echo "  smoke         All smoke scripts (authz, pools, artifacts, s3)"
+	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
 	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; web biome + tsc + vitest + build; docker build)"
@@ -99,21 +99,21 @@ validate:
 ready:
 	@curl -sf http://127.0.0.1:18080/ready | python3 -m json.tool
 
-dogfood-authz:
-	python3 scripts/dogfood_authz_agents.py
+smoke-authz:
+	python3 scripts/smoke_authz_agents.py
 
-dogfood-pools:
-	python3 scripts/dogfood_agent_pools.py
+smoke-pools:
+	python3 scripts/smoke_agent_pools.py
 
-dogfood-artifacts:
-	python3 scripts/dogfood_artifacts.py
+smoke-artifacts:
+	python3 scripts/smoke_artifacts.py
 
-dogfood-s3:
+smoke-s3:
 	@echo "Requires: make infra-minio && make api-s3 (in another terminal) + a built fiber-agent"
-	python3 scripts/dogfood_s3_presign.py
+	python3 scripts/smoke_s3_presign.py
 
-dogfood-compose:
-	bash scripts/dogfood_compose.sh
+smoke-compose:
+	bash scripts/smoke_compose.sh
 
-dogfood: dogfood-authz dogfood-pools dogfood-artifacts
-	@echo "Run dogfood-s3 / dogfood-compose separately as needed"
+smoke: smoke-authz smoke-pools smoke-artifacts
+	@echo "Run smoke-s3 / smoke-compose separately as needed"

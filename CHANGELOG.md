@@ -14,6 +14,17 @@ minor versions may carry breaking changes.
   looks: one sleeping for a month is waiting, not stale, and deleting it would silently
   cancel scheduled work.
 
+### Changed
+
+- **The end-to-end scripts are "smokes", not "dogfood".** `scripts/dogfood_*` are now
+  `scripts/smoke_*`, `make dogfood` is `make smoke` (and `dogfood-authz` … `dogfood-compose`
+  are `smoke-authz` … `smoke-compose`), the CI job is `smoke`, and the scripts print
+  `SMOKE_OK` / `SMOKE_FAIL` instead of `DOGFOOD_OK` / `DOGFOOD_FAIL`. The scripts smoke-test
+  a local stack; they were never dogfooding, which is a different thing this project also
+  does — running Fiber against its own repository, still described under that name in
+  [docs/triggers.md](./docs/triggers.md#dogfooding-this-repo). Anything scripted against the
+  old target or marker names needs updating.
+
 ### Fixed
 
 - **Retention did nothing but purge sessions when `FIBER_RETENTION_DAYS=0`.** The disabled
