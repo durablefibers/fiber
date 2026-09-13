@@ -2,6 +2,7 @@ import { Link, useRouter, useRouterState } from "@tanstack/react-router"
 import {
   Activity,
   Box,
+  Boxes,
   FolderKanban,
   ListChecks,
   LogOut,
@@ -33,7 +34,13 @@ import { api, setToken } from "@/lib/api"
 const SIDEBAR_COOKIE = "sidebar_state"
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 
-function readSidebarOpen(fallback = true): boolean {
+/**
+ * The rail is the resting state. Fiber is canvas-first, and 16rem of chrome is 16rem the
+ * DAG does not get; the nav is somewhere you pass through, not somewhere you work.
+ */
+const SIDEBAR_DEFAULT_OPEN = false
+
+function readSidebarOpen(fallback = SIDEBAR_DEFAULT_OPEN): boolean {
   if (typeof document === "undefined") return fallback
   try {
     const stored = localStorage.getItem(SIDEBAR_COOKIE)
@@ -57,9 +64,19 @@ function writeSidebarOpen(open: boolean) {
   }
 }
 
+/**
+ * Collapsed, a nav item is one 16px glyph on near-black and the default neutral
+ * `bg-sidebar-accent` barely registers. Tinting the mark itself is what reads at rail
+ * width — the shell owns its own emphasis; the shared primitive keeps its neutral default.
+ */
+const ACTIVE_ITEM =
+  "data-active:bg-sky-500/12 data-active:text-sky-100 data-active:[&_svg]:text-sky-400"
+
 const links = [
   { to: "/", label: "Projects", icon: FolderKanban },
-  { to: "/agents", label: "Agents", icon: Box },
+  // `Boxes` for the shared pool, `Box` for a single project's agents below: collapsed,
+  // the label is gone and one repeated glyph in the same column is unreadable.
+  { to: "/agents", label: "Agents", icon: Boxes },
   { to: "/settings", label: "Settings", icon: Settings },
 ] as const
 
@@ -74,10 +91,20 @@ export function AppShell({
 }) {
   const router = useRouter()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  // Start from the default on both sides of hydration, then restore a stored preference
+  // that differs. Reading storage in the initializer looks tidier and does not work: this
+  // route is server-rendered, the server has no `document` so it emits the default, and
+  // React hydrates that markup without re-patching the attribute — the client's "correct"
+  // first value is discarded silently. Changing it after mount is what actually commits.
+  //
+  // So one frame of correction is unavoidable for anyone whose preference differs from
+  // the default. Making the rail the default is what shrinks that to the people who
+  // deliberately opened the sidebar, instead of everyone who ever closed it.
+  const [sidebarOpen, setSidebarOpen] = useState(SIDEBAR_DEFAULT_OPEN)
 
   useEffect(() => {
-    setSidebarOpen(readSidebarOpen(true))
+    const stored = readSidebarOpen()
+    setSidebarOpen((current) => (current === stored ? current : stored))
   }, [])
 
   const onSidebarOpenChange = (open: boolean) => {
@@ -143,6 +170,7 @@ export function AppShell({
                         <SidebarMenuButton
                           tooltip={l.label}
                           isActive={isActive}
+                          className={ACTIVE_ITEM}
                           render={<Link to={l.to} />}
                         >
                           <l.icon />
@@ -156,8 +184,12 @@ export function AppShell({
             </SidebarGroup>
 
             {projectId ? (
-              <SidebarGroup>
-                <SidebarGroupLabel>
+              // Collapsed, `SidebarGroupLabel` fades to nothing, and the two groups read
+              // as one undifferentiated column of glyphs — with no way to tell an
+              // instance-wide destination from a project-scoped one. The rule is the
+              // label's stand-in, so it appears exactly when the label cannot.
+              <SidebarGroup className="group-data-[collapsible=icon]:mt-1 group-data-[collapsible=icon]:border-sidebar-border/60 group-data-[collapsible=icon]:border-t group-data-[collapsible=icon]:pt-2">
+                <SidebarGroupLabel className="truncate">
                   {projectName ?? "Project"}
                 </SidebarGroupLabel>
                 <SidebarGroupContent>
@@ -165,6 +197,7 @@ export function AppShell({
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         tooltip="Overview"
+                        className={ACTIVE_ITEM}
                         isActive={
                           pathname === `/p/${projectId}` ||
                           pathname === `/p/${projectId}/`
@@ -180,6 +213,7 @@ export function AppShell({
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         tooltip="Runs"
+                        className={ACTIVE_ITEM}
                         isActive={pathname.startsWith(`/p/${projectId}/runs`)}
                         render={
                           <Link
@@ -195,6 +229,7 @@ export function AppShell({
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         tooltip="Project agents"
+                        className={ACTIVE_ITEM}
                         isActive={pathname.startsWith(`/p/${projectId}/agents`)}
                         render={
                           <Link
@@ -210,6 +245,7 @@ export function AppShell({
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         tooltip="Durable fibers"
+                        className={ACTIVE_ITEM}
                         isActive={pathname.startsWith(`/p/${projectId}/fibers`)}
                         render={
                           <Link
@@ -225,6 +261,7 @@ export function AppShell({
                     <SidebarMenuItem>
                       <SidebarMenuButton
                         tooltip="Project settings"
+                        className={ACTIVE_ITEM}
                         isActive={pathname.startsWith(
                           `/p/${projectId}/settings`
                         )}
