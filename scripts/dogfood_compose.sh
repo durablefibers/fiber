@@ -42,11 +42,22 @@ else
   fail "api /health"
 fi
 
-CODE=$(curl -sf -o /dev/null -w "%{http_code}" http://127.0.0.1:3100/ || true)
+# Compose starts fiber-web only once fiber-api is healthy, so this check runs the
+# instant nginx's container appears — before it has bound the port. The API check above
+# retries and this one did not, which on a cold runner lost the race by ~50ms.
+CODE=000
+for i in $(seq 1 30); do
+  CODE=$(curl -sf -o /dev/null -w "%{http_code}" http://127.0.0.1:3100/ || true)
+  if [[ "$CODE" == "200" ]]; then
+    break
+  fi
+  sleep 2
+done
 if [[ "$CODE" == "200" ]]; then
   ok "web :3100 HTTP $CODE"
 else
   fail "web :3100 HTTP $CODE"
+  "${COMPOSE[@]}" logs --tail=40 fiber-web || true
 fi
 
 LOGIN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \

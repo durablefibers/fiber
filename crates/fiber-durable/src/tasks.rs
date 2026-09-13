@@ -75,7 +75,7 @@ impl FiberHandler for IntervalTask {
             })
             .await?;
 
-        let project_store = ctx.store().clone();
+        let project_store = ctx.persistence();
         let project_id = ctx.record.project_id;
         let input = ctx.input.clone();
         let next_id = ctx

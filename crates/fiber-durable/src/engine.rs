@@ -38,7 +38,7 @@ pub async fn run_fiber(
         return Ok(FiberOutcome::Failed);
     };
 
-    let mut ctx = FiberContext::new(record.clone(), store.clone());
+    let mut ctx = FiberContext::new(record.clone(), std::sync::Arc::new(store.clone()));
     let result = handler.run(&mut ctx).await;
     let mut record = ctx.record.clone();
     record.state = ctx.take_state();

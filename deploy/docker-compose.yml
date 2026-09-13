@@ -48,7 +48,10 @@ services:
 
   fiber-minio:
     networks: [backend]
-    image: minio/minio:latest
+    # quay.io, not Docker Hub: `minio/minio` there now refuses anonymous pulls with
+    # "pull access denied ... repository does not exist", so a machine without the image
+    # already cached — a new contributor, or CI — cannot bring the stack up at all.
+    image: quay.io/minio/minio:latest
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:

@@ -2511,3 +2511,165 @@ mod propagate_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! The run's definition snapshot governs its execution (convention 4). These helpers
+    //! are how the execution path reads it, so a bug here means a run behaves according to
+    //! something other than what it snapshotted.
+    use super::*;
+
+    fn steps(v: Value) -> Value {
+        v
+    }
+
+    #[test]
+    fn tolerated_steps_come_from_the_snapshot() {
+        let snap = steps(json!([
+            {"id": "a", "continue_on_error": true},
+            {"id": "b", "continue_on_error": false},
+            {"id": "c"},
+        ]));
+        let tolerated = snapshot_tolerated(&snap);
+        assert!(tolerated.contains("a"));
+        assert!(!tolerated.contains("b"), "explicit false is not tolerated");
+        assert!(!tolerated.contains("c"), "absent means not tolerated");
+    }
+
+    #[test]
+    fn a_non_boolean_continue_on_error_does_not_tolerate() {
+        // Only a real `true` tolerates a failure; a truthy-looking string must not.
+        let snap = steps(json!([
+            {"id": "a", "continue_on_error": "true"},
+            {"id": "b", "continue_on_error": 1},
+            {"id": "c", "continue_on_error": null},
+        ]));
+        assert!(snapshot_tolerated(&snap).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_snapshot_tolerates_nothing() {
+        // Failing open here would let a failure pass silently through a broken snapshot.
+        assert!(snapshot_tolerated(&json!({})).is_empty());
+        assert!(snapshot_tolerated(&json!(null)).is_empty());
+        assert!(snapshot_tolerated(&json!([{"no_id": true}])).is_empty());
+    }
+
+    #[test]
+    fn a_steps_if_and_env_are_read_from_its_snapshot_entry() {
+        let snap = steps(json!([
+            {"id": "a", "if": "always()", "env": [["K", "v"], ["K2", "v2"]]},
+            {"id": "b", "if": "never()"},
+        ]));
+        let (if_expr, env) = snapshot_step_if_env(&snap, "a");
+        assert_eq!(if_expr.as_deref(), Some("always()"));
+        assert_eq!(
+            env,
+            vec![
+                ("K".to_string(), "v".to_string()),
+                ("K2".to_string(), "v2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_matrix_binding_is_appended_after_env_so_it_wins() {
+        // compile-time precedence is pipeline < step env < matrix binding; the later
+        // entry is the one that survives being applied in order.
+        let snap = steps(json!([
+            {"id": "a", "env": [["os", "from-env"]], "matrix": {"os": "linux"}},
+        ]));
+        let (_, env) = snapshot_step_if_env(&snap, "a");
+        assert_eq!(
+            env,
+            vec![
+                ("os".to_string(), "from-env".to_string()),
+                ("os".to_string(), "linux".to_string()),
+            ],
+            "the matrix binding must come last"
+        );
+        assert_eq!(env.last().unwrap().1, "linux");
+    }
+
+    #[test]
+    fn an_unknown_step_id_yields_no_condition_and_no_env() {
+        let snap = steps(json!([{"id": "a", "if": "always()"}]));
+        assert_eq!(snapshot_step_if_env(&snap, "missing"), (None, vec![]));
+        assert_eq!(snapshot_step_if_env(&json!(null), "a"), (None, vec![]));
+    }
+
+    #[test]
+    fn malformed_env_entries_are_skipped_not_guessed_at() {
+        let snap = steps(json!([
+            {"id": "a", "env": [["K", "v"], ["only-one"], ["K2", 5], "not-a-pair"]},
+        ]));
+        let (_, env) = snapshot_step_if_env(&snap, "a");
+        assert_eq!(env, vec![("K".to_string(), "v".to_string())]);
+    }
+
+    #[test]
+    fn a_non_string_matrix_value_is_skipped() {
+        let snap = steps(json!([{"id": "a", "matrix": {"n": 3, "os": "linux"}}]));
+        let (_, env) = snapshot_step_if_env(&snap, "a");
+        assert_eq!(env, vec![("os".to_string(), "linux".to_string())]);
+    }
+
+    #[test]
+    fn the_status_column_spelling_matches_the_wire_spelling() {
+        // `status_str` is written by hand while the enum serialises itself via serde. If
+        // they drift, the database column and the JSON the UI receives disagree.
+        for s in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            assert_eq!(
+                json!(status_str(s)),
+                serde_json::to_value(s).unwrap(),
+                "{s:?}"
+            );
+        }
+        for s in [
+            StepStatus::Pending,
+            StepStatus::Queued,
+            StepStatus::Running,
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ] {
+            assert_eq!(
+                json!(step_status_str(s)),
+                serde_json::to_value(s).unwrap(),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_definition_is_read_from_either_stored_shape() {
+        // Older rows store `{"yaml": "..."}`; newer ones store the definition as JSON.
+        let from_json = value_to_definition(&json!({
+            "name": "p",
+            "steps": [{"id": "a", "name": "A", "run": "true"}],
+        }))
+        .unwrap();
+        assert_eq!(from_json.name, "p");
+        assert_eq!(from_json.steps.len(), 1);
+
+        let from_yaml = value_to_definition(&json!({
+            "yaml": "name: p\nsteps:\n  - id: a\n    name: A\n    run: 'true'\n",
+        }))
+        .unwrap();
+        assert_eq!(from_yaml.name, "p");
+        assert_eq!(from_yaml.steps.len(), 1);
+    }
+
+    #[test]
+    fn a_definition_that_is_neither_shape_is_an_error() {
+        assert!(value_to_definition(&json!({"nonsense": true})).is_err());
+        assert!(value_to_definition(&json!({"yaml": "steps: [oops"})).is_err());
+    }
+}

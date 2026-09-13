@@ -1024,9 +1024,16 @@ async fn wait_for_run(
 
 /// Succeeded exits 0; anything else exits 1, so `fiber run --wait` can gate a script.
 fn exit_for_run(status: &str) {
-    if status != "succeeded" {
+    if run_failed(status) {
         std::process::exit(EXIT_RUN_FAILED);
     }
+}
+
+/// Whether a finished run should make the CLI exit non-zero. Anything that is not a
+/// success is a failure for scripting purposes — a cancelled or skipped run must not look
+/// like a green build to a shell.
+fn run_failed(status: &str) -> bool {
+    status != "succeeded"
 }
 
 fn filename_from_disposition(resp: &reqwest::Response) -> Option<String> {
@@ -1035,6 +1042,15 @@ fn filename_from_disposition(resp: &reqwest::Response) -> Option<String> {
         .get(reqwest::header::CONTENT_DISPOSITION)?
         .to_str()
         .ok()?;
+    filename_from_disposition_value(raw)
+}
+
+/// The leaf filename in a `Content-Disposition` value, or `None` when there is not one.
+///
+/// The value comes from the server and is used as a local write path, so only the last
+/// path segment is kept: a header naming `../../etc/passwd` must download as `passwd` in
+/// the working directory and nowhere else.
+fn filename_from_disposition_value(raw: &str) -> Option<String> {
     let name = raw.split("filename=").nth(1)?.trim().trim_matches('"');
     let name = name.rsplit(['/', '\\']).next()?;
     (!name.is_empty()).then(|| name.to_string())
@@ -1092,26 +1108,39 @@ fn token_path() -> PathBuf {
 }
 
 fn dirs_token_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("HOME") {
-        return PathBuf::from(h).join(".fiber");
+    token_home_from(std::env::var_os("HOME"))
+}
+
+/// Where the saved session token lives, given `$HOME`. Falls back to a relative `.fiber`
+/// so a missing HOME does not put the credential somewhere surprising.
+fn token_home_from(home: Option<std::ffi::OsString>) -> PathBuf {
+    match home {
+        Some(h) => PathBuf::from(h).join(".fiber"),
+        None => PathBuf::from(".fiber"),
     }
-    PathBuf::from(".fiber")
 }
 
 fn save_token(token: &str) -> Result<()> {
+    save_token_in(&dirs_token_home(), token)
+}
+
+/// Write the session token into `dir`, creating it if needed.
+///
+/// Split from [`save_token`] so the permissions can be asserted against a temporary
+/// directory rather than the caller's real `$HOME`.
+fn save_token_in(dir: &std::path::Path, token: &str) -> Result<()> {
     use std::io::Write;
-    let dir = dirs_token_home();
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         // The session token is a bearer credential: private dir, private file.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         opts.mode(0o600);
     }
-    let mut f = opts.open(token_path())?;
+    let mut f = opts.open(dir.join("token"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1134,4 +1163,172 @@ fn read_stdin_line() -> Result<String> {
 
 fn load_token() -> Result<String> {
     Ok(std::fs::read_to_string(token_path())?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- artifact download filename ----------------------------------------------------
+
+    #[test]
+    fn a_plain_filename_is_taken_as_is() {
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=\"dist.tgz\"").as_deref(),
+            Some("dist.tgz")
+        );
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=dist.tgz").as_deref(),
+            Some("dist.tgz")
+        );
+    }
+
+    #[test]
+    fn only_the_leaf_of_a_traversing_filename_survives() {
+        // The header comes from the server and becomes a local write path. A download
+        // must never escape the working directory.
+        for raw in [
+            "attachment; filename=\"../../etc/passwd\"",
+            "attachment; filename=\"/etc/passwd\"",
+            "attachment; filename=\"..\\\\..\\\\windows\\\\system32\\\\evil.dll\"",
+        ] {
+            let name = filename_from_disposition_value(raw).expect("a leaf name");
+            assert!(!name.contains('/'), "{name} still contains a separator");
+            assert!(!name.contains('\\'), "{name} still contains a separator");
+            assert!(name != "etc" && !name.starts_with(".."), "{name}");
+        }
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=\"../../etc/passwd\"").as_deref(),
+            Some("passwd")
+        );
+    }
+
+    #[test]
+    fn a_header_without_a_filename_yields_nothing() {
+        // The caller then falls back to `<artifact_id>.bin`.
+        assert_eq!(filename_from_disposition_value("attachment"), None);
+        assert_eq!(filename_from_disposition_value(""), None);
+        assert_eq!(filename_from_disposition_value("inline"), None);
+    }
+
+    #[test]
+    fn an_empty_or_separator_only_filename_yields_nothing() {
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=\"\""),
+            None
+        );
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=/"),
+            None
+        );
+        assert_eq!(
+            filename_from_disposition_value("attachment; filename=\"foo/\""),
+            None
+        );
+    }
+
+    // --- exit status -------------------------------------------------------------------
+
+    #[test]
+    fn only_a_succeeded_run_is_a_zero_exit() {
+        assert!(!run_failed("succeeded"));
+        for status in [
+            "failed",
+            "cancelled",
+            "running",
+            "pending",
+            "queued",
+            "skipped",
+            "",
+        ] {
+            assert!(run_failed(status), "{status} must not look like success");
+        }
+    }
+
+    // --- token location ----------------------------------------------------------------
+
+    #[test]
+    fn the_token_lives_under_dot_fiber_in_home() {
+        assert_eq!(
+            token_home_from(Some("/home/someone".into())),
+            PathBuf::from("/home/someone/.fiber")
+        );
+    }
+
+    #[test]
+    fn a_missing_home_falls_back_to_a_relative_directory() {
+        assert_eq!(token_home_from(None), PathBuf::from(".fiber"));
+    }
+
+    // --- token file permissions --------------------------------------------------------
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fiber-cli-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn saving_a_token_writes_it_where_it_is_read_from() {
+        let dir = scratch("roundtrip");
+        save_token_in(&dir, "tok-abc").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("token")).unwrap(),
+            "tok-abc"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_save_replaces_rather_than_appends() {
+        // Without `truncate`, a shorter token would leave the tail of the old one behind
+        // and the file would no longer be a valid credential.
+        let dir = scratch("replace");
+        save_token_in(&dir, "a-very-long-token-value").unwrap();
+        save_token_in(&dir, "short").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("token")).unwrap(), "short");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("perms");
+        save_token_in(&dir, "tok").unwrap();
+
+        let file_mode = std::fs::metadata(dir.join("token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "the token is a bearer credential");
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "and so is the directory holding it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_left_world_readable_is_tightened_on_the_next_save() {
+        // A file created under an older umask (or an earlier version) must not stay
+        // readable once it is rewritten.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("tighten");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("token"), "old").unwrap();
+        std::fs::set_permissions(dir.join("token"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        save_token_in(&dir, "new").unwrap();
+
+        let mode = std::fs::metadata(dir.join("token"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a pre-existing loose file must be tightened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

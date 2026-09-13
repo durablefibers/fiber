@@ -50,7 +50,11 @@ run records `retry_of`, and its trigger is `retry:<original id>`.
 - Without it, every step runs again.
 
 Because a retry shares artifact blobs with the run it came from, retention deletes a blob
-only once no remaining run references its path.
+only once no remaining run references its path. If that reference check itself fails — a
+database hiccup mid-tick — retention keeps every blob for that tick and logs a warning,
+rather than assuming nothing references them. The cost is a blob that no run points at any
+more surviving on disk; the alternative was deleting one that a surviving retry still
+needs.
 
 ## Reading logs
 

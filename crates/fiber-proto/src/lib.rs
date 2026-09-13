@@ -311,3 +311,229 @@ pub enum RunEvent {
         at: DateTime<Utc>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every variant, so adding one without deciding its terminality fails to compile.
+    const ALL_STEP: [StepStatus; 7] = [
+        StepStatus::Pending,
+        StepStatus::Queued,
+        StepStatus::Running,
+        StepStatus::Succeeded,
+        StepStatus::Failed,
+        StepStatus::Cancelled,
+        StepStatus::Skipped,
+    ];
+    const ALL_RUN: [RunStatus; 5] = [
+        RunStatus::Pending,
+        RunStatus::Running,
+        RunStatus::Succeeded,
+        RunStatus::Failed,
+        RunStatus::Cancelled,
+    ];
+
+    #[test]
+    fn only_finished_step_statuses_are_terminal() {
+        for s in ALL_STEP {
+            let expected = !matches!(
+                s,
+                StepStatus::Pending | StepStatus::Queued | StepStatus::Running
+            );
+            assert_eq!(s.is_terminal(), expected, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn only_finished_run_statuses_are_terminal() {
+        for s in ALL_RUN {
+            let expected = !matches!(s, RunStatus::Pending | RunStatus::Running);
+            assert_eq!(s.is_terminal(), expected, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn status_wire_spellings_are_snake_case_and_stable() {
+        // apps/web/src/lib/api.ts compares against these strings by hand (convention 9);
+        // renaming a variant without updating it there is silent until runtime.
+        assert_eq!(
+            serde_json::to_value(StepStatus::Succeeded).unwrap(),
+            json!("succeeded")
+        );
+        assert_eq!(
+            serde_json::to_value(StepStatus::Cancelled).unwrap(),
+            json!("cancelled")
+        );
+        assert_eq!(
+            serde_json::to_value(StepStatus::Skipped).unwrap(),
+            json!("skipped")
+        );
+        assert_eq!(
+            serde_json::to_value(RunStatus::Pending).unwrap(),
+            json!("pending")
+        );
+        assert_eq!(
+            serde_json::from_value::<StepStatus>(json!("running")).unwrap(),
+            StepStatus::Running
+        );
+        // British spelling only: "canceled" is not accepted.
+        assert!(serde_json::from_value::<StepStatus>(json!("canceled")).is_err());
+    }
+
+    #[test]
+    fn agent_message_tags_are_stable() {
+        let hello = AgentMessage::Hello {
+            name: "agent-1".into(),
+            labels: vec!["os=linux".into()],
+            concurrency: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap()["type"],
+            json!("hello")
+        );
+
+        let complete = AgentMessage::StepComplete {
+            agent_id: Uuid::nil(),
+            step_run_id: Uuid::nil(),
+            status: StepStatus::Succeeded,
+            exit_code: Some(0),
+            error: None,
+        };
+        let v = serde_json::to_value(&complete).unwrap();
+        assert_eq!(v["type"], json!("step_complete"));
+        assert_eq!(v["status"], json!("succeeded"));
+    }
+
+    #[test]
+    fn server_message_tags_are_stable() {
+        assert_eq!(
+            serde_json::to_value(ServerMessage::Cancel {
+                step_run_id: Uuid::nil()
+            })
+            .unwrap()["type"],
+            json!("cancel")
+        );
+        assert_eq!(
+            serde_json::to_value(ServerMessage::Welcome {
+                agent_id: Uuid::nil()
+            })
+            .unwrap()["type"],
+            json!("welcome")
+        );
+    }
+
+    #[test]
+    fn run_event_tags_are_stable() {
+        // The UI event stream (/ws/runs/{id}) switches on these.
+        let v = serde_json::to_value(RunEvent::StepUpdated {
+            run_id: Uuid::nil(),
+            step_run_id: Uuid::nil(),
+            step_id: "build".into(),
+            status: StepStatus::Running,
+        })
+        .unwrap();
+        assert_eq!(v["type"], json!("step_updated"));
+        assert_eq!(
+            serde_json::to_value(RunEvent::RunUpdated {
+                run_id: Uuid::nil(),
+                status: RunStatus::Failed,
+            })
+            .unwrap()["type"],
+            json!("run_updated")
+        );
+    }
+
+    #[test]
+    fn an_offer_from_an_older_server_omits_the_newer_fields() {
+        // timeout_minutes / secret_keys / traceparent / working_directory / shell are all
+        // `#[serde(default)]` precisely so a mixed-version deploy keeps working.
+        let minimal = json!({
+            "type": "offer",
+            "step_run_id": Uuid::nil(),
+            "run_id": Uuid::nil(),
+            "step_id": "build",
+            "step_name": "Build",
+            "image": null,
+            "run": "make",
+            "workspace": null,
+            "env": [],
+        });
+        let msg: ServerMessage = serde_json::from_value(minimal).unwrap();
+        let ServerMessage::Offer {
+            timeout_minutes,
+            secret_keys,
+            traceparent,
+            working_directory,
+            shell,
+            artifacts,
+            restore,
+            ..
+        } = msg
+        else {
+            panic!("expected an offer");
+        };
+        assert_eq!(timeout_minutes, None);
+        assert!(secret_keys.is_empty());
+        assert_eq!(traceparent, None);
+        assert_eq!(working_directory, None);
+        assert_eq!(shell, None);
+        assert!(artifacts.is_empty());
+        assert!(restore.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_field_from_a_newer_peer_is_ignored_rather_than_fatal() {
+        let v = json!({
+            "type": "heartbeat",
+            "agent_id": Uuid::nil(),
+            "something_we_have_not_shipped_yet": 1,
+        });
+        assert!(serde_json::from_value::<AgentMessage>(v).is_ok());
+    }
+
+    #[test]
+    fn the_yaml_facing_renames_are_ref_and_if() {
+        // `ref` and `if` are Rust keywords; fiber.yml spells them plainly, and
+        // docs/pipeline-yaml.md documents them that way.
+        let ws: WorkspaceConfig =
+            serde_json::from_value(json!({"repo": "git@example.com:o/r.git", "ref": "main"}))
+                .unwrap();
+        assert_eq!(ws.git_ref.as_deref(), Some("main"));
+        assert_eq!(
+            serde_json::to_value(&ws).unwrap()["ref"],
+            json!("main"),
+            "must serialise back as `ref`, not `git_ref`"
+        );
+
+        let step: StepDefinition = serde_json::from_value(json!({
+            "id": "test", "name": "test", "if": "always()"
+        }))
+        .unwrap();
+        assert_eq!(step.if_expr.as_deref(), Some("always()"));
+        assert_eq!(
+            serde_json::to_value(&step).unwrap()["if"],
+            json!("always()")
+        );
+    }
+
+    #[test]
+    fn a_step_definition_needs_only_an_id_and_a_name() {
+        let step: StepDefinition = serde_json::from_value(json!({"id": "a", "name": "A"})).unwrap();
+        assert_eq!(step.retries, 0);
+        assert!(step.needs.is_empty());
+        assert!(!step.continue_on_error);
+        assert_eq!(step.run, None);
+        // None means "every project secret"; an empty Vec means none. The distinction is
+        // load-bearing, so it has to survive the default.
+        assert_eq!(step.secrets, None);
+    }
+
+    #[test]
+    fn an_empty_secrets_list_stays_distinct_from_an_absent_one() {
+        let named: StepDefinition =
+            serde_json::from_value(json!({"id": "a", "name": "A", "secrets": []})).unwrap();
+        assert_eq!(named.secrets, Some(vec![]));
+    }
+}

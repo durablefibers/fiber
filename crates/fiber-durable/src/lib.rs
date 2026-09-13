@@ -8,6 +8,7 @@ pub mod context;
 pub mod durability;
 pub mod engine;
 pub mod http_task;
+pub mod persistence;
 pub mod registry;
 pub mod scheduler;
 pub mod store;
@@ -17,10 +18,13 @@ pub mod types;
 pub use context::{FiberContext, FiberSuspended};
 pub use durability::Durability;
 pub use engine::{FiberOutcome, run_fiber};
+pub use persistence::FiberPersistence;
 pub use registry::FiberRegistry;
 pub use scheduler::FiberScheduler;
 pub use store::FiberStore;
 pub use types::{FiberRecord, FiberState, FiberStatus};
 
+#[cfg(test)]
+mod context_tests;
 #[cfg(test)]
 mod tests;

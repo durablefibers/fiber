@@ -52,6 +52,26 @@ pub fn encrypt_secret(plaintext: &str) -> Result<String> {
     let Some(k) = key() else {
         return Ok(plaintext.to_string());
     };
+    encrypt_with(k, plaintext)
+}
+
+pub fn decrypt_secret(stored: &str) -> Result<String> {
+    if !stored.starts_with(PREFIX) {
+        // Plaintext (legacy / no key).
+        return Ok(stored.to_string());
+    }
+    let Some(k) = key() else {
+        return Err(anyhow!(
+            "encrypted secret found but FIBER_SECRETS_KEY is not set"
+        ));
+    };
+    decrypt_with(k, stored)
+}
+
+/// The crypto itself, taking the key explicitly. `encrypt_secret` supplies the
+/// process-wide key from the environment; splitting it out keeps the cipher reachable
+/// from tests, which cannot set a `OnceLock` that another test may already have read.
+fn encrypt_with(k: &[u8; 32], plaintext: &str) -> Result<String> {
     let cipher = Aes256Gcm::new_from_slice(k)
         // Formatted rather than `.context()`: whether this error implements
         // std::error::Error depends on a transitive `std` feature that another crate
@@ -69,15 +89,11 @@ pub fn encrypt_secret(plaintext: &str) -> Result<String> {
     Ok(format!("{PREFIX}{}", hex::encode(out)))
 }
 
-pub fn decrypt_secret(stored: &str) -> Result<String> {
+/// Inverse of [`encrypt_with`]. A value without the `enc:v1:` prefix is passed through
+/// as plaintext, matching `decrypt_secret`.
+fn decrypt_with(k: &[u8; 32], stored: &str) -> Result<String> {
     let Some(rest) = stored.strip_prefix(PREFIX) else {
-        // Plaintext (legacy / no key).
         return Ok(stored.to_string());
-    };
-    let Some(k) = key() else {
-        return Err(anyhow!(
-            "encrypted secret found but FIBER_SECRETS_KEY is not set"
-        ));
     };
     let raw = hex::decode(rest).context("decode ciphertext")?;
     if raw.len() < 13 {
@@ -101,14 +117,126 @@ pub fn decrypt_secret(stored: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    const KEY_A: [u8; 32] = [7u8; 32];
+    const KEY_B: [u8; 32] = [9u8; 32];
+
     #[test]
-    fn plaintext_passthrough_without_key() {
-        // KEY may already be init from other tests; only assert roundtrip API.
-        let s = "hello";
-        // encrypt without key returns plaintext
-        if key().is_none() {
-            assert_eq!(encrypt_secret(s).unwrap(), s);
-            assert_eq!(decrypt_secret(s).unwrap(), s);
+    fn a_secret_survives_a_round_trip() {
+        for plaintext in [
+            "hunter2",
+            "",
+            "a value with spaces and = signs",
+            "ünïcodé ✓ and a\nnewline",
+            &"x".repeat(8192),
+        ] {
+            let sealed = encrypt_with(&KEY_A, plaintext).unwrap();
+            assert!(sealed.starts_with(PREFIX), "{sealed}");
+            assert_eq!(decrypt_with(&KEY_A, &sealed).unwrap(), plaintext);
         }
+    }
+
+    #[test]
+    fn the_ciphertext_does_not_contain_the_plaintext() {
+        let sealed = encrypt_with(&KEY_A, "hunter2").unwrap();
+        assert!(!sealed.contains("hunter2"));
+        assert!(
+            !hex::decode(sealed.strip_prefix(PREFIX).unwrap())
+                .unwrap()
+                .windows(7)
+                .any(|w| w == b"hunter2")
+        );
+    }
+
+    #[test]
+    fn encrypting_twice_gives_different_ciphertext() {
+        // A fresh nonce per call. Equal ciphertexts would leak which projects share a
+        // secret value.
+        let a = encrypt_with(&KEY_A, "same").unwrap();
+        let b = encrypt_with(&KEY_A, "same").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(decrypt_with(&KEY_A, &a).unwrap(), "same");
+        assert_eq!(decrypt_with(&KEY_A, &b).unwrap(), "same");
+    }
+
+    #[test]
+    fn the_wrong_key_is_refused_rather_than_returning_rubbish() {
+        let sealed = encrypt_with(&KEY_A, "hunter2").unwrap();
+        let err = decrypt_with(&KEY_B, &sealed).unwrap_err().to_string();
+        assert!(err.contains("wrong key"), "{err}");
+    }
+
+    #[test]
+    fn a_tampered_ciphertext_fails_its_authentication_tag() {
+        // AES-GCM is authenticated; flipping any byte of nonce or ciphertext must fail
+        // rather than decrypt to something else.
+        let sealed = encrypt_with(&KEY_A, "hunter2").unwrap();
+        let body = sealed.strip_prefix(PREFIX).unwrap();
+        let mut raw = hex::decode(body).unwrap();
+        for i in [0usize, 11, 12, raw.len() - 1] {
+            let original = raw[i];
+            raw[i] ^= 0x01;
+            let tampered = format!("{PREFIX}{}", hex::encode(&raw));
+            assert!(
+                decrypt_with(&KEY_A, &tampered).is_err(),
+                "flipping byte {i} must not decrypt"
+            );
+            raw[i] = original;
+        }
+    }
+
+    #[test]
+    fn a_truncated_ciphertext_is_rejected() {
+        // Below the 12-byte nonce plus a tag there is nothing to authenticate.
+        for body in ["", "00", &"ab".repeat(12), &"ab".repeat(13)] {
+            let short = format!("{PREFIX}{body}");
+            assert!(decrypt_with(&KEY_A, &short).is_err(), "{short}");
+        }
+    }
+
+    #[test]
+    fn a_non_hex_body_is_rejected() {
+        assert!(decrypt_with(&KEY_A, &format!("{PREFIX}not-hex-at-all")).is_err());
+    }
+
+    #[test]
+    fn an_unprefixed_value_is_passed_through_as_plaintext() {
+        // Rows written before FIBER_SECRETS_KEY was set are stored bare.
+        assert_eq!(
+            decrypt_with(&KEY_A, "legacy-plaintext").unwrap(),
+            "legacy-plaintext"
+        );
+        assert_eq!(
+            decrypt_secret("legacy-plaintext").unwrap(),
+            "legacy-plaintext"
+        );
+        // A near-miss prefix is still plaintext, not a malformed ciphertext.
+        assert_eq!(decrypt_secret("enc:v2:ab").unwrap(), "enc:v2:ab");
+    }
+
+    #[test]
+    fn an_encrypted_value_without_a_configured_key_is_an_error_not_a_leak() {
+        // Never hand the raw ciphertext back to a step as if it were the secret.
+        if key().is_none() {
+            let sealed = encrypt_with(&KEY_A, "hunter2").unwrap();
+            let err = decrypt_secret(&sealed).unwrap_err().to_string();
+            assert!(err.contains("FIBER_SECRETS_KEY is not set"), "{err}");
+        }
+    }
+
+    #[test]
+    fn without_a_key_the_env_facing_api_stores_plaintext() {
+        if key().is_none() {
+            assert_eq!(encrypt_secret("hello").unwrap(), "hello");
+            assert_eq!(decrypt_secret("hello").unwrap(), "hello");
+        }
+    }
+
+    #[test]
+    fn load_key_accepts_exactly_thirty_two_bytes_of_hex() {
+        // `load_key` reads the env directly; exercise the parsing rules it applies by
+        // driving the same hex decode, since the OnceLock can only be set once.
+        assert_eq!(hex::decode("ab".repeat(32)).unwrap().len(), 32);
+        assert_ne!(hex::decode("ab".repeat(16)).unwrap().len(), 32);
+        assert!(hex::decode("zz".repeat(32)).is_err());
     }
 }

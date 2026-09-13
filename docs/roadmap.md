@@ -4,6 +4,8 @@ Shipped: MVP durable CI, agents (global + project pools), artifacts (local + S3 
 
 Hardening (audit, September 2026): CI now runs the test suites; instance-admin gate on global agents and user management; agent identity bound to the token with per-step ownership checks; webhooks fail closed with encrypted secrets; loopback-bound Compose with a CORS allowlist, login throttle, and masked errors; offers built from the run snapshot only; transactional propagation with `always()` / transitive `success()` fixed; hot-path indexes; multi-replica safety (schedule CAS, fiber claim, cross-replica cancel / revocation); step and run `timeout_minutes`, persisted retry backoff, agent SIGTERM handling and reconnect backoff.
 
+Coverage (September 2026): unit tests in every crate, with the decisions that need Postgres either extracted into pure functions (lease and retry semantics, retention's blob selection, the snapshot readers, the secret cipher) or driven through a trait double (durable step memoization, sleep ordinals, checkpointing); source audits that fail when a route loses its `access.rs` gate or the hand-mirrored TypeScript drifts from `fiber-proto`; and the Compose dogfood smoke running in CI.
+
 Open source under Apache 2.0 since September 2026 — see `CONTRIBUTING.md` and `SECURITY.md`.
 
 ## Next
