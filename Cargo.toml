@@ -59,7 +59,7 @@ getrandom = "0.4"
 globset = "0.4"
 libc = "0.2"
 argon2 = { version = "0.5", features = ["std"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 zeroize = { version = "1", features = ["derive"] }
 cron = "0.15"
 aws-credential-types = "1"
