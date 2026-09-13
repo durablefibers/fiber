@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn serde_uses_the_same_lowercase_wire_spelling_as_as_str() {
-        // The role crosses the wire to apps/web, which compares against these strings
+        // The role crosses the wire to apps/ui, which compares against these strings
         // by hand (convention 9).
         for role in ASCENDING {
             let json = serde_json::to_string(&role).unwrap();

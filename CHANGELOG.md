@@ -8,6 +8,19 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **Account and user management in the UI.** `POST /api/auth/password`,
+  `DELETE /api/auth/sessions` and `POST /api/users` existed on the server but nothing in the
+  UI reached them. Settings now changes your own password, signs out your other sessions,
+  and — for instance admins — lists, creates, and promotes users.
+- **A project Runs page** at `/p/{project}/runs`: every run, newest first, filterable by
+  status and paged through `next_cursor` with **Load more**. The cursor pagination shipped
+  with run ops; only the twelve most recent runs were ever reachable.
+- **The pipeline editor covers the whole step schema.** `env`, `shell`, `working_directory`,
+  `timeout_minutes`, `secrets` (as the three-state All / None / Pick the YAML actually has)
+  and `continue_on_error` on a step, plus pipeline-wide `env`, run `timeout_minutes`, and
+  `pull_request.types`. All of these could be written in `fiber.yml` and exported from the
+  canvas, but not edited on it.
+- **[docs/ui.md](./docs/ui.md)** — the pages, the canvas, the editor, and the run page.
 - **Terminal durable fibers are cleaned up**, `FIBER_RETENTION_FIBER_DAYS`, default 7.
   Retention covered runs, artifacts and sessions; the `fibers` table grew forever. Memoized
   steps go with them by cascade. A **suspended** fiber is never touched however old its row
@@ -16,6 +29,18 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`apps/web` is now `apps/ui`.** The directory, the package, the Docker image and its
+  `Dockerfile.ui`, the `fiber-ui` Compose service, the `FIBER_UI_BIND` variable, the CI job,
+  and `make ui` (was `make web`). A deployment pinned to `FIBER_WEB_BIND` or driving the
+  `fiber-web` service needs updating; nothing about the running system changed.
+- **Project settings moved off the project overview.** Members, secrets, and the GitHub
+  webhook are at `/p/{project}/settings`; the overview is pipelines and recent runs. The
+  global Settings page no longer asks you to paste a project UUID to set a webhook secret.
+- **The sidebar reaches every project page.** Runs, Agents and Settings were routes with no
+  link — `/p/{project}/agents` existed and was unreachable.
+- **Canvas layout orders columns by barycentre** instead of definition order, so fan-out and
+  fan-in shapes stop crossing their own edges, and columns are centred against the tallest.
+  **Tidy** re-runs the layout; until then, a node you drag stays where you put it.
 - **The end-to-end scripts are "smokes", not "dogfood".** `scripts/dogfood_*` are now
   `scripts/smoke_*`, `make dogfood` is `make smoke` (and `dogfood-authz` … `dogfood-compose`
   are `smoke-authz` … `smoke-compose`), the CI job is `smoke`, and the scripts print
@@ -27,6 +52,23 @@ minor versions may carry breaking changes.
 
 ### Fixed
 
+- **A run's canvas showed nothing for a matrix step.** It was built from the definition
+  snapshot, which holds the step as the author wrote it, while statuses and logs are keyed by
+  the compiled cell ids (`build__os_linux`). The node's status never resolved and clicking it
+  selected a step that did not exist. The canvas is now built from the run's step runs — the
+  DAG that actually ran — so each cell is its own node, tagged with its bindings.
+- **Editing an edge on the canvas silently dropped pipeline and step fields.** Rebuilding the
+  definition from the nodes listed the fields it knew about, so connecting two steps discarded
+  pipeline `env` and `timeout_minutes`, and every step's `env`, `shell`, `working_directory`,
+  `continue_on_error`, `timeout_minutes` and `secrets`.
+- **Deleting a node on the canvas never reached the definition.** The graph and the saved
+  pipeline disagreed until reload; `needs` pointing at the deleted step are now dropped too.
+- **A connection that would close a cycle is refused** rather than drawn and rejected on save.
+- **Selecting a step reset every node you had dragged.** Positions were recomputed on every
+  status and selection change, which also yanked the canvas around during a live run.
+- **The minimap drew no nodes on a run.** Read-only canvases withheld `onNodesChange`, which
+  is how React Flow reports measured sizes back into controlled state; nodes without a
+  measured size are skipped by the minimap. Draggability is gated by `nodesDraggable`.
 - **Retention did nothing but purge sessions when `FIBER_RETENTION_DAYS=0`.** The disabled
   path looped separately and never reached the tick, so anything else retention grew to
   cover was silently skipped in that configuration. There is one loop now, and each part
@@ -474,7 +516,7 @@ timeout now inherit `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` (60) — see the upgrad
 
 - Container images build from one `deploy/Dockerfile` with `--target fiber-api` / `fiber-agent`,
   sharing a cargo-chef dependency layer. `deploy/Dockerfile.api` and the duplicated
-  `deploy/Dockerfile.web` / `deploy/nginx.conf` are gone.
+  `deploy/Dockerfile.ui` / `deploy/nginx.conf` are gone.
 
 ## [0.1.0]
 

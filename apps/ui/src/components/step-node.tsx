@@ -1,5 +1,5 @@
 import { Handle, type Node, type NodeProps, Position } from "@xyflow/react"
-import { Package, RotateCcw } from "lucide-react"
+import { Boxes, GitFork, Package, RotateCcw, ShieldAlert } from "lucide-react"
 import { memo } from "react"
 import { statusColor } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -13,6 +13,15 @@ export type StepNodeData = {
   artifacts?: string[]
   needsCount?: number
   runPreview?: string
+  image?: string
+  /** The step's `if:` expression, when it is not the default `success()`. */
+  condition?: string
+  continueOnError?: boolean
+  /** Cells this step expands to at compile time, when it declares a matrix. */
+  matrixCells?: number
+  matrixAxes?: string[]
+  /** Matrix bindings for an already-expanded cell, e.g. `os: linux`. */
+  matrixBinding?: string
 }
 
 export type StepFlowNode = Node<StepNodeData, "step">
@@ -24,6 +33,7 @@ function StepNodeComponent({ data, selected }: NodeProps<StepFlowNode>) {
   const hasArtifacts = (data.artifacts?.length ?? 0) > 0
   const retries = data.retries ?? 0
   const showId = data.stepId && data.stepId !== data.label
+  const running = data.status === "running"
 
   return (
     <div
@@ -45,7 +55,8 @@ function StepNodeComponent({ data, selected }: NodeProps<StepFlowNode>) {
         <span
           className={cn(
             "mt-1 inline-block size-2 shrink-0 rounded-full",
-            !hasStatus && "bg-white/25"
+            !hasStatus && "bg-white/25",
+            running && "animate-pulse"
           )}
           style={
             color
@@ -64,12 +75,34 @@ function StepNodeComponent({ data, selected }: NodeProps<StepFlowNode>) {
           ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1 text-white/45">
+          {data.continueOnError ? (
+            <ShieldAlert className="size-3 text-amber-300/70" />
+          ) : null}
           {retries > 0 ? <RotateCcw className="size-3" /> : null}
+          {data.image ? <Boxes className="size-3" /> : null}
           {hasArtifacts ? (
             <Package className="size-3.5 text-amber-300/85" />
           ) : null}
         </div>
       </div>
+
+      {data.matrixBinding ? (
+        <div className="mt-1.5 truncate rounded-md bg-violet-400/12 px-1.5 py-0.5 font-mono text-[10px] text-violet-200/90">
+          {data.matrixBinding}
+        </div>
+      ) : null}
+
+      {data.matrixCells ? (
+        <div className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-violet-400/12 px-1.5 py-0.5 text-[10px] text-violet-200/90">
+          <GitFork className="size-3" />
+          {data.matrixCells} cells
+          {data.matrixAxes?.length ? (
+            <span className="font-mono text-violet-200/60">
+              {data.matrixAxes.join(", ")}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       {data.runPreview ? (
         <div className="mt-2 truncate rounded-md bg-black/25 px-2 py-1 font-mono text-[10px] text-white/45">
@@ -77,11 +110,21 @@ function StepNodeComponent({ data, selected }: NodeProps<StepFlowNode>) {
         </div>
       ) : null}
 
-      {hasStatus ? (
-        <div className="mt-1.5 font-medium text-[10px] text-white/40 uppercase tracking-wide">
-          {data.status}
-        </div>
-      ) : null}
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+        {hasStatus ? (
+          <span className="font-medium text-[10px] text-white/40 uppercase tracking-wide">
+            {data.status}
+          </span>
+        ) : null}
+        {data.condition ? (
+          <span
+            className="truncate font-mono text-[10px] text-sky-200/60"
+            title={data.condition}
+          >
+            if {data.condition}
+          </span>
+        ) : null}
+      </div>
 
       {labels.length > 0 ? (
         <div className="mt-2 flex flex-wrap gap-1">

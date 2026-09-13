@@ -15,7 +15,7 @@ make infra          # Postgres :15432 + Redis :16379 (docker compose, deploy/doc
 make infra-minio    # + MinIO :19000 / console :19001 (for S3 artifact path)
 make api            # fiber-api on :18080 (sources scripts/dev-env.sh)
 make api-s3         # same with FIBER_USE_S3=1
-make web            # pnpm dev in apps/web on :3100
+make ui             # pnpm dev in apps/ui on :3100
 make agent          # fiber-agent (requires FIBER_AGENT_TOKEN; Make rewrites http→ws for FIBER_API_URL)
 make check          # THE gate: cargo fmt --check + clippy -D warnings (same as CI)
 make ready          # GET /ready
@@ -27,7 +27,7 @@ Login defaults: **admin / fiber**.
 
 Rust tests are pure unit tests (no DB/Redis needed) living in `#[cfg(test)]` modules across all seven crates: `fiber-core` (`dag`, `due_index`, `path_filter`, `roles`, `schedule`, `secrets`, `step_if`, `store` DAG propagation + snapshot readers, `tokens`), `fiber-api` (`artifacts` key mapping, `artifact_util`, `auth`, `github`, `login_guard`, `otel`, `retention`, `routes` webhook signatures + metrics + the router authz audit, `supervisor`, `ws`), `fiber-proto` (wire tags and `serde(default)` forward-compat), `fiber-agent` (log redaction, env files, workspace refcount), `fiber-cli` (download filenames, token file permissions), `fiber-scheduler` (lease/retry/concurrency decisions), and `fiber-durable` (`src/tests.rs`, `src/context_tests.rs`, `http_task`). `make test` runs all of them plus the web vitest suite.
 
-Anything needing Postgres is tested one of three ways. **Extract the decision** into a pure function and test that — `store::plan_transitions` for DAG propagation, `scheduler::{completion_is_current,retry_plan}` for lease and retry semantics, `retention::unreferenced_blobs` for which artifact blobs are safe to delete, `secrets::{encrypt_with,decrypt_with}` for the cipher. **Drive a trait double** — `FiberContext` takes an `Arc<dyn FiberPersistence>`, so step memoization, the sleep ordinal, and checkpointing are testable without a database. **Audit the source** — `routes::tests` reads its own `include_str!("routes.rs")` to assert every routed handler passes through `access.rs` (convention 8) or is listed in `UNGATED_BY_DESIGN` with a reason, and `apps/web/src/lib/wire-drift.test.ts` reads `fiber-proto` to assert the hand-mirrored TypeScript has not drifted (convention 9).
+Anything needing Postgres is tested one of three ways. **Extract the decision** into a pure function and test that — `store::plan_transitions` for DAG propagation, `scheduler::{completion_is_current,retry_plan}` for lease and retry semantics, `retention::unreferenced_blobs` for which artifact blobs are safe to delete, `secrets::{encrypt_with,decrypt_with}` for the cipher. **Drive a trait double** — `FiberContext` takes an `Arc<dyn FiberPersistence>`, so step memoization, the sleep ordinal, and checkpointing are testable without a database. **Audit the source** — `routes::tests` reads its own `include_str!("routes.rs")` to assert every routed handler passes through `access.rs` (convention 8) or is listed in `UNGATED_BY_DESIGN` with a reason, and `apps/ui/src/lib/wire-drift.test.ts` reads `fiber-proto` to assert the hand-mirrored TypeScript has not drifted (convention 9).
 
 New tests should be able to fail: when adding one, check it by breaking the thing it covers and confirming it goes red.
 
@@ -35,8 +35,8 @@ New tests should be able to fail: when adding one, check it by breaking the thin
 cargo test --workspace
 cargo test -p fiber-core dag::            # one module
 cargo test -p fiber-durable due_index_earliest_and_authoritative   # one test
-cd apps/web && pnpm test                  # vitest (src/**/*.test.ts, jsdom)
-cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build   # what CI runs for the web app
+cd apps/ui && pnpm test                  # vitest (src/**/*.test.ts, jsdom)
+cd apps/ui && pnpm check && pnpm exec tsc --noEmit && pnpm build   # what CI runs for the UI app
 ```
 
 End-to-end coverage is the **smoke scripts**, not integration tests — they drive the live API and print `SMOKE_OK`:
@@ -47,7 +47,7 @@ make smoke-s3             # needs infra-minio + api-s3 + a built fiber-agent
 make smoke-compose        # full `compose up --build` smoke
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy (`-D warnings`), `cargo test --workspace`, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`, `apps/web` Biome + `tsc --noEmit` + vitest + `pnpm build`, and a `docker build` of both images.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy (`-D warnings`), `cargo test --workspace`, `cargo build -p fiber-api -p fiber-agent -p fiber-cli`, `apps/ui` Biome + `tsc --noEmit` + vitest + `pnpm build`, and a `docker build` of both images.
 
 ## Architecture
 
@@ -75,9 +75,9 @@ Start run snapshots the pipeline definition onto the run (immutable for that exe
 
 **CI steps are at-least-once.** Leases expire, stale agents are reclaimed, steps re-run — anything written into a step's `run` must be idempotent. `step_attempts` and `log_lines` are append-only. Durable fibers are also at-least-once (a step that finishes but crashes before checkpoint re-runs).
 
-### Web
+### UI
 
-`apps/web` is TanStack Start + React Router (file-based routes in `src/routes`, generated `routeTree.gen.ts`) + React Flow canvas (`components/dag-canvas.tsx`, `step-node.tsx`) + shadcn/Tailwind v4. `src/lib/api.ts` is the single typed API client and mirrors the Rust types by hand — update both sides together. Formatting/linting is **Biome** (`pnpm check`), not ESLint/Prettier.
+`apps/ui` is TanStack Start + React Router (file-based routes in `src/routes`, generated `routeTree.gen.ts`) + React Flow canvas (`components/dag-canvas.tsx`, `step-node.tsx`) + shadcn/Tailwind v4. `src/lib/api.ts` is the single typed API client and mirrors the Rust types by hand — update both sides together. Formatting/linting is **Biome** (`pnpm check`), not ESLint/Prettier.
 
 ## Conventions & gotchas
 

@@ -4,7 +4,7 @@
 
 ```
 ┌─────────────┐     REST / WS      ┌──────────────┐
-│  apps/web   │◄──────────────────►│  fiber-api   │
+│  apps/ui    │◄──────────────────►│  fiber-api   │
 │  fiber-cli  │                    │  (axum)      │
 └─────────────┘                    └──────┬───────┘
                                           │
@@ -32,7 +32,7 @@
 | `fiber-durable` | Separate durable task runtime (`step`/`stash`/`sleep`) |
 | `fiber-proto` | Shared message / YAML-facing types |
 | `fiber-cli` | Validate, login, run, members, secrets, agents, fibers, spawn agent |
-| `apps/web` | TanStack Start UI + React Flow canvas |
+| `apps/ui` | TanStack Start UI + React Flow canvas |
 
 ## Run lifecycle
 

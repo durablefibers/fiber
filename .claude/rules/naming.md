@@ -9,9 +9,9 @@ Never use `df`, `durablefibers`, or `durable_fibers` for crates, binaries, env v
 | Rust crates | `fiber-*` | `fiber-api`, `fiber-core`, `fiber-scheduler`, `fiber-agent`, `fiber-proto` |
 | Binaries | `fiber`, `fiber-agent` | CLI / agent entrypoints |
 | Env vars | `FIBER_*` | `FIBER_DATABASE_URL`, `FIBER_REDIS_URL`, `FIBER_AGENT_TOKEN` |
-| Docker services | `fiber-*` | `fiber-api`, `fiber-web`, `fiber-postgres` |
+| Docker services | `fiber-*` | `fiber-api`, `fiber-ui`, `fiber-postgres` |
 | Config file | `fiber.yml` | pipeline config-as-code |
-| TS packages | `@fiber/*` if split | web app stays `apps/web` |
+| TS packages | `@fiber/*` if split | UI app stays `apps/ui` |
 
 The repo folder may be named `durablefibers`; code and packages must use `fiber`.
 

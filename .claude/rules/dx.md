@@ -1,6 +1,6 @@
 # Developer experience
 
-- Prefer **`make help`** targets (`infra`, `api`, `api-s3`, `web`, `agent`, `check`, `test`, `smoke`) over inventing one-off shell.
+- Prefer **`make help`** targets (`infra`, `api`, `api-s3`, `ui`, `agent`, `check`, `test`, `smoke`) over inventing one-off shell.
 - Source **`scripts/dev-env.sh`** (or `FIBER_USE_S3=1`) for host-run processes; see `.env.example`.
 - Gate: **`make check`** (fmt + clippy `-D warnings`) and **`make test`**. CI runs the same in `.github/workflows/ci.yml`.
 - Docs entry: [docs/development.md](../../docs/development.md). Roadmap: [docs/roadmap.md](../../docs/roadmap.md).

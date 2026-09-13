@@ -43,7 +43,7 @@ Delegate work that needs its own context. Claude routes on the `description`, or
 | Agent | Model | Role |
 |---|---|---|
 | `fiber-rust-engineer` | inherit | Implements across the Rust crates |
-| `fiber-web-engineer` | inherit | TanStack Start, React Flow, Biome |
+| `fiber-ui-engineer` | inherit | TanStack Start, React Flow, Biome |
 | `fiber-migration-engineer` | inherit | Schema changes: migration + model + store query |
 | `fiber-devops` | inherit | Compose, Dockerfiles, CI workflow, ports, deploys |
 | `fiber-docs-syncer` | inherit | Fixes docs drift against the code |
@@ -65,9 +65,9 @@ Deterministic, so they do not depend on the model remembering. Wired in `setting
 | `guard-bash.sh` | PreToolUse(Bash) | Denies the argv-pattern kill that also kills this session's parent shell; denies volume-destroying Compose teardown; denies writes to *committed* migrations; denies wholesale deletion of `data/workspaces` or `data/artifacts` |
 | `guard-edits.sh` | PreToolUse(Edit\|Write) | Denies edits to applied migrations, `routeTree.gen.ts`, `data/`, `dist/`, `target/`, `Cargo.lock` |
 | `fmt-rust.sh` | PostToolUse(Edit\|Write) | `rustfmt` on edited `.rs` using the repo's `rustfmt.toml`, keeping `cargo fmt --check` green |
-| `fmt-web.sh` | PostToolUse(Edit\|Write) | Biome (not Prettier) on edited `apps/web` files |
+| `fmt-ui.sh` | PostToolUse(Edit\|Write) | Biome (not Prettier) on edited `apps/ui` files |
 | `naming-guard.sh` | PostToolUse(Edit\|Write) | Flags `df_` / `durablefibers` prefixes reintroduced into source |
-| `session-context.sh` | SessionStart | Injects live stack state — API/web/Postgres/Redis up or down, running agents, latest migration |
+| `session-context.sh` | SessionStart | Injects live stack state — API/UI/Postgres/Redis up or down, running agents, latest migration |
 
 Two design notes. `guard-bash.sh` strips heredoc bodies before matching, so *documenting* a hazardous command is never blocked — only running one is. The migration guards check `git ls-files`, so writing the next numbered migration stays unobstructed while editing an applied one is denied.
 

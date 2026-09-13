@@ -19,7 +19,7 @@ metadata:
 | `crates/fiber-api/src/ws.rs` | Server side of `/ws/agent`: builds offers, handles agent messages |
 | `crates/fiber-agent/src/main.rs` | Client side: claims offers, streams logs, uploads artifacts |
 | `crates/fiber-cli/src/main.rs` | Spawns an agent and validates YAML against the same definition types |
-| `apps/web/src/lib/api.ts` | Hand-mirrors these shapes for the UI — **no codegen, silent drift** |
+| `apps/ui/src/lib/api.ts` | Hand-mirrors these shapes for the UI — **no codegen, silent drift** |
 
 `fiber-scheduler` also constructs `ServerMessage` values when dispatching offers.
 
@@ -38,7 +38,7 @@ metadata:
 2. Update the API side: `ws.rs` for the protocol, `fiber-scheduler` where offers are built.
 3. Update `fiber-agent`.
 4. Update `fiber-cli` if it touches the type.
-5. Update `apps/web/src/lib/api.ts` if the shape reaches the UI (`RunEvent` does, via `/ws/runs/{id}`).
+5. Update `apps/ui/src/lib/api.ts` if the shape reaches the UI (`RunEvent` does, via `/ws/runs/{id}`).
 6. `docs/agents.md` for protocol behavior, `docs/pipeline-yaml.md` for definition fields.
 
 ## Verify end-to-end, not by compiling

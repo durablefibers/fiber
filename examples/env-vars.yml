@@ -28,9 +28,9 @@ steps:
 
   # A monorepo step: run somewhere else in the tree, under a different interpreter.
   # `artifacts` stays relative to the workspace root, not to working_directory.
-  web:
+  ui:
     needs: [build]
-    working_directory: apps/web
+    working_directory: apps/ui
     shell: bash
     run: |
       echo "building in $PWD"

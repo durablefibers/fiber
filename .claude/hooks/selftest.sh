@@ -43,12 +43,12 @@ expect allow "make check"                      "$HOOKS/guard-bash.sh" "$(payload
 
 echo "guard-edits.sh"
 expect deny  "edit committed migration"        "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/crates/fiber-core/migrations/001_initial.sql")"
-expect deny  "edit routeTree.gen.ts"           "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/apps/web/src/routeTree.gen.ts")"
+expect deny  "edit routeTree.gen.ts"           "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/apps/ui/src/routeTree.gen.ts")"
 expect deny  "edit data/ runtime state"        "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/data/artifacts/x/y/out.txt")"
 expect deny  "edit Cargo.lock"                 "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/Cargo.lock")"
 expect allow "new migration file"              "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/crates/fiber-core/migrations/005_new.sql")"
 expect allow "edit store.rs"                   "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/crates/fiber-core/src/store.rs")"
-expect allow "edit a web route"                "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/apps/web/src/routes/index.tsx")"
+expect allow "edit a UI route"                 "$HOOKS/guard-edits.sh" "$(path_payload "$PWD/apps/ui/src/routes/index.tsx")"
 
 echo "naming-guard.sh"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT

@@ -29,7 +29,7 @@ function repoRoot(): string {
 const repoFile = (rel: string) => readFileSync(resolve(repoRoot(), rel), "utf8")
 
 const PROTO = repoFile("crates/fiber-proto/src/lib.rs")
-const API_TS = repoFile("apps/web/src/lib/api.ts")
+const API_TS = repoFile("apps/ui/src/lib/api.ts")
 
 /** Wire field names of a `pub struct` in Rust source, following `serde(rename)`. */
 function rustStructFields(source: string, name: string): string[] {

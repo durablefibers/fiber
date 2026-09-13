@@ -6,6 +6,8 @@ Hardening (audit, September 2026): CI now runs the test suites; instance-admin g
 
 Coverage (September 2026): unit tests in every crate, with the decisions that need Postgres either extracted into pure functions (lease and retry semantics, retention's blob selection, the snapshot readers, the secret cipher) or driven through a trait double (durable step memoization, sleep ordinals, checkpointing); source audits that fail when a route loses its `access.rs` gate or the hand-mirrored TypeScript drifts from `fiber-proto`; and the Compose smoke running in CI.
 
+UI (September 2026): the canvas draws a run from its compiled step runs, so matrix cells appear as the nodes that actually ran; the pipeline editor covers the whole step schema; project settings, a paged runs list, and account and user management are reachable pages. See [ui.md](./ui.md).
+
 Open source under Apache 2.0 since September 2026 — see `CONTRIBUTING.md` and `SECURITY.md`.
 
 ## Next
@@ -37,8 +39,8 @@ what the containerised agent needs, and added `/metrics`.
 | **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
 | **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
 | **Observability** | JSON logs, request ids, supervised background loops surfaced in `/ready` |
-| **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable web image so it can be published; build attestations for release assets |
-| **Sessions** | Password change, revoke-all, sliding expiry, tokens off the WS query string |
+| **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable UI image so it can be published; build attestations for release assets |
+| **Sessions** | Sliding expiry |
 | **SCM** | GitLab / Bitbucket webhooks; multibranch indexing |
 | **Secrets** | Vault / OIDC / external secret stores (beyond encrypted project secrets) |
 | **Agents** | Dynamic cloud agents; autoscaling pools |

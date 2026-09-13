@@ -8,7 +8,7 @@ TypeScript UI, and an agent that executes pipeline steps.
 ```bash
 make infra     # Postgres + Redis in Docker
 make api       # fiber-api on :18080  (admin / fiber)
-make web       # the UI on :3100
+make ui        # the UI on :3100
 ```
 
 [docs/getting-started.md](docs/getting-started.md) covers the rest, including running an
@@ -20,8 +20,8 @@ Run what CI runs, before you push:
 
 ```bash
 make check     # cargo fmt --check + clippy -D warnings
-make test      # cargo test --workspace + the web vitest suite
-cd apps/web && pnpm check && pnpm exec tsc --noEmit && pnpm build
+make test      # cargo test --workspace + the ui vitest suite
+cd apps/ui && pnpm check && pnpm exec tsc --noEmit && pnpm build
 ```
 
 Changes to the API, scheduler, agent, or artifact path are not covered by unit tests. Run
@@ -52,7 +52,7 @@ afterwards. [docs/architecture.md](docs/architecture.md) explains the reasoning.
 - **Migrations are append-only**: add the next numbered file in
   `crates/fiber-core/migrations/`, never edit one that has shipped.
 - **Wire types are three-sided.** `fiber-proto` is consumed by the API, the agent, the CLI
-  *and* `apps/web/src/lib/api.ts`, which mirrors it by hand. Change one, check all four.
+  *and* `apps/ui/src/lib/api.ts`, which mirrors it by hand. Change one, check all four.
 
 ## Pull requests
 

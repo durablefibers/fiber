@@ -5,7 +5,7 @@
 `deploy/docker-compose.yml` is the reference deployment. Its defaults are chosen so that `docker compose up` on a shared host does not expose anything by accident:
 
 - Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password (`FIBER_REDIS_PASSWORD`).
-- `fiber-api` (`18080`) and `fiber-web` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_WEB_BIND=0.0.0.0` only for a trusted network.
+- `fiber-api` (`18080`) and `fiber-ui` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_UI_BIND=0.0.0.0` only for a trusted network.
 - Every service has `restart: unless-stopped`; the API waits for Postgres, Redis, **and** MinIO health.
 - Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
 - Set `FIBER_ADMIN_PASSWORD` **before the first boot**: it is applied only when the users table is empty. For an existing instance, change the admin password through the API/UI instead. The API warns at boot while the configured value is the default `fiber`.
@@ -20,7 +20,7 @@ ci.example.com {
 }
 ```
 
-Build the web image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
+Build the UI image with `VITE_FIBER_API_URL=https://ci.example.com` and set `FIBER_CORS_ORIGINS=https://ci.example.com` so the browser is allowed to call the API. Session and agent tokens are bearer credentials and must only travel over TLS.
 
 ### Agent TLS
 
@@ -227,7 +227,7 @@ docker compose -f deploy/docker-compose.yml up -d
 version for a reproducible deployment. To build from the working tree instead, add
 `--build`, which overrides the published image with a local one.
 
-`fiber-web` is still built locally, deliberately: its API URL is baked in at build time, so
+`fiber-ui` is still built locally, deliberately: its API URL is baked in at build time, so
 a generic image would only work for whoever's URL was compiled in.
 
 Before the first tag:
@@ -238,12 +238,12 @@ Before the first tag:
 - **Make the GHCR packages public once.** The first push creates each package private, whatever the
   repository's visibility; flip it in the package settings or `docker pull` needs a token.
 
-The **web image is not published**: `VITE_FIBER_API_URL` is baked in at build time, so a generic
+The **UI image is not published**: `VITE_FIBER_API_URL` is baked in at build time, so a generic
 image would only work for whoever's URL was compiled in. Build it per deployment:
 
 ```bash
-docker build -f apps/web/Dockerfile.web --build-arg VITE_FIBER_API_URL=https://ci.example.com \
-  -t fiber-web apps/web
+docker build -f apps/ui/Dockerfile.ui --build-arg VITE_FIBER_API_URL=https://ci.example.com \
+  -t fiber-ui apps/ui
 ```
 
 Container images build from one `deploy/Dockerfile`:

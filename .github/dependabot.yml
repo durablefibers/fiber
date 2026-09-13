@@ -11,7 +11,7 @@ updates:
         update-types: [minor, patch]
 
   - package-ecosystem: npm
-    directory: /apps/web
+    directory: /apps/ui
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
