@@ -49,6 +49,13 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **The sidebar starts as the icon rail.** Fiber is canvas-first and 16rem of chrome is
+  16rem the DAG does not get. Collapsing it was already remembered; now that the rail is
+  where you start, it had to earn the job: the global agent pool takes a distinct glyph
+  from a project's own agents (they shared one, and collapsed there are no labels to tell
+  them apart), a rule stands in for the group labels that fade out in icon mode, and the
+  active item tints its own mark, because the neutral highlight is invisible at 16px on
+  near-black. Someone who prefers the wide sidebar still gets it, restored on load.
 - **The smokes clean up after themselves.** `smoke-pools` and `smoke-s3` delete the
   projects they create, and the path-filter half of `smoke-artifacts` now runs in a
   project of its own instead of adding a `paths-test` pipeline to the seeded showcase on
