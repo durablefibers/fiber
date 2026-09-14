@@ -79,9 +79,9 @@ fn encrypt_with(k: &[u8; 32], plaintext: &str) -> Result<String> {
         .map_err(|e| anyhow!("aes key: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     getrandom(&mut nonce_bytes).context("nonce rng")?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow!("encrypt secret: {e}"))?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -105,9 +105,9 @@ fn decrypt_with(k: &[u8; 32], stored: &str) -> Result<String> {
         // std::error::Error depends on a transitive `std` feature that another crate
         // happens to enable, which is not something to build on.
         .map_err(|e| anyhow!("aes key: {e}"))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| anyhow!("nonce length"))?;
     let pt = cipher
-        .decrypt(nonce, ct)
+        .decrypt(&nonce, ct)
         .map_err(|_| anyhow!("decrypt secret failed (wrong key?)"))?;
     let s = Zeroizing::new(String::from_utf8(pt).context("secret utf8")?);
     Ok(s.to_string())
@@ -119,6 +119,17 @@ mod tests {
 
     const KEY_A: [u8; 32] = [7u8; 32];
     const KEY_B: [u8; 32] = [9u8; 32];
+
+    /// Written by aes-gcm 0.10 with `KEY_A`. Secrets already in the database were
+    /// encrypted by whatever version was current when they were written, so a crate
+    /// upgrade that changed the nonce layout or the tag position has to fail here
+    /// rather than in production, where it would read as every secret being corrupt.
+    #[test]
+    fn a_ciphertext_from_an_older_aes_gcm_still_decrypts() {
+        let stored =
+            "enc:v1:571a3cf8ac5dc884ae49b4be41355364d05b34a45e66dd7c92b2a88d76eb4e57b02236";
+        assert_eq!(decrypt_with(&KEY_A, stored).unwrap(), "hunter2");
+    }
 
     #[test]
     fn a_secret_survives_a_round_trip() {
