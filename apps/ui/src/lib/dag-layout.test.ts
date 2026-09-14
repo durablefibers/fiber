@@ -4,9 +4,11 @@ import {
   COL_WIDTH,
   layout,
   levelsOf,
+  nodeAriaLabel,
   nodeData,
   orderLevels,
   parseMatrixBindings,
+  sameNodeData,
   toDefinition,
   topologyKey,
   wouldCycle,
@@ -287,5 +289,73 @@ describe("parseMatrixBindings", () => {
   it("gives up rather than guessing when the text is not the expected shape", () => {
     expect(parseMatrixBindings("something else", ["os"])).toEqual({})
     expect(parseMatrixBindings("os: linux", ["os", "rust"])).toEqual({})
+  })
+})
+
+describe("nodeAriaLabel", () => {
+  it("names the step and its status, since the node itself announces neither", () => {
+    expect(nodeAriaLabel(step("build"), "running")).toBe(
+      "build, status running"
+    )
+  })
+
+  it("says so when a step has not started", () => {
+    expect(nodeAriaLabel(step("build"))).toBe("build, not started")
+  })
+
+  it("counts dependencies, singular and plural", () => {
+    expect(nodeAriaLabel(step("sign", ["build"]))).toBe(
+      "sign, not started, needs 1 step"
+    )
+    expect(nodeAriaLabel(step("ship", ["build", "sign"]), "queued")).toBe(
+      "ship, status queued, needs 2 steps"
+    )
+  })
+
+  it("falls back to the id when a step carries no name", () => {
+    expect(nodeAriaLabel(step("step_a1b2", [], { name: "" }))).toBe(
+      "step_a1b2, not started"
+    )
+  })
+})
+
+describe("sameNodeData", () => {
+  const build = step("build", ["checkout"], {
+    labels: ["os=linux"],
+    artifacts: ["out/"],
+  })
+
+  it("holds for two builds of the same step and status", () => {
+    expect(
+      sameNodeData(nodeData(build, "running"), nodeData(build, "running"))
+    ).toBe(true)
+  })
+
+  it("notices a status change, which is the whole point of polling", () => {
+    expect(
+      sameNodeData(nodeData(build, "running"), nodeData(build, "succeeded"))
+    ).toBe(false)
+  })
+
+  it("compares list fields by content, not identity", () => {
+    const again = step("build", ["checkout"], {
+      labels: ["os=linux"],
+      artifacts: ["out/"],
+    })
+    expect(sameNodeData(nodeData(build), nodeData(again))).toBe(true)
+    const relabelled = step("build", ["checkout"], {
+      labels: ["os=mac"],
+      artifacts: ["out/"],
+    })
+    expect(sameNodeData(nodeData(build), nodeData(relabelled))).toBe(false)
+  })
+
+  it("notices an edit to the command or the condition", () => {
+    expect(
+      sameNodeData(nodeData(build), nodeData({ ...build, run: "make" }))
+    ).toBe(false)
+    expect(
+      sameNodeData(nodeData(build), nodeData({ ...build, if: "always()" }))
+    ).toBe(false)
   })
 })

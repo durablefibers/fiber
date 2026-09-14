@@ -37,6 +37,14 @@ the barycentre of their neighbours so a fan-out reads as a fan rather than a tan
 
 - **Tidy** re-runs the layout and re-fits the view. Nodes you drag stay where you put
   them until then — status updates during a live run never move them.
+- **Full screen** — the button, or `F` once the keyboard is in the canvas — gives the
+  whole viewport to the work area; `Escape` or **Exit** comes back. It is the canvas
+  *and* its companion panel that expand, not the canvas alone, so selecting a step still
+  reaches the inspector or the log stream. On the run page the artifact list steps aside
+  to give the graph its room.
+- The view re-fits whenever the canvas changes size, including an ordinary window
+  resize — unless you have panned or zoomed it yourself, in which case your view is
+  left alone until you ask for a new one.
 - In the editor: drag between handles to add a `needs` edge, `Backspace`/`Delete` to
   remove a node or edge, **Add step** for a new one. A connection that would close a
   cycle is refused before it is drawn.
@@ -72,6 +80,8 @@ secret), **None** writes `[]`, **Pick** narrows to the names you list. See
 The canvas and artifacts sit on the left, the step inspector and logs on the right;
 the two stack on a narrow screen. Selecting a step — on the canvas or in the step
 strip — puts it in the URL (`?step=…`), so a link to one step's logs is shareable.
+In **Full screen** the pair fills the viewport and the log pane stops scaling with the
+window, so a wide DAG gets every pixel that is not the logs.
 
 Logs stream over `/ws/runs/{id}` and follow the tail until you scroll up. The toolbar
 filters lines, toggles wrapping, and copies what is shown. Because `seq` restarts each

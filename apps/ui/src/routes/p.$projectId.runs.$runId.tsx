@@ -17,6 +17,8 @@ import {
   statusColor,
 } from "@/lib/api"
 import { parseMatrixBindings } from "@/lib/dag-layout"
+import { useExpand } from "@/lib/use-expand"
+import { cn } from "@/lib/utils"
 
 export const Route = createFileRoute("/p/$projectId/runs/$runId")({
   validateSearch: (search: Record<string, unknown>): { step?: string } => ({
@@ -84,6 +86,7 @@ function RunPage() {
   const [wrapLogs, setWrapLogs] = useState(true)
   const [copied, setCopied] = useState(false)
   const [tick, setTick] = useState(0)
+  const { expanded, toggle: toggleExpand } = useExpand()
   const stepsRef = useRef(steps)
   const selectedRef = useRef(selected)
   const logViewportRef = useRef<HTMLDivElement | null>(null)
@@ -598,14 +601,36 @@ function RunPage() {
         rows would split the height evenly and the content would spill over the pane
         below. So the panes only go min-height-0 once they are actually side by side.
       */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-[1.1fr_0.9fr] lg:overflow-hidden">
-        <div className="flex flex-col lg:min-h-0">
-          <div className="h-[380px] shrink-0 p-4 lg:h-auto lg:min-h-[360px] lg:flex-1">
+      {/*
+        Expanded, the run takes the viewport: the graph gets the room the artifact list
+        was using, and the step rail and log stream stay beside it so clicking a node
+        still lands on its logs — which is the reason to open the graph up at all.
+      */}
+      <div
+        className={cn(
+          "grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-[1.1fr_0.9fr] lg:overflow-hidden",
+          // A wide DAG wants width above all else, so expanded the log pane stops
+          // scaling with the window and the graph takes everything else.
+          // Stacked, the rows would size to content and hand the canvas the smaller
+          // half — the opposite of what expanding it was for.
+          expanded &&
+            "fixed inset-0 z-50 grid-rows-[1.15fr_0.85fr] overflow-hidden bg-background lg:grid-cols-[minmax(0,1fr)_380px] lg:grid-rows-none"
+        )}
+      >
+        <div className={cn("flex flex-col lg:min-h-0", expanded && "min-h-0")}>
+          <div
+            className={cn(
+              "h-[380px] shrink-0 p-4 lg:h-auto lg:min-h-[360px] lg:flex-1",
+              expanded && "h-auto min-h-0 flex-1"
+            )}
+          >
             {definition ? (
               <DagCanvas
                 definition={definition}
                 statuses={statuses}
                 editable={false}
+                expanded={expanded}
+                onToggleExpand={toggleExpand}
                 selectedStepId={
                   steps.find((s) => s.id === selected)?.step_id ?? selected
                 }
@@ -620,7 +645,12 @@ function RunPage() {
               />
             ) : null}
           </div>
-          <div className="border-border/70 border-t px-4 py-3">
+          <div
+            className={cn(
+              "border-border/70 border-t px-4 py-3",
+              expanded && "hidden"
+            )}
+          >
             <div className="mb-2 flex items-center justify-between">
               <h2 className="font-medium text-sm">
                 Artifacts
@@ -672,7 +702,12 @@ function RunPage() {
             )}
           </div>
         </div>
-        <aside className="flex flex-col border-border/70 border-t lg:min-h-0 lg:border-t-0 lg:border-l">
+        <aside
+          className={cn(
+            "flex flex-col border-border/70 border-t lg:min-h-0 lg:border-t-0 lg:border-l",
+            expanded && "min-h-0"
+          )}
+        >
           <div className="flex max-h-28 shrink-0 flex-wrap gap-1 overflow-y-auto border-border/60 border-b p-2">
             {steps.map((s) => (
               <button

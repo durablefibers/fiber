@@ -8,6 +8,15 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **A full-screen canvas** on the pipeline editor and the run view — the toolbar button,
+  or `F` once the keyboard is in the canvas; `Escape` or **Exit** comes back. It expands
+  the whole work area rather than the canvas alone: the graph takes the room the artifact
+  list was using, and the step inspector and log stream stay docked beside it, so clicking
+  a node still lands somewhere. Deliberately not the browser's Fullscreen API, which can
+  only take one element — the canvas would have gone up alone and a selected step would
+  have led nowhere. The graph re-fits to whatever box it ends up with, keyed off the
+  element actually resizing rather than a timer, since React Flow can only fit to
+  dimensions it has already measured.
 - **`DELETE /api/projects/{id}`**, owner only. Nothing could remove a project, so smoke
   runs and abandoned experiments accumulated forever — one path-filter webhook in a
   well-used instance now matches dozens of leftover pipelines. Runs still in flight are
@@ -49,6 +58,40 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **The DAG canvas passes an accessibility and typography audit it previously did not.**
+  Every step node is a tab stop React Flow gives `role="group"` to, so the whole graph
+  announced as "group, node" repeated once per step — nodes now carry a name built from
+  the step, its status, and its dependency count (`nodeAriaLabel`), and the canvas region
+  itself is labelled rather than being an unnamed `role="application"`. Two text colours
+  were below WCAG AA on the node surface — the step id at **2.67:1** and the status line
+  at **3.82:1** — and are now 4.5:1 and 6.2:1. The node's type ramp was six roles bunched
+  at 9–10px distinguished only by colour; it is now three sizes (13 / 11 / 10px) with the
+  9px label chips gone. The running-step pulse is `motion-safe:` and every viewport
+  animation passes through `motionDuration`, so `prefers-reduced-motion` is honoured
+  without losing the state change — the status dot and the status word still carry it.
+- **The canvas stops re-rendering every node on every poll.** A status tick rebuilt each
+  node's `data` object, so all of them got a fresh identity every few seconds and the
+  `memo` on `StepNode` never skipped anything. `sameNodeData` compares first and keeps the
+  object that is already there. The pipeline editor's keyboard handler likewise stopped
+  re-registering its `window` listener on every render.
+- **The graph re-fits when its box changes size**, including an ordinary window resize,
+  which previously left it drifting off-centre with no recovery but the Fit View control.
+  A viewport the viewer panned or zoomed themselves is left alone; expanding or tidying
+  is an explicit request for a new view and fits regardless.
+- **The canvas has a palette instead of a pile of literals.** Every colour it drew was
+  hard-coded at the point of use — `oklch()` literals for surfaces, `rgba()` for edges
+  and the minimap, and long chains of `white/N` over whatever happened to be underneath.
+  It is now a semantic scale (`--canvas`, `--canvas-node`, `--canvas-fg-muted`,
+  `--canvas-edge`, `--canvas-artifact`, `--canvas-matrix`, …) defined for both themes,
+  and the dark values are the ones it already shipped — each alpha stack resolved to the
+  solid colour it was compositing to, so the rendering is unchanged and contrast no
+  longer depends on what is behind the text. A light theme is composed rather than
+  inverted: paper-white nodes on a faintly tinted ground, a darker sky for edges and
+  accents, and every text pair verified at 4.5:1 or better (icons at 3:1). `statusColor`
+  stays a function — status is the one role that must not be remapped by a theme.
+- **React Flow's attribution is hidden by the library's own `proOptions` prop** rather
+  than by a `!important` CSS override contradicting `hideAttribution: false`. Same result,
+  one mechanism. @xyflow/react is MIT and we run no Pro licence.
 - **The sidebar starts as the icon rail.** Fiber is canvas-first and 16rem of chrome is
   16rem the DAG does not get. Collapsing it was already remembered; now that the rail is
   where you start, it had to earn the job: the global agent pool takes a distinct glyph
