@@ -46,6 +46,35 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* The DAG canvas. Its own scale because a graph surface has roles the rest of the
+     app does not: a ground with atmosphere, cards floating on it, edges between them,
+     and accents for artifacts, matrices and conditions. Resolved to solid values
+     rather than stacked alphas so contrast does not depend on what is underneath. */
+  --color-canvas: var(--canvas);
+  --color-canvas-glow: var(--canvas-glow);
+  --color-canvas-grid: var(--canvas-grid);
+  --color-canvas-node: var(--canvas-node);
+  --color-canvas-node-selected: var(--canvas-node-selected);
+  --color-canvas-border: var(--canvas-border);
+  --color-canvas-border-hover: var(--canvas-border-hover);
+  --color-canvas-raise: var(--canvas-raise);
+  --color-canvas-raise-hover: var(--canvas-raise-hover);
+  --color-canvas-chip: var(--canvas-chip);
+  --color-canvas-inset: var(--canvas-inset);
+  --color-canvas-scrim: var(--canvas-scrim);
+  --color-canvas-fg: var(--canvas-fg);
+  --color-canvas-fg-muted: var(--canvas-fg-muted);
+  --color-canvas-fg-subtle: var(--canvas-fg-subtle);
+  --color-canvas-fg-faint: var(--canvas-fg-faint);
+  --color-canvas-accent: var(--canvas-accent);
+  --color-canvas-edge: var(--canvas-edge);
+  --color-canvas-edge-head: var(--canvas-edge-head);
+  --color-canvas-artifact: var(--canvas-artifact);
+  --color-canvas-warn: var(--canvas-warn);
+  --color-canvas-matrix: var(--canvas-matrix);
+  --color-canvas-matrix-bg: var(--canvas-matrix-bg);
+  --color-canvas-condition: var(--canvas-condition);
 }
 
 :root {
@@ -81,6 +110,36 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+
+  /* Canvas, light: paper cards on a faintly tinted ground, not an inverted dark
+     theme. The glow sits at the top of the radial and reads as a soft vignette. */
+  --canvas: oklch(0.99 0.002 260);
+  --canvas-glow: oklch(0.955 0.012 250);
+  --canvas-grid: oklch(0.86 0.006 260);
+  --canvas-node: oklch(1 0 0);
+  --canvas-node-selected: oklch(0.975 0.015 240);
+  --canvas-node-shadow: 0 8px 22px oklch(0.55 0.02 260 / 12%);
+  --canvas-border: oklch(0.9 0.006 260);
+  --canvas-border-hover: oklch(0.8 0.008 260);
+  --canvas-raise: oklch(1 0 0);
+  --canvas-raise-hover: oklch(0.96 0.004 260);
+  --canvas-chip: oklch(0.96 0.004 260);
+  --canvas-inset: oklch(0.965 0.004 260);
+  --canvas-scrim: oklch(1 0 0);
+  --canvas-mask: oklch(0.99 0.002 260 / 62%);
+  --canvas-fg: oklch(0.16 0.012 260);
+  --canvas-fg-muted: oklch(0.45 0.014 260);
+  --canvas-fg-subtle: oklch(0.525 0.014 260);
+  --canvas-fg-faint: oklch(0.64 0.01 260);
+  --canvas-accent: oklch(0.62 0.17 237);
+  --canvas-accent-ring: oklch(0.62 0.17 237 / 22%);
+  --canvas-edge: oklch(0.72 0.1 235);
+  --canvas-edge-head: oklch(0.64 0.12 235);
+  --canvas-artifact: oklch(0.62 0.14 62);
+  --canvas-warn: oklch(0.63 0.125 70);
+  --canvas-matrix: oklch(0.52 0.2 292);
+  --canvas-matrix-bg: oklch(0.955 0.02 292);
+  --canvas-condition: oklch(0.55 0.105 235);
 }
 
 .dark {
@@ -115,6 +174,36 @@
   --sidebar-accent-foreground: oklch(0.95 0.01 260);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.65 0.12 230);
+
+  /* Canvas, dark: the values the canvas already shipped, resolved from the alpha
+     stacks they used to be composed from — the rendering is unchanged. */
+  --canvas: oklch(0.125 0.012 260);
+  --canvas-glow: oklch(0.22 0.028 250);
+  --canvas-grid: oklch(0.322 0.007 265);
+  --canvas-node: oklch(0.18 0.014 260);
+  --canvas-node-selected: oklch(0.2 0.02 250);
+  --canvas-node-shadow: 0 10px 28px oklch(0 0 0 / 32%);
+  --canvas-border: oklch(0.282 0.011 260);
+  --canvas-border-hover: oklch(0.393 0.009 260);
+  --canvas-raise: oklch(0.295 0.024 250);
+  --canvas-raise-hover: oklch(0.367 0.021 249);
+  --canvas-chip: oklch(0.242 0.012 260);
+  --canvas-inset: oklch(0.16 0.011 260);
+  --canvas-scrim: oklch(0.102 0.01 260);
+  --canvas-mask: oklch(0 0 0 / 62%);
+  --canvas-fg: oklch(1 0 0);
+  --canvas-fg-muted: oklch(0.667 0.004 260);
+  --canvas-fg-subtle: oklch(0.587 0.006 260);
+  --canvas-fg-faint: oklch(0.5 0.008 260);
+  --canvas-accent: oklch(0.754 0.139 233);
+  --canvas-accent-ring: oklch(0.754 0.139 233 / 18%);
+  --canvas-edge: oklch(0.545 0.065 232);
+  --canvas-edge-head: oklch(0.642 0.077 231);
+  --canvas-artifact: oklch(0.786 0.135 92);
+  --canvas-warn: oklch(0.69 0.115 92);
+  --canvas-matrix: oklch(0.832 0.051 293);
+  --canvas-matrix-bg: oklch(0.254 0.035 284);
+  --canvas-condition: oklch(0.708 0.044 233);
 }
 
 @layer base {
@@ -127,9 +216,4 @@
   html {
     @apply font-sans;
   }
-}
-
-/* MIT @xyflow/react — hide default attribution badge (no React Flow Pro). */
-.react-flow__attribution {
-  display: none !important;
 }

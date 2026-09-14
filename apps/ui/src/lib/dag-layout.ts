@@ -3,8 +3,8 @@ import type { StepNodeData } from "@/components/step-node"
 import type { PipelineDefinition, StepDefinition } from "@/lib/api"
 
 export const COL_WIDTH = 268
-// A node is ~118px, and ~150px once it carries a matrix binding or condition row.
-// One pitch for both keeps columns aligned without measuring every node.
+// A node measures ~124px, and ~140px once it carries a step id, matrix binding or
+// condition row. One pitch for both keeps columns aligned without measuring every node.
 export const ROW_HEIGHT = 176
 export const ORIGIN_X = 56
 export const ORIGIN_Y = 48
@@ -12,12 +12,12 @@ export const ORIGIN_Y = 48
 export const edgeDefaults = {
   type: "smoothstep" as const,
   animated: false,
-  style: { stroke: "rgba(125,211,252,0.55)", strokeWidth: 1.75 },
+  style: { stroke: "var(--canvas-edge)", strokeWidth: 1.75 },
   markerEnd: {
     type: MarkerType.ArrowClosed,
     width: 16,
     height: 16,
-    color: "rgba(125,211,252,0.7)",
+    color: "var(--canvas-edge-head)",
   },
 }
 
@@ -137,12 +137,56 @@ export function nodeData(s: StepDefinition, status?: string): StepNodeData {
     continueOnError: s.continue_on_error,
     matrixCells: !bound && cells > 1 ? cells : undefined,
     matrixAxes: !bound && cells > 1 ? Object.keys(s.matrix ?? {}) : undefined,
+    ariaLabel: nodeAriaLabel(s, status),
     runPreview: s.run
       ?.split("\n")
       .map((l) => l.trim())
       .find(Boolean)
       ?.slice(0, 48),
   }
+}
+
+/**
+ * What a screen reader hears on a node. React Flow makes every node a tab stop with
+ * `role="group"`, so without this the whole graph announces as "group, node" repeated
+ * once per step and a keyboard user learns nothing from walking it.
+ */
+export function nodeAriaLabel(s: StepDefinition, status?: string): string {
+  const parts = [s.name || s.id]
+  parts.push(status ? `status ${status}` : "not started")
+  const needs = (s.needs ?? []).length
+  if (needs > 0)
+    parts.push(needs === 1 ? "needs 1 step" : `needs ${needs} steps`)
+  return parts.join(", ")
+}
+
+/**
+ * Statuses arrive on every poll, and rebuilding each node's `data` would hand React
+ * Flow a new object identity for every step every few seconds — which defeats the
+ * `memo` on StepNode and re-renders the whole graph to change nothing. Compare first
+ * and keep the object that is already there.
+ */
+export function sameNodeData(a: StepNodeData, b: StepNodeData): boolean {
+  const sameList = (x?: string[], y?: string[]) =>
+    x === y ||
+    (x?.length === y?.length && (x ?? []).every((v, i) => v === y?.[i]))
+  return (
+    a.label === b.label &&
+    a.stepId === b.stepId &&
+    a.status === b.status &&
+    a.retries === b.retries &&
+    a.needsCount === b.needsCount &&
+    a.runPreview === b.runPreview &&
+    a.image === b.image &&
+    a.condition === b.condition &&
+    a.continueOnError === b.continueOnError &&
+    a.matrixCells === b.matrixCells &&
+    a.matrixBinding === b.matrixBinding &&
+    a.ariaLabel === b.ariaLabel &&
+    sameList(a.labels, b.labels) &&
+    sameList(a.artifacts, b.artifacts) &&
+    sameList(a.matrixAxes, b.matrixAxes)
+  )
 }
 
 export function layout(
@@ -173,6 +217,7 @@ export function layout(
     type: "step",
     position: positions.get(s.id) ?? { x: ORIGIN_X, y: ORIGIN_Y },
     selected: selectedId === s.id,
+    ariaLabel: nodeAriaLabel(s, statuses?.[s.id]),
     data: nodeData(s, statuses?.[s.id]),
   }))
 

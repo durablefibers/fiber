@@ -9,7 +9,7 @@ import {
   Save,
   Trash2,
 } from "lucide-react"
-import { useEffect, useId, useMemo, useState } from "react"
+import { useEffect, useId, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import { AppShell } from "@/components/app-shell"
 import { DagCanvas } from "@/components/dag-canvas"
@@ -24,6 +24,7 @@ import {
   type PipelineDefinition,
   type Project,
 } from "@/lib/api"
+import { useExpand } from "@/lib/use-expand"
 import { cn } from "@/lib/utils"
 
 export const Route = createFileRoute("/p/$projectId/pipelines/$pipelineId")({
@@ -309,28 +310,50 @@ function PipelineEditorPage() {
     }
   }
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null
-      const typing =
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable)
-      const meta = e.metaKey || e.ctrlKey
-      if (meta && e.key.toLowerCase() === "s") {
-        e.preventDefault()
-        if (dirty && !saving) void save()
+  // Escape is already spoken for on this route, so the canvas hands it back here
+  // rather than racing for it.
+  const {
+    expanded,
+    setExpanded,
+    toggle: toggleExpand,
+  } = useExpand({
+    escapeToExit: false,
+  })
+
+  // The handler reads half the page's state, so it is rebuilt every render and reached
+  // through a ref — listing those as dependencies would re-register the listener on
+  // every keystroke in the editor, and an empty list would freeze it on the first render.
+  const onKeyRef = useRef<(e: KeyboardEvent) => void>(() => {})
+  onKeyRef.current = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null
+    const typing =
+      target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable)
+    const meta = e.metaKey || e.ctrlKey
+    if (meta && e.key.toLowerCase() === "s") {
+      e.preventDefault()
+      if (dirty && !saving) void save()
+      return
+    }
+    if (e.key === "Escape" && !typing) {
+      // Collapsing the canvas is the less destructive of the two, so it goes first
+      // and the selection survives.
+      if (expanded) {
+        setExpanded(false)
         return
       }
-      if (e.key === "Escape" && !typing) {
-        setInspector("pipeline")
-        selectStep(null)
-      }
+      setInspector("pipeline")
+      selectStep(null)
     }
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => onKeyRef.current(e)
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  })
+  }, [])
 
   useEffect(() => {
     if (!dirty) return
@@ -473,8 +496,25 @@ function PipelineEditorPage() {
         </div>
       ) : null}
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="min-h-[420px] p-3 lg:min-h-0 lg:p-4">
+      {/*
+        Expanded, the editor takes the viewport: the canvas gets the room, and the
+        inspector stays beside it so selecting a step still leads somewhere.
+      */}
+      <div
+        className={cn(
+          "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]",
+          // Stacked, the rows would size to content and hand the canvas the smaller
+          // half — the opposite of what expanding it was for.
+          expanded &&
+            "fixed inset-0 z-50 grid-rows-[1.15fr_0.85fr] overflow-hidden bg-background lg:grid-rows-none"
+        )}
+      >
+        <div
+          className={cn(
+            "min-h-[420px] p-3 lg:min-h-0 lg:p-4",
+            expanded && "min-h-0"
+          )}
+        >
           {definition ? (
             <DagCanvas
               definition={definition}
@@ -482,6 +522,8 @@ function PipelineEditorPage() {
               selectedStepId={selectedId}
               onSelectStep={selectStep}
               onChange={(d) => setDefinition(d)}
+              expanded={expanded}
+              onToggleExpand={toggleExpand}
             />
           ) : (
             <div className="flex h-full min-h-[420px] items-center justify-center rounded-2xl border border-border/60 border-dashed text-muted-foreground text-sm">
