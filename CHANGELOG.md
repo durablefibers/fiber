@@ -58,6 +58,17 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`redis` 0.29 to 1.7 and `aes-gcm` 0.10 to 0.11.** Redis needed no code change — the
+  surface the scheduler uses (`ConnectionManager`, `publish`, `get_async_pubsub`,
+  `on_message`) is unchanged across the 1.0 boundary — but nothing in the unit suite
+  touches Redis, so the pub/sub round trip was exercised against a live server rather
+  than inferred from a clean build. `aes-gcm` 0.11 deprecates `Nonce::from_slice` in
+  favour of `TryFrom`, which is a hard error under clippy `-D warnings`; the cipher now
+  builds its nonce that way and passes it by reference. **Stored secrets are unaffected**
+  — a ciphertext written by 0.10 decrypts under 0.11, the `enc:v1:` layout is identical,
+  and nothing needs re-encrypting. That is now pinned by a test carrying a literal
+  0.10-era ciphertext, so a future bump that moves the nonce or the tag fails in CI
+  instead of in production, where it would read as every secret being corrupt.
 - **The DAG canvas passes an accessibility and typography audit it previously did not.**
   Every step node is a tab stop React Flow gives `role="group"` to, so the whole graph
   announced as "group, node" repeated once per step — nodes now carry a name built from
