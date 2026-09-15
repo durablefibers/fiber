@@ -58,6 +58,13 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`tokio-tungstenite` 0.26 to 0.29**, which needed no code change and removes a
+  duplicate rather than adding one: `axum` 0.8.9 already depends on 0.29, so the agent
+  sitting on 0.26 meant the workspace carried two copies of the WebSocket stack — the
+  one the server speaks and the one the agent speaks. They are now the same crate. The
+  agent protocol is not covered by unit tests, so this was verified by building the
+  agent and running the pools smoke against a live API: offers, claims, log streaming
+  and completion across a scoped and a global pool, `SMOKE_OK`.
 - **`redis` 0.29 to 1.7 and `aes-gcm` 0.10 to 0.11.** Redis needed no code change — the
   surface the scheduler uses (`ConnectionManager`, `publish`, `get_async_pubsub`,
   `on_message`) is unchanged across the 1.0 boundary — but nothing in the unit suite
