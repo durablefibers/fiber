@@ -58,6 +58,13 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`uuid` 1.26.1 and `aws-sdk-s3` 1.146.1**, both inside the ranges already declared,
+  so this is a lockfile change only. uuid's release fixes v7 timestamp handling, which
+  this codebase does not reach — it builds ids with `new_v4` and the `v4` feature alone.
+  `aws-sdk-s3` 1.147.0 was available and deliberately skipped: it pulls a smithy cascade
+  (`aws-smithy-types` 1.6 to 1.7, `aws-smithy-xml` 0.62 to 0.63, a new
+  `aws-smithy-schema`) that deserves its own change rather than riding along with a
+  patch.
 - **`petgraph` 0.7 to 0.8**, with no code change — `DiGraph`, `toposort` and
   `is_cyclic_directed` are unchanged where `dag.rs` uses them. The compiled step list
   and the level map are built from the definition's own order rather than the graph
