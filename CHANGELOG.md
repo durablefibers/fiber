@@ -58,6 +58,12 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **Web dependencies: React 19.2 to 19.3** (with `react-dom` and both `@types` in step),
+  `lucide-react` 1.41 to 1.46, and `cn` 0.2.4 to 0.2.6. The `^` floors move with them, so
+  `package.json` records the versions actually tested rather than the oldest that would
+  still resolve. Beyond the UI suite, the canvas was exercised in a browser on React 19.3
+  — step nodes, their accessible names, the token palette, and full screen in and out —
+  because `tsc` and vitest would not notice a rendering regression.
 - **`uuid` 1.26.1 and `aws-sdk-s3` 1.146.1**, both inside the ranges already declared,
   so this is a lockfile change only. uuid's release fixes v7 timestamp handling, which
   this codebase does not reach — it builds ids with `new_v4` and the `v4` feature alone.
