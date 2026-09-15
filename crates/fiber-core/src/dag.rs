@@ -1,5 +1,5 @@
 use fiber_proto::{PipelineDefinition, StepDefinition};
-use petgraph::algo::{is_cyclic_directed, toposort};
+use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -184,10 +184,10 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         }
     }
 
-    if is_cyclic_directed(&graph) {
-        return Err(DagError::Cycle);
-    }
-
+    // `toposort` is itself the cycle check: it can only order an acyclic graph, and
+    // reports `Err` for anything else — a two-step loop, a longer one, or a step that
+    // needs itself. A separate `is_cyclic_directed` pass in front of it walked the
+    // whole graph a second time to learn what this line already tells us.
     let order = toposort(&graph, None).map_err(|_| DagError::Cycle)?;
     let needs_map: HashMap<&str, &Vec<String>> =
         with_needs.iter().map(|(c, n)| (c.id.as_str(), n)).collect();
@@ -921,6 +921,22 @@ mod tests {
         };
         assert_eq!(levels(&forward), levels(&backward));
         assert_eq!(levels(&forward).last().unwrap().1, 3);
+    }
+
+    /// The degenerate cycle: one step that needs itself. Worth its own case because
+    /// it is the shape a hand-edited `fiber.yml` produces by typo, and because it is
+    /// the one `toposort` could plausibly have treated as an ordinary node.
+    #[test]
+    fn detects_a_step_that_needs_itself() {
+        let def = PipelineDefinition {
+            name: "bad".into(),
+            env: Default::default(),
+            workspace: None,
+            on: None,
+            timeout_minutes: None,
+            steps: vec![step("a", &["a"], "echo a")],
+        };
+        assert!(matches!(compile_definition(&def), Err(DagError::Cycle)));
     }
 
     /// The two-node case can be caught without walking the graph at all; a longer

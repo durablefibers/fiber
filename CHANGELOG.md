@@ -58,6 +58,13 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`compile_definition` stops checking for cycles twice.** It ran
+  `is_cyclic_directed` and then `toposort`, which is the same question asked two ways —
+  `toposort` can only order an acyclic graph and reports `Err` for anything else,
+  including a step that needs itself. The guard is gone and the `map_err` that was
+  already there carries it. The real gain is in the tests: with two checks in front of
+  it, the cycle tests passed even when one was disabled, so neither was pinned. All
+  three now fail if the remaining check breaks, and a fourth covers the self-need typo.
 - **Web dependencies: React 19.2 to 19.3** (with `react-dom` and both `@types` in step),
   `lucide-react` 1.41 to 1.46, and `cn` 0.2.4 to 0.2.6. The `^` floors move with them, so
   `package.json` records the versions actually tested rather than the oldest that would
