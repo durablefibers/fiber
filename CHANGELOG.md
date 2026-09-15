@@ -58,6 +58,14 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **`petgraph` 0.7 to 0.8**, with no code change — `DiGraph`, `toposort` and
+  `is_cyclic_directed` are unchanged where `dag.rs` uses them. The compiled step list
+  and the level map are built from the definition's own order rather than the graph
+  walk, so petgraph making no promise about which valid topological order it returns
+  cannot move a step or a level. Three tests now pin that, because the two the DAG had
+  were a three-node fan-out and a two-node cycle: a level is the longest path from a
+  root and not the shortest, declaration order does not change the compiled levels, and
+  a cycle longer than two steps is still caught.
 - **`tokio-tungstenite` 0.26 to 0.29**, which needed no code change and removes a
   duplicate rather than adding one: `axum` 0.8.9 already depends on 0.29, so the agent
   sitting on 0.26 meant the workspace carried two copies of the WebSocket stack — the

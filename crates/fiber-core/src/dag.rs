@@ -860,6 +860,88 @@ mod tests {
         assert_eq!(dag.levels[1].len(), 2);
     }
 
+    /// A step sits one level past its *furthest* dependency, not its nearest, so an
+    /// uneven diamond has to push the join out to the long branch. `toposort` may
+    /// return any valid order and petgraph does not promise a stable one between
+    /// versions, so this pins the property the level maths actually depends on.
+    #[test]
+    fn a_level_is_the_longest_path_from_a_root_not_the_shortest() {
+        let def = PipelineDefinition {
+            name: "diamond".into(),
+            env: Default::default(),
+            workspace: None,
+            on: None,
+            timeout_minutes: None,
+            steps: vec![
+                step("a", &[], "echo a"),
+                step("b", &["a"], "echo b"),
+                step("c", &["b"], "echo c"),
+                step("d", &["a"], "echo d"),
+                step("join", &["c", "d"], "echo join"),
+            ],
+        };
+        let dag = compile_definition(&def).unwrap();
+        let level = |id: &str| dag.steps.iter().find(|s| s.id == id).unwrap().level;
+        assert_eq!(level("a"), 0);
+        assert_eq!(level("b"), 1);
+        assert_eq!(level("d"), 1);
+        assert_eq!(level("c"), 2);
+        // Reachable at distance 2 through `d`, but 3 through `c` — the long one wins.
+        assert_eq!(level("join"), 3);
+        assert_eq!(dag.levels.len(), 4);
+    }
+
+    /// The compiled order comes from the definition, not from the graph walk, so a
+    /// pipeline that declares its steps bottom-up compiles to the same thing.
+    #[test]
+    fn declaration_order_does_not_change_the_compiled_levels() {
+        let steps = |order: [&str; 4]| {
+            let by_id = |id: &str| match id {
+                "a" => step("a", &[], "echo a"),
+                "b" => step("b", &["a"], "echo b"),
+                "c" => step("c", &["b"], "echo c"),
+                _ => step("d", &["c"], "echo d"),
+            };
+            PipelineDefinition {
+                name: "chain".into(),
+                env: Default::default(),
+                workspace: None,
+                on: None,
+                timeout_minutes: None,
+                steps: order.iter().map(|id| by_id(id)).collect(),
+            }
+        };
+        let forward = compile_definition(&steps(["a", "b", "c", "d"])).unwrap();
+        let backward = compile_definition(&steps(["d", "c", "b", "a"])).unwrap();
+        let levels = |dag: &CompiledDag| {
+            let mut v: Vec<(String, usize)> =
+                dag.steps.iter().map(|s| (s.id.clone(), s.level)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(levels(&forward), levels(&backward));
+        assert_eq!(levels(&forward).last().unwrap().1, 3);
+    }
+
+    /// The two-node case can be caught without walking the graph at all; a longer
+    /// loop is the one that needs the cycle check to be real.
+    #[test]
+    fn detects_a_cycle_longer_than_two_steps() {
+        let def = PipelineDefinition {
+            name: "bad".into(),
+            env: Default::default(),
+            workspace: None,
+            on: None,
+            timeout_minutes: None,
+            steps: vec![
+                step("a", &["c"], "echo a"),
+                step("b", &["a"], "echo b"),
+                step("c", &["b"], "echo c"),
+            ],
+        };
+        assert!(matches!(compile_definition(&def), Err(DagError::Cycle)));
+    }
+
     #[test]
     fn detects_cycle() {
         let def = PipelineDefinition {
