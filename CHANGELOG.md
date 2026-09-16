@@ -6,6 +6,14 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-16
+
+The web app is `apps/ui`, projects can be deleted, and the canvas tells the truth about a
+run. Adds migration 013 (an index; no data change) and carries a **breaking rename**: the
+Compose service `fiber-web` is now `fiber-ui`, `FIBER_WEB_BIND` is now `FIBER_UI_BIND`, and
+the UI image builds from `apps/ui/Dockerfile.ui`. A deployment pinned to either name needs
+updating; nothing about the running system changed. Upgrade the server before the agents.
+
 ### Added
 
 - **A full-screen canvas** on the pipeline editor and the run view — the toolbar button,
