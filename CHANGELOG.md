@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A `matrix-build` showcase pipeline**, and tests that every seeded pipeline compiles.
+  The seed had avoided `matrix:` and imitated it with hand-written parallel lanes — the
+  canvas could not draw a matrix step until 0.5.0, so the one feature that needs a picture
+  had none. It fans out on two axes, carries a per-cell `if` so one cell is visibly
+  skipped, and ends on a step whose `needs` the compiler rewrites onto every cell. The
+  axes are `rust` and `features` rather than `os`: a `macos` cell would sit queued forever
+  on the single agent a demo instance has.
+- **`seed::tests`** — the seeded pipelines were raw JSON that nothing ever compiled, so a
+  malformed one was not a failing test but a pipeline that shows up in the demo project
+  and cannot run. One test now compiles all of them; others pin the matrix expansion, and
+  one refuses a demo whose terminal step hangs off a conditional, since `success()` is
+  transitive and the last node would always be grey.
+
 ## [0.5.0] — 2026-09-16
 
 The web app is `apps/ui`, projects can be deleted, and the canvas tells the truth about a

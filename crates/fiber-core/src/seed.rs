@@ -67,6 +67,7 @@ fn showcase_pipelines() -> Vec<(&'static str, Value)> {
         ("fan-out-tests", fan_out_tests()),
         ("release-with-artifacts", release_with_artifacts()),
         ("retry-and-skip", retry_and_skip()),
+        ("matrix-build", matrix_build()),
         ("nightly-interval", nightly_interval()),
     ]
 }
@@ -114,6 +115,61 @@ fn diamond_ci() -> Value {
             step("types", "typecheck", &["checkout"], "echo typecheck && sleep 0.25", &["os=linux"], 0, &[]),
             step("package", "package", &["lint", "unit", "types"], "mkdir -p dist && echo bundle > dist/app.txt", &["os=linux"], 0, &["dist/app.txt"]),
             step("smoke", "smoke", &["package"], "test -f dist/app.txt && echo smoke-ok", &["os=linux"], 0, &[]),
+        ]
+    })
+}
+
+/// A step the compiler will expand: `matrix` axes, and an optional `if` evaluated per cell.
+fn matrix_step(
+    id: &str,
+    name: &str,
+    needs: &[&str],
+    run: &str,
+    matrix: Value,
+    cell_if: Option<&str>,
+) -> Value {
+    let mut s = step(id, name, needs, run, &["os=linux"], 0, &[]);
+    s["matrix"] = matrix;
+    if let Some(expr) = cell_if {
+        s["if"] = json!(expr);
+    }
+    s
+}
+
+/// A real `matrix:`, expanded by the compiler rather than written out by hand.
+///
+/// The axes are `rust` and `features` rather than the usual `os`, because every cell has
+/// to be runnable on the one agent a demo instance has: a `macos` cell would sit queued
+/// forever and showcase nothing.
+///
+/// `report` needs `test` alone, and `lint` is a leaf. That is deliberate: `success()` is
+/// transitive, so a `report` that also needed `lint` would be skipped by the very cell
+/// this pipeline exists to show being skipped — correct behaviour, but a demo whose last
+/// node is always grey reads as broken. Each step now demonstrates one thing: `test` the
+/// fan-out, `report` the rewriting of `needs` onto every cell, `lint` a per-cell `if`.
+fn matrix_build() -> Value {
+    json!({
+        "name": "matrix-build",
+        "steps": [
+            step("checkout", "checkout", &[], "echo ready", &["os=linux"], 0, &[]),
+            matrix_step(
+                "test",
+                "test",
+                &["checkout"],
+                // Each binding is exported three ways — bare, MATRIX_*, FIBER_MATRIX_*.
+                "echo \"rust=$rust features=$features\" && echo \"also MATRIX_RUST=$MATRIX_RUST\" && sleep 0.2",
+                json!({ "rust": ["stable", "beta"], "features": ["default", "all"] }),
+                None,
+            ),
+            matrix_step(
+                "lint",
+                "lint",
+                &["checkout"],
+                "echo \"clippy on $rust\" && sleep 0.2",
+                json!({ "rust": ["stable", "beta"] }),
+                Some("matrix.rust == 'stable'"),
+            ),
+            step("report", "report", &["test"], "echo all-cells-done > matrix-report.txt && cat matrix-report.txt", &["os=linux"], 0, &["matrix-report.txt"]),
         ]
     })
 }
@@ -168,4 +224,122 @@ fn nightly_interval() -> Value {
             step("tick", "tick", &[], "echo nightly $(date -u +%Y-%m-%dT%H:%M:%SZ)", &["os=linux"], 0, &[]),
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The seeded pipelines are written as raw JSON and were never checked against the
+    //! compiler that has to accept them. A malformed one is not a test failure today —
+    //! it is a pipeline that appears in the demo project and cannot run.
+
+    use super::*;
+    use crate::dag::compile_definition;
+    use fiber_proto::PipelineDefinition;
+
+    fn compiled(definition: &Value) -> crate::dag::CompiledDag {
+        let parsed: PipelineDefinition = serde_json::from_value(definition.clone())
+            .unwrap_or_else(|e| panic!("seed pipeline is not a PipelineDefinition: {e}"));
+        compile_definition(&parsed)
+            .unwrap_or_else(|e| panic!("seed pipeline does not compile: {e}"))
+    }
+
+    #[test]
+    fn every_seeded_pipeline_compiles() {
+        for (name, definition) in showcase_pipelines() {
+            let dag = compiled(&definition);
+            assert!(!dag.steps.is_empty(), "{name} compiled to no steps");
+        }
+    }
+
+    #[test]
+    fn seeded_pipeline_names_are_unique() {
+        // `ensure_showcase` skips by name, so a duplicate would silently seed only one.
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in showcase_pipelines() {
+            assert!(seen.insert(name), "two seeded pipelines are called {name}");
+        }
+    }
+
+    #[test]
+    fn the_matrix_pipeline_expands_into_its_cells() {
+        let dag = compiled(&matrix_build());
+        let ids: std::collections::HashSet<&str> =
+            dag.steps.iter().map(|s| s.id.as_str()).collect();
+
+        // Two axes of two values: four cells, not one step called `test`.
+        for id in [
+            "test__features_default__rust_stable",
+            "test__features_default__rust_beta",
+            "test__features_all__rust_stable",
+            "test__features_all__rust_beta",
+        ] {
+            assert!(ids.contains(id), "missing matrix cell {id} in {ids:?}");
+        }
+        assert!(
+            !ids.contains("test"),
+            "the authored step should not survive expansion"
+        );
+    }
+
+    #[test]
+    fn a_dependency_on_a_matrix_step_is_rewritten_to_every_cell() {
+        let dag = compiled(&matrix_build());
+        let report = dag
+            .steps
+            .iter()
+            .find(|s| s.id == "report")
+            .expect("report step");
+
+        // `needs: [test]` as written points at an id that no longer exists after
+        // expansion; the compiler rewrites it to all four cells.
+        assert_eq!(report.needs.len(), 4, "report needs: {:?}", report.needs);
+        assert!(report.needs.iter().all(|n| n.starts_with("test__")));
+    }
+
+    #[test]
+    fn the_showcase_run_can_actually_finish_green() {
+        // `success()` is transitive: anything downstream of the deliberately skipped
+        // lint cell would be skipped too, leaving the demo's terminal node grey.
+        let dag = compiled(&matrix_build());
+        let skippable: std::collections::HashSet<&str> = dag
+            .steps
+            .iter()
+            .filter(|s| s.if_expr.is_some())
+            .map(|s| s.id.as_str())
+            .collect();
+        for s in &dag.steps {
+            assert!(
+                !s.needs.iter().any(|n| skippable.contains(n.as_str())),
+                "{} depends on conditional {:?}; the demo would end on a skip",
+                s.id,
+                s.needs
+            );
+        }
+    }
+
+    #[test]
+    fn the_conditional_axis_reaches_both_cells_with_its_expression() {
+        let dag = compiled(&matrix_build());
+        let lint: Vec<_> = dag
+            .steps
+            .iter()
+            .filter(|s| s.id.starts_with("lint"))
+            .collect();
+        assert_eq!(
+            lint.len(),
+            2,
+            "lint should expand to one cell per rust value"
+        );
+        // The skip is decided at run time from `if`; what compiles is the expression
+        // travelling to every cell, each carrying its own binding.
+        assert!(
+            lint.iter()
+                .all(|s| s.if_expr.as_deref() == Some("matrix.rust == 'stable'"))
+        );
+        let bindings: std::collections::HashSet<&str> = lint
+            .iter()
+            .filter_map(|s| s.matrix.get("rust").map(String::as_str))
+            .collect();
+        assert_eq!(bindings, ["stable", "beta"].into_iter().collect());
+    }
 }
