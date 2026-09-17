@@ -18,7 +18,7 @@ jobs:
       # Toolchain version comes from rust-toolchain.toml (kept in step with deploy/Dockerfile).
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97"
+          toolchain: "1.98"
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
