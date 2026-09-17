@@ -6,6 +6,15 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fiber.yml` built this repo against a Rust it does not use.** It pinned
+  `rust:1.97-bookworm` while `rust-toolchain.toml` and `deploy/Dockerfile` had moved to
+  1.98, and `.github/workflows/ci.yml` declared 1.97 as well. The pin wins, so nothing
+  failed — `rustup` downloaded a full 1.98 toolchain inside the container instead, on
+  `fmt`, `clippy`, `test` and `build`, on every push and pull request, and in CI. All four
+  files name 1.98 now, and `toolchain_audit` reads them and fails when they disagree.
+
 ### Added
 
 - **A `matrix-build` showcase pipeline**, and tests that every seeded pipeline compiles.

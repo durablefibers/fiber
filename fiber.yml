@@ -23,7 +23,7 @@ timeout_minutes: 45
 steps:
   fmt:
     run: cargo fmt --check
-    image: rust:1.97-bookworm
+    image: rust:1.98-bookworm
     labels: [os=linux]
     timeout_minutes: 5
     secrets: []
@@ -31,7 +31,7 @@ steps:
   clippy:
     needs: [fmt]
     run: cargo clippy -p fiber-api -p fiber-agent -p fiber-cli -p fiber-core -p fiber-scheduler -p fiber-durable -- -D warnings
-    image: rust:1.97-bookworm
+    image: rust:1.98-bookworm
     labels: [os=linux]
     timeout_minutes: 20
     secrets: []
@@ -39,7 +39,7 @@ steps:
   test:
     needs: [fmt]
     run: cargo test --workspace
-    image: rust:1.97-bookworm
+    image: rust:1.98-bookworm
     labels: [os=linux]
     timeout_minutes: 20
     secrets: []
@@ -47,7 +47,7 @@ steps:
   build:
     needs: [clippy, test]
     run: cargo build --release -p fiber-api -p fiber-agent -p fiber-cli
-    image: rust:1.97-bookworm
+    image: rust:1.98-bookworm
     labels: [os=linux]
     timeout_minutes: 25
     secrets: []

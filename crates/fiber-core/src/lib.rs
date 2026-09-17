@@ -11,6 +11,7 @@ pub mod seed;
 pub mod step_if;
 pub mod store;
 pub mod tokens;
+mod toolchain_audit;
 
 pub use dag::{CompiledDag, DagError, compile_definition};
 pub use due_index::DueIndex;
