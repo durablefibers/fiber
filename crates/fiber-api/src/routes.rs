@@ -709,7 +709,7 @@ async fn add_member(
     Path(id): Path<Uuid>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
+    let actor = crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
     let role =
         ProjectRole::parse(&req.role).ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
     if role == ProjectRole::Owner {
@@ -739,7 +739,7 @@ async fn add_member(
     };
     state
         .store
-        .add_project_member(id, target.id, role)
+        .add_project_member(id, target.id, role, actor == ProjectRole::Owner)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(
@@ -753,7 +753,7 @@ async fn update_member(
     Path((id, user_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<UpdateMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
+    let actor = crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
     let role =
         ProjectRole::parse(&req.role).ok_or_else(|| ApiError::BadRequest("invalid role".into()))?;
     if role == ProjectRole::Owner {
@@ -761,7 +761,7 @@ async fn update_member(
     }
     state
         .store
-        .add_project_member(id, user_id, role)
+        .add_project_member(id, user_id, role, actor == ProjectRole::Owner)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
@@ -772,10 +772,10 @@ async fn remove_member(
     State(state): State<AppState>,
     Path((id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
+    let actor = crate::access::require_project(&state, &user, id, ProjectRole::Admin).await?;
     state
         .store
-        .remove_project_member(id, user_id)
+        .remove_project_member(id, user_id, actor == ProjectRole::Owner)
         .await
         .map_err(|e| {
             let msg = e.to_string();

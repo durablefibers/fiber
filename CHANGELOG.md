@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+Adds migration 015: three indexes, one dropped index, a unique index on artifacts (after
+removing duplicate rows), and `CHECK` constraints on the two status columns, added
+`NOT VALID` so an old database with a stray status string still boots. See
+[operations](docs/operations.md#upgrades) before upgrading a large install.
+
 ### Changed
 
 - **`/ready` no longer fails on Redis.** Leases, scheduling, and the queue live in
@@ -49,6 +54,68 @@ minor versions may carry breaking changes.
 - **Supervisor backoff resets after a healthy run.** A loop that crashed once a day
   was, from day seven on, waiting the full 60 s cap before every restart with `/ready`
   at `503` the whole time. A loop that ran at least 60 s before dying starts over at 1 s.
+
+- **A reclaimed step now reports what happened to it.** When an expired lease or a
+  disconnect requeued or failed a step, the row changed but no event was published: the
+  run page showed the step `running` until a reload, and a run that ended on a lost lease
+  never sent its commit status to GitHub. Reclaim now publishes the same step and run
+  events a reported completion does.
+- **Cancelling a run whose row carries a legacy status no longer fails with a 500.** A
+  status outside the vocabulary (tolerated by the new `NOT VALID` check) matched neither
+  the terminal guard nor the cancel update; the run is now returned untouched, and the
+  reclaim loop's orphan-run sweep leaves such runs alone for the operator instead of
+  retrying them every tick.
+- **A cancel can no longer overwrite a finished run.** `cancel_run` was three statements
+  on three connections with no status guard on the run, so a cancel that landed after the
+  last step completed turned `succeeded` into `cancelled` — and GitHub saw `success`
+  followed by `error` for the same commit. It is now one transaction with the run row
+  locked: a run that is already terminal is left exactly as it is, and a step leased
+  between the read and the write is cancelled *and* its agent told, where before the row
+  flipped and the agent kept running with a slot that was never released.
+- **A step that keeps killing its agent now fails instead of running forever.** Reclaim
+  (expired lease, agent disconnect) requeued unconditionally; only a failure the agent
+  *reported* went through the retry budget. A step that OOM-killed its agent was leased,
+  lost, and leased again indefinitely, its run never terminal and its `step_attempts`
+  growing every five minutes. A lost lease now counts against `retries` like a reported
+  failure does, with one extra try: a step is failed with `lease lost after N attempts`
+  once it has lost more than `retries + 1` leases, and its run propagates like any other
+  failure. The extra try is deliberate — a `retries: 0` step survives one rolling agent
+  restart or one network blip, while a step that kills its agent every time still stops
+  after two leases. The reclaim loop also finalises any run left `running` with no open
+  step (the window between a reclaim committing and its propagation running), and a run
+  deleted underneath a reclaim no longer aborts the sweep.
+- **Lease, complete, and reclaim write the step and its attempt in one transaction.**
+  Each used to be a `step_runs` update followed by a `step_attempts` write on a separate
+  connection. A crash between them left an attempt open against a step that was back in
+  the queue, and the timeout backstop then failed every later lease of that step within
+  seconds as "timed out". The backstop now also matches the attempt to the step's current
+  attempt number, so a stale open attempt can never be mistaken for the live one.
+- **A retry keeps its concurrency group.** `retry_run` dropped `concurrency_group`, so a
+  retried `main` build neither superseded nor was superseded by the next push.
+- **Editing a pipeline no longer re-arms a schedule slot the loop just consumed.**
+  `update_pipeline` wrote back a `next_due_at` it had read a moment earlier, racing the
+  scheduler's compare-and-set and firing the pipeline twice. The due time is now decided
+  inside the statement: kept when the cron or interval is unchanged, recomputed from the
+  new rule when it changed (a daily → hourly switch no longer waits for the old daily
+  time), cleared when the schedule is removed.
+- **An admin can no longer demote or remove an owner.** `PUT`/`DELETE` on a member only
+  required `admin`, and the last-owner guard existed only on `DELETE` and counted owners
+  in a separate statement — an admin could strip every owner, or two concurrent removals
+  could each see "two owners" and leave none. Changing or removing an owner now requires
+  the actor to be an owner, and the last-owner rule is evaluated inside the `UPDATE` /
+  `DELETE` under a lock on the project's owner rows. Refusals are `403` when the actor is
+  not an owner and `400` when the target is the last owner.
+- **Project creation is one transaction**, so a crash between the project and its first
+  member cannot leave a project nobody owns.
+- **Re-uploading an artifact replaces its row.** Steps are at-least-once, and a re-run
+  inserted a second `(step, name)` row a dependent's restore then fetched twice.
+  `artifacts` is now unique on `(step_run_id, name)`; migration 015 removes existing
+  duplicates (keeping the newest; both rows pointed at the same blob) before adding it.
+- **Missing indexes for three sweeps** that arrived after migration 007: the run-timeout
+  backstop (`runs (started_at) WHERE status = 'running'`), retention and project delete
+  (`artifacts (path)`), and fiber retention (`fibers (updated_at)` for terminal rows).
+  `idx_log_lines_step (step_run_id, seq)` is dropped — nothing has ordered by `seq` since
+  010, and it taxed every log insert.
 
 ## [0.6.1] — 2026-09-19
 
