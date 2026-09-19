@@ -77,7 +77,7 @@ run ends as `cancelled` with reason `superseded by a newer run`.
 | `needs` | `[]` | Upstream step ids (DAG edges) |
 | `labels` | `[]` | Matched against agent labels (all required labels must be present) |
 | `image` | — | Optional Docker image; agent runs in container when Docker enabled |
-| `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts |
+| `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts, and gets one extra try: a step is failed once it has lost more than `retries + 1` leases |
 | `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
 | `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |
 | `env` | `{}` | Environment for this step; overrides the pipeline's for the same name |

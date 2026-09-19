@@ -1333,6 +1333,26 @@ impl Store {
         Ok(reclaimed)
     }
 
+    /// Running runs with no step left to run: every step is terminal, yet the run was
+    /// never finalised. That is the window between a reclaim committing a step as
+    /// `failed` and `propagate_after_step` running on it — a process that dies in
+    /// between leaves the run `running` with nothing that would ever revisit it, since
+    /// every other sweep looks for open steps. The reclaim loop feeds these back into
+    /// propagation. Bounded so one tick cannot stall behind a pathological backlog.
+    pub async fn runs_with_no_open_steps(&self) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT r.id FROM runs r
+             WHERE r.status = 'running'
+               AND NOT EXISTS (
+                   SELECT 1 FROM step_runs s
+                   WHERE s.run_id = r.id AND s.status IN ('pending', 'queued', 'running'))
+             ORDER BY r.started_at NULLS FIRST, r.id
+             LIMIT 100",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Unlock dependents / cascade skips / finalize the run after a step changed.
     ///
     /// Runs as one transaction with the `runs` row locked (`FOR UPDATE`) so two steps
@@ -1340,16 +1360,20 @@ impl Store {
     /// writes. Transitions are computed in memory to a fixpoint, so a chain
     /// `A(failed) → B → C → D` resolves in one call regardless of step order.
     /// Returns every step whose status changed; publishing happens in the caller,
-    /// after commit.
+    /// after commit. A run that no longer exists (retention or a project delete got
+    /// there first) is not an error: there is nothing left to finalise.
     pub async fn propagate_after_step(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+        let Some(run) = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM runs WHERE id = $1 FOR UPDATE"
         )))
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| anyhow!("run not found"))?;
+        else {
+            tracing::debug!(%run_id, "propagate skipped: run no longer exists");
+            return Ok(Vec::new());
+        };
         let snapshot_steps = run
             .definition_snapshot
             .get("steps")
@@ -1451,11 +1475,13 @@ impl Store {
         .await?
         .ok_or_else(|| anyhow!("run not found"))?;
         // Locking the open steps blocks a concurrent lease until this commits; after
-        // that the lease's `status = 'queued'` guard fails on its own.
+        // that the lease's `status = 'queued'` guard fails on its own. `ORDER BY id` is
+        // the lock order every multi-row step lock in this file uses (see the reclaims),
+        // so two of them on the same run cannot deadlock.
         let open = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "SELECT {STEP_RUN_COLS} FROM step_runs
              WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')
-             ORDER BY step_id
+             ORDER BY id
              FOR UPDATE"
         )))
         .bind(run_id)
@@ -1487,14 +1513,21 @@ impl Store {
             )
             .await?;
         }
-        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+        let updated = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "UPDATE runs SET status = 'cancelled', finished_at = NOW()
              WHERE id = $1 AND status IN ('pending', 'running')
              RETURNING {RUN_COLS}"
         )))
         .bind(run_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        // A status outside the vocabulary (a legacy row the NOT VALID check tolerates)
+        // parses as Pending above but matches nothing here. Leave it alone rather than
+        // cancel its steps under a run that never becomes `cancelled`.
+        let Some(run) = updated else {
+            tx.rollback().await?;
+            return Ok((run, Vec::new()));
+        };
         tx.commit().await?;
 
         // Returned rows carry their pre-cancel `agent_id`, which is what the caller
@@ -2442,7 +2475,8 @@ async fn finish_open_attempt_on(
 /// committed result rather than a snapshot in which both still counted two owners.
 async fn lock_project_owners_on(conn: &mut sqlx::PgConnection, project_id: Uuid) -> Result<()> {
     sqlx::query(
-        "SELECT 1 FROM project_members WHERE project_id = $1 AND role = 'owner' FOR UPDATE",
+        "SELECT 1 FROM project_members WHERE project_id = $1 AND role = 'owner'
+         ORDER BY user_id FOR UPDATE",
     )
     .bind(project_id)
     .execute(conn)
@@ -2493,11 +2527,13 @@ enum RequeueOutcome {
 }
 
 /// Whether a step whose lease was lost gets another attempt. `attempt` is the one just
-/// lost (leases increment it), so the same `attempt > retries` rule the scheduler's
-/// `retry_plan` applies to a reported failure gives `retries + 1` attempts in total
-/// either way. Without this cap a step that kills its agent is re-leased forever.
+/// lost (leases increment it). A lost lease counts against the budget like a reported
+/// failure does, with one extra try: `retries + 2` leases in total, where `retry_plan`
+/// allows `retries + 1`. The extra one is for a rolling agent restart or a network
+/// blip, which a `retries: 0` step must survive once — while a step that kills its
+/// agent every time still stops after two leases instead of being re-leased forever.
 fn requeue_outcome(attempt: i32, retries: i32) -> RequeueOutcome {
-    if attempt > retries {
+    if attempt > retries + 1 {
         RequeueOutcome::Fail
     } else {
         RequeueOutcome::Requeue
@@ -3203,18 +3239,22 @@ mod transition_tests {
     }
 
     #[test]
-    fn a_lost_lease_gets_exactly_retries_plus_one_attempts() {
-        // Mirrors `scheduler::retry_plan`: the lost attempt is already counted, so with
-        // `retries: 2` attempts 1 and 2 come back and the third is the last.
+    fn a_lost_lease_gets_exactly_retries_plus_two_leases() {
+        // One more than `scheduler::retry_plan` grants a reported failure: with
+        // `retries: 2` lost attempts 1, 2 and 3 come back and the fourth is the last.
         assert_eq!(requeue_outcome(1, 2), RequeueOutcome::Requeue);
         assert_eq!(requeue_outcome(2, 2), RequeueOutcome::Requeue);
-        assert_eq!(requeue_outcome(3, 2), RequeueOutcome::Fail);
+        assert_eq!(requeue_outcome(3, 2), RequeueOutcome::Requeue);
         assert_eq!(requeue_outcome(4, 2), RequeueOutcome::Fail);
+        assert_eq!(requeue_outcome(5, 2), RequeueOutcome::Fail);
     }
 
     #[test]
-    fn a_step_without_retries_fails_on_its_first_lost_lease() {
-        // The old behaviour was to requeue unconditionally, which is the forever loop.
-        assert_eq!(requeue_outcome(1, 0), RequeueOutcome::Fail);
+    fn a_step_without_retries_survives_one_lost_lease_and_fails_on_the_second() {
+        // One rolling agent restart is not the step's fault; a second lost lease is the
+        // pattern of a step that kills its agent, and the old unconditional requeue was
+        // the forever loop.
+        assert_eq!(requeue_outcome(1, 0), RequeueOutcome::Requeue);
+        assert_eq!(requeue_outcome(2, 0), RequeueOutcome::Fail);
     }
 }

@@ -359,23 +359,94 @@ impl Scheduler {
 
     /// Requeue steps orphaned when an agent disconnects mid-run.
     pub async fn on_agent_disconnect(&self, agent_id: Uuid) -> Result<()> {
-        let requeued = self.store.requeue_agent_steps(agent_id).await?.requeued;
-        if !requeued.is_empty() {
-            info!(%agent_id, count = requeued.len(), "requeued steps after agent disconnect");
+        let reclaimed = self.store.requeue_agent_steps(agent_id).await?;
+        if !reclaimed.requeued.is_empty() || !reclaimed.failed.is_empty() {
+            info!(
+                %agent_id,
+                requeued = reclaimed.requeued.len(),
+                failed = reclaimed.failed.len(),
+                "reclaimed steps after agent disconnect"
+            );
         }
-        for s in requeued {
-            self.enqueue_step(s.id, s.labels_vec()).await?;
+        self.publish_reclaimed(reclaimed).await?;
+        self.unregister_agent(agent_id).await;
+        Ok(())
+    }
+
+    /// Enqueue and publish what a reclaim did. The store has already committed every
+    /// row change and propagated the runs of the failed steps; this is the same fan-out
+    /// `on_step_complete` does for a reported failure, so the run page and the GitHub
+    /// status see a step that ran out of leases exactly as they see one that failed.
+    async fn publish_reclaimed(&self, reclaimed: fiber_core::Reclaimed) -> Result<()> {
+        let fiber_core::Reclaimed {
+            requeued,
+            failed,
+            propagated,
+        } = reclaimed;
+        let mut runs: Vec<Uuid> = failed.iter().map(|s| s.run_id).collect();
+        for s in requeued.iter().chain(propagated.iter()) {
+            if s.status_enum() == StepStatus::Queued {
+                self.enqueue_step(s.id, s.labels_vec()).await?;
+            }
+        }
+        for s in requeued
+            .iter()
+            .chain(failed.iter())
+            .chain(propagated.iter())
+        {
             let ev = RunEvent::StepUpdated {
                 run_id: s.run_id,
                 step_run_id: s.id,
                 step_id: s.step_id.clone(),
-                status: StepStatus::Queued,
+                status: s.status_enum(),
             };
             if let Ok(payload) = serde_json::to_string(&ev) {
                 self.publish_event(&payload).await;
             }
         }
-        self.unregister_agent(agent_id).await;
+        runs.sort_unstable();
+        runs.dedup();
+        for run_id in runs {
+            self.publish_run_status(run_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_run_status(&self, run_id: Uuid) -> Result<()> {
+        if let Some(run) = self.store.get_run(run_id).await? {
+            let ev = RunEvent::RunUpdated {
+                run_id: run.id,
+                status: run.status_enum(),
+            };
+            if let Ok(payload) = serde_json::to_string(&ev) {
+                self.publish_event(&payload).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalise runs whose every step is terminal but which are still `running`: the
+    /// crash window between a reclaim committing a failure and propagating it. Nothing
+    /// else revisits such a run, so the reclaim tick does.
+    async fn finalise_orphaned_runs(&self) -> Result<()> {
+        for run_id in self.store.runs_with_no_open_steps().await? {
+            info!(%run_id, "finalising run left running with no open steps");
+            for s in self.store.propagate_after_step(run_id).await? {
+                if s.status_enum() == StepStatus::Queued {
+                    self.enqueue_step(s.id, s.labels_vec()).await?;
+                }
+                let ev = RunEvent::StepUpdated {
+                    run_id: s.run_id,
+                    step_run_id: s.id,
+                    step_id: s.step_id.clone(),
+                    status: s.status_enum(),
+                };
+                if let Ok(payload) = serde_json::to_string(&ev) {
+                    self.publish_event(&payload).await;
+                }
+            }
+            self.publish_run_status(run_id).await?;
+        }
         Ok(())
     }
 
@@ -794,24 +865,17 @@ impl Scheduler {
 
         self.enforce_timeouts().await?;
 
-        let requeued = self.store.requeue_expired_leases().await?.requeued;
-        if requeued.is_empty() {
-            return Ok(());
+        let reclaimed = self.store.requeue_expired_leases().await?;
+        if !reclaimed.requeued.is_empty() || !reclaimed.failed.is_empty() {
+            info!(
+                requeued = reclaimed.requeued.len(),
+                failed = reclaimed.failed.len(),
+                "reclaimed expired leases"
+            );
         }
-        info!(count = requeued.len(), "reclaimed expired leases");
-        for s in requeued {
-            self.enqueue_step(s.id, s.labels_vec()).await?;
-            let ev = RunEvent::StepUpdated {
-                run_id: s.run_id,
-                step_run_id: s.id,
-                step_id: s.step_id.clone(),
-                status: StepStatus::Queued,
-            };
-            if let Ok(payload) = serde_json::to_string(&ev) {
-                self.publish_event(&payload).await;
-            }
-        }
-        Ok(())
+        self.publish_reclaimed(reclaimed).await?;
+
+        self.finalise_orphaned_runs().await
     }
 }
 

@@ -24,10 +24,14 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
   (expired lease, agent disconnect) requeued unconditionally; only a failure the agent
   *reported* went through the retry budget. A step that OOM-killed its agent was leased,
   lost, and leased again indefinitely, its run never terminal and its `step_attempts`
-  growing every five minutes. Reclaim now applies the same `retries` rule as a reported
-  failure: the lost attempt counts, and once it exceeds `retries` the step fails with
-  `lease lost after N attempts` and its run propagates like any other failure. A step with
-  `retries: 0` fails on its first lost lease, which is what `retries: 0` means.
+  growing every five minutes. A lost lease now counts against `retries` like a reported
+  failure does, with one extra try: a step is failed with `lease lost after N attempts`
+  once it has lost more than `retries + 1` leases, and its run propagates like any other
+  failure. The extra try is deliberate — a `retries: 0` step survives one rolling agent
+  restart or one network blip, while a step that kills its agent every time still stops
+  after two leases. The reclaim loop also finalises any run left `running` with no open
+  step (the window between a reclaim committing and its propagation running), and a run
+  deleted underneath a reclaim no longer aborts the sweep.
 - **Lease, complete, and reclaim write the step and its attempt in one transaction.**
   Each used to be a `step_runs` update followed by a `step_attempts` write on a separate
   connection. A crash between them left an attempt open against a step that was back in
