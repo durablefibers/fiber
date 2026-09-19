@@ -13,6 +13,16 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
 
 ### Fixed
 
+- **A reclaimed step now reports what happened to it.** When an expired lease or a
+  disconnect requeued or failed a step, the row changed but no event was published: the
+  run page showed the step `running` until a reload, and a run that ended on a lost lease
+  never sent its commit status to GitHub. Reclaim now publishes the same step and run
+  events a reported completion does.
+- **Cancelling a run whose row carries a legacy status no longer fails with a 500.** A
+  status outside the vocabulary (tolerated by the new `NOT VALID` check) matched neither
+  the terminal guard nor the cancel update; the run is now returned untouched, and the
+  reclaim loop's orphan-run sweep leaves such runs alone for the operator instead of
+  retrying them every tick.
 - **A cancel can no longer overwrite a finished run.** `cancel_run` was three statements
   on three connections with no status guard on the run, so a cancel that landed after the
   last step completed turned `succeeded` into `cancelled` — and GitHub saw `success`

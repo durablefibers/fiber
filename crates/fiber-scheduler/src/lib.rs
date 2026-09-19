@@ -368,8 +368,12 @@ impl Scheduler {
                 "reclaimed steps after agent disconnect"
             );
         }
-        self.publish_reclaimed(reclaimed).await?;
+        // Registry cleanup first: it must not depend on a publish that can fail on a
+        // database blip, or a gone agent stays "connected" until the next stale sweep.
         self.unregister_agent(agent_id).await;
+        if let Err(e) = self.publish_reclaimed(reclaimed).await {
+            warn!(%agent_id, error = %e, "could not publish reclaim after agent disconnect");
+        }
         Ok(())
     }
 
@@ -431,7 +435,8 @@ impl Scheduler {
     async fn finalise_orphaned_runs(&self) -> Result<()> {
         for run_id in self.store.runs_with_no_open_steps().await? {
             info!(%run_id, "finalising run left running with no open steps");
-            for s in self.store.propagate_after_step(run_id).await? {
+            let changed = self.store.propagate_after_step(run_id).await?;
+            for s in &changed {
                 if s.status_enum() == StepStatus::Queued {
                     self.enqueue_step(s.id, s.labels_vec()).await?;
                 }
@@ -445,7 +450,30 @@ impl Scheduler {
                     self.publish_event(&payload).await;
                 }
             }
-            self.publish_run_status(run_id).await?;
+            let Some(run) = self.store.get_run(run_id).await? else {
+                continue;
+            };
+            if changed.is_empty() && !run.status_enum().is_terminal() {
+                // The query excludes unknown step statuses, so this is something new:
+                // say what the steps look like rather than publish a non-terminal
+                // RunUpdated every tick.
+                let statuses: Vec<String> = self
+                    .store
+                    .list_step_runs(run_id)
+                    .await?
+                    .into_iter()
+                    .map(|s| format!("{}={}", s.step_id, s.status))
+                    .collect();
+                warn!(%run_id, ?statuses, "run has no open steps but did not finalise");
+                continue;
+            }
+            let ev = RunEvent::RunUpdated {
+                run_id: run.id,
+                status: run.status_enum(),
+            };
+            if let Ok(payload) = serde_json::to_string(&ev) {
+                self.publish_event(&payload).await;
+            }
         }
         Ok(())
     }
@@ -582,12 +610,16 @@ impl Scheduler {
             }
         }
 
-        let ev = RunEvent::RunUpdated {
-            run_id: run.id,
-            status: run.status_enum(),
-        };
-        if let Ok(payload) = serde_json::to_string(&ev) {
-            self.publish_event(&payload).await;
+        // The store returns the run untouched when it was already terminal (or carries a
+        // legacy status); nothing changed, so there is nothing to announce.
+        if run.status_enum() == fiber_proto::RunStatus::Cancelled {
+            let ev = RunEvent::RunUpdated {
+                run_id: run.id,
+                status: run.status_enum(),
+            };
+            if let Ok(payload) = serde_json::to_string(&ev) {
+                self.publish_event(&payload).await;
+            }
         }
 
         Ok(run)

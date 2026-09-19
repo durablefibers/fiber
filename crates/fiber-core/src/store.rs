@@ -507,7 +507,8 @@ impl Store {
             return Ok(vec![]);
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT id FROM runs WHERE id = ANY($1) FOR UPDATE")
+        // By `id`, the lock order every multi-row lock in this file follows.
+        sqlx::query("SELECT id FROM runs WHERE id = ANY($1) ORDER BY id FOR UPDATE")
             .bind(run_ids)
             .execute(&mut *tx)
             .await?;
@@ -1339,6 +1340,11 @@ impl Store {
     /// between leaves the run `running` with nothing that would ever revisit it, since
     /// every other sweep looks for open steps. The reclaim loop feeds these back into
     /// propagation. Bounded so one tick cannot stall behind a pathological backlog.
+    ///
+    /// A run holding a step whose status is outside the vocabulary (a legacy row the
+    /// NOT VALID check tolerates) is left out: propagation reads it as `Pending`, so it
+    /// could never finalise and would be re-selected every tick, crowding out real
+    /// orphans past the limit. Such rows are the operator's to fix.
     pub async fn runs_with_no_open_steps(&self) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar::<_, Uuid>(
             "SELECT r.id FROM runs r
@@ -1346,6 +1352,11 @@ impl Store {
                AND NOT EXISTS (
                    SELECT 1 FROM step_runs s
                    WHERE s.run_id = r.id AND s.status IN ('pending', 'queued', 'running'))
+               AND NOT EXISTS (
+                   SELECT 1 FROM step_runs s
+                   WHERE s.run_id = r.id
+                     AND s.status NOT IN ('pending', 'queued', 'running',
+                                          'succeeded', 'failed', 'cancelled', 'skipped'))
              ORDER BY r.started_at NULLS FIRST, r.id
              LIMIT 100",
         )
