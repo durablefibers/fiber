@@ -152,8 +152,8 @@ A step is offered only if:
 | SIGTERM / SIGINT | In-flight step processes are stopped and the socket is closed **without** reporting a result, so the server requeues those steps to another agent (a rolling agent restart does not fail a build). The agent exits once its steps are stopped (≤ 10 s) |
 | Reconnect | Exponential backoff 1 s → 30 s with jitter; a `401` (revoked token) exits the process with status 2 instead of retrying forever |
 | Concurrency | `--concurrency` is enforced locally with a process-wide semaphore as well as by the server; a step parked on it still counts against its `timeout_minutes`, which start when the offer is received |
-| Disconnect / WS close | Agent marked offline; in-flight steps requeued (the bounced attempt counts against `retries`) |
-| Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + requeue |
+| Disconnect / WS close | Agent marked offline; in-flight steps requeued. The bounced attempt counts against `retries`; once it exceeds them the step fails with `lease lost after N attempts` instead of being requeued |
+| Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + the same requeue-or-fail rule |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
 | Update | `PUT /api/agents/{id}` — name / labels / concurrency (inflight preserved; pool unchanged) |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |

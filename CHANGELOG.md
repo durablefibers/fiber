@@ -6,6 +6,61 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+Adds migration 015: three indexes, one dropped index, a unique index on artifacts (after
+removing duplicate rows), and `CHECK` constraints on the two status columns, added
+`NOT VALID` so an old database with a stray status string still boots. See
+[operations](docs/operations.md#upgrades) before upgrading a large install.
+
+### Fixed
+
+- **A cancel can no longer overwrite a finished run.** `cancel_run` was three statements
+  on three connections with no status guard on the run, so a cancel that landed after the
+  last step completed turned `succeeded` into `cancelled` — and GitHub saw `success`
+  followed by `error` for the same commit. It is now one transaction with the run row
+  locked: a run that is already terminal is left exactly as it is, and a step leased
+  between the read and the write is cancelled *and* its agent told, where before the row
+  flipped and the agent kept running with a slot that was never released.
+- **A step that keeps killing its agent now fails instead of running forever.** Reclaim
+  (expired lease, agent disconnect) requeued unconditionally; only a failure the agent
+  *reported* went through the retry budget. A step that OOM-killed its agent was leased,
+  lost, and leased again indefinitely, its run never terminal and its `step_attempts`
+  growing every five minutes. Reclaim now applies the same `retries` rule as a reported
+  failure: the lost attempt counts, and once it exceeds `retries` the step fails with
+  `lease lost after N attempts` and its run propagates like any other failure. A step with
+  `retries: 0` fails on its first lost lease, which is what `retries: 0` means.
+- **Lease, complete, and reclaim write the step and its attempt in one transaction.**
+  Each used to be a `step_runs` update followed by a `step_attempts` write on a separate
+  connection. A crash between them left an attempt open against a step that was back in
+  the queue, and the timeout backstop then failed every later lease of that step within
+  seconds as "timed out". The backstop now also matches the attempt to the step's current
+  attempt number, so a stale open attempt can never be mistaken for the live one.
+- **A retry keeps its concurrency group.** `retry_run` dropped `concurrency_group`, so a
+  retried `main` build neither superseded nor was superseded by the next push.
+- **Editing a pipeline no longer re-arms a schedule slot the loop just consumed.**
+  `update_pipeline` wrote back a `next_due_at` it had read a moment earlier, racing the
+  scheduler's compare-and-set and firing the pipeline twice. The due time is now decided
+  inside the statement: kept when the cron or interval is unchanged, recomputed from the
+  new rule when it changed (a daily → hourly switch no longer waits for the old daily
+  time), cleared when the schedule is removed.
+- **An admin can no longer demote or remove an owner.** `PUT`/`DELETE` on a member only
+  required `admin`, and the last-owner guard existed only on `DELETE` and counted owners
+  in a separate statement — an admin could strip every owner, or two concurrent removals
+  could each see "two owners" and leave none. Changing or removing an owner now requires
+  the actor to be an owner, and the last-owner rule is evaluated inside the `UPDATE` /
+  `DELETE` under a lock on the project's owner rows. Refusals are `403` when the actor is
+  not an owner and `400` when the target is the last owner.
+- **Project creation is one transaction**, so a crash between the project and its first
+  member cannot leave a project nobody owns.
+- **Re-uploading an artifact replaces its row.** Steps are at-least-once, and a re-run
+  inserted a second `(step, name)` row a dependent's restore then fetched twice.
+  `artifacts` is now unique on `(step_run_id, name)`; migration 015 removes existing
+  duplicates (keeping the newest; both rows pointed at the same blob) before adding it.
+- **Missing indexes for three sweeps** that arrived after migration 007: the run-timeout
+  backstop (`runs (started_at) WHERE status = 'running'`), retention and project delete
+  (`artifacts (path)`), and fiber retention (`fibers (updated_at)` for terminal rows).
+  `idx_log_lines_step (step_run_id, seq)` is dropped — nothing has ordered by `seq` since
+  010, and it taxed every log insert.
+
 ## [0.6.0] — 2026-09-19
 
 Pipelines can keep one run per group, cancelling the older ones on a new push.

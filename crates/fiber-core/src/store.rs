@@ -83,6 +83,9 @@ impl Store {
     ) -> Result<Project> {
         let id = Uuid::new_v4();
         let slug = req.slug.unwrap_or_else(|| slugify(&req.name));
+        // Project and owner land together: a project with no owner can never be deleted
+        // or have an owner granted, since both need one.
+        let mut tx = self.pool.begin().await?;
         let project = sqlx::query_as::<_, Project>(
             "INSERT INTO projects (id, name, slug) VALUES ($1, $2, $3)
              RETURNING id, name, slug, created_at",
@@ -90,29 +93,57 @@ impl Store {
         .bind(id)
         .bind(&req.name)
         .bind(&slug)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        self.add_project_member(project.id, owner_id, crate::roles::ProjectRole::Owner)
+        sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)")
+            .bind(project.id)
+            .bind(owner_id)
+            .bind(crate::roles::ProjectRole::Owner.as_str())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(project)
     }
 
+    /// Add a member or change their role. An existing owner's role only changes when
+    /// `actor_is_owner`, and never to leave the project without one — both checks are
+    /// inside the statement, under a lock on the project's owner rows, so two concurrent
+    /// demotions cannot each see "two owners" and together remove both.
     pub async fn add_project_member(
         &self,
         project_id: Uuid,
         user_id: Uuid,
         role: crate::roles::ProjectRole,
+        actor_is_owner: bool,
     ) -> Result<()> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        lock_project_owners_on(&mut tx, project_id).await?;
+        let changed = sqlx::query(
             "INSERT INTO project_members (project_id, user_id, role)
              VALUES ($1, $2, $3)
-             ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+             ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+             WHERE project_members.role <> 'owner'
+                OR ($4 AND (EXCLUDED.role = 'owner'
+                            OR (SELECT COUNT(*) FROM project_members m
+                                WHERE m.project_id = $1 AND m.role = 'owner') > 1))",
         )
         .bind(project_id)
         .bind(user_id)
         .bind(role.as_str())
-        .execute(&self.pool)
-        .await?;
+        .bind(actor_is_owner)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            // The decision was already made atomically above; this only names the reason.
+            tx.rollback().await?;
+            return Err(if actor_is_owner {
+                crate::ValidationError("cannot demote the last owner".into()).into()
+            } else {
+                anyhow!("forbidden: only an owner can change an owner's role")
+            });
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -159,24 +190,50 @@ impl Store {
         .await?)
     }
 
-    pub async fn remove_project_member(&self, project_id: Uuid, user_id: Uuid) -> Result<()> {
-        let role = self.member_role(project_id, user_id).await?;
-        if role == Some(crate::roles::ProjectRole::Owner) {
-            let owners: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM project_members WHERE project_id = $1 AND role = 'owner'",
+    /// Remove a member. Removing an owner takes an owner (`actor_is_owner`) and never the
+    /// last one; see `add_project_member` for why the guard is inside the statement.
+    /// Removing someone who is not a member is a no-op.
+    pub async fn remove_project_member(
+        &self,
+        project_id: Uuid,
+        user_id: Uuid,
+        actor_is_owner: bool,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_project_owners_on(&mut tx, project_id).await?;
+        let removed = sqlx::query(
+            "DELETE FROM project_members
+             WHERE project_id = $1 AND user_id = $2
+               AND (role <> 'owner'
+                    OR ($3 AND (SELECT COUNT(*) FROM project_members m
+                                WHERE m.project_id = $1 AND m.role = 'owner') > 1))",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(actor_is_owner)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if removed == 0 {
+            let role: Option<String> = sqlx::query_scalar(
+                "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
             )
             .bind(project_id)
-            .fetch_one(&self.pool)
-            .await?;
-            if owners <= 1 {
-                return Err(anyhow!("cannot remove the last owner"));
-            }
-        }
-        sqlx::query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2")
-            .bind(project_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+            tx.rollback().await?;
+            return match role {
+                None => Ok(()),
+                Some(_) if !actor_is_owner => {
+                    Err(anyhow!("forbidden: only an owner can remove an owner"))
+                }
+                Some(_) => {
+                    Err(crate::ValidationError("cannot remove the last owner".into()).into())
+                }
+            };
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -541,34 +598,38 @@ impl Store {
         if let Some(on) = &def.on {
             crate::schedule::validate_triggers(on).map_err(|e| anyhow!(e))?;
         }
-        let name = if let Some(n) = req.name {
-            n
-        } else {
-            sqlx::query_scalar::<_, String>("SELECT name FROM pipelines WHERE id = $1")
-                .bind(pipeline_id)
-                .fetch_one(&self.pool)
-                .await?
-        };
         let existing = self
             .get_pipeline(pipeline_id)
             .await?
             .ok_or_else(|| anyhow!("pipeline not found"))?;
-        let next_due = match def.on.as_ref().filter(|o| has_schedule(o)) {
-            None => None,
-            Some(_) => existing
-                .next_due_at
-                .or_else(|| initial_due_from_definition(&def)),
-        };
+        let scheduled = def.on.as_ref().is_some_and(has_schedule);
+        // A changed cron or interval starts over from the new rule; otherwise the stored
+        // due time is kept. The stored value is read *in the statement* rather than from
+        // `existing`: the schedule loop claims slots with a compare-and-set on this same
+        // column, and writing back a value read a moment ago would re-arm a slot it had
+        // just consumed — the pipeline would fire twice.
+        let existing_def = value_to_definition(&existing.definition).ok();
+        let schedule_changed = crate::schedule::schedule_key(def.on.as_ref())
+            != crate::schedule::schedule_key(existing_def.as_ref().and_then(|d| d.on.as_ref()));
+        let initial = initial_due_from_definition(&def);
         let q = format!(
-            "UPDATE pipelines SET name = $2, definition = $3, updated_at = NOW(), next_due_at = $4
+            "UPDATE pipelines
+             SET name = COALESCE($2, name), definition = $3, updated_at = NOW(),
+                 next_due_at = CASE
+                     WHEN NOT $4 THEN NULL
+                     WHEN $5 THEN $6
+                     ELSE COALESCE(next_due_at, $6)
+                 END
              WHERE id = $1
              RETURNING {PIPELINE_COLS}"
         );
         let pipeline = sqlx::query_as::<_, Pipeline>(AssertSqlSafe(q))
             .bind(pipeline_id)
-            .bind(&name)
+            .bind(&req.name)
             .bind(&req.definition)
-            .bind(next_due)
+            .bind(scheduled)
+            .bind(schedule_changed)
+            .bind(initial)
             .fetch_one(&self.pool)
             .await?;
         Ok(pipeline)
@@ -684,25 +745,24 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<&str>,
     ) -> Result<Option<StepRun>> {
-        let requeued = sqlx::query_as::<_, StepRun>(
+        let mut tx = self.pool.begin().await?;
+        let requeued = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
              SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
                  error = NULL, exit_code = NULL, finished_at = NULL, queued_at = NOW(),
                  not_before = NOW() + make_interval(secs => $2)
              WHERE id = $1 AND status = 'running' AND agent_id = $3
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
+             RETURNING {STEP_RUN_COLS}"
+        )))
         .bind(step_run_id)
         .bind(backoff_secs as f64)
         .bind(agent_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if requeued.is_some() {
-            self.finish_open_attempt(step_run_id, "failed", exit_code, error)
-                .await?;
+            finish_open_attempt_on(&mut tx, step_run_id, "failed", exit_code, error).await?;
         }
+        tx.commit().await?;
         Ok(requeued)
     }
 
@@ -891,8 +951,9 @@ impl Store {
         let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
                (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
-              retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
+              retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted,
+              concurrency_group)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12, $13)
              RETURNING {RUN_COLS}"
         )))
         .bind(new_run_id)
@@ -909,6 +970,9 @@ impl Store {
         .bind(&original.repo_full_name)
         // Re-running a fork's pull request is still running someone else's code.
         .bind(original.untrusted)
+        // Same group as the original: a retry of a `main` build contends with — and is
+        // superseded by — the next push to `main`, exactly as the first run was.
+        .bind(&original.concurrency_group)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -1073,61 +1137,35 @@ impl Store {
         lease_secs: i64,
     ) -> Result<Option<StepRun>> {
         let expires = Utc::now() + chrono::Duration::seconds(lease_secs);
-        let sr = sqlx::query_as::<_, StepRun>(
+        // The row and its attempt land together: a crash between them would leave a
+        // running step with no open attempt, or an open attempt for a lease that
+        // never happened, and the timeout backstop reads the attempt.
+        let mut tx = self.pool.begin().await?;
+        let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
              SET status = 'running', agent_id = $2, lease_expires_at = $3,
                  started_at = COALESCE(started_at, NOW()), attempt = attempt + 1
              WHERE id = $1 AND status = 'queued'
                AND (not_before IS NULL OR not_before <= NOW())
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
+             RETURNING {STEP_RUN_COLS}"
+        )))
         .bind(step_run_id)
         .bind(agent_id)
         .bind(expires)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(ref leased) = sr {
-            self.insert_step_attempt(leased.id, leased.attempt, Some(agent_id), "running")
-                .await?;
+            insert_step_attempt_on(
+                &mut tx,
+                leased.id,
+                leased.attempt,
+                Some(agent_id),
+                "running",
+            )
+            .await?;
         }
+        tx.commit().await?;
         Ok(sr)
-    }
-
-    async fn insert_step_attempt(
-        &self,
-        step_run_id: Uuid,
-        attempt: i32,
-        agent_id: Option<Uuid>,
-        status: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO step_attempts
-                 (id, step_run_id, attempt, agent_id, status, queue_wait_seconds)
-             SELECT $1, $2, $3, $4, $5,
-                    EXTRACT(EPOCH FROM (NOW() - s.queued_at))::float8
-               FROM step_runs s WHERE s.id = $2",
-        )
-        .bind(Uuid::new_v4())
-        .bind(step_run_id)
-        .bind(attempt)
-        .bind(agent_id)
-        .bind(status)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn finish_open_attempt(
-        &self,
-        step_run_id: Uuid,
-        status: &str,
-        exit_code: Option<i32>,
-        error: Option<&str>,
-    ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        finish_open_attempt_on(&mut conn, step_run_id, status, exit_code, error).await
     }
 
     pub async fn list_step_attempts(&self, step_run_id: Uuid) -> Result<Vec<StepAttempt>> {
@@ -1163,23 +1201,23 @@ impl Store {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<Option<StepRun>> {
-        let sr = sqlx::query_as::<_, StepRun>(
+        let mut tx = self.pool.begin().await?;
+        let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
              SET status = $2, exit_code = $3, error = $4, finished_at = NOW(), lease_expires_at = NULL
              WHERE id = $1 AND status = 'running' AND agent_id = $5
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
+             RETURNING {STEP_RUN_COLS}"
+        )))
         .bind(step_run_id)
         .bind(step_status_str(status))
         .bind(exit_code)
         .bind(&error)
         .bind(agent_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if sr.is_some() {
-            self.finish_open_attempt(
+            finish_open_attempt_on(
+                &mut tx,
                 step_run_id,
                 step_status_str(status),
                 exit_code,
@@ -1187,6 +1225,7 @@ impl Store {
             )
             .await?;
         }
+        tx.commit().await?;
         Ok(sr)
     }
 
@@ -1216,7 +1255,8 @@ impl Store {
                     COALESCE(js.t, $1)::bigint AS timeout_minutes
              FROM step_runs s
              JOIN runs r ON r.id = s.run_id
-             JOIN step_attempts a ON a.step_run_id = s.id AND a.finished_at IS NULL
+             JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
+                                 AND a.finished_at IS NULL
              LEFT JOIN LATERAL (
                  SELECT (e->>'timeout_minutes')::bigint AS t
                  FROM jsonb_array_elements(r.definition_snapshot->'steps') e
@@ -1244,41 +1284,53 @@ impl Store {
         .await?)
     }
 
-    pub async fn requeue_expired_leases(&self) -> Result<Vec<StepRun>> {
-        let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs
-             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL, queued_at = NOW()
+    /// Reclaim running steps whose lease ran out. See [`Reclaimed`] for what comes back.
+    pub async fn requeue_expired_leases(&self) -> Result<Reclaimed> {
+        let mut tx = self.pool.begin().await?;
+        // SKIP LOCKED: a row another replica is reclaiming, or an agent is completing,
+        // is not ours this tick — waiting on it would serialise every replica's sweep.
+        let candidates = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "SELECT {STEP_RUN_COLS} FROM step_runs
              WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
-        .fetch_all(&self.pool)
+             ORDER BY id
+             FOR UPDATE SKIP LOCKED"
+        )))
+        .fetch_all(&mut *tx)
         .await?;
-        for s in &requeued {
-            self.finish_open_attempt(s.id, "reclaimed", None, Some("lease expired"))
-                .await?;
-        }
-        Ok(requeued)
+        let reclaimed = reclaim_steps_on(&mut tx, &candidates, "lease expired").await?;
+        tx.commit().await?;
+        self.propagate_reclaim_failures(reclaimed).await
     }
 
-    pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Vec<StepRun>> {
-        let requeued = sqlx::query_as::<_, StepRun>(
-            "UPDATE step_runs
-             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL, queued_at = NOW()
+    /// Reclaim every step `agent_id` was running, on disconnect. See [`Reclaimed`].
+    pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Reclaimed> {
+        let mut tx = self.pool.begin().await?;
+        let candidates = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "SELECT {STEP_RUN_COLS} FROM step_runs
              WHERE agent_id = $1 AND status = 'running'
-             RETURNING id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                       retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                       started_at, finished_at",
-        )
+             ORDER BY id
+             FOR UPDATE"
+        )))
         .bind(agent_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        for s in &requeued {
-            self.finish_open_attempt(s.id, "reclaimed", None, Some("agent disconnected"))
-                .await?;
+        let reclaimed = reclaim_steps_on(&mut tx, &candidates, "agent disconnected").await?;
+        tx.commit().await?;
+        self.propagate_reclaim_failures(reclaimed).await
+    }
+
+    /// A step that failed by running out of attempts is a completed step like any other:
+    /// its dependents skip and its run finalises, or the run stays `running` forever.
+    async fn propagate_reclaim_failures(&self, mut reclaimed: Reclaimed) -> Result<Reclaimed> {
+        let mut runs: Vec<Uuid> = reclaimed.failed.iter().map(|s| s.run_id).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        for run_id in runs {
+            reclaimed
+                .propagated
+                .extend(self.propagate_after_step(run_id).await?);
         }
-        Ok(requeued)
+        Ok(reclaimed)
     }
 
     /// Unlock dependents / cascade skips / finalize the run after a step changed.
@@ -1379,33 +1431,56 @@ impl Store {
 
     /// Cancel a run; `reason` (e.g. "run timed out") is recorded on the cancelled steps
     /// and their open attempts so the outcome is distinguishable from a manual cancel.
+    ///
+    /// One transaction with the run row locked, so a cancel racing a completion cannot
+    /// overwrite `succeeded` or `failed`, and a step leased between the read and the
+    /// write cannot be cancelled without its agent being told. A run that is already
+    /// terminal is left exactly as it is and returned with an empty step list — the
+    /// caller learns the outcome from the run's status, not from an error.
     pub async fn cancel_run_with_reason(
         &self,
         run_id: Uuid,
         reason: Option<&str>,
     ) -> Result<(Run, Vec<StepRun>)> {
-        let running = sqlx::query_as::<_, StepRun>(
-            "SELECT id, run_id, step_id, step_name, status, image, run_cmd, labels, needs,
-                    retries, attempt, agent_id, lease_expires_at, exit_code, error,
-                    started_at, finished_at
-             FROM step_runs WHERE run_id = $1 AND status = 'running'",
-        )
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+            "SELECT {RUN_COLS} FROM runs WHERE id = $1 FOR UPDATE"
+        )))
         .bind(run_id)
-        .fetch_all(&self.pool)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("run not found"))?;
+        // Locking the open steps blocks a concurrent lease until this commits; after
+        // that the lease's `status = 'queued'` guard fails on its own.
+        let open = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "SELECT {STEP_RUN_COLS} FROM step_runs
+             WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')
+             ORDER BY step_id
+             FOR UPDATE"
+        )))
+        .bind(run_id)
+        .fetch_all(&mut *tx)
         .await?;
+        let Some(plan) = cancel_plan(run.status_enum(), &open) else {
+            tx.rollback().await?;
+            return Ok((run, Vec::new()));
+        };
 
-        sqlx::query(
-            "UPDATE step_runs SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL,
+        let cancelled = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "UPDATE step_runs
+             SET status = 'cancelled', finished_at = NOW(), lease_expires_at = NULL,
                  error = COALESCE($2, error)
-             WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')",
-        )
+             WHERE run_id = $1 AND status IN ('pending', 'queued', 'running')
+             RETURNING {STEP_RUN_COLS}"
+        )))
         .bind(run_id)
         .bind(reason)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        for s in &running {
-            self.finish_open_attempt(
-                s.id,
+        for id in &plan.close_attempts {
+            finish_open_attempt_on(
+                &mut tx,
+                *id,
                 "cancelled",
                 None,
                 Some(reason.unwrap_or("run cancelled")),
@@ -1413,13 +1488,22 @@ impl Store {
             .await?;
         }
         let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
-            "UPDATE runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1
-                 RETURNING {RUN_COLS}"
+            "UPDATE runs SET status = 'cancelled', finished_at = NOW()
+             WHERE id = $1 AND status IN ('pending', 'running')
+             RETURNING {RUN_COLS}"
         )))
         .bind(run_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok((run, running))
+        tx.commit().await?;
+
+        // Returned rows carry their pre-cancel `agent_id`, which is what the caller
+        // needs to deliver the Cancel and release the slot.
+        let notify = cancelled
+            .into_iter()
+            .filter(|s| plan.notify.contains(&s.id))
+            .collect();
+        Ok((run, notify))
     }
 
     pub async fn append_log(
@@ -1499,9 +1583,14 @@ impl Store {
         size: i64,
     ) -> Result<Artifact> {
         let id = Uuid::new_v4();
+        // A step is at-least-once, so the same artifact can be uploaded twice; the second
+        // upload replaces the row rather than adding a duplicate a restore would then
+        // fetch twice. `id` and `created_at` stay with the first row.
         Ok(sqlx::query_as::<_, Artifact>(
             "INSERT INTO artifacts (id, run_id, step_run_id, name, path, size)
              VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (step_run_id, name) DO UPDATE
+                 SET path = EXCLUDED.path, size = EXCLUDED.size
              RETURNING id, run_id, step_run_id, name, path, size, created_at",
         )
         .bind(id)
@@ -2348,6 +2437,154 @@ async fn finish_open_attempt_on(
     Ok(())
 }
 
+/// Lock a project's owner rows for the rest of the transaction. Every owner-count check
+/// runs after this, so concurrent owner changes serialise and each sees the other's
+/// committed result rather than a snapshot in which both still counted two owners.
+async fn lock_project_owners_on(conn: &mut sqlx::PgConnection, project_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "SELECT 1 FROM project_members WHERE project_id = $1 AND role = 'owner' FOR UPDATE",
+    )
+    .bind(project_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn insert_step_attempt_on(
+    conn: &mut sqlx::PgConnection,
+    step_run_id: Uuid,
+    attempt: i32,
+    agent_id: Option<Uuid>,
+    status: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO step_attempts
+             (id, step_run_id, attempt, agent_id, status, queue_wait_seconds)
+         SELECT $1, $2, $3, $4, $5,
+                EXTRACT(EPOCH FROM (NOW() - s.queued_at))::float8
+           FROM step_runs s WHERE s.id = $2",
+    )
+    .bind(Uuid::new_v4())
+    .bind(step_run_id)
+    .bind(attempt)
+    .bind(agent_id)
+    .bind(status)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// What a reclaim (expired lease, agent disconnect) did to the steps it found running.
+#[derive(Debug, Default)]
+pub struct Reclaimed {
+    /// Back in the queue for another attempt; the caller re-enqueues and publishes them.
+    pub requeued: Vec<StepRun>,
+    /// Out of attempts and now `failed`; their runs have already been propagated.
+    pub failed: Vec<StepRun>,
+    /// Every step that propagation changed for those runs (skipped dependents), in
+    /// addition to `failed`. Not published by the store — the caller owns events.
+    pub propagated: Vec<StepRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequeueOutcome {
+    Requeue,
+    Fail,
+}
+
+/// Whether a step whose lease was lost gets another attempt. `attempt` is the one just
+/// lost (leases increment it), so the same `attempt > retries` rule the scheduler's
+/// `retry_plan` applies to a reported failure gives `retries + 1` attempts in total
+/// either way. Without this cap a step that kills its agent is re-leased forever.
+fn requeue_outcome(attempt: i32, retries: i32) -> RequeueOutcome {
+    if attempt > retries {
+        RequeueOutcome::Fail
+    } else {
+        RequeueOutcome::Requeue
+    }
+}
+
+/// Apply [`requeue_outcome`] to `candidates` (already locked by the caller) and close
+/// their open attempts, all on one connection so a crash cannot leave an attempt open
+/// against a step that is back in the queue.
+async fn reclaim_steps_on(
+    conn: &mut sqlx::PgConnection,
+    candidates: &[StepRun],
+    reason: &str,
+) -> Result<Reclaimed> {
+    let (requeue_ids, fail_ids): (Vec<Uuid>, Vec<Uuid>) =
+        candidates
+            .iter()
+            .fold((Vec::new(), Vec::new()), |(mut r, mut f), s| {
+                match requeue_outcome(s.attempt, s.retries) {
+                    RequeueOutcome::Requeue => r.push(s.id),
+                    RequeueOutcome::Fail => f.push(s.id),
+                }
+                (r, f)
+            });
+    let mut out = Reclaimed::default();
+    if !requeue_ids.is_empty() {
+        out.requeued = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "UPDATE step_runs
+             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL, queued_at = NOW()
+             WHERE id = ANY($1) AND status = 'running'
+             RETURNING {STEP_RUN_COLS}"
+        )))
+        .bind(&requeue_ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    }
+    if !fail_ids.is_empty() {
+        // `agent_id` stays: the row records which agent lost the last attempt.
+        out.failed = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "UPDATE step_runs
+             SET status = 'failed', lease_expires_at = NULL, finished_at = NOW(),
+                 error = 'lease lost after ' || attempt
+                         || CASE WHEN attempt = 1 THEN ' attempt' ELSE ' attempts' END
+             WHERE id = ANY($1) AND status = 'running'
+             RETURNING {STEP_RUN_COLS}"
+        )))
+        .bind(&fail_ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    }
+    for s in out.requeued.iter().chain(out.failed.iter()) {
+        finish_open_attempt_on(&mut *conn, s.id, "reclaimed", None, Some(reason)).await?;
+    }
+    Ok(out)
+}
+
+/// What a cancel has to do to a run, decided from the run's status and its open steps.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CancelPlan {
+    /// Steps whose open `step_attempts` row must be closed: everything that was running.
+    close_attempts: Vec<Uuid>,
+    /// Steps an agent is executing right now — the ones that need a Cancel delivered and
+    /// a slot released. A subset of `close_attempts`.
+    notify: Vec<Uuid>,
+}
+
+/// Pure cancel decision. `None` means the run is already terminal and nothing may be
+/// written: a cancel that arrives after a completion must leave `succeeded` / `failed`
+/// alone, or GitHub sees `success` followed by `error` for the same commit.
+fn cancel_plan(run_status: RunStatus, open_steps: &[StepRun]) -> Option<CancelPlan> {
+    if run_status.is_terminal() {
+        return None;
+    }
+    let running: Vec<&StepRun> = open_steps
+        .iter()
+        .filter(|s| s.status_enum() == StepStatus::Running)
+        .collect();
+    Some(CancelPlan {
+        close_attempts: running.iter().map(|s| s.id).collect(),
+        notify: running
+            .iter()
+            .filter(|s| s.agent_id.is_some())
+            .map(|s| s.id)
+            .collect(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transition {
     Skip(&'static str),
@@ -2896,5 +3133,88 @@ mod concurrency_tests {
         let g = resolve_concurrency_group(Some("{pipeline}-{version}"), p, Some("main"));
         assert!(g.ends_with("-{version}"), "got {g}");
         assert!(g.starts_with(&p.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn step(status: StepStatus, agent: bool) -> StepRun {
+        StepRun {
+            id: Uuid::new_v4(),
+            run_id: Uuid::nil(),
+            step_id: "s".into(),
+            step_name: "s".into(),
+            status: step_status_str(status).into(),
+            image: None,
+            run_cmd: "true".into(),
+            labels: json!([]),
+            needs: json!([]),
+            retries: 0,
+            attempt: 1,
+            agent_id: agent.then(Uuid::new_v4),
+            lease_expires_at: None,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn cancel_after_the_run_finished_is_a_no_op() {
+        // The step list is what a stale reader might still hold; the run's status wins.
+        let open = vec![step(StepStatus::Running, true)];
+        for status in [
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            assert_eq!(cancel_plan(status, &open), None, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_of_an_active_run_notifies_only_running_steps_with_an_agent() {
+        let leased = step(StepStatus::Running, true);
+        let orphaned = step(StepStatus::Running, false);
+        let queued = step(StepStatus::Queued, false);
+        let pending = step(StepStatus::Pending, false);
+        let open = vec![leased.clone(), orphaned.clone(), queued, pending];
+        for status in [RunStatus::Pending, RunStatus::Running] {
+            let plan = cancel_plan(status, &open).expect("active run cancels");
+            assert_eq!(
+                plan.close_attempts,
+                vec![leased.id, orphaned.id],
+                "{status:?}"
+            );
+            assert_eq!(plan.notify, vec![leased.id], "{status:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_with_nothing_running_still_proceeds() {
+        let open = vec![step(StepStatus::Queued, false)];
+        assert_eq!(
+            cancel_plan(RunStatus::Running, &open),
+            Some(CancelPlan::default())
+        );
+    }
+
+    #[test]
+    fn a_lost_lease_gets_exactly_retries_plus_one_attempts() {
+        // Mirrors `scheduler::retry_plan`: the lost attempt is already counted, so with
+        // `retries: 2` attempts 1 and 2 come back and the third is the last.
+        assert_eq!(requeue_outcome(1, 2), RequeueOutcome::Requeue);
+        assert_eq!(requeue_outcome(2, 2), RequeueOutcome::Requeue);
+        assert_eq!(requeue_outcome(3, 2), RequeueOutcome::Fail);
+        assert_eq!(requeue_outcome(4, 2), RequeueOutcome::Fail);
+    }
+
+    #[test]
+    fn a_step_without_retries_fails_on_its_first_lost_lease() {
+        // The old behaviour was to requeue unconditionally, which is the forever loop.
+        assert_eq!(requeue_outcome(1, 0), RequeueOutcome::Fail);
     }
 }

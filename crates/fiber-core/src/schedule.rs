@@ -44,6 +44,21 @@ pub fn has_schedule(on: &PipelineTriggers) -> bool {
         || on.interval_minutes.filter(|m| *m > 0).is_some()
 }
 
+/// The part of the triggers that decides *when* a pipeline fires next: the trimmed cron
+/// when set (it takes precedence), else the interval. `None` for no schedule. Two
+/// definitions with the same key keep the same `next_due_at` across an edit; a
+/// different key means the due time must be recomputed from the new rule, or a
+/// daily-to-hourly change still fires first at the old daily time.
+pub fn schedule_key(on: Option<&PipelineTriggers>) -> Option<String> {
+    let on = on?;
+    if let Some(expr) = on.cron.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Some(format!("cron:{expr}"));
+    }
+    on.interval_minutes
+        .filter(|m| *m > 0)
+        .map(|m| format!("interval:{m}"))
+}
+
 pub fn schedule_trigger_label(on: &PipelineTriggers) -> String {
     if let Some(expr) = on.cron.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         return format!("schedule:cron:{expr}");
@@ -97,5 +112,40 @@ mod tests {
             cron: Some("not a cron".into()),
         };
         assert!(validate_triggers(&on).is_err());
+    }
+
+    fn triggers(cron: Option<&str>, interval: Option<u32>) -> PipelineTriggers {
+        PipelineTriggers {
+            push: None,
+            pull_request: None,
+            interval_minutes: interval,
+            cron: cron.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn schedule_key_changes_only_when_the_firing_rule_does() {
+        let daily = triggers(Some("0 0 0 * * *"), None);
+        // Whitespace and an interval the cron shadows are not a change.
+        let same = triggers(Some("  0 0 0 * * *  "), Some(60));
+        assert_eq!(schedule_key(Some(&daily)), schedule_key(Some(&same)));
+        let hourly = triggers(Some("0 0 * * * *"), None);
+        assert_ne!(schedule_key(Some(&daily)), schedule_key(Some(&hourly)));
+        assert_ne!(
+            schedule_key(Some(&triggers(None, Some(5)))),
+            schedule_key(Some(&triggers(None, Some(10))))
+        );
+    }
+
+    #[test]
+    fn schedule_key_is_none_without_a_schedule() {
+        assert_eq!(schedule_key(None), None);
+        assert_eq!(schedule_key(Some(&triggers(None, None))), None);
+        assert_eq!(schedule_key(Some(&triggers(Some("   "), Some(0)))), None);
+        // Dropping the schedule is itself a change, so the due time is cleared.
+        assert_ne!(
+            schedule_key(Some(&triggers(None, Some(5)))),
+            schedule_key(None)
+        );
     }
 }

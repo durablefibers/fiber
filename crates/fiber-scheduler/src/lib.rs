@@ -359,7 +359,7 @@ impl Scheduler {
 
     /// Requeue steps orphaned when an agent disconnects mid-run.
     pub async fn on_agent_disconnect(&self, agent_id: Uuid) -> Result<()> {
-        let requeued = self.store.requeue_agent_steps(agent_id).await?;
+        let requeued = self.store.requeue_agent_steps(agent_id).await?.requeued;
         if !requeued.is_empty() {
             info!(%agent_id, count = requeued.len(), "requeued steps after agent disconnect");
         }
@@ -794,7 +794,7 @@ impl Scheduler {
 
         self.enforce_timeouts().await?;
 
-        let requeued = self.store.requeue_expired_leases().await?;
+        let requeued = self.store.requeue_expired_leases().await?.requeued;
         if requeued.is_empty() {
             return Ok(());
         }

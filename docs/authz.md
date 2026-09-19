@@ -54,7 +54,9 @@ PUT    /api/projects/{id}/members/{user_id}  { role }
 DELETE /api/projects/{id}/members/{user_id}
 ```
 
-`POST` can create a user if `password` is provided and the username does not exist. Cannot remove the last owner.
+`POST` can create a user if `password` is provided and the username does not exist.
+
+Owners are protected from everyone below them: granting `owner`, changing an existing owner's role, or removing an owner all require the **actor** to be an owner (`403` otherwise), and the last owner can be neither demoted nor removed (`400`). The last-owner check runs inside the `UPDATE` / `DELETE` under a lock on the project's owner rows, so two concurrent removals cannot each see two owners and leave none.
 
 CLI: `fiber members …` — [cli.md](./cli.md).
 
