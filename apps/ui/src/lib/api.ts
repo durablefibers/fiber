@@ -70,6 +70,18 @@ export type PipelineDefinition = {
   steps: StepDefinition[]
   /** Whole-run wall-clock limit in minutes. */
   timeout_minutes?: number
+  /** One run at a time per group, newest wins. Absent = no limit. */
+  concurrency?: ConcurrencyConfig
+}
+
+export type ConcurrencyConfig = {
+  /**
+   * Runs whose resolved group matches contend. `{pipeline}` and `{ref}` expand;
+   * anything else is literal. Defaults to `{pipeline}-{ref}`.
+   */
+  group?: string
+  /** Cancel older runs in the group when a new one starts. */
+  cancel_in_progress?: boolean
 }
 
 export type StepDefinition = {
@@ -140,6 +152,8 @@ export type Run = {
   finished_at?: string
   /** Set when this run was created by retrying another. */
   retry_of?: string | null
+  /** Resolved concurrency group, when the pipeline declared one. */
+  concurrency_group?: string | null
 }
 
 /** One page of runs, newest first. Pass `next_cursor` back as `before` for the next. */

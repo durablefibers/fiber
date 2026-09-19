@@ -399,6 +399,73 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Start a run, then cancel anything it supersedes.
+    ///
+    /// Every path that starts a run goes through here — the API's manual start, both
+    /// GitHub webhook paths, and the schedule loop — because concurrency that four call
+    /// sites have to remember is concurrency that one of them will forget.
+    pub async fn start_run_for_commit(
+        &self,
+        pipeline_id: Uuid,
+        trigger: &str,
+        commit: fiber_core::models::RunCommit,
+    ) -> Result<(
+        fiber_core::Run,
+        Vec<fiber_core::StepRun>,
+        fiber_core::dag::CompiledDag,
+    )> {
+        let started = self
+            .store
+            .start_run_for_commit(pipeline_id, trigger, commit)
+            .await?;
+        self.cancel_superseded(&started.0).await;
+        Ok(started)
+    }
+
+    pub async fn start_run(
+        &self,
+        pipeline_id: Uuid,
+        trigger: &str,
+    ) -> Result<(
+        fiber_core::Run,
+        Vec<fiber_core::StepRun>,
+        fiber_core::dag::CompiledDag,
+    )> {
+        self.start_run_for_commit(pipeline_id, trigger, Default::default())
+            .await
+    }
+
+    /// Cancel the older unfinished runs of `run`'s concurrency group.
+    ///
+    /// Best effort by design: a run that finished between the query and the cancel is
+    /// already where we want it, and a cancel that fails must not take the new run down
+    /// with it — the worst case is one extra build, not a lost one.
+    async fn cancel_superseded(&self, run: &fiber_core::Run) {
+        let Some(group) = run.concurrency_group.as_deref() else {
+            return;
+        };
+        let older = match self
+            .store
+            .superseded_runs(run.project_id, group, run.id, run.created_at)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(run_id = %run.id, group, error = %e, "could not look up superseded runs");
+                return;
+            }
+        };
+        for id in older {
+            match self
+                .cancel_run_with_reason(id, Some("superseded by a newer run"))
+                .await
+            {
+                Ok(_) => info!(superseded = %id, by = %run.id, group, "cancelled superseded run"),
+                Err(e) => warn!(run_id = %id, error = %e, "could not cancel superseded run"),
+            }
+        }
+    }
+
     /// Cancel run in DB, notify agents to kill in-flight steps, publish events.
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<fiber_core::Run> {
         self.cancel_run_with_reason(run_id, None).await
@@ -694,7 +761,7 @@ impl Scheduler {
             self.schedule_due.set(p.id, next);
             let trigger = schedule_trigger_label(on);
             info!(pipeline = %p.id, %trigger, "scheduled run");
-            match self.store.start_run(p.id, &trigger).await {
+            match self.start_run(p.id, &trigger).await {
                 Ok((run, _, _)) => self.enqueue_run_ready(run.id).await?,
                 // The slot is already advanced; skipping one occurrence beats double-firing.
                 Err(e) => warn!(pipeline = %p.id, error = %e, "scheduled run failed to start"),

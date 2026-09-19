@@ -844,8 +844,10 @@ async fn start_run(
     let trigger = body
         .and_then(|b| b.trigger.clone())
         .unwrap_or_else(|| "manual".into());
+    // Through the scheduler, not the store: that is where superseding older runs of the
+    // same concurrency group happens.
     let (run, steps, _) = state
-        .store
+        .scheduler
         .start_run(id, &trigger)
         .await
         .map_err(ApiError::from)?;
@@ -1726,7 +1728,7 @@ async fn github_webhook(
             let mut run_ids = Vec::new();
             for p in pipelines {
                 let (run, _, _) = state
-                    .store
+                    .scheduler
                     .start_run_for_commit(p.id, &format!("github:push:{branch}"), commit.clone())
                     .await
                     .map_err(ApiError::from)?;
@@ -1838,7 +1840,7 @@ async fn github_webhook(
             let mut run_ids = Vec::new();
             for p in pipelines {
                 let (run, _, _) = state
-                    .store
+                    .scheduler
                     .start_run_for_commit(
                         p.id,
                         &format!("github:pr:{number}:{action}"),
@@ -1995,6 +1997,63 @@ impl IntoResponse for ApiError {
             }
         };
         (status, Json(json!({ "error": msg }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod concurrency_funnel {
+    //! Starting a run has to go through the scheduler, which is where a new run cancels
+    //! the older ones in its concurrency group. Four call sites reach this code — the
+    //! manual start, both webhook paths, and the schedule loop — and a fifth that called
+    //! the store directly would silently opt out of concurrency with nothing to show for
+    //! it. Audit the source rather than trust the next author to notice.
+
+    /// Everything above the first `#[cfg(test)]`, so this module's own text — which
+    /// necessarily contains the pattern it looks for — is not what gets audited.
+    fn handler_source() -> &'static str {
+        let src = include_str!("routes.rs");
+        &src[..src.find("#[cfg(test)]").unwrap_or(src.len())]
+    }
+
+    #[test]
+    fn every_run_start_goes_through_the_scheduler() {
+        let src = handler_source();
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.starts_with(".start_run") {
+                continue;
+            }
+            // The receiver is the previous non-blank line: `.scheduler` or `.store`.
+            let receiver = lines[..i]
+                .iter()
+                .rev()
+                .find(|l| !l.is_empty())
+                .copied()
+                .unwrap_or("");
+            if !receiver.contains("scheduler") {
+                offenders.push(format!("line {}: {receiver} {line}", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these start a run without the scheduler, skipping concurrency — use \
+             state.scheduler.start_run / start_run_for_commit: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn the_audit_can_see_the_calls_it_is_guarding() {
+        // A rename that made `.start_run` unfindable would leave the test above passing
+        // over nothing at all.
+        let n = handler_source()
+            .lines()
+            .filter(|l| l.trim().starts_with(".start_run"))
+            .count();
+        assert!(
+            n >= 3,
+            "expected the manual and both webhook starts, found {n}"
+        );
     }
 }
 

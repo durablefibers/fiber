@@ -61,6 +61,9 @@ pub struct Run {
     /// The code being built came from outside the project (a fork's pull request), so it
     /// receives no project secrets.
     pub untrusted: bool,
+    /// Resolved concurrency group, when the pipeline declared one. Runs sharing it
+    /// contend; a newer one cancels the older.
+    pub concurrency_group: Option<String>,
 }
 
 /// What a webhook says a run is for. Carried onto the run so the agent checks out the

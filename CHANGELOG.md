@@ -6,6 +6,21 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`concurrency:` in a pipeline, with `cancel_in_progress`.** A second push to a branch
+  cancels that branch's previous build instead of racing it. Runs sharing a resolved group
+  contend; the default `{pipeline}-{ref}` keeps branches independent, and a literal group
+  (`deploy`) serialises across pipelines. `{pipeline}` is the pipeline id rather than its
+  name, which is editable and not unique. An unrecognised placeholder is left as written:
+  emptying it would merge groups the author meant to keep apart. Matching is scoped to the
+  project, the resolved group is stored on the run so the rule stays readable after the
+  pipeline changes, and a superseded run ends `cancelled` with reason
+  `superseded by a newer run`. Omitting the block, or `cancel_in_progress: false`, means no
+  limit — queueing is a separate behaviour and Fiber will not guess which was meant.
+  Migration 014. Every path that starts a run now goes through the scheduler, and a source
+  audit fails the build if a new one bypasses it.
+
 ### Fixed
 
 - **`fiber.yml` built this repo against a Rust it does not use.** It pinned

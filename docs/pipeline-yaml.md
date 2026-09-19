@@ -32,8 +32,42 @@ steps:
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
 | `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
+| `concurrency` | no | Keep one run per group in flight; see below |
 
 In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted.
+
+### `concurrency`
+
+Runs whose resolved group matches contend, and a new one cancels the older:
+
+```yaml
+concurrency:
+  group: "{pipeline}-{ref}"   # default
+  cancel_in_progress: true
+```
+
+`{pipeline}` expands to the pipeline id — not its name, which is editable and not unique —
+and `{ref}` to the branch or pull-request ref, empty for a manual run. Anything else is
+literal, including an unrecognised `{placeholder}`, which is left as written rather than
+emptied: collapsing it would merge groups the author meant to keep apart.
+
+The default therefore cancels a branch's previous build on a new push without touching any
+other branch, and makes two manual runs of one pipeline supersede rather than race. A
+literal group is the escape hatch for "one deploy at a time, whatever started it":
+
+```yaml
+concurrency:
+  group: deploy
+  cancel_in_progress: true
+```
+
+Groups are matched **within a project**, so a literal name cannot collide across projects.
+
+Omitting `concurrency` means no limit, and so does `cancel_in_progress: false` — queueing
+instead of cancelling is a different behaviour, and Fiber would rather do nothing than
+guess which one was meant. The resolved group is stored on the run (`concurrency_group`),
+so the rule that governed a run stays readable after the pipeline is edited. A superseded
+run ends as `cancelled` with reason `superseded by a newer run`.
 
 ## Step fields
 
@@ -155,6 +189,7 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 | `examples/cron.yml` | Cron schedule |
 | `examples/paths-filtered.yml` | Path filters |
 | `examples/scoped-secrets.yml` | Per-step `secrets:` allowlist |
+| `examples/concurrency.yml` | One run per branch, cancelling the previous |
 
 ## Semantics
 
