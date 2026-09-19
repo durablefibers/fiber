@@ -16,6 +16,16 @@ pub struct FiberSuspended {
     pub wake_at: DateTime<Utc>,
 }
 
+/// Aborts the task when dropped, so it cannot outlive the scope that spawned it — on a
+/// normal return, an `?`, or a panic unwinding through.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Durability primitives for a single fiber run.
 pub struct FiberContext {
     pub record: FiberRecord,
@@ -55,7 +65,11 @@ impl FiberContext {
         // step lasting longer than the staleness threshold used to look like a crashed
         // fiber and get claimed and run a second time by another sweep. An `http_request`
         // with a 300-second timeout reaches that in one call.
-        let beat = tokio::spawn({
+        //
+        // Aborted by the guard's `Drop`, not by a call after the await: a handler that
+        // panics unwinds straight through here, and a heartbeat left running would keep
+        // the row fresh forever — never reclaimed, never failed, attempts never spent.
+        let _beat = AbortOnDrop(tokio::spawn({
             let store = self.store.clone();
             let id = self.record.id;
             async move {
@@ -66,10 +80,8 @@ impl FiberContext {
                     }
                 }
             }
-        });
-        let result = f().await;
-        beat.abort();
-        let result = result?;
+        }));
+        let result = f().await?;
         self.state.steps.insert(key.to_string(), result.clone());
         self.record.heartbeat_at = Some(Utc::now());
         self.store
@@ -89,15 +101,18 @@ impl FiberContext {
     }
 
     /// Durably sleep until `wake_at`. Returns immediately if already elapsed on resume.
+    ///
+    /// The ordinal is advanced in memory only. It reaches the database in the engine's
+    /// save, in the same `UPDATE` as `status = 'suspended'` and `wake_at` — a checkpoint
+    /// here would land first, and if the save then failed the row would be `running`
+    /// with no `wake_at`, be reclaimed after the staleness threshold, and resume past a
+    /// sleep it never took: a 24-hour sleep cut to a minute.
     pub async fn sleep_until(&mut self, wake_at: DateTime<Utc>) -> Result<(), FiberSuspended> {
         self.sleep_i += 1;
         if self.sleep_i <= self.state.sleeps_done {
             return Ok(());
         }
         self.state.sleeps_done = self.sleep_i;
-        if let Err(e) = self.checkpoint().await {
-            tracing::error!(error = %e, "checkpoint before sleep failed");
-        }
         Err(FiberSuspended { wake_at })
     }
 

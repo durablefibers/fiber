@@ -23,7 +23,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` for paused time: the heartbeat test would otherwise wait real seconds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

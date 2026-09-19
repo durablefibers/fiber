@@ -409,6 +409,15 @@ impl Outbox {
         self.queue.retain(|m| step_of(m) != Some(step_run_id));
         self.dropped.retain(|(s, _), _| *s != step_run_id);
     }
+
+    /// Forget everything: the outage outlasted the lease, so every message held —
+    /// including a completion for a step that finished while disconnected, which no
+    /// give-up would see since nothing was left to cancel — is about an attempt the
+    /// server has reclaimed. The server would reject each one by its attempt anyway.
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.dropped.clear();
+    }
 }
 
 /// Shared handle to the outbox for step tasks; `send` never blocks and never fails.
@@ -566,19 +575,29 @@ impl AgentState {
         if let Some(w) = self.watchdog.take() {
             w.abort();
         }
-        let started = self.disconnected_at.take();
-        if self.steps_in_flight() == 0 {
+        let Some(started) = self.disconnected_at.take() else {
             return;
-        }
+        };
         let grace = grace_after_disconnect(self.lease_secs, HEARTBEAT_INTERVAL);
         let now = tokio::time::Instant::now();
-        if now >= give_up_at(self.last_heartbeat(), started.unwrap_or(now), grace) {
+        if now >= give_up_at(self.last_heartbeat(), started, grace) {
             let n = give_up_steps(&self.cancels, &self.abandoned, &self.outbound);
+            let held = self
+                .outbound
+                .outbox
+                .lock()
+                .map(|mut o| {
+                    let n = o.queue.len();
+                    o.clear();
+                    n
+                })
+                .unwrap_or(0);
             warn!(
                 steps = n,
-                "reconnected after the lease ran out; stopping in-flight steps (the server has requeued them)"
+                dropped_messages = held,
+                "reconnected after the lease ran out; stopping in-flight steps and dropping what was held for them (the server has requeued them)"
             );
-        } else {
+        } else if self.steps_in_flight() > 0 {
             info!(
                 steps = self.steps_in_flight(),
                 "reconnected with steps still running; resuming"
@@ -931,7 +950,9 @@ async fn run_session(
     let hello = AgentMessage::Hello {
         name: args.name.clone(),
         labels: labels.to_vec(),
-        concurrency: args.concurrency,
+        // The local semaphore already clamps; report the same number, or the server
+        // would register an online agent that is never offered anything.
+        concurrency: args.concurrency.max(1),
         protocol_version: fiber_proto::PROTOCOL_VERSION,
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?.into()))
@@ -2516,6 +2537,17 @@ mod tests {
         assert_eq!(o.queue.len(), 2);
         assert!(o.queue.iter().all(|m| step_of(m) == Some(b)));
     }
+    #[test]
+    fn clearing_the_outbox_forgets_a_completion_held_through_a_reclaim() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(10);
+        o.push(log_chunk(step, 0));
+        o.push(complete(step));
+        o.clear();
+        assert!(o.queue.is_empty());
+        assert!(o.take_dropped().is_empty());
+    }
+
     // --- how long to keep running after a disconnect ---------------------------------
 
     #[test]

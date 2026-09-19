@@ -70,26 +70,37 @@ pub async fn run_fiber(
                 }
                 return Ok(FiberOutcome::Suspended);
             }
-            record.error = Some(format!("{e:#}"));
-            record.heartbeat_at = None;
-            // The claim no longer counts a resume, so the failure counts itself. This is
-            // the event the retry budget is actually about.
-            record.attempts += 1;
-            let outcome = failure_outcome(record.attempts, max_attempts);
-            match outcome {
-                FiberOutcome::Failed => {
-                    record.status = FiberStatus::Failed;
-                }
-                _ => {
-                    record.status = FiberStatus::Suspended;
-                    record.wake_at =
-                        Some(Utc::now() + chrono::Duration::seconds(RETRY_BACKOFF_SECS));
-                }
-            }
-            store.save(&record).await?;
-            Ok(outcome)
+            fail_fiber(store, record, format!("{e:#}"), max_attempts).await
         }
     }
+}
+
+/// Record a failed attempt on `record`: spend one, and either retry after a short backoff
+/// or fail for good. Shared by the handler-error path and the poller's panic path, so a
+/// handler that panics is charged exactly as one that returns `Err`.
+pub async fn fail_fiber(
+    store: &FiberStore,
+    mut record: FiberRecord,
+    error: String,
+    max_attempts: i32,
+) -> anyhow::Result<FiberOutcome> {
+    record.error = Some(error);
+    record.heartbeat_at = None;
+    // The claim no longer counts a resume, so the failure counts itself. This is
+    // the event the retry budget is actually about.
+    record.attempts += 1;
+    let outcome = failure_outcome(record.attempts, max_attempts);
+    match outcome {
+        FiberOutcome::Failed => {
+            record.status = FiberStatus::Failed;
+        }
+        _ => {
+            record.status = FiberStatus::Suspended;
+            record.wake_at = Some(Utc::now() + chrono::Duration::seconds(RETRY_BACKOFF_SECS));
+        }
+    }
+    store.save(&record).await?;
+    Ok(outcome)
 }
 
 /// Decide whether a failed attempt is retried or terminal. Pure so it can be unit-tested

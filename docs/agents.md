@@ -138,7 +138,7 @@ cargo run -p fiber-agent
 
 ## Run
 
-Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client).
+Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client). A `concurrency` below 1 is treated as 1 — an agent that is online but can never be offered anything is a misconfiguration nobody would notice.
 
 ## Label matching
 
@@ -147,11 +147,22 @@ A step is offered only if:
 1. The agent is **global** or bound to the step's **project**, and  
 2. **Every** step label appears on the agent (empty step labels match any agent).
 
+Steps are offered **oldest-queued first** (`queued_at`), so a step requeued after a lost lease keeps its place rather than sorting behind every step that has never started. The label match is applied in the query too, so a long run of steps for some other kind of agent cannot push this agent's work past the scan limit.
+
+An offer is **all or nothing**. It is built from the run's snapshot, the project's secrets and the run's artifacts after the lease is taken, and the `step_attempts` row opens only once it is built and about to be sent. If something cannot be read, nothing is sent, and what happens next depends on why:
+
+- **A database error** backs the lease out: the step returns to the queue with no attempt spent and a 30-second `not_before` backoff, so a step whose offer keeps failing is not the very next thing every agent tries and cannot block the queue behind it. The fill pass then moves on to the next candidate (skipping what it already backed out, and stopping after five failures). Logged at `error` with the run and step ids.
+- **A secret that cannot be decrypted** (a wrong or rotated `FIBER_SECRETS_KEY`) will not clear on its own, so the step is **failed** through the ordinary completion path with `cannot decrypt project secret NAME (is FIBER_SECRETS_KEY right?)` on the step and its attempt; `retries` apply, dependents skip, and the run finalises. Nothing runs without its secrets.
+
+The alternative was an offer with no workspace, env or restores, which ran the step in an empty directory and spent a retry on it.
+
+The server counts an agent's in-flight steps **from the database** (`step_runs` running under it), not from what it remembers delivering, so a `Cancel` that never reached the agent, or a completion the replica never saw, frees the slot as soon as the row leaves `running`.
+
 ## Lifecycle
 
 | Event | Behavior |
 |---|---|
-| Heartbeat | Touches `last_seen_at`, renews leases, may receive new offers. Retried steps are not offered before their backoff (`not_before`) |
+| Heartbeat | Touches `last_seen_at`, renews leases, then receives offers until every free slot is filled — a concurrency-4 agent fills in one heartbeat, not four. Retried steps are not offered before their backoff (`not_before`) |
 | Step timeout | Every offer carries `timeout_minutes`; the agent kills the process group at the deadline and reports `failed` (`timed out after N min`). The server fails it itself after a grace period if the agent does not |
 | SIGTERM / SIGINT | In-flight step processes are stopped **without** reporting a result; once they are gone (≤ 10 s) the agent sends `Goodbye` and closes. `Goodbye` makes the server requeue those steps at once rather than when their leases expire, so a rolling agent restart hands the work to another agent within seconds. The bounced attempt counts against `retries` with one extra try, so a step bounced once never fails — even with `retries: 0` — but a step that loses more than `retries + 1` leases fails. A rolling restart of a whole pool can bounce the same step twice (it is re-leased immediately, with no backoff), which does fail a `retries: 0` step; give such steps `retries: 1` or restart agents one at a time |
 | Disconnect / WS close | The session ends; the steps do not. The agent is marked offline, but every step it was running stays `running` under its lease and keeps executing on the agent, its output buffered locally (up to 10 000 messages; past that the oldest log lines go, never a completion or an artifact, and a system line says how many were lost). Nothing is requeued |
@@ -166,7 +177,7 @@ A step is offered only if:
 | Server shutdown | On SIGTERM the API sends Close 1012 ("server shutting down") to every agent and waits for the sessions to end (up to 20 s) before exiting; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect and Reconnect rows — they keep running |
 | Older agent | An agent whose `Hello` has no `protocol_version` cancels its steps on any close, so for it a close is still the end of the attempt: the server requeues its steps at once on disconnect, exactly as before |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
-| Update | `PUT /api/agents/{id}` — name / labels / concurrency (inflight preserved; pool unchanged) |
+| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |
 
 ## Presence in UI
