@@ -1194,9 +1194,12 @@ impl Store {
     /// but `not_before` is set 30 s out: a step at the head of the queue whose offer
     /// keeps failing would otherwise be leased and backed out on every heartbeat of
     /// every agent, and nothing behind it would ever be offered. The guard binds the
-    /// leased row's `attempt` and `lease_expires_at` as well as the agent, so a release
-    /// that arrives after a long stall cannot unlease a newer lease the same agent
-    /// holds. `None` means a cancel, reclaim, or newer lease got there first.
+    /// leased row's `attempt` as well as the agent, so a release that arrives after a
+    /// long stall cannot unlease a newer lease the same agent holds (a newer lease has
+    /// a higher `attempt`). It deliberately does not bind `lease_expires_at`: a heartbeat
+    /// renews that between the lease and the back-out, and a release that missed on it
+    /// would leave the step leased with no offer sent until the lease expired. `None`
+    /// means a cancel, reclaim, or newer lease got there first.
     pub async fn unlease_step(&self, leased: &StepRun) -> Result<Option<StepRun>> {
         Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
@@ -1205,13 +1208,12 @@ impl Store {
                  started_at = CASE WHEN attempt = 1 THEN NULL ELSE started_at END,
                  not_before = NOW() + make_interval(secs => {OFFER_RETRY_BACKOFF_SECS})
              WHERE id = $1 AND status = 'running' AND agent_id = $2
-               AND attempt = $3 AND lease_expires_at IS NOT DISTINCT FROM $4
+               AND attempt = $3
              RETURNING {STEP_RUN_COLS}"
         )))
         .bind(leased.id)
         .bind(leased.agent_id)
         .bind(leased.attempt)
-        .bind(leased.lease_expires_at)
         .fetch_optional(&self.pool)
         .await?)
     }
