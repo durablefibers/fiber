@@ -422,7 +422,12 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let welcome = ServerMessage::Welcome { agent_id };
+    let welcome = ServerMessage::Welcome {
+        agent_id,
+        // The agent keeps a step running for this long after losing its socket; past
+        // it the reclaim loop has requeued the step and the agent stops its copy.
+        lease_secs: u64::try_from(fiber_scheduler::LEASE_SECS).ok(),
+    };
     if sink
         .send(Message::Text(
             serde_json::to_string(&welcome).unwrap_or_default().into(),
@@ -457,6 +462,12 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
     // connection, and a retry is a new attempt with its own budget.
     let mut logged: HashMap<(Uuid, i32), u64> = HashMap::new();
     let log_cap = step_log_cap();
+    // What the agent declared in Hello (0 until it does): decides whether a close ends
+    // its attempts or just this session. `goodbye` is set when the agent says it is
+    // exiting on purpose. Not persisted — `agents` has no column for the revision yet;
+    // the Hello log line carries it.
+    let mut agent_protocol: u32 = 0;
+    let mut goodbye = false;
 
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Text(text) = msg else {
@@ -474,6 +485,7 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                 name,
                 labels,
                 concurrency,
+                protocol_version,
             } => {
                 // A force-disconnected session (token rotated, agent deleted) must not be
                 // able to re-register itself by replaying Hello.
@@ -483,7 +495,8 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                     });
                     break;
                 }
-                info!(%agent_id, %name, ?labels, "agent hello");
+                agent_protocol = protocol_version;
+                info!(%agent_id, %name, ?labels, protocol_version, "agent hello");
                 // Reload from DB so pool scope is authoritative (not client-supplied).
                 // A missing row ends the session rather than defaulting: `.flatten()`
                 // into `and_then(project_id)` made "agent deleted" indistinguishable from
@@ -497,10 +510,19 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                     break;
                 };
                 let project_id = agent_row.project_id;
-                state
+                // Counts the steps the agent still holds from before this session, so a
+                // reconnect is not offered slots it is already using.
+                if let Err(e) = state
                     .scheduler
                     .register_agent(agent_id, labels, concurrency, project_id)
-                    .await;
+                    .await
+                {
+                    warn!(%agent_id, error = %e, "could not register agent; ending session");
+                    let _ = tx.send(ServerMessage::Error {
+                        message: "registration failed — reconnect".into(),
+                    });
+                    break;
+                }
                 // Re-bind connection under confirmed agent_id (same as token)
                 state
                     .scheduler
@@ -683,11 +705,25 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
                     Err(e) => warn!(error = %e, "step complete failed"),
                 }
             }
+            AgentMessage::Goodbye { agent_id: claimed } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                // The agent has stopped its steps and is exiting: end the session here
+                // and requeue in the tail, rather than wait LEASE_SECS for leases it
+                // will not renew. Nothing after this is offered to it.
+                info!(%agent_id, "agent goodbye; requeueing its steps");
+                goodbye = true;
+                break;
+            }
         }
     }
 
     let _ = state.store.set_agent_online(agent_id, false).await;
-    if let Err(e) = state.scheduler.on_agent_disconnect(agent_id).await {
+    // A close is no longer the end of the agent's attempts: from protocol revision 1 it
+    // keeps its steps running and renews their leases when it is back, so the rows are
+    // left as they are and the reclaim loop requeues whatever expires. An older agent,
+    // or one that said Goodbye, has stopped its steps, and they are requeued now.
+    let policy = fiber_scheduler::disconnect_policy(agent_protocol, goodbye);
+    if let Err(e) = state.scheduler.on_agent_disconnect(agent_id, policy).await {
         warn!(error = %e, %agent_id, "agent disconnect cleanup failed");
     }
     writer.abort();

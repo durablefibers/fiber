@@ -4,6 +4,17 @@ use uuid::Uuid;
 
 pub mod validate;
 
+/// The agent protocol revision this crate speaks. An agent sends it in `Hello`; a server
+/// reads it to decide what the agent can be relied on to do, and a later server may
+/// refuse a revision it no longer supports.
+///
+/// - `0` — never sent: an agent older than this field. It cancels its steps on any
+///   socket close, so the server requeues them at once on disconnect.
+/// - `1` — the agent keeps its step tasks and its outbound queue across sessions, resumes
+///   heartbeats (lease renewal) after a reconnect, sends `Goodbye` before a deliberate
+///   exit, and reads `lease_secs` from `Welcome`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
@@ -227,6 +238,10 @@ pub enum AgentMessage {
         name: String,
         labels: Vec<String>,
         concurrency: u32,
+        /// [`PROTOCOL_VERSION`] of the agent. Absent (`0`) from agents older than the
+        /// field; see the constant for what each revision promises.
+        #[serde(default)]
+        protocol_version: u32,
     },
     Heartbeat {
         agent_id: Uuid,
@@ -259,6 +274,14 @@ pub enum AgentMessage {
         exit_code: Option<i32>,
         error: Option<String>,
     },
+    /// The agent is exiting on purpose (SIGTERM) and has already stopped its steps: the
+    /// server requeues everything it holds now instead of waiting for the leases to
+    /// expire. Sent after the steps are stopped, so no two attempts overlap. A server
+    /// older than this variant answers `Error { "invalid message" }` and requeues on the
+    /// close that follows, which is the same outcome.
+    Goodbye {
+        agent_id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +290,12 @@ pub enum AgentMessage {
 pub enum ServerMessage {
     Welcome {
         agent_id: Uuid,
+        /// How long a step lease lives without renewal, in seconds. An agent that loses
+        /// its socket keeps running its steps for this long (less a margin) while it
+        /// reconnects; past it the server has reclaimed them. Absent from older servers,
+        /// which requeue on disconnect — the agent then stops its steps on any close.
+        #[serde(default)]
+        lease_secs: Option<u64>,
     },
     Offer {
         step_run_id: Uuid,
@@ -411,6 +440,7 @@ mod tests {
             name: "agent-1".into(),
             labels: vec!["os=linux".into()],
             concurrency: 2,
+            protocol_version: PROTOCOL_VERSION,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap()["type"],
@@ -440,11 +470,53 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ServerMessage::Welcome {
-                agent_id: Uuid::nil()
+                agent_id: Uuid::nil(),
+                lease_secs: Some(300),
             })
             .unwrap()["type"],
             json!("welcome")
         );
+        assert_eq!(
+            serde_json::to_value(AgentMessage::Goodbye {
+                agent_id: Uuid::nil()
+            })
+            .unwrap()["type"],
+            json!("goodbye")
+        );
+    }
+
+    #[test]
+    fn a_hello_without_protocol_version_is_revision_zero() {
+        // An agent older than the field: the server must read it as the legacy contract
+        // (cancels on close), not reject it.
+        let v: AgentMessage = serde_json::from_value(json!({
+            "type": "hello", "name": "old", "labels": [], "concurrency": 1
+        }))
+        .unwrap();
+        assert!(matches!(
+            v,
+            AgentMessage::Hello {
+                protocol_version: 0,
+                ..
+            }
+        ));
+        // 0 is reserved for agents without the field.
+        const { assert!(PROTOCOL_VERSION >= 1) };
+    }
+
+    #[test]
+    fn a_welcome_without_lease_secs_is_an_old_server() {
+        let v: ServerMessage = serde_json::from_value(json!({
+            "type": "welcome", "agent_id": Uuid::nil()
+        }))
+        .unwrap();
+        assert!(matches!(
+            v,
+            ServerMessage::Welcome {
+                lease_secs: None,
+                ..
+            }
+        ));
     }
 
     #[test]

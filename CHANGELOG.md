@@ -11,7 +11,45 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
 `NOT VALID` so an old database with a stray status string still boots. See
 [operations](docs/operations.md#upgrades) before upgrading a large install.
 
+### Changed
+
+- **A disconnect no longer requeues; a lease outlives its session.** Until now any drop
+  of the agent's WebSocket — an API deploy, a proxy idle timeout, a NAT hiccup — ended
+  every step in flight on both sides: the agent killed its steps and the server requeued
+  them at once, so a rolling API deploy restarted every running build and spent a retry
+  on each. Now the server only marks the agent offline; the steps stay `running` under
+  their leases, and the agent keeps executing them, buffers their output (10 000
+  messages; past that the oldest log lines go, never a completion or an artifact, with a
+  system line saying how many), reconnects with its usual backoff, renews the leases on
+  its first heartbeat back, and flushes the buffer in order. The server accepts the late
+  lines and completions as long as the row is still `running` under that agent, and
+  counts the steps it still holds before offering it more. An agent that has not
+  reconnected within the lease (300 s, less a 30 s margin) stops its steps without
+  reporting them, and the reclaim loop requeues the expired leases within the existing
+  `retries + 1` budget. See [operations](docs/operations.md#shutdown-and-deploys).
+
+  Two exits still requeue immediately, on purpose: an agent stopping on SIGTERM now sends
+  a new `Goodbye` message once its steps are gone, so a rolling *agent* restart hands the
+  work to another agent within seconds instead of after the lease; and a token rotation,
+  agent delete, or project delete ends the session with a requeue as before. The
+  stale-agent sweep (45 s without a heartbeat) now only marks the agent offline and closes
+  its socket; its leases expire on their own.
+
+  Wire: `Hello` gains `protocol_version` (`fiber_proto::PROTOCOL_VERSION` = 1; absent
+  from older agents and read as 0), `Welcome` gains `lease_secs`, and `AgentMessage` gains
+  `Goodbye`, all backward compatible. An agent with no `protocol_version` cancels its
+  steps on any close, so the server requeues its steps on disconnect exactly as before;
+  a new agent against a server that sends no `lease_secs` stops its steps on close as
+  before. Only new-on-new keeps a step running through a reconnect — upgrade the API
+  first, then the agents. `protocol_version` is logged on `Hello` and not yet stored.
+
 ### Fixed
+
+- **An agent that reconnected was offered more steps than it could run.** Its
+  concurrency slots were counted per session and reset on reconnect, so the server
+  offered it `concurrency` new steps while it still held the old ones; the new ones sat on
+  the agent's local semaphore with their timeout clocks running. On `Hello` the server now
+  counts the steps the agent still holds in the database.
 
 - **A reclaimed step now reports what happened to it.** When an expired lease or a
   disconnect requeued or failed a step, the row changed but no event was published: the
