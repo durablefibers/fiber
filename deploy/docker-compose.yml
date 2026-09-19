@@ -109,6 +109,13 @@ services:
       - "${FIBER_API_BIND:-127.0.0.1}:18080:8080"
     volumes:
       - fiber_artifacts:/data/artifacts
+    # fiber-api is PID 1 here; without an init, SIGTERM from `docker stop` is dropped and
+    # the container is SIGKILLed after the default 10 s — mid-request, mid-upload.
+    init: true
+    # The API drains for up to 20 s (in-flight requests finish, WebSocket sessions send a
+    # Close frame and end), then flushes telemetry (≤ 5 s), and exits on its own before
+    # this runs out.
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/ready || exit 1"]
       interval: 10s
