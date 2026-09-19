@@ -169,9 +169,11 @@ A step is offered only if:
 ## Executor
 
 - **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the step's workspace directory.
-- **Docker**: if `image` is set (or docker mode on), runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client.
+- **Docker**: if `image` is set and docker mode is on, runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client. The image is checked against the docker reference grammar and passed after `--`, so a pipeline cannot smuggle a `docker run` flag through it.
 
 Process groups: cancel kills the step's process group so grandchildren die too.
+
+Steps and git run with no stdin and `GIT_TERMINAL_PROMPT=0`: anything that would wait on a terminal fails at once instead of at the timeout. Git is limited to the `file`, `git`, `http`, `https`, and `ssh` transports (`GIT_ALLOW_PROTOCOL`, unless the operator set it), and the agent refuses a `workspace.repo` that is not one of those or an scp-like `user@host:path`, so the `ext::` transport — which runs a command on the host — is unreachable however the definition was written. A credential in the remote URL is masked in the log.
 
 ## What a step can see
 

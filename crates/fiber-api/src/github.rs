@@ -102,8 +102,10 @@ pub async fn list_pull_request_files(
     let mut files = Vec::new();
     let mut page = 1u32;
     loop {
-        let url =
-            format!("{base}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}");
+        let Some(path) = pull_request_files_path(owner, repo, number, page) else {
+            anyhow::bail!("refusing to list files for an implausible repository or pull request");
+        };
+        let url = format!("{base}{path}");
         let resp = client
             .get(&url)
             .bearer_auth(token)
@@ -229,6 +231,21 @@ pub fn repo_from_remote(url: &str) -> Option<(String, String)> {
     }
 }
 
+/// The API path listing a pull request's files, or `None` when a segment could not have
+/// come from a real repository.
+///
+/// The owner, name, and number arrive in a webhook body. The signature proves the body
+/// came from whoever holds the project's secret — which a project admin sets themselves —
+/// so it cannot be allowed to steer the token at a different path.
+fn pull_request_files_path(owner: &str, repo: &str, number: i64, page: u32) -> Option<String> {
+    if !is_safe_segment(owner) || !is_safe_segment(repo) || number <= 0 {
+        return None;
+    }
+    Some(format!(
+        "/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}"
+    ))
+}
+
 /// A path segment safe to interpolate into a GitHub API URL.
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
@@ -348,5 +365,19 @@ mod tests {
         assert!(!is_safe_segment("a?b"));
         assert!(!is_safe_segment("a b"));
         assert!(!is_safe_segment("a%2Fb"));
+    }
+
+    #[test]
+    fn the_pull_request_files_path_refuses_what_the_status_path_refuses() {
+        assert_eq!(
+            pull_request_files_path("octocat", "Hello-World", 7, 2).as_deref(),
+            Some("/repos/octocat/Hello-World/pulls/7/files?per_page=100&page=2")
+        );
+        // A signed body from a project admin must not be able to aim the instance token
+        // at another path.
+        assert!(pull_request_files_path("a/b/..", "x", 1, 1).is_none());
+        assert!(pull_request_files_path("octocat", "..", 1, 1).is_none());
+        assert!(pull_request_files_path("octocat", "Hello-World", 0, 1).is_none());
+        assert!(pull_request_files_path("octocat", "Hello-World", -5, 1).is_none());
     }
 }

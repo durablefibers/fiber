@@ -25,3 +25,6 @@ deploy/.env
 # Python bytecode from the smoke scripts
 __pycache__/
 *.pyc
+
+# Claude Code agent worktrees (each is its own checkout)
+.claude/worktrees/
