@@ -418,7 +418,9 @@ async fn run_session(
     let hello = AgentMessage::Hello {
         name: args.name.clone(),
         labels: labels.to_vec(),
-        concurrency: args.concurrency,
+        // The local semaphore already clamps; report the same number, or the server
+        // would register an online agent that is never offered anything.
+        concurrency: args.concurrency.max(1),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;

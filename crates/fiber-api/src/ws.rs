@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Server-initiated liveness for agent sockets. An agent whose host vanished — NAT
@@ -143,106 +143,135 @@ fn is_bare_program_name(s: &str) -> bool {
         && s != ".."
 }
 
-async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
+/// Why an offer could not be built, sorted by what to do about the lease. An offer sent
+/// without its workspace, secrets or restore list would run the step in an empty
+/// directory, fail it, and spend a retry — so none is sent; the question is only
+/// whether trying again later could work.
+#[derive(Debug)]
+enum OfferError {
+    /// Might clear: a store error, or the run row gone from under the lease. The step
+    /// goes back to the queue with a backoff.
+    Transient(anyhow::Error),
+    /// Will not clear on its own — a project secret that cannot be decrypted. The step
+    /// is failed with this reason; retrying would lease and back it out every heartbeat
+    /// and never run anything behind it.
+    Permanent(String),
+}
+
+impl std::fmt::Display for OfferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OfferError::Transient(e) => write!(f, "{e:#}"),
+            OfferError::Permanent(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<anyhow::Error> for OfferError {
+    /// The one permanent cause is typed by the store; everything else is assumed to be
+    /// the database, which is the only other thing the offer path talks to.
+    fn from(e: anyhow::Error) -> Self {
+        match e.downcast_ref::<fiber_core::SecretDecryptError>() {
+            Some(d) => OfferError::Permanent(d.to_string()),
+            None => OfferError::Transient(e),
+        }
+    }
+}
+
+async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage, OfferError> {
     let mut env = vec![
         ("FIBER_RUN_ID".into(), step.run_id.to_string()),
         ("FIBER_STEP_ID".into(), step.step_id.clone()),
     ];
     let mut artifacts = Vec::new();
-    let mut workspace = None;
     let mut timeout_minutes = None;
     let mut working_directory = None;
     let mut shell = None;
     let mut secret_keys = Vec::new();
     let mut needs_closure = None;
-    match state.store.get_run(step.run_id).await {
-        Ok(Some(run)) => {
-            let snapshot = &run.definition_snapshot;
-            workspace = workspace_from_snapshot(snapshot).map(|mut ws| {
-                // The webhook recorded what to build; the snapshot only knows the
-                // pipeline's default ref.
-                if let Some(r) = run.head_ref.clone() {
-                    ws.git_ref = r;
-                }
-                ws.sha = run.head_sha.clone();
-                ws
-            });
-            let mut secret_allow: Option<Vec<String>> = None;
-            match snapshot_step(snapshot, &step.step_id) {
-                Some(s) => {
-                    artifacts = snapshot_str_list(s.get("artifacts"));
-                    env.extend(snapshot_env(s.get("env")));
-                    timeout_minutes = s
-                        .get("timeout_minutes")
-                        .and_then(|v| v.as_u64())
-                        .map(|m| m as u32);
-                    // Re-checked here rather than trusted from the snapshot: it was
-                    // validated when the pipeline compiled, but a snapshot is a stored
-                    // document and this is the last point before it reaches an agent.
-                    working_directory = s
-                        .get("working_directory")
-                        .and_then(|v| v.as_str())
-                        .filter(|d| is_contained_relative_path(d))
-                        .map(str::to_string);
-                    shell = s
-                        .get("shell")
-                        .and_then(|v| v.as_str())
-                        .filter(|sh| is_bare_program_name(sh))
-                        .map(str::to_string);
-                    // Absent (or null) = every project secret; a list = only those names.
-                    secret_allow = s
-                        .get("secrets")
-                        .filter(|v| !v.is_null())
-                        .map(|v| snapshot_str_list(Some(v)));
-                    needs_closure = Some(needs_closure_for(snapshot, &step.step_id));
-                }
-                None => warn!(
-                    run_id = %step.run_id, step = %step.step_id,
-                    "step missing from run snapshot; offering without artifacts/env"
-                ),
+    let run = state
+        .store
+        .get_run(step.run_id)
+        .await?
+        .ok_or_else(|| OfferError::Transient(anyhow::anyhow!("run missing")))?;
+    let snapshot = &run.definition_snapshot;
+    let workspace = workspace_from_snapshot(snapshot).map(|mut ws| {
+        // The webhook recorded what to build; the snapshot only knows the
+        // pipeline's default ref.
+        if let Some(r) = run.head_ref.clone() {
+            ws.git_ref = r;
+        }
+        ws.sha = run.head_sha.clone();
+        ws
+    });
+    let mut secret_allow: Option<Vec<String>> = None;
+    match snapshot_step(snapshot, &step.step_id) {
+        Some(s) => {
+            artifacts = snapshot_str_list(s.get("artifacts"));
+            env.extend(snapshot_env(s.get("env")));
+            timeout_minutes = s
+                .get("timeout_minutes")
+                .and_then(|v| v.as_u64())
+                .map(|m| m as u32);
+            // Re-checked here rather than trusted from the snapshot: it was
+            // validated when the pipeline compiled, but a snapshot is a stored
+            // document and this is the last point before it reaches an agent.
+            working_directory = s
+                .get("working_directory")
+                .and_then(|v| v.as_str())
+                .filter(|d| is_contained_relative_path(d))
+                .map(str::to_string);
+            shell = s
+                .get("shell")
+                .and_then(|v| v.as_str())
+                .filter(|sh| is_bare_program_name(sh))
+                .map(str::to_string);
+            // Absent (or null) = every project secret; a list = only those names.
+            secret_allow = s
+                .get("secrets")
+                .filter(|v| !v.is_null())
+                .map(|v| snapshot_str_list(Some(v)));
+            needs_closure = Some(needs_closure_for(snapshot, &step.step_id));
+        }
+        // A snapshot without this step is a stored document that has gone wrong, not
+        // a transient failure: requeueing would lease and unlease it every heartbeat.
+        // Offered as-is, loudly, so the step fails in front of someone.
+        None => warn!(
+            run_id = %step.run_id, step = %step.step_id,
+            "step missing from run snapshot; offering without artifacts/env"
+        ),
+    }
+    if run.untrusted {
+        warn!(
+            run_id = %run.id,
+            "run builds code from outside the project (fork pull request); injecting no secrets"
+        );
+    } else {
+        // One undecryptable row fails the whole read, and the offer with it: a step
+        // that ran without its secrets would fail in a way that looks like the build's
+        // fault. The store types that failure; `OfferError::from` fails the step on it.
+        let secrets = state.store.list_secret_values(run.project_id).await?;
+        let mut available: Vec<String> = Vec::new();
+        for (k, v) in secrets {
+            available.push(k.clone());
+            if secret_allow.as_ref().is_some_and(|a| !a.contains(&k)) {
+                continue;
             }
-            if run.untrusted {
-                warn!(
-                    run_id = %run.id,
-                    "run builds code from outside the project (fork pull request); injecting no secrets"
-                );
-            } else {
-                match state.store.list_secret_values(run.project_id).await {
-                    Ok(secrets) => {
-                        let mut available: Vec<String> = Vec::new();
-                        for (k, v) in secrets {
-                            available.push(k.clone());
-                            if secret_allow.as_ref().is_some_and(|a| !a.contains(&k)) {
-                                continue;
-                            }
-                            secret_keys.push(k.clone());
-                            env.push((k, v));
-                        }
-                        if let Some(allow) = &secret_allow {
-                            for name in allow {
-                                if !available.contains(name) {
-                                    warn!(
-                                        run_id = %step.run_id, step = %step.step_id, secret = %name,
-                                        "step requests a secret the project does not define"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // One undecryptable row fails the whole read. Silence here would make
-                    // a wrong or rotated FIBER_SECRETS_KEY look like "builds mysteriously
-                    // have no secrets"; say so where the operator will look.
-                    Err(e) => error!(
-                        run_id = %step.run_id, project_id = %run.project_id, error = %e,
-                        "cannot read project secrets; the step will run without them"
-                    ),
+            secret_keys.push(k.clone());
+            env.push((k, v));
+        }
+        if let Some(allow) = &secret_allow {
+            for name in allow {
+                if !available.contains(name) {
+                    warn!(
+                        run_id = %step.run_id, step = %step.step_id, secret = %name,
+                        "step requests a secret the project does not define"
+                    );
                 }
             }
         }
-        Ok(None) => warn!(run_id = %step.run_id, "run missing while building offer"),
-        Err(e) => warn!(run_id = %step.run_id, error = %e, "loading run for offer"),
     }
-    let restore = restore_list(state, step.run_id, step.id, needs_closure.as_ref()).await;
+    let restore = restore_list(state, step.run_id, step.id, needs_closure.as_ref()).await?;
     // Both values were checked when the pipeline compiled, and the agent refuses them
     // again before use. A snapshot from a server older than that check can still hold one;
     // the agent will fail the step, and this is the line that says why.
@@ -265,7 +294,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
     }
     // Agents always get a limit: the step's own, else the server default.
     let default_minutes = fiber_scheduler::TimeoutConfig::from_env().default_minutes as u32;
-    ServerMessage::Offer {
+    Ok(ServerMessage::Offer {
         step_run_id: step.id,
         run_id: step.run_id,
         step_id: step.step_id.clone(),
@@ -281,6 +310,72 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         shell,
         secret_keys,
         traceparent: current_traceparent(),
+    })
+}
+
+/// Offer the agent steps until it has no free slot or nothing matches. Each offer is
+/// leased first (that is what `offer_for_agent` does) and built second; one that cannot
+/// be built is backed out (or failed, when the cause is permanent), nothing is sent for
+/// it, and the pass moves on to the next candidate — skipping the ones it already
+/// backed out, and giving up after a few failures so a store that is down costs one
+/// heartbeat a bounded amount of work.
+async fn fill_agent(state: &AppState, agent_id: Uuid, tx: &mpsc::UnboundedSender<ServerMessage>) {
+    let mut cursor = fiber_scheduler::FillCursor::new();
+    loop {
+        let step = match state
+            .scheduler
+            .offer_for_agent(agent_id, cursor.skip())
+            .await
+        {
+            Ok(Some(step)) => step,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(%agent_id, error = %e, "offer lookup failed");
+                return;
+            }
+        };
+        let span = tracing::info_span!(
+            "fiber.offer",
+            %agent_id,
+            run_id = %step.run_id,
+            step_id = %step.step_id,
+        );
+        let built = offer_for_step(state, step.clone()).instrument(span).await;
+        // The attempt opens only for an offer that is about to go out; if even that
+        // write fails the offer is treated like any other transient failure.
+        let built = match built {
+            Ok(offer) => match state.scheduler.record_offer_sent(&step).await {
+                Ok(()) => Ok(offer),
+                Err(e) => Err(OfferError::Transient(e)),
+            },
+            Err(e) => Err(e),
+        };
+        match built {
+            Ok(offer) => {
+                if tx.send(offer).is_err() {
+                    // The writer is gone; the disconnect path reclaims the lease.
+                    return;
+                }
+            }
+            Err(OfferError::Permanent(reason)) => {
+                if let Err(e) = state.scheduler.fail_unsent_offer(&step, &reason).await {
+                    warn!(%agent_id, run_id = %step.run_id, step = %step.step_id, error = %e,
+                        "could not fail the step; the reclaim loop will requeue it");
+                }
+                if !cursor.note_failure(step.id) {
+                    return;
+                }
+            }
+            Err(OfferError::Transient(e)) => {
+                state
+                    .scheduler
+                    .release_offer(&step, &format!("{e:#}"))
+                    .await;
+                if !cursor.note_failure(step.id) {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -371,23 +466,24 @@ fn workspace_from_snapshot(snapshot: &serde_json::Value) -> Option<WorkspaceOffe
 
 /// Artifacts to place in the step's workspace before it runs: those produced by the
 /// steps it depends on, latest wins per path.
+///
+/// A store error is an error: restoring nothing would hand the step an empty workspace
+/// and a green build a red one, for a database blip.
 async fn restore_list(
     state: &AppState,
     run_id: Uuid,
     current_step_run_id: Uuid,
     needs_closure: Option<&HashSet<String>>,
-) -> Vec<ArtifactRestore> {
-    let Ok(arts) = state.store.list_artifacts(run_id).await else {
-        return vec![];
-    };
+) -> anyhow::Result<Vec<ArtifactRestore>> {
+    let arts = state.store.list_artifacts(run_id).await?;
     // step_run_id -> step_id, so artifacts can be attributed to the step that produced them.
-    let producer: HashMap<Uuid, String> = match state.store.list_step_runs(run_id).await {
-        Ok(steps) => steps.into_iter().map(|s| (s.id, s.step_id)).collect(),
-        Err(e) => {
-            warn!(%run_id, error = %e, "cannot map artifacts to steps; restoring none");
-            return vec![];
-        }
-    };
+    let producer: HashMap<Uuid, String> = state
+        .store
+        .list_step_runs(run_id)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.step_id))
+        .collect();
     let mut by_name = std::collections::BTreeMap::new();
     for a in arts {
         if a.step_run_id == current_step_run_id {
@@ -413,7 +509,7 @@ async fn restore_list(
             },
         );
     }
-    by_name.into_values().collect()
+    Ok(by_name.into_values().collect())
 }
 
 /// The step a message refers to, but only if `agent_id` is the agent it was last
@@ -594,15 +690,7 @@ async fn handle_agent(
                     .register_connection(agent_id, tx.clone())
                     .await;
                 let _ = state.store.touch_agent(agent_id).await;
-                if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let span = tracing::info_span!(
-                        "fiber.offer",
-                        %agent_id,
-                        run_id = %step.run_id,
-                        step_id = %step.step_id,
-                    );
-                    let _ = tx.send(offer_for_step(&state, step).instrument(span).await);
-                }
+                fill_agent(&state, agent_id, &tx).await;
             }
             AgentMessage::Heartbeat { agent_id: claimed } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
@@ -628,15 +716,7 @@ async fn handle_agent(
                 }
                 let _ = state.store.touch_agent(agent_id).await;
                 let _ = state.scheduler.renew_leases(agent_id).await;
-                if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                    let span = tracing::info_span!(
-                        "fiber.offer",
-                        %agent_id,
-                        run_id = %step.run_id,
-                        step_id = %step.step_id,
-                    );
-                    let _ = tx.send(offer_for_step(&state, step).instrument(span).await);
-                }
+                fill_agent(&state, agent_id, &tx).await;
             }
             AgentMessage::Claim {
                 agent_id: claimed,
@@ -762,11 +842,7 @@ async fn handle_agent(
                     .on_step_complete(agent_id, step_run_id, status, exit_code, error)
                     .await
                 {
-                    Ok(_) => {
-                        if let Ok(Some(step)) = state.scheduler.offer_for_agent(agent_id).await {
-                            let _ = tx.send(offer_for_step(&state, step).await);
-                        }
-                    }
+                    Ok(_) => fill_agent(&state, agent_id, &tx).await,
                     Err(e) => warn!(error = %e, "step complete failed"),
                 }
             }
@@ -983,6 +1059,39 @@ async fn handle_run_events(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_secret_that_cannot_be_decrypted_fails_the_step_rather_than_the_offer() {
+        // The one cause that never clears on its own. Backing the step out would lease
+        // and unlease it every heartbeat, at the head of the queue, forever.
+        let e = anyhow::Error::from(fiber_core::SecretDecryptError {
+            name: "API_KEY".into(),
+            source: anyhow::anyhow!("decrypt secret failed (wrong key?)"),
+        });
+        match OfferError::from(e) {
+            OfferError::Permanent(reason) => {
+                assert!(reason.contains("API_KEY"), "{reason}");
+                assert!(reason.contains("FIBER_SECRETS_KEY"), "{reason}");
+            }
+            OfferError::Transient(e) => panic!("must be permanent, got transient: {e}"),
+        }
+    }
+
+    #[test]
+    fn any_other_failure_is_transient_and_backs_the_step_out() {
+        // A wrapped decrypt error still classifies; a bare store error does not.
+        let wrapped = anyhow::Error::from(fiber_core::SecretDecryptError {
+            name: "TOKEN".into(),
+            source: anyhow::anyhow!("boom"),
+        })
+        .context("reading project secrets");
+        assert!(matches!(
+            OfferError::from(wrapped),
+            OfferError::Permanent(_)
+        ));
+        let db = anyhow::anyhow!("connection reset by peer");
+        assert!(matches!(OfferError::from(db), OfferError::Transient(_)));
+    }
 
     #[test]
     fn workspace_comes_from_snapshot_only() {

@@ -103,3 +103,19 @@ fn a_failure_spends_an_attempt_and_the_budget_is_exhausted_by_failures() {
     assert_eq!(failure_outcome(2, 3), FiberOutcome::Retry);
     assert_eq!(failure_outcome(3, 3), FiberOutcome::Failed);
 }
+
+#[test]
+fn an_idle_due_index_cannot_skip_the_ready_query_for_more_than_thirty_seconds() {
+    use crate::scheduler::sweep_is_due;
+    use std::time::Duration;
+    // Something due, or nothing known: always ask.
+    assert!(sweep_is_due(false, None));
+    assert!(sweep_is_due(false, Some(Duration::from_secs(1))));
+    assert!(sweep_is_due(true, None), "a fresh replica has never asked");
+    // Index says idle: skip, but only for so long. The index is per replica; a fiber
+    // created on a replica that then died is not in it and must still be claimed.
+    assert!(!sweep_is_due(true, Some(Duration::from_secs(2))));
+    assert!(!sweep_is_due(true, Some(Duration::from_secs(29))));
+    assert!(sweep_is_due(true, Some(Duration::from_secs(30))));
+    assert!(sweep_is_due(true, Some(Duration::from_secs(3600))));
+}
