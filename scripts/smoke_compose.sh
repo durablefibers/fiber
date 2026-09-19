@@ -91,6 +91,30 @@ else
     fail "pipeline on compose agent"
     "${COMPOSE[@]}" logs --tail=40 fiber-agent || true
   fi
+
+  # A deploy must not restart the builds in flight: a step's lease outlives the agent's
+  # session. Restart the API under a running step and expect it to finish on attempt 1,
+  # with every line it printed while the API was away.
+  echo "== api restart under a running step =="
+  RESTART_RUN=$(python3 "$ROOT/scripts/_compose_pipeline.py" restart-run-start || true)
+  if [[ -z "$RESTART_RUN" ]]; then
+    fail "start a step to restart the api under"
+  else
+    "${COMPOSE[@]}" restart fiber-api
+    for i in $(seq 1 60); do
+      if curl -sf http://127.0.0.1:18080/ready >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+    if python3 "$ROOT/scripts/_compose_pipeline.py" restart-run-verify "$RESTART_RUN"; then
+      ok "step survived the api restart on attempt 1"
+    else
+      fail "step did not survive the api restart"
+      "${COMPOSE[@]}" logs --tail=60 fiber-api || true
+      "${COMPOSE[@]}" logs --tail=40 fiber-agent || true
+    fi
+  fi
   "${COMPOSE[@]}" --profile agent rm -sf fiber-agent >/dev/null 2>&1 || true
   python3 "$ROOT/scripts/_compose_pipeline.py" cleanup >/dev/null 2>&1 || true
 fi

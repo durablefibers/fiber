@@ -1230,6 +1230,18 @@ impl Store {
         Ok(sr)
     }
 
+    /// Steps `agent_id` currently holds a lease on. What an agent that reconnects is
+    /// still running, and so how many of its concurrency slots are taken.
+    pub async fn count_running_steps_for_agent(&self, agent_id: Uuid) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM step_runs WHERE agent_id = $1 AND status = 'running'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     pub async fn renew_agent_leases(&self, agent_id: Uuid, lease_secs: i64) -> Result<u64> {
         let expires = Utc::now() + chrono::Duration::seconds(lease_secs);
         let res = sqlx::query(
