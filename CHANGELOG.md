@@ -6,6 +6,15 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-19
+
+A security release. Two pipeline fields set by a project writer reached a process on the
+agent host unchecked, and either one led to the agent's own token — on a global agent, to
+every project's secrets. No migration and no schema change. Upgrade the API first, then
+the agents: an agent older than this release still executes whatever an older snapshot
+holds, and a pipeline stored with a now-invalid `image` or `workspace.repo` stops
+producing runs until it is corrected (see the note below).
+
 ### Security
 
 - **A step's `image:` and a pipeline's `workspace.repo` are now validated before they reach
