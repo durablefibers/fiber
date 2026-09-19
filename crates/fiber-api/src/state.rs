@@ -14,4 +14,13 @@ pub struct AppState {
     pub loop_health: Arc<crate::supervisor::LoopHealth>,
     pub artifacts: ArtifactBackend,
     pub login_guard: Arc<LoginGuard>,
+    /// Flips to `true` once a shutdown signal arrives. Long-lived handlers (the WebSocket
+    /// sessions) watch it so they can close cleanly instead of being cut off when the
+    /// process exits.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Every WebSocket session holds a `subscribe()`d receiver of this for its whole
+    /// life. `axum::serve`'s drain only tracks HTTP connections — an upgrade resolves its
+    /// connection future at the handshake and the session runs detached — so main waits
+    /// on `closed()` here to know the sessions have actually finished.
+    pub sessions: tokio::sync::watch::Sender<()>,
 }

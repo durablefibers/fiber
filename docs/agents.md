@@ -164,6 +164,8 @@ The server counts an agent's in-flight steps **from the database** (`step_runs` 
 | Reconnect | Exponential backoff 1 s → 30 s with jitter; a `401` (revoked token) exits the process with status 2 instead of retrying forever |
 | Concurrency | `--concurrency` is enforced locally with a process-wide semaphore as well as by the server; a step parked on it still counts against its `timeout_minutes`, which start when the offer is received |
 | Disconnect / WS close | Agent marked offline; in-flight steps requeued. The bounced attempt counts against `retries` with one extra try: once the step has lost more than `retries + 1` leases it fails with `lease lost after N attempts` instead of being requeued |
+| Server ping | The server pings the socket every 15 s and closes it (code 1008, "liveness timeout") after 45 s without any frame; the close takes the Disconnect path. A healthy agent's 10 s heartbeat answers long before |
+| Server shutdown | On SIGTERM the API sends Close 1012 ("server shutting down") to every agent and waits for the sessions to end (up to 20 s) before exiting; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect row |
 | Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + the same requeue-or-fail rule |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
 | Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |

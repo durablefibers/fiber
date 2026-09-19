@@ -7,6 +7,7 @@
 - Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password (`FIBER_REDIS_PASSWORD`).
 - `fiber-api` (`18080`) and `fiber-ui` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_UI_BIND=0.0.0.0` only for a trusted network.
 - Every service has `restart: unless-stopped`; the API waits for Postgres, Redis, **and** MinIO health.
+- `fiber-api` runs with `init: true` and `stop_grace_period: 30s`, so `docker stop` and a `compose up` of a new image deliver SIGTERM and the API drains (see [Shutdown and deploys](#shutdown-and-deploys)) instead of being killed after Docker's default 10 s.
 - Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
 - Set `FIBER_ADMIN_PASSWORD` **before the first boot**: it is applied only when the users table is empty. For an existing instance, change the admin password through the API/UI instead. The API warns at boot while the configured value is the default `fiber`.
 
@@ -36,6 +37,50 @@ Environment=SSL_CERT_FILE=/etc/fiber/internal-ca.pem
 The binaries link no OpenSSL, so a host needs no `libssl` — only a CA bundle
 (`ca-certificates` on Debian and Ubuntu). Without one, nothing is trusted and every TLS
 connection fails.
+
+## Shutdown and deploys
+
+On SIGTERM or SIGINT, `fiber-api` stops accepting connections, lets requests already in
+flight finish, and ends every open WebSocket session with a Close frame (code `1012`,
+"server shutting down") — the process waits for those sessions to finish, not just for
+HTTP. It then flushes the OpenTelemetry batch and exits. The drain is bounded at
+**20 s**: a request or session still open then is dropped and the process leaves anyway,
+which with the ≤ 5 s telemetry flush stays inside the 30 s `stop_grace_period`. Each
+phase is logged under `shutdown:`.
+
+The Close frame is what lets an agent reconnect at once instead of discovering a dead
+socket by TCP timeout, particularly behind a proxy that would otherwise hold its side
+half-open. The UI already reconnects 2 s after any close, so for browsers the frame is
+tidiness rather than a change in behaviour.
+
+An agent treats the Close like any other disconnect ([agents](./agents.md#lifecycle)):
+its in-flight steps are requeued and re-run when it reconnects. A deploy therefore still
+restarts the steps that were running at that moment; what it no longer does is cut off an
+artifact upload half-way, drop an HTTP response, or lose the last batch of traces.
+Background loops are not drained. A scheduled run or a durable-fiber step interrupted
+mid-way is picked up by the replica that comes up next — that is what at-least-once
+means here.
+
+## Request limits
+
+- Ordinary API requests are answered `408 Request Timeout` after **30 s** and the
+  handler is dropped, so a slow client or a stuck query cannot hold a server task
+  indefinitely. WebSocket upgrades (`/ws/*`), artifact transfers
+  (`/api/artifacts/{id}/download`, `/api/agent/steps/{id}/artifacts`,
+  `/api/agent/artifacts/{id}/download`) and `DELETE /api/projects/{id}` are exempt: a
+  session lives as long as the agent, an artifact moves at link speed up to its size
+  cap, and a project delete cascades through everything the project ever ran.
+- The GitHub webhook accepts deliveries up to **25 MiB**, GitHub's own maximum, with at
+  most **8** deliveries buffered at once (the endpoint is unauthenticated until the body
+  is read and its signature checked); further deliveries wait for a slot and fail with
+  `408` if none frees up in time. GitHub does **not** retry a failed delivery: it is listed
+  under the webhook's *Recent Deliveries* and must be redelivered from there, so a `408`
+  is a push that did not build until someone does. Other JSON bodies keep the 2 MiB default.
+- The server pings every agent socket every **15 s** and closes it after **45 s** without
+  a frame of any kind (two pongs missed; the agent's own 10 s heartbeat normally answers
+  long before). The close takes the normal disconnect path, so an agent whose host
+  vanished silently goes offline within a minute instead of when the kernel gives up on
+  the TCP connection.
 
 ## Re-running a run
 
@@ -165,7 +210,7 @@ that are down and the endpoint returns `503`, so a load balancer takes the insta
 rather than leaving it accepting traffic it cannot act on:
 
 ```json
-{"checks": {"loops": ["schedules"], "postgres": "ok", "redis": "ok"}, "ok": false}
+{"checks": {"loops": ["schedules"], "postgres": "ok", "redis": "ok"}, "degraded": false, "ok": false}
 ```
 
 `/metrics` carries `fiber_background_loop_up{loop=...}` and
@@ -258,8 +303,41 @@ dependency graph. `CHANGELOG.md` records what each version contains.
 
 ## Health checks
 
-- `GET /health` — process up  
-- `GET /ready` — Postgres + Redis reachable (Compose healthcheck uses this). Failing checks report `"error"` only; the cause is in the API log.
+- `GET /health` — process up.
+- `GET /ready` — what the Compose healthcheck and a load balancer should use. `200` when
+  Postgres answers and every supervised loop is running; `503` otherwise. Each dependency
+  probe is bounded at **2 s**, so a hung Postgres shows up as `"postgres": "error"` inside
+  the orchestrator's own probe window instead of as an unexplained probe timeout. Failing
+  checks report `"error"` only; the cause is in the API log.
+
+Redis is reported but does not fail the probe. Leases, scheduling, the queue, and lease
+reclaim all live in Postgres, so a replica without Redis still runs builds. `/ready`
+answers `200` with `"redis": "degraded"` and a top-level `"degraded": true`:
+
+```json
+{"checks": {"loops": "ok", "postgres": "ok", "redis": "degraded"}, "degraded": true, "ok": true}
+```
+
+Alert on `degraded`; do not pull the replica for it. While Redis is down:
+
+- **Live run views stall across replicas.** `/ws/runs/{id}` still receives events raised
+  on the replica it is connected to (they go through an in-process broadcast first), but
+  nothing from the others. Reloading the page catches up from Postgres.
+- **Agent commands do not fan out.** Run cancel, token rotation and agent deletion reach
+  an agent only when it is connected to the replica that handled the request; otherwise
+  they take effect when the agent reconnects or its lease expires.
+- **Status updates land a little later.** Each event publish waits out one reconnect
+  attempt with a 1 s connect timeout (about two seconds in all) before giving up on
+  that event. Handlers that publish sit under the 30 s request timeout, which is why the
+  client is bounded this tightly rather than left at its 13 s default.
+- **External `fiber:events` consumers see a gap.**
+
+Everything reconnects on its own when Redis is back: the client-side manager retries per
+command, and the `events` and `agent_cmds` subscriber loops retry every 2 s. The same
+holds at boot — an unreachable Redis no longer makes `fiber-api` crash-loop; it logs
+`redis unreachable at boot; starting degraded` and comes up. If a broken live view
+matters more to you than build throughput, have the load balancer also require
+`"degraded": false` in the body.
 
 ## Retention / GC
 
@@ -289,7 +367,7 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `FIBER_OTEL_ENDPOINT` to an OTLP HTTP colle
 - **Redis `fiber:events`** — run/step/log events fan out so `/ws/runs/{id}` subscribers on any replica see them.
 - **Redis `fiber:agent_cmds`** — agent-directed messages (run cancel, token rotation / delete disconnects) fan out so the replica holding the agent's socket delivers them.
 
-Agent presence (labels, concurrency) is per replica: an agent is offered steps by the replica it is connected to. Its in-flight count is not — it is `SELECT COUNT(*) … WHERE agent_id = … AND status = 'running'` at offer time, so a cancel or completion that only another replica saw still frees the slot. Redis is not a queue — queued steps live in Postgres and are pulled, oldest-queued first, on each agent heartbeat until the agent is full.
+Agent presence (labels, concurrency) is per replica: an agent is offered steps by the replica it is connected to. Its in-flight count is not — it is `SELECT COUNT(*) … WHERE agent_id = … AND status = 'running'` at offer time, so a cancel or completion that only another replica saw still frees the slot. Redis is not a queue — queued steps live in Postgres and are pulled, oldest-queued first, on each agent heartbeat until the agent is full, which is why a replica keeps building with Redis down ([Health checks](#health-checks) lists what it loses).
 
 ## Smoke scripts
 
