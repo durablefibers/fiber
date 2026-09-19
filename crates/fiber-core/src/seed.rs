@@ -13,7 +13,7 @@ pub async fn ensure_showcase(store: &Store, owner_id: Uuid) -> Result<()> {
     let project = match store.get_project_by_slug(SHOWCASE_SLUG).await? {
         Some(p) => {
             store
-                .add_project_member(p.id, owner_id, ProjectRole::Owner)
+                .add_project_member(p.id, owner_id, ProjectRole::Owner, true)
                 .await?;
             p
         }
