@@ -256,6 +256,12 @@ pub enum AgentMessage {
         stream: String,
         data: String,
         seq: u64,
+        /// The attempt this line belongs to, echoed from the `Offer`. A `step_run_id` is
+        /// the same across attempts, so without this a line held on the agent through a
+        /// reclaim would land under the attempt that replaced it. The server drops a
+        /// line whose attempt is not the row's; absent (older agents) it is not checked.
+        #[serde(default)]
+        attempt: Option<i32>,
     },
     /// Legacy WS base64 upload. Prefer HTTP: presign PUT to S3 when available,
     /// else `PUT /api/agent/steps/.../artifacts`.
@@ -266,6 +272,9 @@ pub enum AgentMessage {
         path: String,
         size: u64,
         content_base64: Option<String>,
+        /// As on `LogChunk`.
+        #[serde(default)]
+        attempt: Option<i32>,
     },
     StepComplete {
         agent_id: Uuid,
@@ -273,6 +282,10 @@ pub enum AgentMessage {
         status: StepStatus,
         exit_code: Option<i32>,
         error: Option<String>,
+        /// As on `LogChunk`: a completion held through a reclaim must not close the
+        /// attempt that replaced the one it reports on.
+        #[serde(default)]
+        attempt: Option<i32>,
     },
     /// The agent is exiting on purpose (SIGTERM) and has already stopped its steps: the
     /// server requeues everything it holds now instead of waiting for the leases to
@@ -306,6 +319,11 @@ pub enum ServerMessage {
         run: String,
         workspace: Option<WorkspaceOffer>,
         env: Vec<(String, String)>,
+        /// Which attempt of the step this offer is for. The agent echoes it on every
+        /// message about the step, so output from an earlier attempt of the same
+        /// `step_run_id` cannot be taken for this one. Absent from older servers.
+        #[serde(default)]
+        attempt: Option<i32>,
         /// Workspace-relative paths to upload after success.
         #[serde(default)]
         artifacts: Vec<String>,
@@ -453,6 +471,7 @@ mod tests {
             status: StepStatus::Succeeded,
             exit_code: Some(0),
             error: None,
+            attempt: Some(1),
         };
         let v = serde_json::to_value(&complete).unwrap();
         assert_eq!(v["type"], json!("step_complete"));
@@ -502,6 +521,19 @@ mod tests {
         ));
         // 0 is reserved for agents without the field.
         const { assert!(PROTOCOL_VERSION >= 1) };
+    }
+
+    #[test]
+    fn a_completion_without_attempt_is_an_old_agent() {
+        let v: AgentMessage = serde_json::from_value(json!({
+            "type": "step_complete", "agent_id": Uuid::nil(), "step_run_id": Uuid::nil(),
+            "status": "succeeded", "exit_code": 0, "error": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            v,
+            AgentMessage::StepComplete { attempt: None, .. }
+        ));
     }
 
     #[test]

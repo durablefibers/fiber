@@ -1230,6 +1230,19 @@ impl Store {
         Ok(sr)
     }
 
+    /// Lines already stored for one attempt of a step. Seeds the per-session log cap
+    /// when an agent reconnects mid-attempt, so the cap is per attempt, not per socket.
+    pub async fn count_log_lines(&self, step_run_id: Uuid, attempt: i32) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM log_lines WHERE step_run_id = $1 AND attempt = $2",
+        )
+        .bind(step_run_id)
+        .bind(attempt)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     /// Steps `agent_id` currently holds a lease on. What an agent that reconnects is
     /// still running, and so how many of its concurrency slots are taken.
     pub async fn count_running_steps_for_agent(&self, agent_id: Uuid) -> Result<i64> {
@@ -1315,8 +1328,10 @@ impl Store {
         self.propagate_reclaim_failures(reclaimed).await
     }
 
-    /// Reclaim every step `agent_id` was running, on disconnect. See [`Reclaimed`].
-    pub async fn requeue_agent_steps(&self, agent_id: Uuid) -> Result<Reclaimed> {
+    /// Reclaim every step `agent_id` was running. `reason` closes the attempts (what
+    /// `step_attempts.error` says: "agent disconnected", "agent shut down"). See
+    /// [`Reclaimed`].
+    pub async fn requeue_agent_steps(&self, agent_id: Uuid, reason: &str) -> Result<Reclaimed> {
         let mut tx = self.pool.begin().await?;
         let candidates = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "SELECT {STEP_RUN_COLS} FROM step_runs
@@ -1327,7 +1342,7 @@ impl Store {
         .bind(agent_id)
         .fetch_all(&mut *tx)
         .await?;
-        let reclaimed = reclaim_steps_on(&mut tx, &candidates, "agent disconnected").await?;
+        let reclaimed = reclaim_steps_on(&mut tx, &candidates, reason).await?;
         tx.commit().await?;
         self.propagate_reclaim_failures(reclaimed).await
     }

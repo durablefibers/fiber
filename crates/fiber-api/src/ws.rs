@@ -273,6 +273,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         image: step.image,
         run: step.run_cmd,
         workspace,
+        attempt: Some(step.attempt),
         env,
         artifacts,
         restore,
@@ -417,15 +418,30 @@ async fn restore_list(
 }
 
 /// The step a message refers to, but only if `agent_id` is the agent it was last
-/// leased to. Used for log lines: output that arrives after a cancel or reclaim is
-/// still this agent's output for its own attempt, and is what an operator reads to
-/// learn why the step stopped.
-async fn owned_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Option<StepRun> {
+/// leased to and `attempt` (echoed from the offer; `None` from older agents) is the
+/// attempt the row is on. Used for log lines: output that arrives after a cancel or
+/// reclaim is still this agent's output for its own attempt, and is what an operator
+/// reads to learn why the step stopped — but output an agent held through a reclaim
+/// and delivered after it leased the same step again belongs to the earlier attempt,
+/// and is dropped rather than filed under the new one.
+async fn owned_step(
+    state: &AppState,
+    agent_id: Uuid,
+    step_run_id: Uuid,
+    attempt: Option<i32>,
+) -> Option<StepRun> {
     let step = state.store.get_step_run(step_run_id).await.ok().flatten()?;
     if step.agent_id != Some(agent_id) {
         tracing::debug!(
             %agent_id, %step_run_id, owner = ?step.agent_id,
             "dropping agent message for a step it does not own"
+        );
+        return None;
+    }
+    if !fiber_scheduler::attempt_is_current(attempt, step.attempt) {
+        warn!(
+            %agent_id, %step_run_id, row_attempt = step.attempt, reported_attempt = ?attempt,
+            "dropping agent message for an earlier attempt of the step"
         );
         return None;
     }
@@ -435,8 +451,13 @@ async fn owned_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Opti
 /// Like `owned_step`, but the lease must still be live. Used for artifacts (and,
 /// via the scheduler, completions): once a step was reclaimed or re-leased, the
 /// re-leased attempt reports its own outputs — this attempt's are dropped.
-async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Option<StepRun> {
-    let step = owned_step(state, agent_id, step_run_id).await?;
+async fn leased_step(
+    state: &AppState,
+    agent_id: Uuid,
+    step_run_id: Uuid,
+    attempt: Option<i32>,
+) -> Option<StepRun> {
+    let step = owned_step(state, agent_id, step_run_id, attempt).await?;
     if step.status_enum() != StepStatus::Running {
         tracing::debug!(
             %agent_id, %step_run_id, status = %step.status,
@@ -520,15 +541,20 @@ async fn handle_agent(
     // Log a spoofed agent_id once per session, not once per log line.
     let mut spoof_logged = false;
     // Lines already stored per (step, attempt), so the cap costs a counter rather than a
-    // `SELECT COUNT(*)` on every line. Kept per session: a step's output goes to one agent
-    // connection, and a retry is a new attempt with its own budget.
+    // `SELECT COUNT(*)` on every line. Seeded from the table on the first line a session
+    // sees for an attempt: an agent that reconnects mid-attempt continues the count it
+    // left, rather than getting a fresh budget per socket. A retry is a new attempt with
+    // its own budget.
     let mut logged: HashMap<(Uuid, i32), u64> = HashMap::new();
+    // Set when this side ends the session because the token no longer authorises the
+    // agent: its steps are requeued at once, whatever it declared in Hello.
+    let mut revoked = false;
     let log_cap = step_log_cap();
-    // What the agent declared in Hello (0 until it does): decides whether a close ends
-    // its attempts or just this session. `goodbye` is set when the agent says it is
-    // exiting on purpose. Not persisted — `agents` has no column for the revision yet;
-    // the Hello log line carries it.
-    let mut agent_protocol: u32 = 0;
+    // What the agent declared in Hello (`None` until it does): decides whether a close
+    // ends its attempts or just this session. `goodbye` is set when the agent says it
+    // is exiting on purpose. Not persisted — `agents` has no column for the revision
+    // yet; the Hello log line carries it.
+    let mut agent_protocol: Option<u32> = None;
     let mut goodbye = false;
     let mut shutdown = state.shutdown.clone();
     let mut liveness = tokio::time::Instant::now() + AGENT_LIVENESS_TIMEOUT;
@@ -545,6 +571,9 @@ async fn handle_agent(
                     "agent sent nothing (not even a pong); closing its socket"
                 );
                 close = Some(close_frame(close_code::POLICY, "liveness timeout"));
+                // Deliberately KeepLeases (via the tail): a socket the agent stopped
+                // answering on may be black-holed while the agent itself is fine and
+                // reconnecting; if it is gone, the leases expire on their own.
                 break;
             }
             _ = shutting_down(&mut shutdown) => {
@@ -582,7 +611,7 @@ async fn handle_agent(
                     });
                     break;
                 }
-                agent_protocol = protocol_version;
+                agent_protocol = Some(protocol_version);
                 info!(%agent_id, %name, ?labels, protocol_version, "agent hello");
                 // Reload from DB so pool scope is authoritative (not client-supplied).
                 // A missing row ends the session rather than defaulting: `.flatten()`
@@ -636,6 +665,7 @@ async fn handle_agent(
                 );
                 if !still_valid {
                     warn!(%agent_id, "agent token no longer valid; ending session");
+                    revoked = true;
                     let _ = tx.send(ServerMessage::Error {
                         message: "agent token revoked — reconnect with a valid token".into(),
                     });
@@ -672,13 +702,24 @@ async fn handle_agent(
                 stream: stream_name,
                 data,
                 seq,
+                attempt,
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
-                if let Some(step) = owned_step(&state, agent_id, step_run_id).await {
+                if let Some(step) = owned_step(&state, agent_id, step_run_id, attempt).await {
                     // A runaway step could otherwise write until the disk filled. Past the
                     // cap the lines are dropped, with one line saying so — silence would
                     // look like the step stopped producing output.
-                    let seen = logged.entry((step_run_id, step.attempt)).or_insert(0);
+                    let key = (step_run_id, step.attempt);
+                    if !logged.contains_key(&key) {
+                        let stored = state
+                            .store
+                            .count_log_lines(step_run_id, step.attempt)
+                            .await
+                            .map(|n| u64::try_from(n).unwrap_or(0))
+                            .unwrap_or(0);
+                        logged.insert(key, stored);
+                    }
+                    let seen = logged.entry(key).or_insert(0);
                     *seen += 1;
                     let (data, stream_name) = if *seen > log_cap {
                         continue;
@@ -726,13 +767,14 @@ async fn handle_agent(
                 path: rel_path,
                 size,
                 content_base64,
+                attempt,
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
                 // Prefer HTTP upload; keep WS base64 as a small-file fallback.
                 let Some(b64) = content_base64 else {
                     continue;
                 };
-                if let Some(step) = leased_step(&state, agent_id, step_run_id).await {
+                if let Some(step) = leased_step(&state, agent_id, step_run_id, attempt).await {
                     let rel = crate::artifact_util::sanitize_artifact_rel_path(&rel_path)
                         .or_else(|| crate::artifact_util::sanitize_artifact_rel_path(&name));
                     let Some(rel) = rel else {
@@ -776,12 +818,14 @@ async fn handle_agent(
                 status,
                 exit_code,
                 error,
+                attempt,
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
-                // on_step_complete additionally rejects completions for steps not leased to agent_id.
+                // on_step_complete additionally rejects completions for steps not leased
+                // to agent_id, or reporting on an attempt the row has moved past.
                 match state
                     .scheduler
-                    .on_step_complete(agent_id, step_run_id, status, exit_code, error)
+                    .on_step_complete(agent_id, step_run_id, attempt, status, exit_code, error)
                     .await
                 {
                     Ok(_) => {
@@ -808,8 +852,18 @@ async fn handle_agent(
     // A close is no longer the end of the agent's attempts: from protocol revision 1 it
     // keeps its steps running and renews their leases when it is back, so the rows are
     // left as they are and the reclaim loop requeues whatever expires. An older agent,
-    // or one that said Goodbye, has stopped its steps, and they are requeued now.
-    let policy = fiber_scheduler::disconnect_policy(agent_protocol, goodbye);
+    // or one that said Goodbye, has stopped its steps, and they are requeued now. A
+    // session that never said Hello learned nothing about the agent and touches nothing:
+    // the agent's other session may be holding the leases.
+    // A revoked token is decided here, not by the agent: with Redis down the
+    // `force_disconnect_agent` fan-out never arrives, and this break is the only path.
+    let policy = if revoked {
+        fiber_scheduler::DisconnectPolicy::RequeueNow {
+            reason: "agent token revoked",
+        }
+    } else {
+        fiber_scheduler::disconnect_policy(agent_protocol, goodbye)
+    };
     if let Err(e) = state.scheduler.on_agent_disconnect(agent_id, policy).await {
         warn!(error = %e, %agent_id, "agent disconnect cleanup failed");
     }

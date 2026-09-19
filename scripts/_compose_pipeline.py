@@ -186,7 +186,9 @@ def restart_run_verify(run_id: str) -> int:
         problems.append(f"marker missing from logs; tail={logs[-5:]}")
     # Lines produced while the API was down were buffered on the agent and flushed
     # after the reconnect; none of the 25 ticks may be missing.
-    ticks = sorted(int(l.split()[1]) for l in logs if l.startswith("tick "))
+    # A line the outbox re-sent after an aborted write can appear twice (append-only,
+    # no dedupe); a missing tick is the failure, a duplicate is not.
+    ticks = sorted({int(l.split()[1]) for l in logs if l.startswith("tick ")})
     if ticks != list(range(1, 26)):
         problems.append(f"ticks lost across the restart: {ticks}")
     if problems:

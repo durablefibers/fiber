@@ -80,6 +80,10 @@ pub enum AgentCommandKind {
     Cancel { step_run_id: Uuid },
     /// Terminate the agent's session here (token rotated, agent deleted).
     Disconnect { reason: String },
+    /// Close the agent's socket here but leave its leases alone (stale sweep). A
+    /// separate tag from `Disconnect` on purpose: a replica older than this variant
+    /// cannot parse it and ignores it, where a `Disconnect` would make it requeue.
+    DropSession { reason: String },
 }
 
 impl Scheduler {
@@ -229,7 +233,22 @@ impl Scheduler {
                     .await;
                 // Requeue is idempotent (the originating instance already did it).
                 let _ = self
-                    .on_agent_disconnect(cmd.agent_id, DisconnectPolicy::RequeueNow)
+                    .on_agent_disconnect(
+                        cmd.agent_id,
+                        DisconnectPolicy::RequeueNow {
+                            reason: "agent disconnected",
+                        },
+                    )
+                    .await;
+            }
+            AgentCommandKind::DropSession { reason } => {
+                if !self.has_connection(cmd.agent_id).await {
+                    return;
+                }
+                self.send_local(cmd.agent_id, ServerMessage::Error { message: reason })
+                    .await;
+                let _ = self
+                    .on_agent_disconnect(cmd.agent_id, DisconnectPolicy::KeepLeases)
                     .await;
             }
         }
@@ -319,7 +338,12 @@ impl Scheduler {
         )
         .await;
         let _ = self
-            .on_agent_disconnect(agent_id, DisconnectPolicy::RequeueNow)
+            .on_agent_disconnect(
+                agent_id,
+                DisconnectPolicy::RequeueNow {
+                    reason: "agent disconnected",
+                },
+            )
             .await;
         self.publish_agent_command(&AgentCommand {
             agent_id,
@@ -332,12 +356,9 @@ impl Scheduler {
 
     /// Like [`force_disconnect_agent`](Self::force_disconnect_agent) but the agent's
     /// leases stand: the session ends and the agent reconnects, and whatever it is
-    /// running carries on under the same lease.
-    ///
-    /// Only the local socket is dropped. Another replica holding it learns of the stale
-    /// mark through its own session's next heartbeat, which finds no connection and
-    /// ends — and a replica older than this fan-out would requeue on receipt, which is
-    /// the one thing this must not do.
+    /// running carries on under the same lease. Fanned out as `DropSession`, which a
+    /// replica older than the variant ignores rather than requeueing on; the server
+    /// ping closes a wedged socket there within 45 s anyway.
     async fn drop_agent_session(&self, agent_id: Uuid, reason: &str) {
         self.send_local(
             agent_id,
@@ -349,6 +370,13 @@ impl Scheduler {
         let _ = self
             .on_agent_disconnect(agent_id, DisconnectPolicy::KeepLeases)
             .await;
+        self.publish_agent_command(&AgentCommand {
+            agent_id,
+            kind: AgentCommandKind::DropSession {
+                reason: reason.to_string(),
+            },
+        })
+        .await;
     }
 
     /// Ask the agent holding `step_run_id` to kill it, wherever it is connected:
@@ -412,11 +440,11 @@ impl Scheduler {
         // Registry cleanup first: it must not depend on a publish that can fail on a
         // database blip, or a gone agent stays "connected" until the next stale sweep.
         self.unregister_agent(agent_id).await;
-        let DisconnectPolicy::RequeueNow = policy else {
+        let DisconnectPolicy::RequeueNow { reason } = policy else {
             debug!(%agent_id, "agent disconnected; its leases stand until they expire");
             return Ok(());
         };
-        let reclaimed = self.store.requeue_agent_steps(agent_id).await?;
+        let reclaimed = self.store.requeue_agent_steps(agent_id, reason).await?;
         if !reclaimed.requeued.is_empty() || !reclaimed.failed.is_empty() {
             info!(
                 %agent_id,
@@ -746,10 +774,13 @@ impl Scheduler {
         Ok(())
     }
 
+    /// `attempt` is what the agent echoed from its offer; `None` from an agent older
+    /// than the field.
     pub async fn on_step_complete(
         &self,
         agent_id: Uuid,
         step_run_id: Uuid,
+        attempt: Option<i32>,
         status: StepStatus,
         exit_code: Option<i32>,
         error: Option<String>,
@@ -759,8 +790,11 @@ impl Scheduler {
         // Decide about the slot before anything returns: a step whose rows were deleted
         // under the agent still has to give its slot back.
         if releases_slot(
-            found.as_ref().map(|s| (s.status_enum(), s.agent_id)),
+            found
+                .as_ref()
+                .map(|s| (s.status_enum(), s.agent_id, s.attempt)),
             agent_id,
+            attempt,
         ) {
             let mut agents = self.agents.write().await;
             if let Some(a) = agents.get_mut(&agent_id) {
@@ -773,11 +807,20 @@ impl Scheduler {
             return Ok(None);
         };
 
-        // Ignore late completes after cancel / reclaim / re-lease to another agent.
-        if !completion_is_current(current.status_enum(), current.agent_id, agent_id) {
-            debug!(
+        // Ignore late completes after cancel / reclaim / re-lease to another agent, or
+        // for an attempt the row has moved past.
+        if !completion_is_current(
+            current.status_enum(),
+            current.agent_id,
+            current.attempt,
+            agent_id,
+            attempt,
+        ) {
+            warn!(
                 %step_run_id,
                 status = %current.status,
+                row_attempt = current.attempt,
+                reported_attempt = ?attempt,
                 "ignoring late step complete"
             );
             return Ok(None);
@@ -989,6 +1032,7 @@ impl Scheduler {
             self.on_step_complete(
                 agent_id,
                 t.step_run_id,
+                None,
                 StepStatus::Failed,
                 None,
                 Some(error),
@@ -1031,26 +1075,49 @@ impl TimeoutConfig {
 pub enum DisconnectPolicy {
     /// The rows stay `running` under the agent until it renews them or they expire.
     KeepLeases,
-    /// Requeue them now (with the attempt cap), as an expired lease would.
-    RequeueNow,
+    /// Requeue them now (with the attempt cap), as an expired lease would. `reason`
+    /// closes the attempts.
+    RequeueNow { reason: &'static str },
 }
 
 /// What to do with an agent's steps when its socket closes.
 ///
-/// `protocol_version` is what the agent declared in `Hello` (`0` when it sent none).
-/// From revision 1 an agent keeps its step tasks across sessions and renews their
-/// leases when it reconnects, so a close is not the end of its attempts — unless it
-/// said `Goodbye`, which means it has already stopped them and is exiting, and the
-/// steps should not wait out a lease nobody will renew. An older agent cancels its
-/// steps on any close, so for it a close *is* the end of the attempt and the old
-/// behaviour (requeue at once) is the right one; letting its leases expire would only
-/// delay the retry by `LEASE_SECS`.
-pub fn disconnect_policy(protocol_version: u32, goodbye: bool) -> DisconnectPolicy {
-    if goodbye || protocol_version < 1 {
-        DisconnectPolicy::RequeueNow
-    } else {
-        DisconnectPolicy::KeepLeases
+/// `hello` is the `protocol_version` the agent declared in `Hello` (`Some(0)` when it
+/// sent the message without the field), or `None` when the session never got as far as
+/// `Hello`. From revision 1 an agent keeps its step tasks across sessions and renews
+/// their leases when it reconnects, so a close is not the end of its attempts — unless
+/// it said `Goodbye`, which means it has already stopped them and is exiting, and the
+/// steps should not wait out a lease nobody will renew. An older agent cancels its steps
+/// on any close, so for it a close *is* the end of the attempt and the old behaviour
+/// (requeue at once) is the right one; letting its leases expire would only delay the
+/// retry by `LEASE_SECS`.
+///
+/// A session that never said `Hello` holds nothing — but the same agent's *other*
+/// session may. An agent reconnecting while its previous socket is still draining, or a
+/// second process started with the same token, opens a socket that closes before or
+/// without `Hello`; requeueing on that close would take the live leases out from under
+/// the session that is renewing them. Nothing was learned about the agent, so nothing
+/// is done to its steps.
+pub fn disconnect_policy(hello: Option<u32>, goodbye: bool) -> DisconnectPolicy {
+    if goodbye {
+        return DisconnectPolicy::RequeueNow {
+            reason: "agent shut down",
+        };
     }
+    match hello {
+        Some(v) if v < 1 => DisconnectPolicy::RequeueNow {
+            reason: "agent disconnected",
+        },
+        _ => DisconnectPolicy::KeepLeases,
+    }
+}
+
+/// Whether a message's `attempt` (echoed from the offer; `None` from older agents)
+/// refers to the attempt the row is on. A `step_run_id` is stable across attempts, so
+/// this is what keeps a line, artifact or completion that an agent held through a
+/// reclaim off the attempt that replaced it.
+pub fn attempt_is_current(reported: Option<i32>, row_attempt: i32) -> bool {
+    reported.is_none_or(|a| a == row_attempt)
 }
 
 /// In-flight slots for an agent that just said `Hello`: what this replica already
@@ -1071,9 +1138,13 @@ fn inflight_after_hello(local: u32, leased_rows: i64) -> u32 {
 fn completion_is_current(
     current: StepStatus,
     row_agent: Option<Uuid>,
+    row_attempt: i32,
     reporting_agent: Uuid,
+    reported_attempt: Option<i32>,
 ) -> bool {
-    current == StepStatus::Running && row_agent == Some(reporting_agent)
+    current == StepStatus::Running
+        && row_agent == Some(reporting_agent)
+        && attempt_is_current(reported_attempt, row_attempt)
 }
 
 /// Whether a `StepComplete` should give the reporting agent its concurrency slot back.
@@ -1088,10 +1159,20 @@ fn completion_is_current(
 /// That is self-inflicted load on a host the agent already runs arbitrary pipeline shell
 /// on, and `release_slot` is saturating so it cannot wrap — whereas the leak is
 /// permanent and reachable by any project owner against an agent shared with others.
-fn releases_slot(current: Option<(StepStatus, Option<Uuid>)>, reporting_agent: Uuid) -> bool {
+fn releases_slot(
+    current: Option<(StepStatus, Option<Uuid>, i32)>,
+    reporting_agent: Uuid,
+    reported_attempt: Option<i32>,
+) -> bool {
     match current {
         None => true,
-        Some((status, row_agent)) => completion_is_current(status, row_agent, reporting_agent),
+        Some((status, row_agent, row_attempt)) => completion_is_current(
+            status,
+            row_agent,
+            row_attempt,
+            reporting_agent,
+            reported_attempt,
+        ),
     }
 }
 
@@ -1186,8 +1267,37 @@ mod tests {
         assert!(completion_is_current(
             StepStatus::Running,
             Some(agent),
-            agent
+            1,
+            agent,
+            Some(1)
         ));
+    }
+
+    #[test]
+    fn a_report_for_an_attempt_the_row_has_moved_past_is_dropped() {
+        // The agent finished attempt 1 while disconnected, the lease expired, the step
+        // was requeued and the same agent leased it again as attempt 2. The completion
+        // it held from attempt 1 arrives now: same step_run_id, same agent, row running
+        // — only the attempt tells it apart, and it must not close attempt 2.
+        let agent = Uuid::new_v4();
+        assert!(!completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            2,
+            agent,
+            Some(1)
+        ));
+        assert!(!attempt_is_current(Some(1), 2));
+        // An agent older than the field sends none: judged by the row alone, as before.
+        assert!(completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            2,
+            agent,
+            None
+        ));
+        assert!(attempt_is_current(None, 2));
+        assert!(attempt_is_current(Some(2), 2));
     }
 
     #[test]
@@ -1199,7 +1309,9 @@ mod tests {
         assert!(!completion_is_current(
             StepStatus::Running,
             Some(new_agent),
-            old_agent
+            2,
+            old_agent,
+            Some(2)
         ));
     }
 
@@ -1215,7 +1327,7 @@ mod tests {
             StepStatus::Pending,
         ] {
             assert!(
-                !completion_is_current(status, Some(agent), agent),
+                !completion_is_current(status, Some(agent), 1, agent, Some(1)),
                 "{status:?} must not accept a completion"
             );
         }
@@ -1227,7 +1339,9 @@ mod tests {
         assert!(!completion_is_current(
             StepStatus::Running,
             None,
-            Uuid::new_v4()
+            1,
+            Uuid::new_v4(),
+            Some(1)
         ));
     }
 
@@ -1242,9 +1356,17 @@ mod tests {
         assert!(completion_is_current(
             StepStatus::Running,
             Some(agent),
-            agent
+            1,
+            agent,
+            Some(1)
         ));
-        assert!(!completion_is_current(StepStatus::Queued, None, agent));
+        assert!(!completion_is_current(
+            StepStatus::Queued,
+            None,
+            1,
+            agent,
+            Some(1)
+        ));
     }
 
     // --- disconnect policy ------------------------------------------------------------
@@ -1252,7 +1374,7 @@ mod tests {
     #[test]
     fn a_current_agent_keeps_its_leases_across_a_disconnect() {
         assert_eq!(
-            disconnect_policy(fiber_proto::PROTOCOL_VERSION, false),
+            disconnect_policy(Some(fiber_proto::PROTOCOL_VERSION), false),
             DisconnectPolicy::KeepLeases
         );
     }
@@ -1261,16 +1383,36 @@ mod tests {
     fn an_agent_that_said_goodbye_has_its_steps_requeued_at_once() {
         // It has stopped its steps and is exiting; nothing will renew the leases.
         assert_eq!(
-            disconnect_policy(fiber_proto::PROTOCOL_VERSION, true),
-            DisconnectPolicy::RequeueNow
+            disconnect_policy(Some(fiber_proto::PROTOCOL_VERSION), true),
+            DisconnectPolicy::RequeueNow {
+                reason: "agent shut down"
+            }
         );
+        // Goodbye is its own word, whatever the revision.
+        assert!(matches!(
+            disconnect_policy(None, true),
+            DisconnectPolicy::RequeueNow { .. }
+        ));
     }
 
     #[test]
     fn an_agent_without_a_protocol_version_is_requeued_on_close() {
         // Older agents cancel their steps on any close, so a close is the end of the
         // attempt; keeping the lease would only delay the retry by LEASE_SECS.
-        assert_eq!(disconnect_policy(0, false), DisconnectPolicy::RequeueNow);
+        assert_eq!(
+            disconnect_policy(Some(0), false),
+            DisconnectPolicy::RequeueNow {
+                reason: "agent disconnected"
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_that_never_said_hello_touches_no_leases() {
+        // A second socket for the same token that closes before Hello: the agent's
+        // live session still holds and renews the leases; requeueing here would take
+        // them out from under it.
+        assert_eq!(disconnect_policy(None, false), DisconnectPolicy::KeepLeases);
     }
 
     #[test]
@@ -1292,15 +1434,16 @@ mod tests {
         // running on a *global* agent — which survives the project — reports into
         // nothing; the agent held the slot and must get it back, or a shared agent
         // silently loses capacity until it reconnects.
-        assert!(releases_slot(None, Uuid::new_v4()));
+        assert!(releases_slot(None, Uuid::new_v4(), None));
     }
 
     #[test]
     fn the_leaseholder_finishing_its_own_step_gives_the_slot_back() {
         let agent = Uuid::new_v4();
         assert!(releases_slot(
-            Some((StepStatus::Running, Some(agent))),
-            agent
+            Some((StepStatus::Running, Some(agent), 1)),
+            agent,
+            Some(1)
         ));
     }
 
@@ -1311,8 +1454,9 @@ mod tests {
         let old_agent = Uuid::new_v4();
         let new_agent = Uuid::new_v4();
         assert!(!releases_slot(
-            Some((StepStatus::Running, Some(new_agent))),
-            old_agent
+            Some((StepStatus::Running, Some(new_agent), 1)),
+            old_agent,
+            Some(1)
         ));
     }
 
@@ -1326,7 +1470,7 @@ mod tests {
             StepStatus::Skipped,
         ] {
             assert!(
-                !releases_slot(Some((status, Some(agent))), agent),
+                !releases_slot(Some((status, Some(agent), 1)), agent, Some(1)),
                 "{status:?} already released its slot once"
             );
         }

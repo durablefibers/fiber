@@ -21,9 +21,12 @@ metadata:
 | `crates/fiber-cli/src/main.rs` | Spawns an agent and validates YAML against the same definition types |
 | `apps/ui/src/lib/api.ts` | Hand-mirrors these shapes for the UI — **no codegen, silent drift** |
 
-`fiber-scheduler` also constructs `ServerMessage` values when dispatching offers, and reads
+`fiber-scheduler` also constructs `ServerMessage` values when dispatching offers, reads
 `Hello.protocol_version` (through `disconnect_policy`) to decide whether a close ends the
-agent's attempts. `fiber-cli` and `api.ts` do not touch `Hello`, `Welcome`, or `Goodbye`
+agent's attempts, and checks the `attempt` echoed on `LogChunk` / `Artifact` /
+`StepComplete` against the row (`attempt_is_current`) — a `step_run_id` is the same across
+attempts, so that field is what keeps a message held through a reclaim off the attempt
+that replaced it. Every new step-scoped message must carry it. `fiber-cli` and `api.ts` do not touch `Hello`, `Welcome`, or `Goodbye`
 today (`wire-drift.test.ts` mirrors only the definition and status types) — check again
 before assuming that.
 

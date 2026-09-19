@@ -55,8 +55,11 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
   its socket; its leases expire on their own.
 
   Wire: `Hello` gains `protocol_version` (`fiber_proto::PROTOCOL_VERSION` = 1; absent
-  from older agents and read as 0), `Welcome` gains `lease_secs`, and `AgentMessage` gains
-  `Goodbye`, all backward compatible. An agent with no `protocol_version` cancels its
+  from older agents and read as 0), `Welcome` gains `lease_secs`, `AgentMessage` gains
+  `Goodbye`, and `Offer`, `LogChunk`, `Artifact` and `StepComplete` gain `attempt` — the
+  server drops a message whose attempt is not the row's, so output an agent held through
+  a reclaim cannot land on, or close, the attempt that replaced it — all backward
+  compatible. An agent with no `protocol_version` cancels its
   steps on any close, so the server requeues its steps on disconnect exactly as before;
   a new agent against a server that sends no `lease_secs` stops its steps on close as
   before. Only new-on-new keeps a step running through a reconnect — upgrade the API
@@ -64,6 +67,13 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
 
 ### Fixed
 
+- **A rotated token now requeues on the socket's own replica.** The heartbeat that finds
+  the token invalid ends the session with an immediate requeue, so a rotation or delete
+  no longer depends on the Redis fan-out reaching the replica that holds the socket.
+- **The per-attempt log cap is per attempt, not per socket.** The counter behind
+  `FIBER_STEP_LOG_MAX_LINES` was kept per session, so an agent that reconnected
+  mid-attempt started a fresh budget each time; it is now seeded from the lines already
+  stored for that attempt.
 - **An agent that reconnected was offered more steps than it could run.** Its
   concurrency slots were counted per session and reset on reconnect, so the server
   offered it `concurrency` new steps while it still held the old ones; the new ones sat on
