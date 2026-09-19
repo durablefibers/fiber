@@ -9,7 +9,7 @@
 - Brute-force guard: 10 failed logins for a username within 10 minutes → that username is locked for 60 s (`429` + `Retry-After`; ~10 guesses/minute sustained). Keyed by username, so a known username can be held locked by an attacker — accepted over IP keying, which is spoofable behind a proxy  
 - Default bootstrap user: `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` (admin / fiber) — also the first **instance admin**
 
-WebSocket `/ws/runs/{id}?token=<session>` requires a valid session and **reader** on the run’s project.
+WebSocket `/ws/runs/{id}` takes the session token in the `Sec-WebSocket-Protocol` header as `fiber.token.<session>` (never the query string) and requires **reader** on the run’s project.
 
 Agent auth uses a separate agent token (`/ws/agent?token=` or Bearer on agent HTTP routes).
 

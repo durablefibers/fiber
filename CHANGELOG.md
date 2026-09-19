@@ -6,6 +6,40 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **A step's `image:` and a pipeline's `workspace.repo` are now validated before they reach
+  a process on the agent host.** Both are set by anyone who can edit a pipeline, which is a
+  project writer. Docker accepted `image: "-v/:/host"` as a flag and mounted the host root
+  into the step; git accepted `repo: "ext::<command>"` as a transport and ran the command
+  during workspace preparation, before any container existed. Either path reached the
+  agent's own token, and on a global agent that token receives every project's secrets.
+  The pipeline now fails to compile (HTTP 400, `fiber validate`) unless `image` is a docker
+  image reference and `repo` is an `http(s)`, `ssh`, `git`, or `file` URL, an scp-like
+  `user@host:path`, or a path; the agent checks both again before use, passes the image
+  after `--`, and pins `GIT_ALLOW_PROTOCOL`. A run whose snapshot predates this check fails
+  its step with the reason rather than executing it. **A stored pipeline that no longer
+  compiles stops producing runs**: a manual or webhook start returns the error, and a
+  cron or interval pipeline skips its occurrence with only a server-side warning. After
+  upgrading, run `fiber validate` on each `fiber.yml`, or re-save each pipeline, so a
+  legacy `image` (say, one with a space in it) is found before its schedule is missed.
+- **`/ws/runs/{id}` no longer accepts a session token in the query string.** The UI has
+  sent it in the WebSocket subprotocol since 0.2; the fallback only put a two-week
+  credential into access logs. `/ws/agent` keeps `?token=` for older agents.
+- The pull-request file listing validates the repository owner, name, and number from the
+  webhook body before building the GitHub API URL, as the commit-status path already did.
+  A project admin, who sets their own webhook secret, could otherwise aim the instance's
+  `GITHUB_TOKEN` at an arbitrary API path.
+- A failure to decrypt a project's secrets (a wrong or rotated `FIBER_SECRETS_KEY`) is now
+  logged at error level when an offer is built. It used to silently strip every secret
+  from the step.
+
+### Changed
+
+- Steps and git on the agent run with no stdin and `GIT_TERMINAL_PROMPT=0`, so a command
+  that waits on a terminal fails at once instead of at the step timeout. A credential in
+  the `workspace.repo` URL is masked in the step log.
+
 ## [0.6.0] — 2026-09-19
 
 Pipelines can keep one run per group, cancelling the older ones on a new push.

