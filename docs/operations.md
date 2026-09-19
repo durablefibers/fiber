@@ -72,8 +72,10 @@ means here.
   cap, and a project delete cascades through everything the project ever ran.
 - The GitHub webhook accepts deliveries up to **25 MiB**, GitHub's own maximum, with at
   most **8** deliveries buffered at once (the endpoint is unauthenticated until the body
-  is read and its signature checked); further deliveries wait for a slot and GitHub
-  retries any that time out. Other JSON bodies keep the 2 MiB default.
+  is read and its signature checked); further deliveries wait for a slot and fail with
+  `408` if none frees up in time. GitHub does **not** retry a failed delivery: it is listed
+  under the webhook's *Recent Deliveries* and must be redelivered from there, so a `408`
+  is a push that did not build until someone does. Other JSON bodies keep the 2 MiB default.
 - The server pings every agent socket every **15 s** and closes it after **45 s** without
   a frame of any kind (two pongs missed; the agent's own 10 s heartbeat normally answers
   long before). The close takes the normal disconnect path, so an agent whose host

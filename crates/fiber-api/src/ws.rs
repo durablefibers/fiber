@@ -86,7 +86,10 @@ pub async fn agent_ws(
         }
     };
     let token_hash = fiber_core::tokens::hash_token(&token);
-    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash))
+    // Subscribed before the upgrade, not inside the session: a shutdown that lands
+    // between the handshake response and the session's first poll must still wait for it.
+    let session = state.sessions.subscribe();
+    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash, session))
 }
 
 /// Build the offer for a leased step from the run's definition snapshot **only**.
@@ -446,9 +449,15 @@ async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Opt
 
 /// `agent_id` is bound once from the authenticated token and never rebound from a
 /// client-supplied field: an agent may only ever act as itself.
-async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_hash: String) {
+async fn handle_agent(
+    socket: WebSocket,
+    state: AppState,
+    agent_id: Uuid,
+    token_hash: String,
+    session: tokio::sync::watch::Receiver<()>,
+) {
     // Held to the end of the function: shutdown waits for it to drop.
-    let _session = state.sessions.subscribe();
+    let _session = session;
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -863,13 +872,39 @@ pub async fn run_events_ws(
     }
     // The client offered a subprotocol, so the handshake has to name it back. Without
     // this the browser closes the socket immediately.
+    let session = state.sessions.subscribe();
     ws.protocols([format!("fiber.token.{token}")])
-        .on_upgrade(move |socket| handle_run_events(socket, state, run_id))
+        .on_upgrade(move |socket| handle_run_events(socket, state, run_id, session))
 }
 
-async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
+/// One text frame to a run-stream subscriber, bounded by `RUN_EVENTS_SEND_TIMEOUT`.
+/// `false` means the socket is gone or not reading and the session should end.
+async fn send_bounded(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    text: String,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            RUN_EVENTS_SEND_TIMEOUT,
+            sink.send(Message::Text(text.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+/// A browser that cannot take a frame in this long is not reading; a stalled tab must not
+/// hold a session open through a deploy's drain.
+const RUN_EVENTS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn handle_run_events(
+    socket: WebSocket,
+    state: AppState,
+    run_id: Uuid,
+    session: tokio::sync::watch::Receiver<()>,
+) {
     // Held to the end of the function: shutdown waits for it to drop.
-    let _session = state.sessions.subscribe();
+    let _session = session;
     let (mut sink, mut stream) = socket.split();
     let mut sub = state.scheduler.subscribe();
 
@@ -878,8 +913,10 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
             run_id,
             status: run.status_enum(),
         };
-        if let Ok(text) = serde_json::to_string(&ev) {
-            let _ = sink.send(Message::Text(text.into())).await;
+        if let Ok(text) = serde_json::to_string(&ev)
+            && !send_bounded(&mut sink, text).await
+        {
+            return;
         }
         if let Ok(steps) = state.store.list_step_runs(run_id).await {
             for s in steps {
@@ -889,8 +926,10 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                     step_id: s.step_id.clone(),
                     status: s.status_enum(),
                 };
-                if let Ok(text) = serde_json::to_string(&ev) {
-                    let _ = sink.send(Message::Text(text.into())).await;
+                if let Ok(text) = serde_json::to_string(&ev)
+                    && !send_bounded(&mut sink, text).await
+                {
+                    return;
                 }
             }
         }
@@ -928,10 +967,8 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                                 RunEvent::StepUpdated { run_id: rid, .. } => *rid == run_id,
                                 RunEvent::Log { run_id: rid, .. } => *rid == run_id,
                             };
-                            if matches {
-                                if sink.send(Message::Text(payload.into())).await.is_err() {
-                                    break;
-                                }
+                            if matches && !send_bounded(&mut sink, payload).await {
+                                break;
                             }
                         }
                     }

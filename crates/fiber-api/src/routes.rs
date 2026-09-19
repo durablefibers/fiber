@@ -35,7 +35,8 @@ const WEBHOOK_MAX_BYTES: usize = 25 << 20;
 /// The webhook is unauthenticated until its body is buffered and the HMAC checked, so
 /// the limit above is also what a stranger may make this process hold — times the
 /// number of deliveries in flight. Cap that. Excess deliveries queue for a slot and
-/// hit the request timeout if none frees up; GitHub retries.
+/// hit the request timeout if none frees up. GitHub does not retry a failed delivery on
+/// its own: it is recorded under the webhook's Deliveries and must be redelivered by hand.
 const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
 /// A readiness probe that hangs is worse than one that fails: the orchestrator's own
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
