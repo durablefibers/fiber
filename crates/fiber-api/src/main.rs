@@ -18,12 +18,20 @@ use clap::Parser;
 use fiber_core::{Store, db};
 use fiber_durable::{FiberRegistry, FiberScheduler, FiberStore, tasks};
 use fiber_scheduler::Scheduler;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use state::AppState;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+/// How long in-flight requests get to finish after SIGTERM before the process exits
+/// anyway. Below Compose's `stop_grace_period: 30s`, so the exit is ours and not SIGKILL's.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long the boot-time Redis probe waits before the process starts without it.
+const REDIS_BOOT_PROBE: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "fiber-api", version)]
@@ -57,7 +65,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _otel = otel::init()?;
+    let otel = otel::init()?;
 
     let args = Args::parse();
     std::fs::create_dir_all(&args.artifacts_dir)?;
@@ -75,9 +83,26 @@ async fn main() -> Result<()> {
         .await?;
     fiber_core::ensure_showcase(&store, admin.id).await?;
 
+    // Lazy: the first command connects, and the manager reconnects on its own after
+    // that. Connecting eagerly here made an unreachable Redis a crash loop, although
+    // leases and scheduling need only Postgres; now the process comes up degraded
+    // (`/ready` says so) and heals when Redis does.
     let client = redis::Client::open(args.redis_url.as_str())?;
-    let redis = ConnectionManager::new(client).await?;
+    let redis = ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())?;
     let scheduler = Arc::new(Scheduler::new(store.clone(), redis));
+    match tokio::time::timeout(REDIS_BOOT_PROBE, scheduler.redis_ping()).await {
+        Ok(Ok(())) => tracing::info!("redis reachable"),
+        Ok(Err(e)) => tracing::error!(
+            error = %e,
+            "redis unreachable at boot; starting degraded (no live run streams or \
+             cross-replica commands until it is back)"
+        ),
+        Err(_) => tracing::error!(
+            secs = REDIS_BOOT_PROBE.as_secs(),
+            "redis did not answer at boot; starting degraded (no live run streams or \
+             cross-replica commands until it is back)"
+        ),
+    }
 
     let fiber_store = FiberStore::new(store.pool.clone());
     let registry = FiberRegistry::new();
@@ -150,6 +175,7 @@ async fn main() -> Result<()> {
         });
     }
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = AppState {
         store,
         scheduler,
@@ -157,6 +183,7 @@ async fn main() -> Result<()> {
         artifacts,
         login_guard: Arc::new(login_guard::LoginGuard::new()),
         loop_health: health,
+        shutdown: shutdown_rx.clone(),
     };
 
     if args.admin_password == "fiber" {
@@ -171,8 +198,79 @@ async fn main() -> Result<()> {
 
     tracing::info!(%args.listen, "fiber-api listening");
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    axum::serve(listener, app).await?;
+    let server = axum::serve(listener, app).with_graceful_shutdown({
+        let mut rx = shutdown_rx;
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
+    });
+    let mut server = tokio::spawn(server.into_future());
+
+    // A deploy used to be a hard kill: no signal handler, so SIGTERM ended the process
+    // mid-request and mid-upload, with the OTel batch unflushed. Now the listener
+    // closes, requests in flight finish, the WebSocket sessions get a Close frame, and
+    // only then does the process leave — within DRAIN_TIMEOUT either way.
+    tokio::select! {
+        signal = shutdown_signal() => {
+            tracing::info!(%signal, "shutdown: stopped accepting connections; draining");
+            let _ = shutdown_tx.send(true);
+            match tokio::time::timeout(DRAIN_TIMEOUT, &mut server).await {
+                Ok(Ok(Ok(()))) => tracing::info!("shutdown: drained"),
+                Ok(Ok(Err(e))) => tracing::error!(error = %e, "shutdown: server ended with an error"),
+                Ok(Err(e)) => tracing::error!(error = %e, "shutdown: server task failed"),
+                Err(_) => {
+                    tracing::warn!(
+                        secs = DRAIN_TIMEOUT.as_secs(),
+                        "shutdown: drain timed out; exiting with connections open"
+                    );
+                    server.abort();
+                }
+            }
+        }
+        ended = &mut server => {
+            // Only an accept-loop failure gets here; there is nothing to drain.
+            match ended {
+                Ok(Ok(())) => tracing::warn!("server stopped without a signal"),
+                Ok(Err(e)) => tracing::error!(error = %e, "server failed"),
+                Err(e) => tracing::error!(error = %e, "server task failed"),
+            }
+        }
+    }
+
+    tracing::info!("shutdown: flushing telemetry");
+    drop(otel);
+    tracing::info!("shutdown: complete");
     Ok(())
+}
+
+/// Resolves on SIGINT (ctrl-c) everywhere, and on SIGTERM — what `docker stop`,
+/// Compose, and systemd send — on unix. Returns which one, for the log.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "cannot listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+    }
 }
 
 /// Browser origins allowed to call the API. `FIBER_CORS_ORIGINS` is a comma-separated

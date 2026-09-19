@@ -17,12 +17,31 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::time::Duration;
+use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// An ordinary request that has not answered in this long is answered `408` and its
+/// handler dropped, so a slow client or a stuck query cannot hold a hyper task
+/// indefinitely. Streams and artifact transfers are routed around it below.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// GitHub delivers webhook payloads up to 25 MiB; axum's 2 MiB default turned a large
+/// push into a `413` and no run.
+const WEBHOOK_MAX_BYTES: usize = 25 << 20;
+/// A readiness probe that hangs is worse than one that fails: the orchestrator's own
+/// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
+/// gets this long to answer before it is reported down.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Two sub-routers, one layer. `Router::layer` wraps the routes present when it is
+    // called, so the request timeout goes on the JSON surface and the long-lived
+    // routes are merged in afterwards, outside it: a WebSocket upgrade lives for the
+    // session and an artifact moves up to MAX_ARTIFACT_BYTES at whatever speed the
+    // link allows.
+    let api = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
@@ -67,13 +86,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/runs/{id}/steps", get(list_steps))
         .route("/api/runs/{id}/artifacts", get(list_run_artifacts))
-        .route("/api/artifacts/{id}/download", get(download_artifact))
-        .route(
-            "/api/agent/steps/{step_run_id}/artifacts",
-            put(agent_upload_artifact).layer(DefaultBodyLimit::max(
-                crate::artifact_util::MAX_ARTIFACT_BYTES as usize + 1024,
-            )),
-        )
         .route(
             "/api/agent/steps/{step_run_id}/artifacts/presign",
             post(agent_presign_artifact),
@@ -81,10 +93,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/agent/steps/{step_run_id}/artifacts/complete",
             post(agent_complete_artifact),
-        )
-        .route(
-            "/api/agent/artifacts/{id}/download",
-            get(agent_download_artifact),
         )
         .route("/api/steps/{id}/logs", get(list_logs))
         .route("/api/steps/{id}/attempts", get(list_attempts))
@@ -100,11 +108,31 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents/{id}/rotate-token", post(rotate_agent_token))
         .route(
             "/api/projects/{id}/webhooks/github",
-            post(github_webhook).put(set_github_secret),
+            // The limit wraps only what is on the method router when `.layer` runs,
+            // so the delivery gets 25 MiB and the secret-setting PUT keeps the default.
+            post(github_webhook)
+                .layer(DefaultBodyLimit::max(WEBHOOK_MAX_BYTES))
+                .put(set_github_secret),
+        )
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ));
+    let streaming = Router::new()
+        .route("/api/artifacts/{id}/download", get(download_artifact))
+        .route(
+            "/api/agent/steps/{step_run_id}/artifacts",
+            put(agent_upload_artifact).layer(DefaultBodyLimit::max(
+                crate::artifact_util::MAX_ARTIFACT_BYTES as usize + 1024,
+            )),
+        )
+        .route(
+            "/api/agent/artifacts/{id}/download",
+            get(agent_download_artifact),
         )
         .route("/ws/agent", get(agent_ws))
-        .route("/ws/runs/{id}", get(run_events_ws))
-        .with_state(state)
+        .route("/ws/runs/{id}", get(run_events_ws));
+    api.merge(streaming).with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
@@ -278,23 +306,59 @@ fn esc(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Readiness for the load balancer and the Compose healthcheck.
+///
+/// `503` when Postgres cannot be reached or a supervised loop is down: nothing useful
+/// happens without them. Redis is reported but does not fail the probe. Leases,
+/// scheduling, and the queue live in Postgres, so a replica without Redis still runs
+/// builds; what it loses is live `/ws/runs` streaming, cross-replica cancel and
+/// disconnect fan-out, and durable-fiber events. That is `"redis": "degraded"` with
+/// `"degraded": true` at `200`, not an outage from the balancer's point of view.
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     let mut checks = json!({
         "postgres": "ok",
         "redis": "ok",
     });
     let mut ok = true;
+    let mut degraded = false;
 
     // Detail goes to the log, not to unauthenticated callers (connection strings leak).
-    if let Err(e) = sqlx::query("SELECT 1").execute(&state.store.pool).await {
-        ok = false;
-        tracing::error!(error = %e, "readiness: postgres");
-        checks["postgres"] = json!("error");
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        sqlx::query("SELECT 1").execute(&state.store.pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            ok = false;
+            tracing::error!(error = %e, "readiness: postgres");
+            checks["postgres"] = json!("error");
+        }
+        Err(_) => {
+            ok = false;
+            tracing::error!(
+                secs = PROBE_TIMEOUT.as_secs(),
+                "readiness: postgres probe timed out"
+            );
+            checks["postgres"] = json!("error");
+        }
     }
-    if let Err(e) = state.scheduler.redis_ping().await {
-        ok = false;
-        tracing::error!(error = %e, "readiness: redis");
-        checks["redis"] = json!("error");
+    match tokio::time::timeout(PROBE_TIMEOUT, state.scheduler.redis_ping()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            degraded = true;
+            tracing::warn!(error = %e, "readiness: redis unreachable; serving degraded");
+            checks["redis"] = json!("degraded");
+        }
+        Err(_) => {
+            degraded = true;
+            tracing::warn!(
+                secs = PROBE_TIMEOUT.as_secs(),
+                "readiness: redis probe timed out; serving degraded"
+            );
+            checks["redis"] = json!("degraded");
+        }
     }
     // A dead scheduler loop leaves the process answering requests while nothing is
     // reclaimed or scheduled. Saying `ok` through that is the failure this reports.
@@ -307,7 +371,12 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         checks["loops"] = json!(down);
     }
 
-    let body = json!({ "ok": ok, "service": "fiber-api", "checks": checks });
+    let body = json!({
+        "ok": ok,
+        "degraded": degraded,
+        "service": "fiber-api",
+        "checks": checks,
+    });
     if ok {
         (StatusCode::OK, Json(body)).into_response()
     } else {

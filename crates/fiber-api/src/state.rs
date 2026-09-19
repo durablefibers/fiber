@@ -14,4 +14,8 @@ pub struct AppState {
     pub loop_health: Arc<crate::supervisor::LoopHealth>,
     pub artifacts: ArtifactBackend,
     pub login_guard: Arc<LoginGuard>,
+    /// Flips to `true` once a shutdown signal arrives. Long-lived handlers (the WebSocket
+    /// sessions) watch it so they can close cleanly instead of being cut off when the
+    /// process exits.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
