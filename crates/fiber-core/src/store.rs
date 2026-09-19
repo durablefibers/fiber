@@ -30,6 +30,26 @@ const HISTOGRAM_BUCKETS: &[f64] = &[
     1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
 ];
 
+/// Expand a concurrency group template into the string runs actually contend on.
+///
+/// `{pipeline}` is the pipeline id rather than its name: names are editable and not
+/// unique, and a group that silently changes meaning when someone renames a pipeline is
+/// worse than a long one. `{ref}` is the branch or PR ref, empty for a manual run — which
+/// is deliberate, so two manual runs of one pipeline still contend with each other.
+///
+/// Unknown placeholders are left alone. A template is author-supplied text, and quietly
+/// eating `{version}` would make one group out of what was meant to be many.
+pub fn resolve_concurrency_group(
+    template: Option<&str>,
+    pipeline_id: Uuid,
+    head_ref: Option<&str>,
+) -> String {
+    template
+        .unwrap_or("{pipeline}-{ref}")
+        .replace("{pipeline}", &pipeline_id.to_string())
+        .replace("{ref}", head_ref.unwrap_or(""))
+}
+
 impl Store {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -686,6 +706,34 @@ impl Store {
         Ok(requeued)
     }
 
+    /// Unfinished runs of this project in the same group, created before `run_id`.
+    ///
+    /// Ordering by `(created_at, id)` makes the decision total: when two runs start in the
+    /// same instant exactly one of them is "older", so they cannot cancel each other and
+    /// leave the group with nothing running.
+    pub async fn superseded_runs(
+        &self,
+        project_id: Uuid,
+        group: &str,
+        run_id: Uuid,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM runs
+              WHERE project_id = $1
+                AND concurrency_group = $2
+                AND status NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                AND (created_at, id) < ($3, $4)
+              ORDER BY created_at",
+        )
+        .bind(project_id)
+        .bind(group)
+        .bind(created_at)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn start_run(
         &self,
         pipeline_id: Uuid,
@@ -712,6 +760,21 @@ impl Store {
         let compiled = compile_definition(&def)?;
         let run_id = Uuid::new_v4();
         let snapshot = serde_json::to_value(&compiled)?;
+        // Resolved now and stored on the row, so the rule that governed this run stays
+        // readable after the pipeline is edited — the same reason the snapshot is here.
+        // Only a pipeline that asked to cancel gets a group; without one the run contends
+        // with nothing, which is what every existing pipeline expects.
+        let concurrency_group = def
+            .concurrency
+            .as_ref()
+            .filter(|c| c.cancel_in_progress)
+            .map(|c| {
+                resolve_concurrency_group(
+                    c.group.as_deref(),
+                    pipeline_id,
+                    commit.head_ref.as_deref(),
+                )
+            });
 
         // The run row and every step row land together: a half-inserted DAG would
         // otherwise "succeed" once its partial set of steps finished.
@@ -719,8 +782,8 @@ impl Store {
         let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
                (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
-                head_sha, head_ref, pr_number, repo_full_name, untrusted)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11)
+                head_sha, head_ref, pr_number, repo_full_name, untrusted, concurrency_group)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
              RETURNING {RUN_COLS}"
         )))
         .bind(run_id)
@@ -734,6 +797,7 @@ impl Store {
         .bind(commit.pr_number)
         .bind(&commit.repo_full_name)
         .bind(commit.untrusted)
+        .bind(&concurrency_group)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -2206,7 +2270,7 @@ fn step_status_str(s: StepStatus) -> &'static str {
 
 const RUN_COLS: &str = "id, pipeline_id, project_id, status, trigger, definition_snapshot, \
      created_at, started_at, finished_at, retry_of, head_sha, head_ref, pr_number, \
-     repo_full_name, untrusted";
+     repo_full_name, untrusted, concurrency_group";
 
 const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";
@@ -2764,5 +2828,73 @@ mod snapshot_tests {
     fn a_definition_that_is_neither_shape_is_an_error() {
         assert!(value_to_definition(&json!({"nonsense": true})).is_err());
         assert!(value_to_definition(&json!({"yaml": "steps: [oops"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    //! The group is the whole decision: two runs contend exactly when their resolved
+    //! strings match, so what the template expands to is what cancels what.
+
+    use super::resolve_concurrency_group;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_default_group_separates_branches_of_one_pipeline() {
+        let p = Uuid::new_v4();
+        let main = resolve_concurrency_group(None, p, Some("main"));
+        let feature = resolve_concurrency_group(None, p, Some("feature/x"));
+        assert_ne!(
+            main, feature,
+            "a push to one branch must not cancel another"
+        );
+        assert_eq!(main, resolve_concurrency_group(None, p, Some("main")));
+    }
+
+    #[test]
+    fn the_default_group_separates_pipelines_on_one_branch() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_ne!(
+            resolve_concurrency_group(None, a, Some("main")),
+            resolve_concurrency_group(None, b, Some("main")),
+        );
+    }
+
+    #[test]
+    fn manual_runs_of_one_pipeline_contend_with_each_other() {
+        // No ref, so `{ref}` is empty — which is the point: pressing Run twice should
+        // supersede, not race.
+        let p = Uuid::new_v4();
+        assert_eq!(
+            resolve_concurrency_group(None, p, None),
+            resolve_concurrency_group(None, p, None),
+        );
+    }
+
+    #[test]
+    fn a_literal_group_makes_every_pipeline_that_names_it_contend() {
+        // The escape hatch for "only one deploy at a time, whatever started it".
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            resolve_concurrency_group(Some("deploy"), a, Some("main")),
+            resolve_concurrency_group(Some("deploy"), b, Some("release")),
+        );
+    }
+
+    #[test]
+    fn a_template_may_mix_placeholders_and_literals() {
+        let p = Uuid::new_v4();
+        let g = resolve_concurrency_group(Some("deploy-{ref}"), p, Some("main"));
+        assert_eq!(g, "deploy-main");
+    }
+
+    #[test]
+    fn an_unknown_placeholder_is_left_alone_rather_than_emptied() {
+        // Eating it would collapse what the author meant as many groups into one, and
+        // silently serialise builds that were supposed to run side by side.
+        let p = Uuid::new_v4();
+        let g = resolve_concurrency_group(Some("{pipeline}-{version}"), p, Some("main"));
+        assert!(g.ends_with("-{version}"), "got {g}");
+        assert!(g.starts_with(&p.to_string()));
     }
 }

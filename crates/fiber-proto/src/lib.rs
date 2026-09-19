@@ -167,6 +167,27 @@ pub struct PipelineDefinition {
     /// Wall-clock limit for the whole run, in minutes, from run start. Unset = none.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// One run at a time per group, newest wins. Unset = no limit.
+    #[serde(default)]
+    pub concurrency: Option<ConcurrencyConfig>,
+}
+
+/// Keep one run per group in flight, cancelling the older ones.
+///
+/// Absent means unlimited, which stays the default: a project that wants every push built
+/// should not have to say so. Present with `cancel_in_progress: false` is also unlimited
+/// today — queueing rather than cancelling is a separate behaviour, and refusing to guess
+/// which one an author meant is cheaper than silently picking one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConcurrencyConfig {
+    /// Runs sharing this resolved string contend. `{pipeline}` and `{ref}` expand;
+    /// anything else is literal. Defaults to `{pipeline}-{ref}`, which is what makes a
+    /// second push to one branch cancel the first without touching any other branch.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Cancel older runs in the group when a new one starts.
+    #[serde(default)]
+    pub cancel_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -471,6 +471,7 @@ pub fn definition_from_map(
         name,
         env: BTreeMap::new(),
         workspace: None,
+        concurrency: None,
         on: None,
         steps: ordered
             .into_iter()
@@ -541,6 +542,8 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
         steps: serde_yaml::Value,
         #[serde(default)]
         timeout_minutes: Option<u32>,
+        #[serde(default)]
+        concurrency: Option<fiber_proto::ConcurrencyConfig>,
     }
 
     let raw: Raw = serde_yaml::from_str(yaml)?;
@@ -588,6 +591,7 @@ pub fn parse_pipeline_yaml(yaml: &str) -> Result<PipelineDefinition, serde_yaml:
         on: raw.on,
         steps,
         timeout_minutes: raw.timeout_minutes,
+        concurrency: raw.concurrency,
     })
 }
 
@@ -609,6 +613,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             workspace: None,
+            concurrency: None,
             on: None,
             steps: vec![s],
             timeout_minutes: None,
@@ -652,6 +657,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             workspace: None,
+            concurrency: None,
             on: None,
             steps: vec![s],
             timeout_minutes: None,
@@ -683,6 +689,7 @@ mod tests {
                 name: "p".into(),
                 env: Default::default(),
                 workspace: None,
+                concurrency: None,
                 on: None,
                 steps: vec![st],
                 timeout_minutes: None,
@@ -703,6 +710,7 @@ mod tests {
                 name: "p".into(),
                 env: Default::default(),
                 workspace: None,
+                concurrency: None,
                 on: None,
                 steps: vec![st],
                 timeout_minutes: None,
@@ -720,6 +728,7 @@ mod tests {
                 name: "p".into(),
                 env: Default::default(),
                 workspace: None,
+                concurrency: None,
                 on: None,
                 steps: vec![st],
                 timeout_minutes: None,
@@ -736,6 +745,7 @@ mod tests {
                 name: "p".into(),
                 env: Default::default(),
                 workspace: None,
+                concurrency: None,
                 on: None,
                 steps: vec![st],
                 timeout_minutes: None,
@@ -790,6 +800,7 @@ mod tests {
             name: "s".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![a, b, step("c", &[], "true")],
@@ -810,6 +821,7 @@ mod tests {
             name: "t".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             steps: vec![s.clone()],
             timeout_minutes: None,
@@ -846,6 +858,7 @@ mod tests {
             name: "demo".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![
@@ -870,6 +883,7 @@ mod tests {
             name: "diamond".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![
@@ -906,6 +920,7 @@ mod tests {
                 name: "chain".into(),
                 env: Default::default(),
                 workspace: None,
+                concurrency: None,
                 on: None,
                 timeout_minutes: None,
                 steps: order.iter().map(|id| by_id(id)).collect(),
@@ -932,6 +947,7 @@ mod tests {
             name: "bad".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![step("a", &["a"], "echo a")],
@@ -947,6 +963,7 @@ mod tests {
             name: "bad".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![
@@ -964,6 +981,7 @@ mod tests {
             name: "bad".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![step("a", &["b"], "echo a"), step("b", &["a"], "echo b")],
@@ -981,6 +999,7 @@ mod tests {
             name: "m".into(),
             env: Default::default(),
             workspace: None,
+            concurrency: None,
             on: None,
             timeout_minutes: None,
             steps: vec![

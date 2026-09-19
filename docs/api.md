@@ -26,6 +26,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 |---|---|---|
 | GET/POST | `/api/projects` | session; create → owner on new project |
 | GET | `/api/projects/{id}` | reader (includes `role`) |
+| POST | `/api/pipelines/{id}/runs` | writer — starts a run; a pipeline with `concurrency.cancel_in_progress` cancels older runs in the same group first. Runs carry `concurrency_group` |
 | DELETE | `/api/projects/{id}` | **owner** — deletes the project and everything under it. Cancels runs still in flight first, then removes artifact blobs nothing else references. Runs are deleted in batches of 100. Returns `{ok, cancelled_runs, runs_deleted, blobs_deleted}`. Irreversible |
 | GET/POST | `/api/projects/{id}/members` | reader / admin |
 | PUT/DELETE | `/api/projects/{id}/members/{user_id}` | admin |

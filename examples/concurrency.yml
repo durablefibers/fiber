@@ -1,0 +1,34 @@
+# One run per branch: a second push cancels the first build of that branch and leaves
+# every other branch alone.
+#
+# `{pipeline}-{ref}` is the default, written out here to show what it expands to. Omit
+# `concurrency` entirely and every push builds; set `cancel_in_progress: false` and it
+# also builds, because queueing rather than cancelling is a separate behaviour Fiber does
+# not yet have and will not guess at.
+name: concurrency-demo
+workspace:
+  repo: https://github.com/octocat/Hello-World.git
+  ref: master
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: "{pipeline}-{ref}"
+  cancel_in_progress: true
+
+steps:
+  checkout:
+    run: test -f README && echo checked-out
+    labels: [os=linux]
+
+  slow-build:
+    needs: [checkout]
+    # Long enough that a second push lands while this is still running, which is the
+    # whole point of the example.
+    run: echo building && sleep 30 && echo built
+    labels: [os=linux]
+
+  publish:
+    needs: [slow-build]
+    run: echo publish
+    labels: [os=linux]
