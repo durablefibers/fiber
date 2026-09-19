@@ -154,7 +154,7 @@ A step is offered only if:
 | Concurrency | `--concurrency` is enforced locally with a process-wide semaphore as well as by the server; a step parked on it still counts against its `timeout_minutes`, which start when the offer is received |
 | Disconnect / WS close | Agent marked offline; in-flight steps requeued (the bounced attempt counts against `retries`) |
 | Server ping | The server pings the socket every 15 s and closes it (code 1008, "liveness timeout") after 45 s without any frame; the close takes the Disconnect path. A healthy agent's 10 s heartbeat answers long before |
-| Server shutdown | The API sends Close 1012 ("server shutting down") to every agent on SIGTERM and drains for up to 25 s; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect row |
+| Server shutdown | On SIGTERM the API sends Close 1012 ("server shutting down") to every agent and waits for the sessions to end (up to 20 s) before exiting; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect row |
 | Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + requeue |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
 | Update | `PUT /api/agents/{id}` — name / labels / concurrency (inflight preserved; pool unchanged) |

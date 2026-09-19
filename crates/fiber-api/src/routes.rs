@@ -5,7 +5,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fiber_core::{
@@ -17,7 +17,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::convert::Infallible;
 use std::time::Duration;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
@@ -30,6 +32,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// GitHub delivers webhook payloads up to 25 MiB; axum's 2 MiB default turned a large
 /// push into a `413` and no run.
 const WEBHOOK_MAX_BYTES: usize = 25 << 20;
+/// The webhook is unauthenticated until its body is buffered and the HMAC checked, so
+/// the limit above is also what a stranger may make this process hold — times the
+/// number of deliveries in flight. Cap that. Excess deliveries queue for a slot and
+/// hit the request timeout if none frees up; GitHub retries.
+const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
 /// A readiness probe that hangs is worse than one that fails: the orchestrator's own
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
 /// gets this long to answer before it is reported down.
@@ -41,6 +48,11 @@ pub fn router(state: AppState) -> Router {
     // routes are merged in afterwards, outside it: a WebSocket upgrade lives for the
     // session and an artifact moves up to MAX_ARTIFACT_BYTES at whatever speed the
     // link allows.
+    // The limits wrap only what is on the method router when `.layer` runs, so the
+    // delivery gets them and the secret-setting PUT (added below) keeps the defaults.
+    let webhook: MethodRouter<AppState> = post(github_webhook)
+        .layer::<_, Infallible>(DefaultBodyLimit::max(WEBHOOK_MAX_BYTES))
+        .layer(ConcurrencyLimitLayer::new(WEBHOOK_MAX_IN_FLIGHT));
     let api = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -51,10 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/password", post(change_password))
         .route("/api/auth/sessions", axum::routing::delete(revoke_sessions))
         .route("/api/projects", get(list_projects).post(create_project))
-        .route(
-            "/api/projects/{id}",
-            get(get_project).delete(delete_project),
-        )
+        .route("/api/projects/{id}", get(get_project))
         .route(
             "/api/projects/{id}/members",
             get(list_members).post(add_member),
@@ -108,17 +117,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents/{id}/rotate-token", post(rotate_agent_token))
         .route(
             "/api/projects/{id}/webhooks/github",
-            // The limit wraps only what is on the method router when `.layer` runs,
-            // so the delivery gets 25 MiB and the secret-setting PUT keeps the default.
-            post(github_webhook)
-                .layer(DefaultBodyLimit::max(WEBHOOK_MAX_BYTES))
-                .put(set_github_secret),
+            webhook.put(set_github_secret),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ));
+    // Also untimed: deleting a project cascades through every run, step, log line and
+    // artifact it ever had. Dropping the sqlx future at 30 s would not stop Postgres —
+    // the owner would get a `408` while the delete finished anyway.
     let streaming = Router::new()
+        .route("/api/projects/{id}", delete(delete_project))
         .route("/api/artifacts/{id}/download", get(download_artifact))
         .route(
             "/api/agent/steps/{step_run_id}/artifacts",
@@ -2364,6 +2373,25 @@ mod tests {
             stale.is_empty(),
             "UNGATED_BY_DESIGN lists handlers that no longer need to be there: {stale:?}"
         );
+    }
+
+    #[test]
+    fn the_audit_sees_both_sub_routers() {
+        // `router_block()` runs from `pub fn router(` to the first `async fn`. The
+        // untimed routes live in a second sub-router inside that function; moving it to
+        // a helper defined lower down would drop those handlers out of every check here
+        // without failing anything. Pin the shape.
+        let router = router_block();
+        assert!(
+            router.contains("let streaming = Router::new()"),
+            "the untimed sub-router must be built inside `router()` so the audit reads it"
+        );
+        for routed in ["/ws/agent", "/ws/runs/{id}", "agent_upload_artifact"] {
+            assert!(
+                router.contains(routed),
+                "{routed} is not in the audited router block"
+            );
+        }
     }
 
     #[test]

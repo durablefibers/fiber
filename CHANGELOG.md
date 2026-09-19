@@ -19,18 +19,23 @@ minor versions may carry breaking changes.
   is back.
 
 - **Ordinary API requests time out after 30 s** with `408`, so a slow client or a stuck
-  query cannot hold a server task open indefinitely. WebSocket upgrades and artifact
-  uploads/downloads are exempt. The GitHub webhook now accepts deliveries up to 25 MiB
-  (GitHub's maximum); the 2 MiB default turned a large push into `413` and no run.
+  query cannot hold a server task open indefinitely. WebSocket upgrades, artifact
+  uploads/downloads and project deletion are exempt. The GitHub webhook now accepts
+  deliveries up to 25 MiB (GitHub's maximum) — the 2 MiB default turned a large push
+  into `413` and no run — with at most eight deliveries buffered at once, since the
+  endpoint is unauthenticated until the signature is checked. With Redis down, an event
+  publish now fails in about two seconds instead of the client's 13 s default, so a
+  cancel or completion cannot spend its request budget on one publish.
 
 ### Fixed
 
 - **`fiber-api` shuts down cleanly.** There was no signal handler: SIGTERM ended the
   process mid-request and mid-upload, and as PID 1 in Compose without an init it was not
   even delivered — the container was killed after 10 s. Now the listener closes, in-flight
-  requests finish, every WebSocket gets a Close frame (`1012`) so agents and browsers
-  reconnect immediately, the OpenTelemetry batch flushes, and the process exits, all
-  within a 25 s bound. Compose runs it with `init: true` and `stop_grace_period: 30s`.
+  requests finish, every WebSocket session sends a Close frame (`1012`) and ends — the
+  process waits for the sessions, not only for HTTP — the OpenTelemetry batch flushes,
+  and the process exits, all within a 20 s bound. Compose runs it with `init: true` and
+  `stop_grace_period: 30s`.
 
 - **An agent whose host vanished no longer stays `online` for hours.** The server pings
   each agent socket every 15 s and closes it after 45 s without any frame, which takes

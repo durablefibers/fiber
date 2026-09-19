@@ -41,11 +41,17 @@ connection fails.
 ## Shutdown and deploys
 
 On SIGTERM or SIGINT, `fiber-api` stops accepting connections, lets requests already in
-flight finish, sends every open WebSocket a Close frame (code `1012`, "server shutting
-down") so agents and browsers reconnect at once rather than after a TCP timeout, flushes
-the OpenTelemetry batch, and exits. The drain is bounded at **25 s**: a request still
-running then is dropped and the process leaves anyway, inside the 30 s
-`stop_grace_period`. Each phase is logged under `shutdown:`.
+flight finish, and ends every open WebSocket session with a Close frame (code `1012`,
+"server shutting down") — the process waits for those sessions to finish, not just for
+HTTP. It then flushes the OpenTelemetry batch and exits. The drain is bounded at
+**20 s**: a request or session still open then is dropped and the process leaves anyway,
+which with the ≤ 5 s telemetry flush stays inside the 30 s `stop_grace_period`. Each
+phase is logged under `shutdown:`.
+
+The Close frame is what lets an agent reconnect at once instead of discovering a dead
+socket by TCP timeout, particularly behind a proxy that would otherwise hold its side
+half-open. The UI already reconnects 2 s after any close, so for browsers the frame is
+tidiness rather than a change in behaviour.
 
 An agent treats the Close like any other disconnect ([agents](./agents.md#lifecycle)):
 its in-flight steps are requeued and re-run when it reconnects. A deploy therefore still
@@ -59,12 +65,15 @@ means here.
 
 - Ordinary API requests are answered `408 Request Timeout` after **30 s** and the
   handler is dropped, so a slow client or a stuck query cannot hold a server task
-  indefinitely. WebSocket upgrades (`/ws/*`) and artifact transfers
+  indefinitely. WebSocket upgrades (`/ws/*`), artifact transfers
   (`/api/artifacts/{id}/download`, `/api/agent/steps/{id}/artifacts`,
-  `/api/agent/artifacts/{id}/download`) are exempt: a session lives as long as the agent,
-  and an artifact moves at link speed up to its size cap.
-- The GitHub webhook accepts deliveries up to **25 MiB**, GitHub's own maximum. Other
-  JSON bodies keep the 2 MiB default.
+  `/api/agent/artifacts/{id}/download`) and `DELETE /api/projects/{id}` are exempt: a
+  session lives as long as the agent, an artifact moves at link speed up to its size
+  cap, and a project delete cascades through everything the project ever ran.
+- The GitHub webhook accepts deliveries up to **25 MiB**, GitHub's own maximum, with at
+  most **8** deliveries buffered at once (the endpoint is unauthenticated until the body
+  is read and its signature checked); further deliveries wait for a slot and GitHub
+  retries any that time out. Other JSON bodies keep the 2 MiB default.
 - The server pings every agent socket every **15 s** and closes it after **45 s** without
   a frame of any kind (two pongs missed; the agent's own 10 s heartbeat normally answers
   long before). The close takes the normal disconnect path, so an agent whose host
@@ -315,8 +324,10 @@ Alert on `degraded`; do not pull the replica for it. While Redis is down:
 - **Agent commands do not fan out.** Run cancel, token rotation and agent deletion reach
   an agent only when it is connected to the replica that handled the request; otherwise
   they take effect when the agent reconnects or its lease expires.
-- **Status updates land more slowly.** Each event publish waits out the Redis client's
-  reconnect attempts (a few seconds) before giving up on that event.
+- **Status updates land a little later.** Each event publish waits out one reconnect
+  attempt with a 1 s connect timeout (about two seconds in all) before giving up on
+  that event. Handlers that publish sit under the 30 s request timeout, which is why the
+  client is bounded this tightly rather than left at its 13 s default.
 - **External `fiber:events` consumers see a gap.**
 
 Everything reconnects on its own when Redis is back: the client-side manager retries per

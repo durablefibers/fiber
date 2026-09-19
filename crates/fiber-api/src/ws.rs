@@ -416,6 +416,8 @@ async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Opt
 /// `agent_id` is bound once from the authenticated token and never rebound from a
 /// client-supplied field: an agent may only ever act as itself.
 async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_hash: String) {
+    // Held to the end of the function: shutdown waits for it to drop.
+    let _session = state.sessions.subscribe();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -844,6 +846,8 @@ pub async fn run_events_ws(
 }
 
 async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
+    // Held to the end of the function: shutdown waits for it to drop.
+    let _session = state.sessions.subscribe();
     let (mut sink, mut stream) = socket.split();
     let mut sub = state.scheduler.subscribe();
 
@@ -883,10 +887,14 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                 }
             }
             _ = shutting_down(&mut shutdown) => {
-                // The browser client reconnects on close; a reset would make it wait
-                // out its backoff first.
+                // The UI retries 2 s after any close; the frame matters through a proxy
+                // that would otherwise hold the browser's socket half-open.
                 let frame = close_frame(close_code::RESTART, "server shutting down");
-                let _ = sink.send(Message::Close(Some(frame))).await;
+                let _ = tokio::time::timeout(
+                    CLOSE_FLUSH_TIMEOUT,
+                    sink.send(Message::Close(Some(frame))),
+                )
+                .await;
                 break;
             }
             ev = sub.recv() => {
