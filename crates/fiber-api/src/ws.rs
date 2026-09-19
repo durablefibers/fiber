@@ -780,15 +780,17 @@ async fn handle_agent(
                     // A runaway step could otherwise write until the disk filled. Past the
                     // cap the lines are dropped, with one line saying so — silence would
                     // look like the step stopped producing output.
+                    // One attempt now spans sessions, so the count for a key this
+                    // session has not seen starts from what the attempt already wrote.
                     let key = (step_run_id, step.attempt);
-                    if !logged.contains_key(&key) {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = logged.entry(key) {
                         let stored = state
                             .store
                             .count_log_lines(step_run_id, step.attempt)
                             .await
                             .map(|n| u64::try_from(n).unwrap_or(0))
                             .unwrap_or(0);
-                        logged.insert(key, stored);
+                        slot.insert(stored);
                     }
                     let seen = logged.entry(key).or_insert(0);
                     *seen += 1;
