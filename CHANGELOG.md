@@ -6,6 +6,12 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-19
+
+Pipelines can keep one run per group, cancelling the older ones on a new push.
+Adds migration 014 (a nullable column and an index; no data change) and no breaking
+change: a pipeline that declares no `concurrency:` behaves exactly as before.
+
 ### Added
 
 - **`concurrency:` in a pipeline, with `cancel_in_progress`.** A second push to a branch
@@ -21,17 +27,6 @@ minor versions may carry breaking changes.
   Migration 014. Every path that starts a run now goes through the scheduler, and a source
   audit fails the build if a new one bypasses it.
 
-### Fixed
-
-- **`fiber.yml` built this repo against a Rust it does not use.** It pinned
-  `rust:1.97-bookworm` while `rust-toolchain.toml` and `deploy/Dockerfile` had moved to
-  1.98, and `.github/workflows/ci.yml` declared 1.97 as well. The pin wins, so nothing
-  failed — `rustup` downloaded a full 1.98 toolchain inside the container instead, on
-  `fmt`, `clippy`, `test` and `build`, on every push and pull request, and in CI. All four
-  files name 1.98 now, and `toolchain_audit` reads them and fails when they disagree.
-
-### Added
-
 - **A `matrix-build` showcase pipeline**, and tests that every seeded pipeline compiles.
   The seed had avoided `matrix:` and imitated it with hand-written parallel lanes — the
   canvas could not draw a matrix step until 0.5.0, so the one feature that needs a picture
@@ -44,6 +39,15 @@ minor versions may carry breaking changes.
   and cannot run. One test now compiles all of them; others pin the matrix expansion, and
   one refuses a demo whose terminal step hangs off a conditional, since `success()` is
   transitive and the last node would always be grey.
+
+### Fixed
+
+- **`fiber.yml` built this repo against a Rust it does not use.** It pinned
+  `rust:1.97-bookworm` while `rust-toolchain.toml` and `deploy/Dockerfile` had moved to
+  1.98, and `.github/workflows/ci.yml` declared 1.97 as well. The pin wins, so nothing
+  failed — `rustup` downloaded a full 1.98 toolchain inside the container instead, on
+  `fmt`, `clippy`, `test` and `build`, on every push and pull request, and in CI. All four
+  files name 1.98 now, and `toolchain_audit` reads them and fails when they disagree.
 
 ## [0.5.0] — 2026-09-16
 
