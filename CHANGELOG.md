@@ -24,7 +24,17 @@ large install.
   cleared — turned into "every never-started step before any requeued one, however old
   its run"; and every heartbeat of every agent read the entire backlog. A requeued step
   now keeps its place, a heartbeat reads at most 200 steps the agent can actually take,
-  and `fiber_oldest_queued_step_age_seconds` measures what it says.
+  and `fiber_oldest_queued_step_age_seconds` measures what it says: it now reads the
+  oldest `queued_at` among leasable steps, where it read the oldest run's `created_at`
+  and charged a dependent step for the whole time its predecessors ran.
+- **A secret that cannot be decrypted fails the step, with the reason.** This reverses
+  0.6.1, which logged the failure and let the step run without its secrets — a build
+  that then failed looked like the build's fault. The store now types the failure
+  (`SecretDecryptError`), and an offer that hits it is not sent: the step is failed
+  through the ordinary completion path with `cannot decrypt project secret NAME (is
+  FIBER_SECRETS_KEY right?)` on the step and its attempt, `retries` apply, dependents
+  skip, the run finalises, and the queue drains past it. A wrong or rotated key now shows
+  up on the run page instead of in a log line, and nothing runs without its secrets.
 - **An agent's slots are counted from the database**, not from what the replica remembers
   delivering. A `Cancel` that never reached the agent (a Redis gap between replicas) or a
   completion another replica handled used to leave a slot taken until the agent
@@ -41,9 +51,15 @@ large install.
   failure reading any of them was swallowed: a database blip during a heartbeat sent an
   offer with no workspace, env, secrets or restores, the step ran in an empty directory,
   failed, and spent a retry, with nothing in the log. The lease is now backed out (the
-  step returns to the queue in its original position, its attempt counter restored, the
-  `step_attempts` row closed as `reclaimed` with `offer not sent: …`), nothing is sent,
-  and the failure is logged at `error` with the run and step ids.
+  step returns to the queue with its attempt counter restored and a **30-second
+  backoff** on `not_before`, so a step whose offer keeps failing is not the very next
+  thing every agent tries and cannot block the queue behind it), nothing is sent, the
+  failure is logged at `error` with the run and step ids, and the fill pass moves on to
+  the next candidate — skipping what it already backed out and giving up after five
+  failures, so a database that is down costs one heartbeat a bounded amount of work.
+  The `step_attempts` row is now opened only once an offer is built and about to be
+  sent, so a backed-out offer leaves no near-zero-length attempt behind to fill the
+  table and collapse the step-duration histogram.
 - **Two pushes on two replicas can no longer both run in a `cancel_in_progress` group.**
   The superseded runs were looked up after the new run committed, and `created_at` was
   the transaction's start time, so two starts could each commit and each see the other

@@ -7,6 +7,11 @@
 - A cancel that arrives after a run finished changes nothing: it stays `succeeded`.
 - An agent fills every free slot in one heartbeat: three parallel root steps on a
   concurrency-3 agent are all running within seconds, not one per 10-second heartbeat.
+- A project whose secret cannot be decrypted does not block the queue: its step ends
+  `failed` with the decrypt reason, and a run in a healthy project still leases and
+  completes behind it. (Poisoned through the API by storing a literal `enc:v1:…` value,
+  which only decrypts to nothing when the API has no `FIBER_SECRETS_KEY` — the dev
+  default; with a key set the literal round-trips and the scenario reports SKIP.)
 
 Needs infra and a rebuilt fiber-api; starts (and stops) its own fiber-agent.
 """
@@ -217,16 +222,19 @@ def main() -> int:
 
     # Concurrency 3: if the group did not cancel, its runs *could* run side by side, so
     # "exactly one in flight" is the group's doing and not the agent's cap — and the
-    # fan-out check needs every slot.
+    # fan-out check needs every slot. Global (no project), so the poisoned project's
+    # step and the healthy one share this agent's queue: that is where a head-of-line
+    # block would show. The labels keep it from taking anything else on the instance.
     code, agent = req(
         "POST",
         "/api/agents",
         token=admin,
-        body={"name": "smoke-concurrency", "labels": LABELS, "concurrency": 3, "project_id": pid},
+        body={"name": "smoke-concurrency", "labels": LABELS, "concurrency": 3},
     )
     check("create agent", code == 201 and "token" in agent, agent)
     agent_id = agent["agent"]["id"]
     proc = start_agent(agent["token"], "smoke-concurrency", "/tmp/fiber-agent-smoke-concurrency.log", 3)
+    projects_to_drop = [pid]
 
     try:
         # --- every free slot fills in one heartbeat ------------------------------------
@@ -317,6 +325,61 @@ def main() -> int:
         code, cancelled = req("POST", f"/api/runs/{rid4}/cancel", token=admin)
         check("cancel the retry", code == 200 and cancelled.get("status") == "cancelled", cancelled)
 
+        # --- an undecryptable secret fails its step and blocks nothing else --------------
+        code, poisoned = req(
+            "POST",
+            "/api/projects",
+            token=admin,
+            body={"name": "Poisoned", "slug": f"poisoned-{int(time.time())}"},
+        )
+        check("create poisoned project", code in (200, 201) and "id" in poisoned, poisoned)
+        pid_x = poisoned["id"]
+        code, sec = req(
+            "POST",
+            f"/api/projects/{pid_x}/secrets",
+            token=admin,
+            body={"key": "API_KEY", "value": "enc:v1:00112233445566778899aabbccddeeff00112233"},
+        )
+        check("store the poisoned secret", code in (200, 201), sec)
+        code, pipe_x = req(
+            "POST",
+            f"/api/projects/{pid_x}/pipelines",
+            token=admin,
+            body={"name": "poisoned-probe", "definition": plain},
+        )
+        check("poisoned pipeline", code in (200, 201) and "id" in pipe_x, pipe_x)
+        code, rx = req("POST", f"/api/pipelines/{pipe_x['id']}/runs", token=admin, body={})
+        check("start poisoned run", code in (200, 201) and "run" in rx, rx)
+        ridx = rx["run"]["id"]
+        code, rh = req("POST", f"/api/pipelines/{pipe_p['id']}/runs", token=admin, body={})
+        check("start healthy run behind it", code in (200, 201) and "run" in rh, rh)
+        ridh = rh["run"]["id"]
+        sth = wait_run_status(admin, ridh, "succeeded", timeout=45)
+        check("healthy run completes behind the poisoned one", sth == "succeeded", sth)
+        stx = wait_run_status(admin, ridx, "failed", timeout=45)
+        stepx = steps_of(admin, ridx)
+        errx = stepx[0].get("error") if stepx else None
+        if stx == "succeeded":
+            print("SKIP poisoned-secret scenario: the API decrypted the literal enc:v1: value "
+                  "(FIBER_SECRETS_KEY is set); poison the row via SQL to exercise it")
+        else:
+            check("poisoned run fails", stx == "failed", stx)
+            check(
+                "poisoned step carries the decrypt reason",
+                bool(errx) and "cannot decrypt project secret API_KEY" in errx
+                and "FIBER_SECRETS_KEY" in errx,
+                errx,
+            )
+            if stepx:
+                code, attx = req("GET", f"/api/steps/{stepx[0]['id']}/attempts", token=admin)
+                check(
+                    "poisoned step has exactly one attempt, closed with the reason",
+                    code == 200 and len(attx) == 1 and attx[0].get("status") == "failed"
+                    and attx[0].get("finished_at") and attx[0].get("error") == errx,
+                    attx,
+                )
+        projects_to_drop.append(pid_x)
+
         # --- a cancel after a finish changes nothing --------------------------------------
         code, r3 = req("POST", f"/api/pipelines/{pipe_p['id']}/runs", token=admin, body={})
         check("start plain run", code in (200, 201) and "run" in r3, r3)
@@ -345,7 +408,8 @@ def main() -> int:
         print(f"SMOKE_FAIL failures={FAILS}")
         print(f"kept project for inspection: {pid}")
         return 1
-    drop_project(admin, pid)
+    for p in projects_to_drop:
+        drop_project(admin, p)
     print("SMOKE_OK concurrency")
     return 0
 

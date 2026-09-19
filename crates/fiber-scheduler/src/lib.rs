@@ -18,6 +18,39 @@ const AGENT_CMDS_CHANNEL: &str = "fiber:agent_cmds";
 const LEASE_SECS: i64 = 300;
 /// Ceiling on the per-attempt retry backoff, so a high `retries` cannot park a step for hours.
 const MAX_RETRY_BACKOFF_SECS: u64 = 60;
+/// Offers one fill may back out before it stops trying. Bounds the work of one heartbeat
+/// when the store is genuinely down, where every candidate would fail the same way.
+const MAX_OFFER_FAILURES_PER_FILL: u32 = 5;
+
+/// What one pass of offering to an agent has already backed out, so the next candidate
+/// is a different step, and how many times — so a store that is down costs a bounded
+/// number of lease/unlease round trips per heartbeat rather than one per queued step.
+#[derive(Debug, Default)]
+pub struct FillCursor {
+    skip: Vec<Uuid>,
+    failures: u32,
+}
+
+impl FillCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Steps this pass must not lease again.
+    pub fn skip(&self) -> &[Uuid] {
+        &self.skip
+    }
+
+    /// Note an offer for `step_id` that was backed out. Returns whether the pass may
+    /// go on to the next candidate.
+    pub fn note_failure(&mut self, step_id: Uuid) -> bool {
+        if !self.skip.contains(&step_id) {
+            self.skip.push(step_id);
+        }
+        self.failures += 1;
+        self.failures < MAX_OFFER_FAILURES_PER_FILL
+    }
+}
 
 #[derive(Clone)]
 pub struct Scheduler {
@@ -626,14 +659,19 @@ impl Scheduler {
     }
 
     /// Find a queued step matching agent labels + project pool and lease it, if the
-    /// agent has a free slot. Call again until it returns `None` to fill the agent.
+    /// agent has a free slot. Call again until it returns `None` to fill the agent;
+    /// `skip` holds the steps this pass already backed out (see [`FillCursor`]).
     ///
     /// The slot count is the database's: steps `running` under this agent, whatever
     /// replica leased them and whether or not this one ever saw them finish. The
     /// in-memory reservation only bridges the gap between that count and the lease
     /// committing, so two offers built at once on one replica cannot both fit through
     /// the last slot.
-    pub async fn offer_for_agent(&self, agent_id: Uuid) -> Result<Option<fiber_core::StepRun>> {
+    pub async fn offer_for_agent(
+        &self,
+        agent_id: Uuid,
+        skip: &[Uuid],
+    ) -> Result<Option<fiber_core::StepRun>> {
         // Fail closed without presence: a socket that never sent Hello (or whose
         // presence was reclaimed) gets nothing rather than the global pool.
         let (agent_labels, concurrency, others_reserved) = {
@@ -653,7 +691,7 @@ impl Scheduler {
             }
         };
         let leased = self
-            .lease_within_slots(agent_id, agent_labels, concurrency, others_reserved)
+            .lease_within_slots(agent_id, agent_labels, concurrency, others_reserved, skip)
             .await;
         // Leased or not, the reservation is done: a leased step is now `running` in
         // the database and counted from there.
@@ -670,18 +708,20 @@ impl Scheduler {
         agent_labels: Vec<String>,
         concurrency: u32,
         others_reserved: u32,
+        skip: &[Uuid],
     ) -> Result<Option<fiber_core::StepRun>> {
         let db_running = self.store.count_running_steps_for_agent(agent_id).await?;
         if !slots_available(concurrency, db_running, others_reserved) {
             return Ok(None);
         }
-        self.try_lease_for(agent_id, agent_labels).await
+        self.try_lease_for(agent_id, agent_labels, skip).await
     }
 
     async fn try_lease_for(
         &self,
         agent_id: Uuid,
         agent_labels: Vec<String>,
+        skip: &[Uuid],
     ) -> Result<Option<fiber_core::StepRun>> {
         // Pool scope is authoritative from the DB row, never from in-memory state.
         let agent_project_id = match self.store.get_agent(agent_id).await? {
@@ -694,6 +734,9 @@ impl Scheduler {
             .list_queued_steps_for_pool(agent_project_id, &agent_labels)
             .await?;
         for step in queued {
+            if skip.contains(&step.id) {
+                continue;
+            }
             let needed = step.labels_vec();
             // The query already filtered on containment; this is the same rule in Rust,
             // kept as the check of record so a change to one is caught by the other.
@@ -707,21 +750,24 @@ impl Scheduler {
         Ok(None)
     }
 
-    /// Back out a lease whose offer could not be built and was never sent.
+    /// Back out a lease whose offer could not be built for a reason that may clear (a
+    /// store error) and was never sent.
     ///
     /// The step goes back to the queue as it was before the lease (attempt counter and
-    /// all — the agent never saw it, so nothing ran); a cancel or reclaim that got
-    /// there first is left alone. Logged at error: this is a store failure on the
-    /// offer path, and the step will be leased again on the next heartbeat.
-    pub async fn release_offer(&self, agent_id: Uuid, step: &fiber_core::StepRun, reason: &str) {
-        match self.store.unlease_step(step.id, agent_id, reason).await {
+    /// all — the agent never saw it, so nothing ran), held back 30 s so it is not the
+    /// very next thing every agent tries; a cancel, reclaim, or newer lease that got
+    /// there first is left alone. Logged at error: this is a store failure on the offer
+    /// path.
+    pub async fn release_offer(&self, step: &fiber_core::StepRun, reason: &str) {
+        let agent_id = step.agent_id.unwrap_or_default();
+        match self.store.unlease_step(step).await {
             Ok(Some(_)) => tracing::error!(
                 %agent_id, run_id = %step.run_id, step = %step.step_id, reason,
-                "offer could not be built; step returned to the queue"
+                "offer could not be built; step returned to the queue with a backoff"
             ),
             Ok(None) => tracing::error!(
                 %agent_id, run_id = %step.run_id, step = %step.step_id, reason,
-                "offer could not be built; step was already cancelled or reclaimed"
+                "offer could not be built; step was already cancelled, reclaimed, or re-leased"
             ),
             Err(e) => tracing::error!(
                 %agent_id, run_id = %step.run_id, step = %step.step_id, reason, error = %e,
@@ -729,6 +775,46 @@ impl Scheduler {
                  the reclaim loop will requeue it when the lease expires"
             ),
         }
+    }
+
+    /// Fail a leased step whose offer cannot be built for a reason that will not clear
+    /// — a project secret that cannot be decrypted — without sending it.
+    ///
+    /// Through the ordinary completion path, so the attempt is recorded and closed with
+    /// the reason, `retries` apply, dependents skip, the run finalises, and the events
+    /// go out: the failure is visible on the step instead of in a log line, and the
+    /// queue drains past it. Nothing runs without its secrets.
+    pub async fn fail_unsent_offer(&self, step: &fiber_core::StepRun, reason: &str) -> Result<()> {
+        let agent_id = step
+            .agent_id
+            .ok_or_else(|| anyhow::anyhow!("leased step has no agent"))?;
+        tracing::error!(
+            %agent_id, run_id = %step.run_id, step = %step.step_id, reason,
+            "offer cannot be built; failing the step"
+        );
+        self.store
+            .record_step_attempt(step.id, step.attempt, agent_id)
+            .await?;
+        self.on_step_complete(
+            agent_id,
+            step.id,
+            StepStatus::Failed,
+            None,
+            Some(reason.to_string()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Open the attempt for a lease whose offer is built and about to be sent. See
+    /// `Store::record_step_attempt` for the window this leaves.
+    pub async fn record_offer_sent(&self, step: &fiber_core::StepRun) -> Result<()> {
+        let agent_id = step
+            .agent_id
+            .ok_or_else(|| anyhow::anyhow!("leased step has no agent"))?;
+        self.store
+            .record_step_attempt(step.id, step.attempt, agent_id)
+            .await
     }
 
     pub async fn renew_leases(&self, agent_id: Uuid) -> Result<()> {
@@ -1108,6 +1194,36 @@ mod tests {
         assert!(!slots_available(u32::MAX, i64::from(u32::MAX), 1));
         // A negative count is a store bug, not free capacity.
         assert!(slots_available(1, -5, 0));
+    }
+
+    // --- one fill pass ----------------------------------------------------------------
+
+    #[test]
+    fn a_backed_out_step_is_skipped_for_the_rest_of_the_pass() {
+        // Without this the next `offer_for_agent` leases the same head-of-queue step
+        // again, and the pass never reaches anything behind it.
+        let mut c = FillCursor::new();
+        let a = Uuid::new_v4();
+        assert!(c.skip().is_empty());
+        assert!(c.note_failure(a));
+        assert_eq!(c.skip(), &[a]);
+        assert!(c.note_failure(a), "a repeat is one entry, not two");
+        assert_eq!(c.skip(), &[a]);
+    }
+
+    #[test]
+    fn a_pass_stops_after_a_bounded_number_of_failures() {
+        // A store that is down fails every candidate the same way; one heartbeat must
+        // not walk the whole queue leasing and unleasing.
+        let mut c = FillCursor::new();
+        for i in 1..MAX_OFFER_FAILURES_PER_FILL {
+            assert!(c.note_failure(Uuid::new_v4()), "failure {i} may continue");
+        }
+        assert!(
+            !c.note_failure(Uuid::new_v4()),
+            "failure {MAX_OFFER_FAILURES_PER_FILL} must stop the pass"
+        );
+        assert_eq!(c.skip().len() as u32, MAX_OFFER_FAILURES_PER_FILL);
     }
 
     #[test]

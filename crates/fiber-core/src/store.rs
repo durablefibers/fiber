@@ -345,13 +345,16 @@ impl Store {
             sqlx::query_as("SELECT COUNT(*) FILTER (WHERE online), COUNT(*) FROM agents")
                 .fetch_one(&self.pool)
                 .await?;
-        // How long the oldest step that could be leased right now has been waiting. Steps
-        // held back by retry backoff are excluded: they are waiting on purpose, and
-        // counting them would make a healthy queue look starved.
+        // How long the oldest step that could be leased right now has been waiting,
+        // measured from when it became leasable (`queued_at`, stamped on every path since
+        // 012 and backfilled by 016) — not from its run's creation, which charged a
+        // dependent step for the whole time its predecessors ran. Steps held back by a
+        // backoff are excluded: they are waiting on purpose, and counting them would make
+        // a healthy queue look starved.
         let oldest_queued_step_age_secs: Option<f64> = sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(r.created_at)))::float8 \
-             FROM step_runs s JOIN runs r ON r.id = s.run_id \
-             WHERE s.status = 'queued' AND (s.not_before IS NULL OR s.not_before <= NOW())",
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(queued_at)))::float8 \
+             FROM step_runs \
+             WHERE status = 'queued' AND (not_before IS NULL OR not_before <= NOW())",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1141,11 +1144,12 @@ impl Store {
         lease_secs: i64,
     ) -> Result<Option<StepRun>> {
         let expires = Utc::now() + chrono::Duration::seconds(lease_secs);
-        // The row and its attempt land together: a crash between them would leave a
-        // running step with no open attempt, or an open attempt for a lease that
-        // never happened, and the timeout backstop reads the attempt.
-        let mut tx = self.pool.begin().await?;
-        let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+        // No `step_attempts` row yet: that is written by `record_step_attempt` once the
+        // offer has been built and is about to be sent. An offer that cannot be built is
+        // backed out with `unlease_step`, and an attempt row for it would be a ~0 s
+        // "reclaimed" attempt every time — one per heartbeat while the cause persists,
+        // which both fills the table and collapses the step-duration histogram.
+        Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
              SET status = 'running', agent_id = $2, lease_expires_at = $3,
                  started_at = COALESCE(started_at, NOW()), attempt = attempt + 1
@@ -1156,64 +1160,60 @@ impl Store {
         .bind(step_run_id)
         .bind(agent_id)
         .bind(expires)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(ref leased) = sr {
-            insert_step_attempt_on(
-                &mut tx,
-                leased.id,
-                leased.attempt,
-                Some(agent_id),
-                "running",
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(sr)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
-    /// Put a step just leased to `agent_id` back exactly as it was before the lease,
-    /// because the offer for it could not be built and was never sent.
+    /// Open the `step_attempts` row for a lease whose offer is built and about to go
+    /// out. `attempt` is the leased row's counter, so a late call cannot open a row
+    /// against a newer lease.
     ///
-    /// The agent never saw the step, so nothing ran: the attempt counter goes back
-    /// (`lease_step` had incremented it), `started_at` is cleared again when this was
-    /// the first lease, and `queued_at` is left alone so the step keeps its place in the
-    /// queue rather than going to the back. Only `retries` accounting is undone —
-    /// `step_attempts` is append-only, so the attempt row stays and is closed as
-    /// `reclaimed` with the reason, and the next lease appends a row with the same
-    /// attempt number. Guarded on `running` under `agent_id`: a cancel or reclaim that
-    /// got there first wins, and `None` says so.
-    pub async fn unlease_step(
+    /// Between `lease_step` and this, a running step has no attempt row, and the
+    /// timeout backstop (`list_timed_out_steps`, which joins on the open attempt) does
+    /// not see it. That window is one offer build on one connection; an API crash
+    /// inside it leaves the lease to expire (`LEASE_SECS`) and the reclaim loop to
+    /// requeue the step, which is the same path any lost lease takes.
+    pub async fn record_step_attempt(
         &self,
         step_run_id: Uuid,
+        attempt: i32,
         agent_id: Uuid,
-        reason: &str,
-    ) -> Result<Option<StepRun>> {
-        let mut tx = self.pool.begin().await?;
-        let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+    ) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        insert_step_attempt_on(&mut conn, step_run_id, attempt, Some(agent_id), "running").await
+    }
+
+    /// Put a step just leased to `agent_id` back as it was before the lease, because
+    /// the offer for it could not be built for a reason that may clear (a store error)
+    /// and was never sent.
+    ///
+    /// The agent never saw the step, so nothing ran: the attempt counter goes back
+    /// (`lease_step` had incremented it) and `started_at` is cleared again when this
+    /// was the first lease. No attempt row exists yet (`record_step_attempt` runs after
+    /// the offer is built), so there is nothing to close. `queued_at` is left alone,
+    /// but `not_before` is set 30 s out: a step at the head of the queue whose offer
+    /// keeps failing would otherwise be leased and backed out on every heartbeat of
+    /// every agent, and nothing behind it would ever be offered. The guard binds the
+    /// leased row's `attempt` and `lease_expires_at` as well as the agent, so a release
+    /// that arrives after a long stall cannot unlease a newer lease the same agent
+    /// holds. `None` means a cancel, reclaim, or newer lease got there first.
+    pub async fn unlease_step(&self, leased: &StepRun) -> Result<Option<StepRun>> {
+        Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
             "UPDATE step_runs
              SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
                  attempt = attempt - 1,
-                 started_at = CASE WHEN attempt = 1 THEN NULL ELSE started_at END
+                 started_at = CASE WHEN attempt = 1 THEN NULL ELSE started_at END,
+                 not_before = NOW() + make_interval(secs => {OFFER_RETRY_BACKOFF_SECS})
              WHERE id = $1 AND status = 'running' AND agent_id = $2
+               AND attempt = $3 AND lease_expires_at IS NOT DISTINCT FROM $4
              RETURNING {STEP_RUN_COLS}"
         )))
-        .bind(step_run_id)
-        .bind(agent_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if sr.is_some() {
-            finish_open_attempt_on(
-                &mut tx,
-                step_run_id,
-                "reclaimed",
-                None,
-                Some(&format!("offer not sent: {reason}")),
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(sr)
+        .bind(leased.id)
+        .bind(leased.agent_id)
+        .bind(leased.attempt)
+        .bind(leased.lease_expires_at)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// Steps the database shows running on `agent_id` — the authoritative count behind
@@ -2367,8 +2367,14 @@ impl Store {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for (key, value) in rows {
-            let plain = crate::secrets::decrypt_secret(&value)
-                .with_context(|| format!("decrypt secret {key}"))?;
+            // Typed, not `.context()`: the caller decides whether to retry on the
+            // error's kind, and a decrypt failure is the one kind that never clears.
+            let plain = crate::secrets::decrypt_secret(&value).map_err(|source| {
+                anyhow::Error::from(crate::SecretDecryptError {
+                    name: key.clone(),
+                    source,
+                })
+            })?;
             out.push((key, plain));
         }
         Ok(out)
@@ -2483,6 +2489,11 @@ const STEP_RUN_COLS_S: &str = "s.id, s.run_id, s.step_id, s.step_name, s.status,
 /// has to be deep enough to get past steps another replica leases in the same instant;
 /// unbounded, each heartbeat of each agent transferred the whole backlog.
 const QUEUE_SCAN_LIMIT: i64 = 200;
+
+/// How long a step whose offer could not be built waits before it is leased again.
+/// Longer than a heartbeat, so the retry is not the very next one; short enough that
+/// a database blip costs one heartbeat's worth of delay.
+const OFFER_RETRY_BACKOFF_SECS: i64 = 30;
 
 async fn list_step_runs_on(conn: &mut sqlx::PgConnection, run_id: Uuid) -> Result<Vec<StepRun>> {
     Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(

@@ -1,6 +1,5 @@
 use crate::artifacts::ArtifactBackend;
 use crate::state::AppState;
-use anyhow::Context as _;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -113,28 +112,38 @@ fn is_bare_program_name(s: &str) -> bool {
         && s != ".."
 }
 
-/// Why an offer could not be built. Every variant means the step must go back to the
-/// queue: an offer sent without its workspace, secrets or restore list would run the
-/// step in an empty directory, fail it, and spend a retry on a database blip.
+/// Why an offer could not be built, sorted by what to do about the lease. An offer sent
+/// without its workspace, secrets or restore list would run the step in an empty
+/// directory, fail it, and spend a retry — so none is sent; the question is only
+/// whether trying again later could work.
 #[derive(Debug)]
 enum OfferError {
-    /// The run row is gone (deleted under the lease).
-    RunMissing,
-    Store(anyhow::Error),
+    /// Might clear: a store error, or the run row gone from under the lease. The step
+    /// goes back to the queue with a backoff.
+    Transient(anyhow::Error),
+    /// Will not clear on its own — a project secret that cannot be decrypted. The step
+    /// is failed with this reason; retrying would lease and back it out every heartbeat
+    /// and never run anything behind it.
+    Permanent(String),
 }
 
 impl std::fmt::Display for OfferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OfferError::RunMissing => write!(f, "run missing"),
-            OfferError::Store(e) => write!(f, "store error: {e:#}"),
+            OfferError::Transient(e) => write!(f, "{e:#}"),
+            OfferError::Permanent(reason) => f.write_str(reason),
         }
     }
 }
 
 impl From<anyhow::Error> for OfferError {
+    /// The one permanent cause is typed by the store; everything else is assumed to be
+    /// the database, which is the only other thing the offer path talks to.
     fn from(e: anyhow::Error) -> Self {
-        OfferError::Store(e)
+        match e.downcast_ref::<fiber_core::SecretDecryptError>() {
+            Some(d) => OfferError::Permanent(d.to_string()),
+            None => OfferError::Transient(e),
+        }
     }
 }
 
@@ -153,7 +162,7 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
         .store
         .get_run(step.run_id)
         .await?
-        .ok_or(OfferError::RunMissing)?;
+        .ok_or_else(|| OfferError::Transient(anyhow::anyhow!("run missing")))?;
     let snapshot = &run.definition_snapshot;
     let workspace = workspace_from_snapshot(snapshot).map(|mut ws| {
         // The webhook recorded what to build; the snapshot only knows the
@@ -209,12 +218,8 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
     } else {
         // One undecryptable row fails the whole read, and the offer with it: a step
         // that ran without its secrets would fail in a way that looks like the build's
-        // fault. The reason lands in the error log with the run and step ids.
-        let secrets = state
-            .store
-            .list_secret_values(run.project_id)
-            .await
-            .context("reading project secrets (is FIBER_SECRETS_KEY right?)")?;
+        // fault. The store types that failure; `OfferError::from` fails the step on it.
+        let secrets = state.store.list_secret_values(run.project_id).await?;
         let mut available: Vec<String> = Vec::new();
         for (k, v) in secrets {
             available.push(k.clone());
@@ -279,11 +284,18 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
 
 /// Offer the agent steps until it has no free slot or nothing matches. Each offer is
 /// leased first (that is what `offer_for_agent` does) and built second; one that cannot
-/// be built is backed out and nothing is sent — and the loop stops there, because the
-/// next one would hit the same store.
+/// be built is backed out (or failed, when the cause is permanent), nothing is sent for
+/// it, and the pass moves on to the next candidate — skipping the ones it already
+/// backed out, and giving up after a few failures so a store that is down costs one
+/// heartbeat a bounded amount of work.
 async fn fill_agent(state: &AppState, agent_id: Uuid, tx: &mpsc::UnboundedSender<ServerMessage>) {
+    let mut cursor = fiber_scheduler::FillCursor::new();
     loop {
-        let step = match state.scheduler.offer_for_agent(agent_id).await {
+        let step = match state
+            .scheduler
+            .offer_for_agent(agent_id, cursor.skip())
+            .await
+        {
             Ok(Some(step)) => step,
             Ok(None) => return,
             Err(e) => {
@@ -297,19 +309,40 @@ async fn fill_agent(state: &AppState, agent_id: Uuid, tx: &mpsc::UnboundedSender
             run_id = %step.run_id,
             step_id = %step.step_id,
         );
-        match offer_for_step(state, step.clone()).instrument(span).await {
+        let built = offer_for_step(state, step.clone()).instrument(span).await;
+        // The attempt opens only for an offer that is about to go out; if even that
+        // write fails the offer is treated like any other transient failure.
+        let built = match built {
+            Ok(offer) => match state.scheduler.record_offer_sent(&step).await {
+                Ok(()) => Ok(offer),
+                Err(e) => Err(OfferError::Transient(e)),
+            },
+            Err(e) => Err(e),
+        };
+        match built {
             Ok(offer) => {
                 if tx.send(offer).is_err() {
                     // The writer is gone; the disconnect path reclaims the lease.
                     return;
                 }
             }
-            Err(e) => {
+            Err(OfferError::Permanent(reason)) => {
+                if let Err(e) = state.scheduler.fail_unsent_offer(&step, &reason).await {
+                    warn!(%agent_id, run_id = %step.run_id, step = %step.step_id, error = %e,
+                        "could not fail the step; the reclaim loop will requeue it");
+                }
+                if !cursor.note_failure(step.id) {
+                    return;
+                }
+            }
+            Err(OfferError::Transient(e)) => {
                 state
                     .scheduler
-                    .release_offer(agent_id, &step, &e.to_string())
+                    .release_offer(&step, &format!("{e:#}"))
                     .await;
-                return;
+                if !cursor.note_failure(step.id) {
+                    return;
+                }
             }
         }
     }
@@ -887,6 +920,39 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_secret_that_cannot_be_decrypted_fails_the_step_rather_than_the_offer() {
+        // The one cause that never clears on its own. Backing the step out would lease
+        // and unlease it every heartbeat, at the head of the queue, forever.
+        let e = anyhow::Error::from(fiber_core::SecretDecryptError {
+            name: "API_KEY".into(),
+            source: anyhow::anyhow!("decrypt secret failed (wrong key?)"),
+        });
+        match OfferError::from(e) {
+            OfferError::Permanent(reason) => {
+                assert!(reason.contains("API_KEY"), "{reason}");
+                assert!(reason.contains("FIBER_SECRETS_KEY"), "{reason}");
+            }
+            OfferError::Transient(e) => panic!("must be permanent, got transient: {e}"),
+        }
+    }
+
+    #[test]
+    fn any_other_failure_is_transient_and_backs_the_step_out() {
+        // A wrapped decrypt error still classifies; a bare store error does not.
+        let wrapped = anyhow::Error::from(fiber_core::SecretDecryptError {
+            name: "TOKEN".into(),
+            source: anyhow::anyhow!("boom"),
+        })
+        .context("reading project secrets");
+        assert!(matches!(
+            OfferError::from(wrapped),
+            OfferError::Permanent(_)
+        ));
+        let db = anyhow::anyhow!("connection reset by peer");
+        assert!(matches!(OfferError::from(db), OfferError::Transient(_)));
+    }
 
     #[test]
     fn workspace_comes_from_snapshot_only() {

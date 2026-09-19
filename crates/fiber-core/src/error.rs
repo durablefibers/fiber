@@ -13,3 +13,29 @@ impl std::fmt::Display for ValidationError {
 }
 
 impl std::error::Error for ValidationError {}
+
+/// A project secret that exists but cannot be read back. Typed so the offer path can
+/// tell it from a transient store error: a wrong or rotated `FIBER_SECRETS_KEY` is not
+/// going to fix itself on the next heartbeat, and a step must not run without the
+/// secret, so the step is failed with this message rather than retried.
+#[derive(Debug)]
+pub struct SecretDecryptError {
+    pub name: String,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for SecretDecryptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot decrypt project secret {} (is FIBER_SECRETS_KEY right?)",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for SecretDecryptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}

@@ -145,7 +145,12 @@ A step is offered only if:
 
 Steps are offered **oldest-queued first** (`queued_at`), so a step requeued after a lost lease keeps its place rather than sorting behind every step that has never started. The label match is applied in the query too, so a long run of steps for some other kind of agent cannot push this agent's work past the scan limit.
 
-An offer is **all or nothing**. It is built from the run's snapshot, the project's secrets and the run's artifacts after the lease is taken; if any of those cannot be read (a database blip, an undecryptable secret), the lease is backed out — the step returns to the queue at its original position with no attempt spent, the `step_attempts` row is closed as `reclaimed` with `offer not sent: …` — and nothing is sent. The failure is logged at `error` with the run and step ids. The alternative was an offer with no workspace, env or restores, which ran the step in an empty directory and spent a retry on it.
+An offer is **all or nothing**. It is built from the run's snapshot, the project's secrets and the run's artifacts after the lease is taken, and the `step_attempts` row opens only once it is built and about to be sent. If something cannot be read, nothing is sent, and what happens next depends on why:
+
+- **A database error** backs the lease out: the step returns to the queue with no attempt spent and a 30-second `not_before` backoff, so a step whose offer keeps failing is not the very next thing every agent tries and cannot block the queue behind it. The fill pass then moves on to the next candidate (skipping what it already backed out, and stopping after five failures). Logged at `error` with the run and step ids.
+- **A secret that cannot be decrypted** (a wrong or rotated `FIBER_SECRETS_KEY`) will not clear on its own, so the step is **failed** through the ordinary completion path with `cannot decrypt project secret NAME (is FIBER_SECRETS_KEY right?)` on the step and its attempt; `retries` apply, dependents skip, and the run finalises. Nothing runs without its secrets.
+
+The alternative was an offer with no workspace, env or restores, which ran the step in an empty directory and spent a retry on it.
 
 The server counts an agent's in-flight steps **from the database** (`step_runs` running under it), not from what it remembers delivering, so a `Cancel` that never reached the agent, or a completion the replica never saw, frees the slot as soon as the row leaves `running`.
 
