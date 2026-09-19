@@ -8,11 +8,63 @@ minor versions may carry breaking changes.
 
 Adds migration 015: three indexes, one dropped index, a unique index on artifacts (after
 removing duplicate rows), and `CHECK` constraints on the two status columns, added
-`NOT VALID` so an old database with a stray status string still boots. See
-[operations](docs/operations.md#upgrades) before upgrading a large install.
+`NOT VALID` so an old database with a stray status string still boots. Adds migration
+016: one partial index on `step_runs (queued_at, id)` for the new queue order, replacing
+`idx_step_runs_queued`. See [operations](docs/operations.md#upgrades) before upgrading a
+large install.
+
+### Changed
+
+- **An agent fills every free slot in one heartbeat.** Offers were made one per
+  heartbeat, so a concurrency-4 agent took forty seconds to fill and a new step waited up
+  to ten with idle capacity beside it. Every offer point (`Hello`, heartbeat, step
+  completion) now offers until the agent is full or nothing matches.
+- **The queue is oldest-first by `queued_at`, bounded, and label-filtered in SQL.** It was
+  ordered by `started_at NULLS FIRST` over the whole table, which `started_at` — never
+  cleared — turned into "every never-started step before any requeued one, however old
+  its run"; and every heartbeat of every agent read the entire backlog. A requeued step
+  now keeps its place, a heartbeat reads at most 200 steps the agent can actually take,
+  and `fiber_oldest_queued_step_age_seconds` measures what it says.
+- **An agent's slots are counted from the database**, not from what the replica remembers
+  delivering. A `Cancel` that never reached the agent (a Redis gap between replicas) or a
+  completion another replica handled used to leave a slot taken until the agent
+  reconnected. The in-memory count is now only a reservation held while an offer is being
+  leased. `concurrency: 0` from an agent is treated as 1 on both sides.
+- **The durable poller asks the database at least every 30 seconds.** Its due index is
+  per replica, so a fiber created on a replica that then died could wait hours to be
+  claimed elsewhere.
 
 ### Fixed
 
+- **An offer that cannot be built is not sent.** The lease was taken first and the offer
+  built second — from the run's snapshot, the project's secrets and its artifacts — and a
+  failure reading any of them was swallowed: a database blip during a heartbeat sent an
+  offer with no workspace, env, secrets or restores, the step ran in an empty directory,
+  failed, and spent a retry, with nothing in the log. The lease is now backed out (the
+  step returns to the queue in its original position, its attempt counter restored, the
+  `step_attempts` row closed as `reclaimed` with `offer not sent: …`), nothing is sent,
+  and the failure is logged at `error` with the run and step ids.
+- **Two pushes on two replicas can no longer both run in a `cancel_in_progress` group.**
+  The superseded runs were looked up after the new run committed, and `created_at` was
+  the transaction's start time, so two starts could each commit and each see the other
+  as newer. A start (or retry) in a group now takes a transaction-scoped advisory lock on
+  `(project, group)`, stamps the run with a timestamp taken inside the lock, and finds
+  what it supersedes on the same connection; the cancels follow the commit and are
+  guarded like any other. The decision (`superseded`) is a pure function with tests.
+- **A retry now supersedes the older runs of its group.** `POST /runs/{id}/retry` reached
+  the store directly, so a retry of a `main` build — which 0.6.0's fix gave the group —
+  still did not cancel the run it replaced. It goes through the scheduler with every
+  other start, and the source audit that enforces that now covers it.
+- **A failed save after a durable `sleep` no longer skips the sleep.** `sleep` checkpointed
+  its ordinal before the engine persisted `status = suspended` and `wake_at`; if that save
+  failed, the row stayed `running` with no wake time, was reclaimed as stale, and resumed
+  past the sleep — a 24-hour sleep became a 60-second one. The ordinal now reaches the
+  database only in the engine's save, in the same `UPDATE` as the status and wake time.
+- **A panicking fiber handler no longer keeps its row alive forever.** The step heartbeat
+  outlived a panic, so the row was never stale, never reclaimed, never failed, and its
+  attempts never spent. The heartbeat is aborted when the step is dropped — by return,
+  `?`, or unwinding — and the poller records `fiber task panicked: …` and spends an
+  attempt exactly as a returned error does.
 - **A reclaimed step now reports what happened to it.** When an expired lease or a
   disconnect requeued or failed a step, the row changed but no event was published: the
   run page showed the step `running` until a reload, and a run that ended on a lost lease

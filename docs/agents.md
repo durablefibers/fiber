@@ -134,7 +134,7 @@ cargo run -p fiber-agent
 
 ## Run
 
-Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client).
+Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client). A `concurrency` below 1 is treated as 1 — an agent that is online but can never be offered anything is a misconfiguration nobody would notice.
 
 ## Label matching
 
@@ -143,11 +143,17 @@ A step is offered only if:
 1. The agent is **global** or bound to the step's **project**, and  
 2. **Every** step label appears on the agent (empty step labels match any agent).
 
+Steps are offered **oldest-queued first** (`queued_at`), so a step requeued after a lost lease keeps its place rather than sorting behind every step that has never started. The label match is applied in the query too, so a long run of steps for some other kind of agent cannot push this agent's work past the scan limit.
+
+An offer is **all or nothing**. It is built from the run's snapshot, the project's secrets and the run's artifacts after the lease is taken; if any of those cannot be read (a database blip, an undecryptable secret), the lease is backed out — the step returns to the queue at its original position with no attempt spent, the `step_attempts` row is closed as `reclaimed` with `offer not sent: …` — and nothing is sent. The failure is logged at `error` with the run and step ids. The alternative was an offer with no workspace, env or restores, which ran the step in an empty directory and spent a retry on it.
+
+The server counts an agent's in-flight steps **from the database** (`step_runs` running under it), not from what it remembers delivering, so a `Cancel` that never reached the agent, or a completion the replica never saw, frees the slot as soon as the row leaves `running`.
+
 ## Lifecycle
 
 | Event | Behavior |
 |---|---|
-| Heartbeat | Touches `last_seen_at`, renews leases, may receive new offers. Retried steps are not offered before their backoff (`not_before`) |
+| Heartbeat | Touches `last_seen_at`, renews leases, then receives offers until every free slot is filled — a concurrency-4 agent fills in one heartbeat, not four. Retried steps are not offered before their backoff (`not_before`) |
 | Step timeout | Every offer carries `timeout_minutes`; the agent kills the process group at the deadline and reports `failed` (`timed out after N min`). The server fails it itself after a grace period if the agent does not |
 | SIGTERM / SIGINT | In-flight step processes are stopped and the socket is closed **without** reporting a result, so the server requeues those steps to another agent. The bounced attempt counts against `retries` with one extra try, so a step bounced once never fails — even with `retries: 0` — but a step that loses more than `retries + 1` leases fails. A rolling restart of a whole pool can bounce the same step twice (it is re-leased immediately, with no backoff), which does fail a `retries: 0` step; give such steps `retries: 1` or restart agents one at a time. The agent exits once its steps are stopped (≤ 10 s) |
 | Reconnect | Exponential backoff 1 s → 30 s with jitter; a `401` (revoked token) exits the process with status 2 instead of retrying forever |
@@ -155,7 +161,7 @@ A step is offered only if:
 | Disconnect / WS close | Agent marked offline; in-flight steps requeued. The bounced attempt counts against `retries` with one extra try: once the step has lost more than `retries + 1` leases it fails with `lease lost after N attempts` instead of being requeued |
 | Stale | No heartbeat for `FIBER_AGENT_STALE_SECS` (default **45**) → offline + the same requeue-or-fail rule |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
-| Update | `PUT /api/agents/{id}` — name / labels / concurrency (inflight preserved; pool unchanged) |
+| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |
 
 ## Presence in UI

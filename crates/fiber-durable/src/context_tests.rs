@@ -254,6 +254,30 @@ async fn a_failing_step_is_not_memoized_so_the_retry_runs_it() {
     assert_eq!(store.appended_keys(), vec!["flaky"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_panicking_step_takes_its_heartbeat_down_with_it() {
+    // The heartbeat keeps a running fiber from looking stale. A handler that panics
+    // unwinds past the point that would have stopped it; left running, it keeps the row
+    // fresh forever — never reclaimed, never failed, attempts never spent.
+    let store = RecordingStore::new();
+    let mut ctx = ctx_with(FiberState::default(), &store);
+    let task = tokio::spawn(async move {
+        ctx.step("boom", || async { panic!("handler bug") })
+            .await
+            .map(|_| ())
+    });
+    assert!(task.await.is_err(), "the step must have panicked");
+
+    // Paused time auto-advances when the runtime is idle; a surviving heartbeat task
+    // would tick several times in this window.
+    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    assert_eq!(
+        store.heartbeats.load(Ordering::SeqCst),
+        0,
+        "no heartbeat may outlive the step that spawned it"
+    );
+}
+
 #[tokio::test]
 async fn a_step_whose_checkpoint_fails_to_persist_surfaces_the_error() {
     // At-least-once: the effect happened but the checkpoint did not, so the step will run
@@ -272,18 +296,48 @@ async fn a_step_whose_checkpoint_fails_to_persist_surfaces_the_error() {
 // --- sleep ordinals ------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_first_sleep_suspends_and_checkpoints_its_ordinal() {
+async fn a_first_sleep_suspends_and_advances_its_ordinal_in_memory_only() {
     let store = RecordingStore::new();
     let mut ctx = ctx_with(FiberState::default(), &store);
     let wake = Utc::now() + Duration::seconds(30);
 
     let suspended = ctx.sleep_until(wake).await.unwrap_err();
     assert_eq!(suspended.wake_at, wake);
-    assert_eq!(ctx.state().sleeps_done, 1);
+    assert_eq!(ctx.state().sleeps_done, 1, "the engine's save carries this");
 
-    let checkpoints = store.checkpoints.lock().unwrap();
-    assert_eq!(checkpoints.len(), 1, "must checkpoint before suspending");
-    assert_eq!(checkpoints[0].sleeps_done, 1);
+    assert!(
+        store.checkpoints.lock().unwrap().is_empty(),
+        "the ordinal must not be persisted ahead of the status and wake_at the engine \
+         writes with it"
+    );
+}
+
+#[tokio::test]
+async fn a_save_that_fails_after_a_sleep_does_not_skip_the_sleep_on_resume() {
+    // The engine's save (status = suspended, wake_at, sleeps_done, in one UPDATE) is
+    // what makes a sleep durable. If it fails, the row stays `running` with no wake_at,
+    // is reclaimed as stale, and the handler runs again from the top. Whatever the
+    // store holds at that point must still make the first sleep suspend — otherwise a
+    // 24-hour sleep becomes a 60-second one.
+    let store = RecordingStore::new();
+    let mut first = ctx_with(FiberState::default(), &store);
+    let wake = Utc::now() + Duration::hours(24);
+    first.sleep_until(wake).await.unwrap_err();
+    // The save never happens (crash, database error); nothing else is written.
+
+    // Resume from what the store actually has.
+    let persisted = store
+        .checkpoints
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    let mut resumed_ctx = ctx_with(persisted, &store);
+    assert!(
+        resumed_ctx.sleep_until(wake).await.is_err(),
+        "a sleep whose save never landed must suspend again, not be skipped"
+    );
 }
 
 #[tokio::test]

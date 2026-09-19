@@ -284,11 +284,12 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` or `FIBER_OTEL_ENDPOINT` to an OTLP HTTP colle
 - **Leases** — `lease_step`, lease renewal, expired-lease reclaim and stale-agent marking are single conditional `UPDATE ... RETURNING` statements; two replicas cannot lease the same step.
 - **Propagation** — unlocking dependents / cascading skips / finishing a run happens in one transaction with the run row locked.
 - **Schedules** — a cron/interval slot is claimed with a compare-and-set on `pipelines.next_due_at` (plus "no active run"), so exactly one replica starts each scheduled run.
+- **Concurrency groups** — a run start or retry in a group takes `pg_advisory_xact_lock` on `(project, group)` for its transaction and decides what it supersedes inside it, so two replicas starting runs in one group cannot both keep running.
 - **Durable fibers** — ready fibers are claimed with `UPDATE ... FOR UPDATE SKIP LOCKED`; a fiber runs on one replica per attempt.
 - **Redis `fiber:events`** — run/step/log events fan out so `/ws/runs/{id}` subscribers on any replica see them.
 - **Redis `fiber:agent_cmds`** — agent-directed messages (run cancel, token rotation / delete disconnects) fan out so the replica holding the agent's socket delivers them.
 
-Agent presence (labels, concurrency, in-flight counts) is per replica: an agent is offered steps by the replica it is connected to. Redis is not a queue — queued steps live in Postgres and are pulled on each agent heartbeat.
+Agent presence (labels, concurrency) is per replica: an agent is offered steps by the replica it is connected to. Its in-flight count is not — it is `SELECT COUNT(*) … WHERE agent_id = … AND status = 'running'` at offer time, so a cancel or completion that only another replica saw still frees the slot. Redis is not a queue — queued steps live in Postgres and are pulled, oldest-queued first, on each agent heartbeat until the agent is full.
 
 ## Smoke scripts
 
@@ -353,5 +354,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
   - Adds three indexes (`runs`, `artifacts`, `fibers`) and drops `idx_log_lines_step`, which nothing has read since 010. The builds hold a `SHARE` lock on their table for seconds on a typical install; `log_lines`, the only large table, is not indexed here.
   - The migration is idempotent (`IF NOT EXISTS` throughout), so a partially-applied environment converges on the next boot.
 - After 015, **a lost lease counts against `retries`** (see *Stuck runs*): a step fails once it has lost more than `retries + 1` leases. A step that was being re-leased forever before the upgrade fails on its next reclaim and its run finalises; nothing else about in-flight runs changes.
+- Migration `016_queue_order.sql` adds one partial index, `step_runs (queued_at, id) WHERE status = 'queued'`, drops `idx_step_runs_queued` (no reader left), and backfills `queued_at` on any queued row a pre-012 path left without one. Seconds on any install; idempotent.
+- After 016, offers are made **oldest-queued first**, and an agent is offered steps until it is full on every heartbeat. A backlog that had been draining newest-run-first drains in queue order from the first heartbeat after the upgrade; nothing about in-flight steps changes.
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  
 - Agent tokens are hashes only — rotating requires distributing a new plaintext token
