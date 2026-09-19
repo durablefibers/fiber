@@ -777,7 +777,11 @@ async fn execute_step_inner(
         if let Some(ws) = workspace {
             log(
                 "system",
-                format!("preparing workspace from {} @ {}", ws.repo, ws.git_ref),
+                format!(
+                    "preparing workspace from {} @ {}",
+                    without_userinfo(&ws.repo),
+                    ws.git_ref
+                ),
             );
             // One network clone per run, then a local copy per step. The lock keeps
             // concurrent steps of this run from racing to create the reference.
@@ -841,6 +845,14 @@ async fn execute_step_inner(
     if shell.is_some() && shell.map(str::trim) != Some(shell_prog) {
         bail!("shell must be a bare program name");
     }
+    // This is the boundary: the value is about to become a `docker run` argument. The
+    // server checked it at compile time, but a snapshot from an older server did not.
+    if let Some(img) = image.map(str::trim)
+        && !img.is_empty()
+        && !fiber_proto::validate::image_reference_ok(img)
+    {
+        bail!("image `{img}` is not a docker image reference");
+    }
     let host_cwd = match subdir {
         Some(d) => {
             let full = work_dir.join(d);
@@ -865,7 +877,13 @@ async fn execute_step_inner(
     }
 
     let mut env_file: Option<tempfile::NamedTempFile> = None;
-    let mut child = if let Some(img) = image.filter(|i| !i.is_empty()).filter(|_| exec.use_docker) {
+    // Trimmed here as at compile time, so the value docker sees is the value that was
+    // checked. Empty means "no image".
+    let mut child = if let Some(img) = image
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .filter(|_| exec.use_docker)
+    {
         let mount = format!("{}:/workspace", work_dir.display());
         log(
             "system",
@@ -944,7 +962,10 @@ async fn execute_step_inner(
         // `sh -c`, never `sh -lc`: a login shell sources /etc/profile, which on Debian
         // resets PATH and throws away what the image put there — `rust:*` keeps cargo on
         // /usr/local/cargo/bin, so `-l` turns a plain `cargo build` into "cargo: not found".
-        cmd.args([img, shell_prog, "-c", run])
+        // `--` ends docker's own options, so whatever the image string is, it is an image.
+        // No stdin: a step that waits on a terminal should fail now, not at the timeout.
+        cmd.args(["--", img, shell_prog, "-c", run])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -960,6 +981,7 @@ async fn execute_step_inner(
         // the environment assembled just below, PATH included.
         cmd.args(["-c", run])
             .current_dir(&host_cwd)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1484,9 +1506,19 @@ async fn prepare_reference_clone(
     tokio::fs::create_dir_all(reference).await?;
 
     let target = ws.sha.clone().unwrap_or_else(|| ws.git_ref.clone());
-    log("system", format!("fetching {} @ {target}", ws.repo));
+    // This is the boundary: the value is about to become a `git remote add` argument, on
+    // the host, before any container exists. `ext::<command>` would run the command.
+    // Trimmed, so the value checked is the value git gets.
+    let repo = ws.repo.trim();
+    if !fiber_proto::validate::repo_url_ok(repo) {
+        bail!("workspace repo is not a fetchable URL");
+    }
+    log(
+        "system",
+        format!("fetching {} @ {target}", without_userinfo(repo)),
+    );
     run_git(reference, &["init", "--quiet"], log).await?;
-    run_git(reference, &["remote", "add", "origin", &ws.repo], log).await?;
+    run_git(reference, &["remote", "add", "origin", repo], log).await?;
 
     // Depth 50 keeps the fetch small while leaving room to check out a commit slightly
     // behind the ref tip (a push that lands while the run is queued).
@@ -1497,7 +1529,8 @@ async fn prepare_reference_clone(
         log,
     )
     .await
-    .with_context(|| format!("fetch {} from {}", ws.git_ref, ws.repo))?;
+    // This string is persisted as the step's error and shown in the UI: no credential.
+    .with_context(|| format!("fetch {} from {}", ws.git_ref, without_userinfo(&ws.repo)))?;
 
     // `--` goes *after* the revision: before it, git reads the argument as a pathspec.
     let checkout = match &ws.sha {
@@ -1571,18 +1604,18 @@ async fn clone_step_workspace(
     }
     let _ = tokio::fs::remove_dir(work_dir).await;
     let src = format!("file://{}", reference.display());
-    let out = Command::new("git")
-        .args(["clone", "--depth", "1", &src])
-        .arg(work_dir)
-        .output()
-        .await
-        .context("git clone from the run reference")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        log("system", format!("workspace clone failed: {}", err.trim()));
-        bail!("could not create the step workspace from the run's clone");
-    }
-    Ok(())
+    let dest = work_dir.to_string_lossy();
+    // Through `run_git` like every other invocation: no stdin, no prompt, pinned
+    // transports. A local clone cannot prompt, but the rule is easier to keep than the
+    // exception.
+    // From the agent's own directory, as before: `src` and `dest` may be relative to it.
+    run_git(
+        Path::new("."),
+        &["clone", "--quiet", "--depth", "1", &src, &dest],
+        log,
+    )
+    .await
+    .context("could not create the step workspace from the run's clone")
 }
 
 /// Delete run workspaces — and orphaned step env files — left behind by a crash.
@@ -1625,15 +1658,28 @@ async fn sweep_stale_workspaces(root: &Path, ttl_hours: u64) {
     }
 }
 
+/// Transports git may use here. `file` is the per-step clone from the run's reference
+/// copy; the rest are what a `workspace.repo` can name. Anything else — `ext::`, which
+/// runs a command, above all — is refused by git itself, whatever the URL says.
+const GIT_ALLOW_PROTOCOL: &str = "file:git:http:https:ssh";
+
 async fn run_git(cwd: &Path, args: &[&str], log: &mut impl FnMut(&str, String)) -> Result<()> {
-    log("system", format!("git {}", args.join(" ")));
-    let output = Command::new("git")
-        .args(args)
+    // The remote URL may carry a token; the log line must not.
+    let shown: Vec<String> = args.iter().map(|a| without_userinfo(a)).collect();
+    log("system", format!("git {}", shown.join(" ")));
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(cwd)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("git")?;
+        // A prompt for credentials or a host key would hang until the step timeout when
+        // the agent has a terminal, and fail at once when it does not. Make it the latter.
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    // An operator who set this deliberately keeps their setting.
+    if std::env::var_os("GIT_ALLOW_PROTOCOL").is_none() {
+        cmd.env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL);
+    }
+    let output = cmd.output().await.context("git")?;
     if !output.stdout.is_empty() {
         log(
             "stdout",
@@ -1652,6 +1698,22 @@ async fn run_git(cwd: &Path, args: &[&str], log: &mut impl FnMut(&str, String)) 
     Ok(())
 }
 
+/// `scheme://user:secret@host/...` with the userinfo replaced, for log lines. Anything
+/// without a `://` userinfo is returned as written.
+fn without_userinfo(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    // Userinfo lives in the authority, which ends at the first `/`. The *last* `@` in it
+    // is the separator: a password may itself contain `@`, and the tail of one is still
+    // a secret.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return s.to_string();
+    };
+    format!("{scheme}://***@{}", &rest[at + 1..])
+}
+
 #[allow(dead_code)]
 fn _ws_ty(_: Ws) {}
 
@@ -1664,6 +1726,32 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_token_in_the_remote_url_never_reaches_the_log() {
+        assert_eq!(
+            without_userinfo("https://x-access-token:ghs_abc@github.com/org/repo.git"),
+            "https://***@github.com/org/repo.git"
+        );
+        assert_eq!(
+            without_userinfo("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            without_userinfo("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+        assert_eq!(
+            without_userinfo("https://host/path/with@sign"),
+            "https://host/path/with@sign"
+        );
+        assert_eq!(without_userinfo("fetch"), "fetch");
+        // A password containing `@`: nothing of it may survive.
+        assert_eq!(
+            without_userinfo("https://user:p@ss@w0rd@github.com/org/repo.git"),
+            "https://***@github.com/org/repo.git"
+        );
     }
 
     #[test]

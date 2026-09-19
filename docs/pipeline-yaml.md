@@ -28,7 +28,7 @@ steps:
 |---|---|---|
 | `name` | yes | Pipeline display name |
 | `env` | no | Environment for every step; see below |
-| `workspace` | no | Git clone into the step workspace |
+| `workspace` | no | Git clone into the step workspace. `repo` must be an `http(s)://`, `ssh://`, `git://`, or `file://` URL, an scp-like `user@host:path`, or a path — rejected when the pipeline compiles otherwise, and again by the agent, which also pins `GIT_ALLOW_PROTOCOL`. Git's `ext::` transport runs a command, and the repo is added on the agent host before any container exists |
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
 | `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
@@ -76,7 +76,7 @@ run ends as `cancelled` with reason `superseded by a newer run`.
 | `run` | — | Shell script (required for execution) |
 | `needs` | `[]` | Upstream step ids (DAG edges) |
 | `labels` | `[]` | Matched against agent labels (all required labels must be present) |
-| `image` | — | Optional Docker image; agent runs in container when Docker enabled |
+| `image` | — | Optional Docker image; agent runs in container when Docker enabled. A docker image reference only (`name[:tag][@digest]`, optionally registry-qualified): the value becomes a `docker run` argument, so anything docker could read as a flag (`-v/:/host`, `--privileged`) is rejected when the pipeline compiles and again by the agent, which also passes it after `--` |
 | `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts, and gets one extra try: a step is failed once it has lost more than `retries + 1` leases |
 | `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
 | `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |

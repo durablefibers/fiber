@@ -73,6 +73,7 @@ Login is throttled per username: 10 failures within 10 minutes lock that usernam
 | `FIBER_AGENT_DOCKER_MEMORY` | unlimited | `--memory` for step containers, e.g. `2g`. Off by default so an upgrade cannot start OOM-killing existing builds |
 | `FIBER_AGENT_DOCKER_CPUS` | unlimited | `--cpus` for step containers, e.g. `2` |
 | `FIBER_AGENT_DOCKER_PIDS_LIMIT` | `512` | `--pids-limit`; `0` = unlimited |
+| `GIT_ALLOW_PROTOCOL` | `file:git:http:https:ssh` | Transports git may use for the workspace fetch. Set by the agent when absent so the `ext::` transport (which runs a command) is unreachable; an operator's own value is kept as is |
 
 Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned, mode `0640`);
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,

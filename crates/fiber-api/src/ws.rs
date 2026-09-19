@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::Instrument;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -175,25 +175,36 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
                     run_id = %run.id,
                     "run builds code from outside the project (fork pull request); injecting no secrets"
                 );
-            } else if let Ok(secrets) = state.store.list_secret_values(run.project_id).await {
-                let mut available: Vec<String> = Vec::new();
-                for (k, v) in secrets {
-                    available.push(k.clone());
-                    if secret_allow.as_ref().is_some_and(|a| !a.contains(&k)) {
-                        continue;
-                    }
-                    secret_keys.push(k.clone());
-                    env.push((k, v));
-                }
-                if let Some(allow) = &secret_allow {
-                    for name in allow {
-                        if !available.contains(name) {
-                            warn!(
-                                run_id = %step.run_id, step = %step.step_id, secret = %name,
-                                "step requests a secret the project does not define"
-                            );
+            } else {
+                match state.store.list_secret_values(run.project_id).await {
+                    Ok(secrets) => {
+                        let mut available: Vec<String> = Vec::new();
+                        for (k, v) in secrets {
+                            available.push(k.clone());
+                            if secret_allow.as_ref().is_some_and(|a| !a.contains(&k)) {
+                                continue;
+                            }
+                            secret_keys.push(k.clone());
+                            env.push((k, v));
+                        }
+                        if let Some(allow) = &secret_allow {
+                            for name in allow {
+                                if !available.contains(name) {
+                                    warn!(
+                                        run_id = %step.run_id, step = %step.step_id, secret = %name,
+                                        "step requests a secret the project does not define"
+                                    );
+                                }
+                            }
                         }
                     }
+                    // One undecryptable row fails the whole read. Silence here would make
+                    // a wrong or rotated FIBER_SECRETS_KEY look like "builds mysteriously
+                    // have no secrets"; say so where the operator will look.
+                    Err(e) => error!(
+                        run_id = %step.run_id, project_id = %run.project_id, error = %e,
+                        "cannot read project secrets; the step will run without them"
+                    ),
                 }
             }
         }
@@ -201,6 +212,26 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> ServerMessage {
         Err(e) => warn!(run_id = %step.run_id, error = %e, "loading run for offer"),
     }
     let restore = restore_list(state, step.run_id, step.id, needs_closure.as_ref()).await;
+    // Both values were checked when the pipeline compiled, and the agent refuses them
+    // again before use. A snapshot from a server older than that check can still hold one;
+    // the agent will fail the step, and this is the line that says why.
+    if let Some(img) = step.image.as_deref().map(str::trim)
+        && !img.is_empty()
+        && !fiber_proto::validate::image_reference_ok(img)
+    {
+        warn!(
+            run_id = %step.run_id, step = %step.step_id, image = %img,
+            "snapshot image is not a docker image reference; the agent will refuse it"
+        );
+    }
+    if let Some(ws) = &workspace
+        && !fiber_proto::validate::repo_url_ok(&ws.repo)
+    {
+        warn!(
+            run_id = %step.run_id, step = %step.step_id,
+            "snapshot workspace repo is not a fetchable URL; the agent will refuse it"
+        );
+    }
     // Agents always get a limit: the step's own, else the server default.
     let default_minutes = fiber_scheduler::TimeoutConfig::from_env().default_minutes as u32;
     ServerMessage::Offer {
@@ -677,13 +708,6 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-#[derive(Deserialize)]
-pub struct RunEventsQs {
-    /// Deprecated, same reason as the agent socket: a URL is logged, a subprotocol is not.
-    #[serde(default)]
-    pub token: Option<String>,
-}
-
 /// Lines stored per step attempt before the rest are dropped.
 ///
 /// `0` disables the cap, for whoever would rather risk the disk than lose output.
@@ -715,10 +739,11 @@ pub async fn run_events_ws(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
     headers: HeaderMap,
-    Query(qs): Query<RunEventsQs>,
 ) -> impl IntoResponse {
-    let via_subprotocol = token_from_subprotocol(&headers);
-    let Some(token) = via_subprotocol.clone().or_else(|| qs.token.clone()) else {
+    // Subprotocol only. A session token is the whole user's authority for two weeks, and
+    // a query string is written to every access log between the browser and this process.
+    // The agent socket still takes `?token=` for older agents; nothing in-tree needs it here.
+    let Some(token) = token_from_subprotocol(&headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "missing token").into_response();
     };
     let user = match state.store.user_by_session_token(&token).await {
@@ -750,11 +775,8 @@ pub async fn run_events_ws(
     }
     // The client offered a subprotocol, so the handshake has to name it back. Without
     // this the browser closes the socket immediately.
-    let ws = match &via_subprotocol {
-        Some(t) => ws.protocols([format!("fiber.token.{t}")]),
-        None => ws,
-    };
-    ws.on_upgrade(move |socket| handle_run_events(socket, state, run_id))
+    ws.protocols([format!("fiber.token.{token}")])
+        .on_upgrade(move |socket| handle_run_events(socket, state, run_id))
 }
 
 async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
