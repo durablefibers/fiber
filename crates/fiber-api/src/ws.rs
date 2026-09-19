@@ -1,6 +1,7 @@
 use crate::artifacts::ArtifactBackend;
 use crate::state::AppState;
-use axum::extract::ws::{Message, WebSocket};
+use axum::body::Bytes;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
@@ -11,10 +12,37 @@ use fiber_proto::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Server-initiated liveness for agent sockets. An agent whose host vanished — NAT
+/// table timeout, power loss, a VM snapshot — leaves a half-open TCP connection that
+/// the kernel can keep for hours. Until now that agent stayed `online` and kept
+/// receiving offers nobody would run. Any frame counts as life (the agent's own
+/// heartbeat comes every 10 s), so a healthy agent never gets near the deadline.
+const AGENT_PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Two pings unanswered.
+const AGENT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long the writer gets to put the Close frame on the wire before it is dropped.
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
+    CloseFrame {
+        code,
+        reason: reason.into(),
+    }
+}
+
+/// Resolves once the process is shutting down (immediately if it already is). The
+/// `watch::Ref` that `wait_for` hands back is dropped in here rather than in a
+/// `select!` arm, where holding it across an `await` would make the session future
+/// `!Send`.
+async fn shutting_down(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
 
 #[derive(Deserialize)]
 pub struct AgentQs {
@@ -58,7 +86,10 @@ pub async fn agent_ws(
         }
     };
     let token_hash = fiber_core::tokens::hash_token(&token);
-    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash))
+    // Subscribed before the upgrade, not inside the session: a shutdown that lands
+    // between the handshake response and the session's first poll must still wait for it.
+    let session = state.sessions.subscribe();
+    ws.on_upgrade(move |socket| handle_agent(socket, state, agent.id, token_hash, session))
 }
 
 /// Build the offer for a leased step from the run's definition snapshot **only**.
@@ -418,7 +449,15 @@ async fn leased_step(state: &AppState, agent_id: Uuid, step_run_id: Uuid) -> Opt
 
 /// `agent_id` is bound once from the authenticated token and never rebound from a
 /// client-supplied field: an agent may only ever act as itself.
-async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_hash: String) {
+async fn handle_agent(
+    socket: WebSocket,
+    state: AppState,
+    agent_id: Uuid,
+    token_hash: String,
+    session: tokio::sync::watch::Receiver<()>,
+) {
+    // Held to the end of the function: shutdown waits for it to drop.
+    let _session = session;
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
@@ -438,13 +477,36 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
         .register_connection(agent_id, tx.clone())
         .await;
 
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let Ok(text) = serde_json::to_string(&msg) else {
-                continue;
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
+    // The writer owns the sink: scheduler messages, the liveness pings, and — last —
+    // the Close frame this side sends when it ends the session, so the agent learns
+    // why instead of seeing a reset.
+    let (close_tx, mut close_rx) = oneshot::channel::<CloseFrame>();
+    let mut writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(AGENT_PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await; // the first tick is immediate; the agent just said hello
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let Ok(text) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
+                    if sink.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                        break;
+                    }
+                }
+                frame = &mut close_rx => {
+                    if let Ok(frame) = frame {
+                        let _ = sink.send(Message::Close(Some(frame))).await;
+                    }
+                    break;
+                }
             }
         }
     });
@@ -457,8 +519,33 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
     // connection, and a retry is a new attempt with its own budget.
     let mut logged: HashMap<(Uuid, i32), u64> = HashMap::new();
     let log_cap = step_log_cap();
+    let mut shutdown = state.shutdown.clone();
+    let mut liveness = tokio::time::Instant::now() + AGENT_LIVENESS_TIMEOUT;
+    // Why this side ended the session, if it did. `None` means the agent went first.
+    let mut close: Option<CloseFrame> = None;
 
-    while let Some(Ok(msg)) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = stream.next() => msg,
+            _ = tokio::time::sleep_until(liveness) => {
+                warn!(
+                    %agent_id,
+                    secs = AGENT_LIVENESS_TIMEOUT.as_secs(),
+                    "agent sent nothing (not even a pong); closing its socket"
+                );
+                close = Some(close_frame(close_code::POLICY, "liveness timeout"));
+                break;
+            }
+            _ = shutting_down(&mut shutdown) => {
+                info!(%agent_id, "shutdown: closing agent session");
+                close = Some(close_frame(close_code::RESTART, "server shutting down"));
+                break;
+            }
+        };
+        let Some(Ok(msg)) = msg else {
+            break;
+        };
+        liveness = tokio::time::Instant::now() + AGENT_LIVENESS_TIMEOUT;
         let Message::Text(text) = msg else {
             continue;
         };
@@ -690,7 +777,17 @@ async fn handle_agent(socket: WebSocket, state: AppState, agent_id: Uuid, token_
     if let Err(e) = state.scheduler.on_agent_disconnect(agent_id).await {
         warn!(error = %e, %agent_id, "agent disconnect cleanup failed");
     }
-    writer.abort();
+    if let Some(frame) = close {
+        let _ = close_tx.send(frame);
+        if tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+    } else {
+        writer.abort();
+    }
 }
 
 /// Client-supplied `agent_id` fields are ignored; log the first disagreement per session.
@@ -775,11 +872,39 @@ pub async fn run_events_ws(
     }
     // The client offered a subprotocol, so the handshake has to name it back. Without
     // this the browser closes the socket immediately.
+    let session = state.sessions.subscribe();
     ws.protocols([format!("fiber.token.{token}")])
-        .on_upgrade(move |socket| handle_run_events(socket, state, run_id))
+        .on_upgrade(move |socket| handle_run_events(socket, state, run_id, session))
 }
 
-async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
+/// One text frame to a run-stream subscriber, bounded by `RUN_EVENTS_SEND_TIMEOUT`.
+/// `false` means the socket is gone or not reading and the session should end.
+async fn send_bounded(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    text: String,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            RUN_EVENTS_SEND_TIMEOUT,
+            sink.send(Message::Text(text.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+/// A browser that cannot take a frame in this long is not reading; a stalled tab must not
+/// hold a session open through a deploy's drain.
+const RUN_EVENTS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn handle_run_events(
+    socket: WebSocket,
+    state: AppState,
+    run_id: Uuid,
+    session: tokio::sync::watch::Receiver<()>,
+) {
+    // Held to the end of the function: shutdown waits for it to drop.
+    let _session = session;
     let (mut sink, mut stream) = socket.split();
     let mut sub = state.scheduler.subscribe();
 
@@ -788,8 +913,10 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
             run_id,
             status: run.status_enum(),
         };
-        if let Ok(text) = serde_json::to_string(&ev) {
-            let _ = sink.send(Message::Text(text.into())).await;
+        if let Ok(text) = serde_json::to_string(&ev)
+            && !send_bounded(&mut sink, text).await
+        {
+            return;
         }
         if let Ok(steps) = state.store.list_step_runs(run_id).await {
             for s in steps {
@@ -799,13 +926,16 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                     step_id: s.step_id.clone(),
                     status: s.status_enum(),
                 };
-                if let Ok(text) = serde_json::to_string(&ev) {
-                    let _ = sink.send(Message::Text(text.into())).await;
+                if let Ok(text) = serde_json::to_string(&ev)
+                    && !send_bounded(&mut sink, text).await
+                {
+                    return;
                 }
             }
         }
     }
 
+    let mut shutdown = state.shutdown.clone();
     loop {
         tokio::select! {
             msg = stream.next() => {
@@ -817,6 +947,17 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                     _ => {}
                 }
             }
+            _ = shutting_down(&mut shutdown) => {
+                // The UI retries 2 s after any close; the frame matters through a proxy
+                // that would otherwise hold the browser's socket half-open.
+                let frame = close_frame(close_code::RESTART, "server shutting down");
+                let _ = tokio::time::timeout(
+                    CLOSE_FLUSH_TIMEOUT,
+                    sink.send(Message::Close(Some(frame))),
+                )
+                .await;
+                break;
+            }
             ev = sub.recv() => {
                 match ev {
                     Ok(payload) => {
@@ -826,10 +967,8 @@ async fn handle_run_events(socket: WebSocket, state: AppState, run_id: Uuid) {
                                 RunEvent::StepUpdated { run_id: rid, .. } => *rid == run_id,
                                 RunEvent::Log { run_id: rid, .. } => *rid == run_id,
                             };
-                            if matches {
-                                if sink.send(Message::Text(payload.into())).await.is_err() {
-                                    break;
-                                }
+                            if matches && !send_bounded(&mut sink, payload).await {
+                                break;
                             }
                         }
                     }

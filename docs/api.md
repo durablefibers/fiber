@@ -7,7 +7,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | GET | `/health` | no | Liveness |
-| GET | `/ready` | no | Postgres + Redis + supervised background loops; `503` when any is down |
+| GET | `/ready` | no | Postgres + supervised background loops; `503` when either is down. Redis is reported (`"redis": "degraded"`, `"degraded": true`) but keeps `200`; each probe is bounded at 2 s. See [operations](./operations.md#health-checks) |
 | GET | `/metrics` | Prometheus exposition. Off unless `FIBER_METRICS_TOKEN` is set, then requires it as a bearer token; `404` when off, `401` when wrong |
 
 ## Auth

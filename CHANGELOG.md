@@ -11,7 +11,49 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
 `NOT VALID` so an old database with a stray status string still boots. See
 [operations](docs/operations.md#upgrades) before upgrading a large install.
 
+### Changed
+
+- **`/ready` no longer fails on Redis.** Leases, scheduling, and the queue live in
+  Postgres, so a replica without Redis still runs builds; reporting `503` for it made a
+  Redis blip a full API outage from the load balancer's point of view. The probe now
+  answers `200` with `"redis": "degraded"` and a top-level `"degraded": true`, and
+  `docs/operations.md` lists what is actually lost (cross-replica live run streams and
+  agent-command fan-out). Postgres down or a supervised loop down is still `503`. For the
+  same reason an unreachable Redis at boot no longer crash-loops `fiber-api`: the client
+  connects lazily, the process logs that it is starting degraded, and it heals when Redis
+  is back.
+
+- **Ordinary API requests time out after 30 s** with `408`, so a slow client or a stuck
+  query cannot hold a server task open indefinitely. WebSocket upgrades, artifact
+  uploads/downloads and project deletion are exempt. The GitHub webhook now accepts
+  deliveries up to 25 MiB (GitHub's maximum) — the 2 MiB default turned a large push
+  into `413` and no run — with at most eight deliveries buffered at once, since the
+  endpoint is unauthenticated until the signature is checked. With Redis down, an event
+  publish now fails in about two seconds instead of the client's 13 s default, so a
+  cancel or completion cannot spend its request budget on one publish.
+
 ### Fixed
+
+- **`fiber-api` shuts down cleanly.** There was no signal handler: SIGTERM ended the
+  process mid-request and mid-upload, and as PID 1 in Compose without an init it was not
+  even delivered — the container was killed after 10 s. Now the listener closes, in-flight
+  requests finish, every WebSocket session sends a Close frame (`1012`) and ends — the
+  process waits for the sessions, not only for HTTP — the OpenTelemetry batch flushes,
+  and the process exits, all within a 20 s bound. Compose runs it with `init: true` and
+  `stop_grace_period: 30s`.
+
+- **An agent whose host vanished no longer stays `online` for hours.** The server pings
+  each agent socket every 15 s and closes it after 45 s without any frame, which takes
+  the normal disconnect path; before, a half-open connection lingered until the kernel
+  gave up on it while the agent kept being offered steps.
+
+- **Readiness probes are bounded at 2 s.** A hung Postgres made `/ready` hang with it,
+  so the orchestrator killed the pod for "probe timeout" with nothing in the log to say
+  why; a dependency that does not answer in time is now reported down.
+
+- **Supervisor backoff resets after a healthy run.** A loop that crashed once a day
+  was, from day seven on, waiting the full 60 s cap before every restart with `/ready`
+  at `503` the whole time. A loop that ran at least 60 s before dying starts over at 1 s.
 
 - **A reclaimed step now reports what happened to it.** When an expired lease or a
   disconnect requeued or failed a step, the row changed but no event was published: the

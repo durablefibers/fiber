@@ -15,6 +15,19 @@ use std::time::Duration;
 /// Restart backoff, capped. A loop that panics on every iteration should not spin.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A loop that stayed up this long before dying had recovered from whatever it was
+/// failing on. Its next restart starts the backoff over rather than inheriting a 60 s
+/// wait from a bad hour last week — with `/ready` answering 503 for the whole of it.
+const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long to wait before restarting a loop, given the delay used for its previous
+/// restart (`None` for the first) and how long it ran this time.
+fn restart_delay(last: Option<Duration>, ran_for: Duration) -> Duration {
+    match last {
+        Some(d) if ran_for < HEALTHY_AFTER => (d * 2).min(MAX_BACKOFF),
+        _ => MIN_BACKOFF,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LoopState {
@@ -78,19 +91,26 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut backoff = MIN_BACKOFF;
+        let mut last_delay = None;
         loop {
             health.mark(name, true, None);
+            let started = std::time::Instant::now();
             let exit = match tokio::spawn(make()).await {
                 // These loops are written to run forever, so returning is itself wrong.
                 Ok(()) => "returned unexpectedly".to_string(),
                 Err(e) if e.is_panic() => "panicked".to_string(),
                 Err(_) => "cancelled".to_string(),
             };
-            tracing::error!(loop_name = name, reason = %exit, "background loop stopped; restarting");
+            let delay = restart_delay(last_delay, started.elapsed());
+            tracing::error!(
+                loop_name = name,
+                reason = %exit,
+                delay_secs = delay.as_secs(),
+                "background loop stopped; restarting"
+            );
             health.mark(name, false, Some(exit));
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            tokio::time::sleep(delay).await;
+            last_delay = Some(delay);
         }
     });
 }
@@ -98,6 +118,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_while_the_loop_keeps_dying_quickly() {
+        let quick = Duration::from_millis(100);
+        assert_eq!(restart_delay(None, quick), MIN_BACKOFF);
+        assert_eq!(
+            restart_delay(Some(Duration::from_secs(1)), quick),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            restart_delay(Some(Duration::from_secs(32)), quick),
+            Duration::from_secs(60)
+        );
+        assert_eq!(restart_delay(Some(MAX_BACKOFF), quick), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_resets_after_a_healthy_run() {
+        // A loop at the 60 s cap that then ran for an hour is not the loop that was
+        // crashing: its next restart should be quick again.
+        assert_eq!(
+            restart_delay(Some(MAX_BACKOFF), Duration::from_secs(3600)),
+            MIN_BACKOFF
+        );
+        assert_eq!(restart_delay(Some(MAX_BACKOFF), HEALTHY_AFTER), MIN_BACKOFF);
+        // Just short of healthy still counts as a quick death.
+        assert_eq!(
+            restart_delay(
+                Some(Duration::from_secs(4)),
+                HEALTHY_AFTER - Duration::from_secs(1)
+            ),
+            Duration::from_secs(8)
+        );
+    }
 
     #[test]
     fn a_fresh_supervisor_reports_nothing_down() {
