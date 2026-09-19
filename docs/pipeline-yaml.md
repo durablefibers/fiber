@@ -67,7 +67,10 @@ Omitting `concurrency` means no limit, and so does `cancel_in_progress: false` â
 instead of cancelling is a different behaviour, and Fiber would rather do nothing than
 guess which one was meant. The resolved group is stored on the run (`concurrency_group`),
 so the rule that governed a run stays readable after the pipeline is edited. A superseded
-run ends as `cancelled` with reason `superseded by a newer run`.
+run ends as `cancelled` with reason `superseded by a newer run`. A **retry** is a new run in
+the original's group and supersedes (or is superseded) like any other start. Starts within
+one group are serialised on the server, so two pushes landing at the same instant on two
+API replicas still leave exactly one run in flight.
 
 ## Step fields
 

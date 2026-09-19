@@ -767,39 +767,7 @@ impl Store {
         Ok(requeued)
     }
 
-    /// Unfinished runs of this project in the same group, created before `run_id`.
-    ///
-    /// Ordering by `(created_at, id)` makes the decision total: when two runs start in the
-    /// same instant exactly one of them is "older", so they cannot cancel each other and
-    /// leave the group with nothing running.
-    pub async fn superseded_runs(
-        &self,
-        project_id: Uuid,
-        group: &str,
-        run_id: Uuid,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<Uuid>> {
-        Ok(sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM runs
-              WHERE project_id = $1
-                AND concurrency_group = $2
-                AND status NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
-                AND (created_at, id) < ($3, $4)
-              ORDER BY created_at",
-        )
-        .bind(project_id)
-        .bind(group)
-        .bind(created_at)
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn start_run(
-        &self,
-        pipeline_id: Uuid,
-        trigger: &str,
-    ) -> Result<(Run, Vec<StepRun>, CompiledDag)> {
+    pub async fn start_run(&self, pipeline_id: Uuid, trigger: &str) -> Result<StartedRun> {
         self.start_run_for_commit(pipeline_id, trigger, RunCommit::default())
             .await
     }
@@ -807,12 +775,17 @@ impl Store {
     /// Start a run for a specific commit. The agent checks out `head_sha` rather than
     /// whatever the branch points at by the time it clones, so a second push mid-build
     /// cannot retarget this run.
+    ///
+    /// When the run has a concurrency group, the insert and the search for the runs it
+    /// supersedes happen under one advisory lock on `(project, group)`, so two pushes
+    /// landing on two replicas at once cannot each commit, each see the other as newer,
+    /// and both keep running. The caller cancels `superseded` after this commits.
     pub async fn start_run_for_commit(
         &self,
         pipeline_id: Uuid,
         trigger: &str,
         commit: RunCommit,
-    ) -> Result<(Run, Vec<StepRun>, CompiledDag)> {
+    ) -> Result<StartedRun> {
         let pipeline = self
             .get_pipeline(pipeline_id)
             .await?
@@ -840,11 +813,21 @@ impl Store {
         // The run row and every step row land together: a half-inserted DAG would
         // otherwise "succeed" once its partial set of steps finished.
         let mut tx = self.pool.begin().await?;
+        if let Some(group) = &concurrency_group {
+            lock_concurrency_group_on(&mut tx, pipeline.project_id, group).await?;
+        }
+        // `clock_timestamp()`, not `NOW()`: NOW() is the transaction's start, which is
+        // before the group lock was taken. Two starts waiting on the lock would then be
+        // ordered by who *began* rather than who *got in*, and the one that got in second
+        // could carry the earlier timestamp and be cancelled by a run it had already
+        // seen and cancelled itself.
         let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
-               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
-                head_sha, head_ref, pr_number, repo_full_name, untrusted, concurrency_group)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12)
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, created_at,
+                started_at, head_sha, head_ref, pr_number, repo_full_name, untrusted,
+                concurrency_group)
+             VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp(), clock_timestamp(), $7, $8, $9,
+                     $10, $11, $12)
              RETURNING {RUN_COLS}"
         )))
         .bind(run_id)
@@ -861,6 +844,7 @@ impl Store {
         .bind(&concurrency_group)
         .fetch_one(&mut *tx)
         .await?;
+        let superseded = superseded_runs_on(&mut tx, &run).await?;
 
         for step in &compiled.steps {
             let sid = Uuid::new_v4();
@@ -912,7 +896,12 @@ impl Store {
         let _ = self.propagate_after_step(run_id).await?;
         let run = self.get_run(run_id).await?.unwrap_or(run);
 
-        Ok((run, self.list_step_runs(run_id).await?, compiled))
+        Ok(StartedRun {
+            steps: self.list_step_runs(run_id).await?,
+            run,
+            dag: compiled,
+            superseded,
+        })
     }
 
     pub async fn get_run(&self, id: Uuid) -> Result<Option<Run>> {
@@ -930,7 +919,10 @@ impl Store {
     /// With `failed_only`, steps that succeeded the first time are carried over as
     /// already-succeeded (their artifacts copied so dependents can still restore them)
     /// and only the rest run again. Otherwise every step runs.
-    pub async fn retry_run(&self, run_id: Uuid, failed_only: bool) -> Result<(Run, Vec<StepRun>)> {
+    ///
+    /// Same group serialisation as `start_run_for_commit`: a retry of a `main` build is a
+    /// new run in the `main` group and supersedes (or is superseded by) the others.
+    pub async fn retry_run(&self, run_id: Uuid, failed_only: bool) -> Result<StartedRun> {
         let original = self
             .get_run(run_id)
             .await?
@@ -949,12 +941,16 @@ impl Store {
 
         let new_run_id = Uuid::new_v4();
         let mut tx = self.pool.begin().await?;
+        if let Some(group) = &original.concurrency_group {
+            lock_concurrency_group_on(&mut tx, original.project_id, group).await?;
+        }
         let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
             "INSERT INTO runs
-               (id, pipeline_id, project_id, status, trigger, definition_snapshot, started_at,
-              retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted,
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, created_at,
+              started_at, retry_of, head_sha, head_ref, pr_number, repo_full_name, untrusted,
               concurrency_group)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, $12, $13)
+             VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp(), clock_timestamp(), $7, $8, $9,
+                     $10, $11, $12, $13)
              RETURNING {RUN_COLS}"
         )))
         .bind(new_run_id)
@@ -976,6 +972,7 @@ impl Store {
         .bind(&original.concurrency_group)
         .fetch_one(&mut *tx)
         .await?;
+        let superseded = superseded_runs_on(&mut tx, &run).await?;
 
         for step in &compiled.steps {
             let sid = Uuid::new_v4();
@@ -1057,7 +1054,12 @@ impl Store {
 
         let _ = self.propagate_after_step(new_run_id).await?;
         let run = self.get_run(new_run_id).await?.unwrap_or(run);
-        Ok((run, self.list_step_runs(new_run_id).await?))
+        Ok(StartedRun {
+            steps: self.list_step_runs(new_run_id).await?,
+            run,
+            dag: compiled,
+            superseded,
+        })
     }
 
     /// Of `paths`, those still referenced by an artifact row. Retention must not delete a
@@ -1116,17 +1118,18 @@ impl Store {
 
     /// Queued steps for the global pool: everything except untrusted runs, which need a
     /// project-dedicated agent (see `list_queued_steps_for_pool`).
-    pub async fn list_queued_steps(&self) -> Result<Vec<StepRun>> {
-        Ok(sqlx::query_as::<_, StepRun>(
-            "SELECT s.id, s.run_id, s.step_id, s.step_name, s.status, s.image, s.run_cmd,
-                    s.labels, s.needs, s.retries, s.attempt, s.agent_id, s.lease_expires_at,
-                    s.exit_code, s.error, s.started_at, s.finished_at
+    pub async fn list_queued_steps(&self, agent_labels: &[String]) -> Result<Vec<StepRun>> {
+        Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "SELECT {STEP_RUN_COLS_S}
              FROM step_runs s
              INNER JOIN runs r ON r.id = s.run_id
              WHERE s.status = 'queued' AND NOT r.untrusted
                AND (s.not_before IS NULL OR s.not_before <= NOW())
-             ORDER BY s.started_at NULLS FIRST, s.id",
-        )
+               AND s.labels <@ $1
+             ORDER BY s.queued_at, s.id
+             LIMIT {QUEUE_SCAN_LIMIT}"
+        )))
+        .bind(json!(agent_labels))
         .fetch_all(&self.pool)
         .await?)
     }
@@ -1167,6 +1170,61 @@ impl Store {
         }
         tx.commit().await?;
         Ok(sr)
+    }
+
+    /// Put a step just leased to `agent_id` back exactly as it was before the lease,
+    /// because the offer for it could not be built and was never sent.
+    ///
+    /// The agent never saw the step, so nothing ran: the attempt counter goes back
+    /// (`lease_step` had incremented it), `started_at` is cleared again when this was
+    /// the first lease, and `queued_at` is left alone so the step keeps its place in the
+    /// queue rather than going to the back. Only `retries` accounting is undone —
+    /// `step_attempts` is append-only, so the attempt row stays and is closed as
+    /// `reclaimed` with the reason, and the next lease appends a row with the same
+    /// attempt number. Guarded on `running` under `agent_id`: a cancel or reclaim that
+    /// got there first wins, and `None` says so.
+    pub async fn unlease_step(
+        &self,
+        step_run_id: Uuid,
+        agent_id: Uuid,
+        reason: &str,
+    ) -> Result<Option<StepRun>> {
+        let mut tx = self.pool.begin().await?;
+        let sr = sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+            "UPDATE step_runs
+             SET status = 'queued', agent_id = NULL, lease_expires_at = NULL,
+                 attempt = attempt - 1,
+                 started_at = CASE WHEN attempt = 1 THEN NULL ELSE started_at END
+             WHERE id = $1 AND status = 'running' AND agent_id = $2
+             RETURNING {STEP_RUN_COLS}"
+        )))
+        .bind(step_run_id)
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if sr.is_some() {
+            finish_open_attempt_on(
+                &mut tx,
+                step_run_id,
+                "reclaimed",
+                None,
+                Some(&format!("offer not sent: {reason}")),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(sr)
+    }
+
+    /// Steps the database shows running on `agent_id` — the authoritative count behind
+    /// its concurrency slots. Served by `idx_step_runs_agent`.
+    pub async fn count_running_steps_for_agent(&self, agent_id: Uuid) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM step_runs WHERE agent_id = $1 AND status = 'running'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn list_step_attempts(&self, step_run_id: Uuid) -> Result<Vec<StepAttempt>> {
@@ -1899,26 +1957,34 @@ impl Store {
     /// as the agent's user, where it can read the agent's own token out of `/proc` and
     /// then lease other projects' work. So untrusted steps are offered **only** to agents
     /// bound to that project — never to the global pool.
+    ///
+    /// Oldest queued first, by `queued_at` — a step requeued after a lost lease keeps its
+    /// original position rather than sorting behind every never-started step — and only
+    /// steps whose labels the agent satisfies (`labels <@ agent labels`; an empty
+    /// requirement is contained in anything), so a long run of steps for some *other*
+    /// kind of agent cannot push this agent's work past the scan limit.
     pub async fn list_queued_steps_for_pool(
         &self,
         agent_project_id: Option<Uuid>,
+        agent_labels: &[String],
     ) -> Result<Vec<StepRun>> {
         if let Some(pid) = agent_project_id {
-            Ok(sqlx::query_as::<_, StepRun>(
-                "SELECT s.id, s.run_id, s.step_id, s.step_name, s.status, s.image, s.run_cmd,
-                        s.labels, s.needs, s.retries, s.attempt, s.agent_id, s.lease_expires_at,
-                        s.exit_code, s.error, s.started_at, s.finished_at
+            Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
+                "SELECT {STEP_RUN_COLS_S}
                  FROM step_runs s
                  INNER JOIN runs r ON r.id = s.run_id
                  WHERE s.status = 'queued' AND r.project_id = $1
                    AND (s.not_before IS NULL OR s.not_before <= NOW())
-                 ORDER BY s.started_at NULLS FIRST, s.id",
-            )
+                   AND s.labels <@ $2
+                 ORDER BY s.queued_at, s.id
+                 LIMIT {QUEUE_SCAN_LIMIT}"
+            )))
             .bind(pid)
+            .bind(json!(agent_labels))
             .fetch_all(&self.pool)
             .await?)
         } else {
-            self.list_queued_steps().await
+            self.list_queued_steps(agent_labels).await
         }
     }
 
@@ -2408,6 +2474,16 @@ const RUN_COLS: &str = "id, pipeline_id, project_id, status, trigger, definition
 const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";
 
+/// `STEP_RUN_COLS` qualified with the `s` alias, for the queue queries that join `runs`.
+const STEP_RUN_COLS_S: &str = "s.id, s.run_id, s.step_id, s.step_name, s.status, s.image, \
+     s.run_cmd, s.labels, s.needs, s.retries, s.attempt, s.agent_id, s.lease_expires_at, \
+     s.exit_code, s.error, s.started_at, s.finished_at";
+
+/// Queued steps read per offer. An offer leases the first one it can, so the scan only
+/// has to be deep enough to get past steps another replica leases in the same instant;
+/// unbounded, each heartbeat of each agent transferred the whole backlog.
+const QUEUE_SCAN_LIMIT: i64 = 200;
+
 async fn list_step_runs_on(conn: &mut sqlx::PgConnection, run_id: Uuid) -> Result<Vec<StepRun>> {
     Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
         "SELECT {STEP_RUN_COLS} FROM step_runs WHERE run_id = $1 ORDER BY step_id"
@@ -2517,6 +2593,107 @@ async fn insert_step_attempt_on(
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// A run that was just created, with everything the caller needs to enqueue it and to
+/// cancel what it supersedes. `superseded` was decided inside the creating transaction,
+/// under the group lock, so it is exact rather than a best-effort snapshot taken later.
+#[derive(Debug)]
+pub struct StartedRun {
+    pub run: Run,
+    pub steps: Vec<StepRun>,
+    pub dag: CompiledDag,
+    /// Older unfinished runs of the same concurrency group. The store does not cancel
+    /// them — cancelling takes the run and step locks, and doing that inside the start
+    /// transaction would hold the group lock across every agent notification.
+    pub superseded: Vec<Uuid>,
+}
+
+/// Serialise run starts within one concurrency group for the rest of the transaction.
+///
+/// A transaction-scoped advisory lock keyed on `project:group`: released on commit or
+/// rollback, so a crashed start cannot wedge the group. `hashtext` folds the string to
+/// the 32-bit key space; a collision between two unrelated groups only makes their
+/// starts wait on each other, never miss each other.
+async fn lock_concurrency_group_on(
+    conn: &mut sqlx::PgConnection,
+    project_id: Uuid,
+    group: &str,
+) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("{project_id}:{group}"))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The unfinished runs `run` supersedes, read on the creating connection so they are
+/// exactly the runs that were committed when `run` took the group lock. The SQL narrows
+/// to the group (the partial index in migration 014); [`superseded`] makes the decision.
+async fn superseded_runs_on(conn: &mut sqlx::PgConnection, run: &Run) -> Result<Vec<Uuid>> {
+    let Some(group) = run.concurrency_group.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let candidates = sqlx::query_as::<_, RunKey>(
+        "SELECT id, project_id, concurrency_group, status, created_at FROM runs
+          WHERE project_id = $1
+            AND concurrency_group = $2
+            AND status NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+          ORDER BY created_at, id",
+    )
+    .bind(run.project_id)
+    .bind(group)
+    .fetch_all(conn)
+    .await?;
+    let new = RunKey::from(run);
+    Ok(candidates
+        .into_iter()
+        .filter(|c| superseded(&new, c))
+        .map(|c| c.id)
+        .collect())
+}
+
+/// The part of a run that decides whether it is superseded by another.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RunKey {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub concurrency_group: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Run> for RunKey {
+    fn from(run: &Run) -> Self {
+        Self {
+            id: run.id,
+            project_id: run.project_id,
+            concurrency_group: run.concurrency_group.clone(),
+            status: run.status.clone(),
+            created_at: run.created_at,
+        }
+    }
+}
+
+/// Whether starting `new` cancels `candidate`.
+///
+/// Same project, same resolved group (a run with none contends with nothing), still
+/// unfinished, not `new` itself, and older by `(created_at, id)`. Ordering on the pair
+/// makes the decision total: when two runs carry the same timestamp exactly one of
+/// them is older, so they cannot cancel each other and leave the group empty.
+pub fn superseded(new: &RunKey, candidate: &RunKey) -> bool {
+    let Some(group) = new.concurrency_group.as_deref() else {
+        return false;
+    };
+    candidate.id != new.id
+        && candidate.project_id == new.project_id
+        && candidate.concurrency_group.as_deref() == Some(group)
+        && !run_status_terminal(&candidate.status)
+        && (candidate.created_at, candidate.id) < (new.created_at, new.id)
+}
+
+fn run_status_terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled" | "skipped")
 }
 
 /// What a reclaim (expired lease, agent disconnect) did to the steps it found running.
@@ -3180,6 +3357,103 @@ mod concurrency_tests {
         let g = resolve_concurrency_group(Some("{pipeline}-{version}"), p, Some("main"));
         assert!(g.ends_with("-{version}"), "got {g}");
         assert!(g.starts_with(&p.to_string()));
+    }
+
+    // --- what a new run cancels ---------------------------------------------------------
+    //
+    // `superseded` is the decision `start_run` / `retry_run` apply, under the group lock,
+    // to every unfinished run of the group. The SQL narrows to the group; this is what
+    // says which of those go.
+
+    use super::{RunKey, superseded};
+    use chrono::{DateTime, Duration, Utc};
+
+    fn key(project: Uuid, group: Option<&str>, status: &str, created_at: DateTime<Utc>) -> RunKey {
+        RunKey {
+            id: Uuid::new_v4(),
+            project_id: project,
+            concurrency_group: group.map(str::to_string),
+            status: status.to_string(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn an_older_unfinished_run_of_the_same_group_is_superseded() {
+        let p = Uuid::new_v4();
+        let t = Utc::now();
+        let new = key(p, Some("main"), "running", t);
+        for status in ["pending", "running"] {
+            let older = key(p, Some("main"), status, t - Duration::seconds(1));
+            assert!(superseded(&new, &older), "{status} must be superseded");
+        }
+    }
+
+    #[test]
+    fn a_finished_run_is_left_alone() {
+        // Cancelling it would rewrite an outcome GitHub already saw.
+        let p = Uuid::new_v4();
+        let t = Utc::now();
+        let new = key(p, Some("main"), "running", t);
+        for status in ["succeeded", "failed", "cancelled", "skipped"] {
+            let older = key(p, Some("main"), status, t - Duration::seconds(1));
+            assert!(!superseded(&new, &older), "{status} must not be superseded");
+        }
+    }
+
+    #[test]
+    fn a_run_never_supersedes_itself() {
+        let p = Uuid::new_v4();
+        let new = key(p, Some("main"), "running", Utc::now());
+        assert!(!superseded(&new, &new));
+    }
+
+    #[test]
+    fn a_newer_run_is_not_superseded_by_an_older_one() {
+        // The direction matters: a late-committing older run must not cancel the newer
+        // one that already superseded it.
+        let p = Uuid::new_v4();
+        let t = Utc::now();
+        let old = key(p, Some("main"), "running", t - Duration::seconds(1));
+        let newer = key(p, Some("main"), "running", t);
+        assert!(!superseded(&old, &newer));
+    }
+
+    #[test]
+    fn the_same_instant_is_broken_by_id_so_exactly_one_wins() {
+        let p = Uuid::new_v4();
+        let t = Utc::now();
+        let a = key(p, Some("main"), "running", t);
+        let b = key(p, Some("main"), "running", t);
+        assert_ne!(
+            superseded(&a, &b),
+            superseded(&b, &a),
+            "two runs with one timestamp must not cancel each other, nor neither"
+        );
+    }
+
+    #[test]
+    fn another_group_project_or_no_group_does_not_contend() {
+        let p = Uuid::new_v4();
+        let t = Utc::now();
+        let new = key(p, Some("main"), "running", t);
+        let earlier = t - Duration::seconds(1);
+        assert!(!superseded(
+            &new,
+            &key(p, Some("release"), "running", earlier)
+        ));
+        assert!(!superseded(
+            &new,
+            &key(Uuid::new_v4(), Some("main"), "running", earlier)
+        ));
+        assert!(!superseded(&new, &key(p, None, "running", earlier)));
+        // A run without a group contends with nothing, whatever is older.
+        let ungrouped = key(p, None, "running", t);
+        assert!(!superseded(&ungrouped, &key(p, None, "running", earlier)));
+        assert!(!superseded(
+            &ungrouped,
+            &key(p, Some("main"), "running", earlier)
+        ));
     }
 }
 

@@ -90,6 +90,19 @@ Optional `wake_at` (RFC3339) on create starts the fiber suspended until due.
   attempt; only a genuine failure, or a `running` fiber found stale after a crash, spends
   one. Counting resumes meant a fiber that slept three times exhausted its retries while
   working perfectly  
+- **A sleep is durable only once the engine has saved it.** `sleep` advances the ordinal in
+  memory; the engine then writes `status = suspended`, `wake_at` and the ordinal in one
+  `UPDATE`. If that save fails, the row is reclaimed as stale and the handler runs again
+  from the top — and the sleep is taken again, because nothing recorded it. (It used to
+  checkpoint the ordinal first, so a failed save turned a 24-hour sleep into a 60-second one)  
+- **A panic is a failure.** The step heartbeat is aborted when the step's future is dropped,
+  including by a panic unwinding through it, so a panicking handler cannot keep its row
+  fresh forever; the poller then records `fiber task panicked: …` and spends an attempt
+  exactly as a returned error does  
+- **The poller asks the database at least every 30 seconds.** Its in-memory due index only
+  knows about fibers the same replica created or ran, so it may skip the ready query while
+  idle, but never for longer than that — a fiber created on a replica that then died is
+  claimed by another within 30 seconds plus one poll  
 - **Cancel wins.** It is terminal, so the poller does not pick the fiber up again, and a
   save from a handler that was already running is rejected rather than overwriting the
   decision. A cancelled fiber stays cancelled even if its work would have succeeded  

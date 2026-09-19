@@ -38,26 +38,32 @@ pub struct Scheduler {
 pub struct AgentPresence {
     pub labels: Vec<String>,
     pub concurrency: u32,
-    pub inflight: u32,
+    /// Offers this replica is in the middle of leasing for the agent. Held only from
+    /// the reservation to the lease's commit, after which the database counts the
+    /// step; it exists so two concurrent offers on one replica cannot both pass the
+    /// cap in the instant before either has leased. It is *not* the in-flight count —
+    /// that comes from `step_runs` in [`Scheduler::offer_for_agent`], so a lost
+    /// `Cancel` or a completion this replica never saw cannot leak a slot.
+    pub reserved: u32,
     /// `None` = global pool.
     pub project_id: Option<Uuid>,
 }
 
 impl AgentPresence {
-    /// Take a concurrency slot if one is free. Check and increment are one operation so
-    /// two concurrent offers for the same agent cannot both pass the cap.
+    /// Take a reservation if one fits under the cap. Check and increment are one
+    /// operation so two concurrent offers for the same agent cannot both pass.
     pub fn try_reserve_slot(&mut self) -> bool {
-        if self.inflight >= self.concurrency {
+        if self.reserved >= self.concurrency {
             return false;
         }
-        self.inflight += 1;
+        self.reserved += 1;
         true
     }
 
-    /// Give a slot back. Saturating: a duplicate release must not wrap to u32::MAX and
-    /// hand the agent unlimited concurrency.
+    /// Give a reservation back. Saturating: a duplicate release must not wrap to
+    /// u32::MAX and hand the agent unlimited concurrency.
     pub fn release_slot(&mut self) {
-        self.inflight = self.inflight.saturating_sub(1);
+        self.reserved = self.reserved.saturating_sub(1);
     }
 }
 
@@ -216,7 +222,7 @@ impl Scheduler {
     async fn apply_agent_command(&self, cmd: AgentCommand) {
         match cmd.kind {
             AgentCommandKind::Cancel { step_run_id } => {
-                self.deliver_cancel(cmd.agent_id, step_run_id, true).await;
+                self.deliver_cancel(cmd.agent_id, step_run_id).await;
             }
             AgentCommandKind::Disconnect { reason } => {
                 if !self.has_connection(cmd.agent_id).await {
@@ -246,20 +252,23 @@ impl Scheduler {
         project_id: Option<Uuid>,
     ) {
         let mut agents = self.agents.write().await;
-        // A repeated Hello on a live session must not reset the concurrency accounting.
-        let inflight = agents.get(&agent_id).map(|a| a.inflight).unwrap_or(0);
+        // A repeated Hello on a live session must not drop reservations still in flight.
+        let reserved = agents.get(&agent_id).map(|a| a.reserved).unwrap_or(0);
         agents.insert(
             agent_id,
             AgentPresence {
                 labels,
-                concurrency,
-                inflight,
+                // An agent that says 0 is online and never offered anything, with no
+                // line in any log to say why. The agent clamps too; this covers older
+                // ones.
+                concurrency: concurrency.max(1),
+                reserved,
                 project_id,
             },
         );
     }
 
-    /// Update labels/concurrency without resetting inflight (for live agents).
+    /// Update labels/concurrency without dropping reservations in flight (for live agents).
     pub async fn update_agent_presence(
         &self,
         agent_id: Uuid,
@@ -316,17 +325,11 @@ impl Scheduler {
     /// Ask the agent holding `step_run_id` to kill it, wherever it is connected:
     /// delivered here if the socket is local, and always fanned out over Redis (a
     /// local send success only proves the writer task is alive, not that this replica
-    /// still holds the agent's live socket). `release_slot` frees the agent's
-    /// concurrency slot on the delivering replica — pass `false` when the completion
-    /// path already did.
-    pub async fn cancel_step_on_agent(
-        &self,
-        agent_id: Uuid,
-        step_run_id: Uuid,
-        release_slot: bool,
-    ) {
-        self.deliver_cancel(agent_id, step_run_id, release_slot)
-            .await;
+    /// still holds the agent's live socket). Nothing to do about the agent's slot: the
+    /// step row is no longer `running`, so the next offer's count already excludes it,
+    /// whether or not the Cancel ever arrives.
+    pub async fn cancel_step_on_agent(&self, agent_id: Uuid, step_run_id: Uuid) {
+        self.deliver_cancel(agent_id, step_run_id).await;
         self.publish_agent_command(&AgentCommand {
             agent_id,
             kind: AgentCommandKind::Cancel { step_run_id },
@@ -334,19 +337,9 @@ impl Scheduler {
         .await;
     }
 
-    async fn deliver_cancel(&self, agent_id: Uuid, step_run_id: Uuid, release_slot: bool) {
-        if !self
-            .send_local(agent_id, ServerMessage::Cancel { step_run_id })
-            .await
-        {
-            return;
-        }
-        if release_slot {
-            let mut agents = self.agents.write().await;
-            if let Some(a) = agents.get_mut(&agent_id) {
-                a.inflight = a.inflight.saturating_sub(1);
-            }
-        }
+    async fn deliver_cancel(&self, agent_id: Uuid, step_run_id: Uuid) {
+        self.send_local(agent_id, ServerMessage::Cancel { step_run_id })
+            .await;
     }
 
     pub async fn unregister_agent(&self, agent_id: Uuid) {
@@ -501,8 +494,9 @@ impl Scheduler {
     /// Start a run, then cancel anything it supersedes.
     ///
     /// Every path that starts a run goes through here — the API's manual start, both
-    /// GitHub webhook paths, and the schedule loop — because concurrency that four call
-    /// sites have to remember is concurrency that one of them will forget.
+    /// GitHub webhook paths, the schedule loop, and [`Scheduler::retry_run`] — because
+    /// concurrency that five call sites have to remember is concurrency that one of
+    /// them will forget.
     pub async fn start_run_for_commit(
         &self,
         pipeline_id: Uuid,
@@ -517,8 +511,8 @@ impl Scheduler {
             .store
             .start_run_for_commit(pipeline_id, trigger, commit)
             .await?;
-        self.cancel_superseded(&started.0).await;
-        Ok(started)
+        let started = self.cancel_superseded(started).await;
+        Ok((started.run, started.steps, started.dag))
     }
 
     pub async fn start_run(
@@ -534,35 +528,42 @@ impl Scheduler {
             .await
     }
 
-    /// Cancel the older unfinished runs of `run`'s concurrency group.
+    /// Re-run a finished run from its own snapshot. A retry is a new run in the same
+    /// concurrency group, so it supersedes the older ones exactly as a fresh start does.
+    pub async fn retry_run(
+        &self,
+        run_id: Uuid,
+        failed_only: bool,
+    ) -> Result<(fiber_core::Run, Vec<fiber_core::StepRun>)> {
+        let started = self.store.retry_run(run_id, failed_only).await?;
+        let started = self.cancel_superseded(started).await;
+        Ok((started.run, started.steps))
+    }
+
+    /// Cancel the runs the store found superseded when it created `started.run`. They
+    /// were decided under the group lock, so the set is exact; the cancels themselves
+    /// happen after that commit, and each is guarded, so one that finished in between
+    /// is left as it is.
     ///
-    /// Best effort by design: a run that finished between the query and the cancel is
-    /// already where we want it, and a cancel that fails must not take the new run down
-    /// with it — the worst case is one extra build, not a lost one.
-    async fn cancel_superseded(&self, run: &fiber_core::Run) {
-        let Some(group) = run.concurrency_group.as_deref() else {
-            return;
-        };
-        let older = match self
-            .store
-            .superseded_runs(run.project_id, group, run.id, run.created_at)
-            .await
-        {
-            Ok(ids) => ids,
-            Err(e) => {
-                warn!(run_id = %run.id, group, error = %e, "could not look up superseded runs");
-                return;
-            }
-        };
-        for id in older {
+    /// Best effort by design: a cancel that fails must not take the new run down with
+    /// it — the worst case is one extra build, not a lost one.
+    async fn cancel_superseded(
+        &self,
+        mut started: fiber_core::StartedRun,
+    ) -> fiber_core::StartedRun {
+        let group = started.run.concurrency_group.as_deref().unwrap_or("");
+        for id in std::mem::take(&mut started.superseded) {
             match self
                 .cancel_run_with_reason(id, Some("superseded by a newer run"))
                 .await
             {
-                Ok(_) => info!(superseded = %id, by = %run.id, group, "cancelled superseded run"),
+                Ok(_) => {
+                    info!(superseded = %id, by = %started.run.id, group, "cancelled superseded run")
+                }
                 Err(e) => warn!(run_id = %id, error = %e, "could not cancel superseded run"),
             }
         }
+        started
     }
 
     /// Cancel run in DB, notify agents to kill in-flight steps, publish events.
@@ -579,8 +580,7 @@ impl Scheduler {
 
         for s in &running {
             if let Some(aid) = s.agent_id {
-                // The replica that delivers the Cancel releases the agent's slot.
-                self.cancel_step_on_agent(aid, s.id, true).await;
+                self.cancel_step_on_agent(aid, s.id).await;
             }
             let ev = RunEvent::StepUpdated {
                 run_id: s.run_id,
@@ -625,21 +625,26 @@ impl Scheduler {
         Ok(run)
     }
 
-    /// Find a queued step matching agent labels + project pool and lease it.
+    /// Find a queued step matching agent labels + project pool and lease it, if the
+    /// agent has a free slot. Call again until it returns `None` to fill the agent.
+    ///
+    /// The slot count is the database's: steps `running` under this agent, whatever
+    /// replica leased them and whether or not this one ever saw them finish. The
+    /// in-memory reservation only bridges the gap between that count and the lease
+    /// committing, so two offers built at once on one replica cannot both fit through
+    /// the last slot.
     pub async fn offer_for_agent(&self, agent_id: Uuid) -> Result<Option<fiber_core::StepRun>> {
-        // Reserve a concurrency slot under one write lock (check + increment together),
-        // and give it back below if nothing was leased. Two concurrent offers for the
-        // same agent can no longer both pass the check.
         // Fail closed without presence: a socket that never sent Hello (or whose
         // presence was reclaimed) gets nothing rather than the global pool.
-        let agent_labels = {
+        let (agent_labels, concurrency, others_reserved) = {
             let mut agents = self.agents.write().await;
             match agents.get_mut(&agent_id) {
                 Some(a) => {
+                    let others = a.reserved;
                     if !a.try_reserve_slot() {
                         return Ok(None);
                     }
-                    a.labels.clone()
+                    (a.labels.clone(), a.concurrency, others)
                 }
                 None => {
                     debug!(%agent_id, "no presence for agent; not offering");
@@ -647,14 +652,30 @@ impl Scheduler {
                 }
             }
         };
-        let leased = self.try_lease_for(agent_id, agent_labels).await;
-        if !matches!(leased, Ok(Some(_))) {
-            let mut agents = self.agents.write().await;
-            if let Some(a) = agents.get_mut(&agent_id) {
-                a.release_slot();
-            }
+        let leased = self
+            .lease_within_slots(agent_id, agent_labels, concurrency, others_reserved)
+            .await;
+        // Leased or not, the reservation is done: a leased step is now `running` in
+        // the database and counted from there.
+        let mut agents = self.agents.write().await;
+        if let Some(a) = agents.get_mut(&agent_id) {
+            a.release_slot();
         }
         leased
+    }
+
+    async fn lease_within_slots(
+        &self,
+        agent_id: Uuid,
+        agent_labels: Vec<String>,
+        concurrency: u32,
+        others_reserved: u32,
+    ) -> Result<Option<fiber_core::StepRun>> {
+        let db_running = self.store.count_running_steps_for_agent(agent_id).await?;
+        if !slots_available(concurrency, db_running, others_reserved) {
+            return Ok(None);
+        }
+        self.try_lease_for(agent_id, agent_labels).await
     }
 
     async fn try_lease_for(
@@ -670,10 +691,12 @@ impl Scheduler {
 
         let queued = self
             .store
-            .list_queued_steps_for_pool(agent_project_id)
+            .list_queued_steps_for_pool(agent_project_id, &agent_labels)
             .await?;
         for step in queued {
             let needed = step.labels_vec();
+            // The query already filtered on containment; this is the same rule in Rust,
+            // kept as the check of record so a change to one is caught by the other.
             if labels_match(&agent_labels, &needed) {
                 if let Some(leased) = self.store.lease_step(step.id, agent_id, LEASE_SECS).await? {
                     info!(%agent_id, step = %leased.step_id, "leased step");
@@ -682,6 +705,30 @@ impl Scheduler {
             }
         }
         Ok(None)
+    }
+
+    /// Back out a lease whose offer could not be built and was never sent.
+    ///
+    /// The step goes back to the queue as it was before the lease (attempt counter and
+    /// all — the agent never saw it, so nothing ran); a cancel or reclaim that got
+    /// there first is left alone. Logged at error: this is a store failure on the
+    /// offer path, and the step will be leased again on the next heartbeat.
+    pub async fn release_offer(&self, agent_id: Uuid, step: &fiber_core::StepRun, reason: &str) {
+        match self.store.unlease_step(step.id, agent_id, reason).await {
+            Ok(Some(_)) => tracing::error!(
+                %agent_id, run_id = %step.run_id, step = %step.step_id, reason,
+                "offer could not be built; step returned to the queue"
+            ),
+            Ok(None) => tracing::error!(
+                %agent_id, run_id = %step.run_id, step = %step.step_id, reason,
+                "offer could not be built; step was already cancelled or reclaimed"
+            ),
+            Err(e) => tracing::error!(
+                %agent_id, run_id = %step.run_id, step = %step.step_id, reason, error = %e,
+                "offer could not be built and the lease could not be released; \
+                 the reclaim loop will requeue it when the lease expires"
+            ),
+        }
     }
 
     pub async fn renew_leases(&self, agent_id: Uuid) -> Result<()> {
@@ -700,19 +747,10 @@ impl Scheduler {
         exit_code: Option<i32>,
         error: Option<String>,
     ) -> Result<Option<fiber_core::StepRun>> {
+        // No slot bookkeeping here: the agent's slots are counted from `step_runs`
+        // at offer time, so a step whose row is gone, or one this replica never leased,
+        // frees its slot by no longer being `running` — nothing to remember.
         let found = self.store.get_step_run(step_run_id).await?;
-
-        // Decide about the slot before anything returns: a step whose rows were deleted
-        // under the agent still has to give its slot back.
-        if releases_slot(
-            found.as_ref().map(|s| (s.status_enum(), s.agent_id)),
-            agent_id,
-        ) {
-            let mut agents = self.agents.write().await;
-            if let Some(a) = agents.get_mut(&agent_id) {
-                a.release_slot();
-            }
-        }
 
         let Some(current) = found else {
             debug!(%step_run_id, "step complete for a row that no longer exists");
@@ -936,9 +974,7 @@ impl Scheduler {
                 Some(error),
             )
             .await?;
-            // on_step_complete already released the slot for a locally held agent.
-            self.cancel_step_on_agent(agent_id, t.step_run_id, false)
-                .await;
+            self.cancel_step_on_agent(agent_id, t.step_run_id).await;
         }
         for (run_id, minutes) in self.store.list_timed_out_runs().await? {
             warn!(run = %run_id, minutes, "run timed out");
@@ -982,23 +1018,16 @@ fn completion_is_current(
     current == StepStatus::Running && row_agent == Some(reporting_agent)
 }
 
-/// Whether a `StepComplete` should give the reporting agent its concurrency slot back.
+/// Whether one more lease fits under `concurrency`.
 ///
-/// `None` means the step row is gone — the run was deleted under a live agent, which
-/// happens when a project is deleted while one of its steps is running on a *global*
-/// agent that outlives it. The agent really did hold that slot, so it has to come back;
-/// leaving it taken permanently shrinks a shared agent's capacity until it reconnects.
-///
-/// The trade is that an agent could spam completions for ids that never existed and
-/// saturate its own counter to zero, taking more work than its `concurrency` allows.
-/// That is self-inflicted load on a host the agent already runs arbitrary pipeline shell
-/// on, and `release_slot` is saturating so it cannot wrap — whereas the leak is
-/// permanent and reachable by any project owner against an agent shared with others.
-fn releases_slot(current: Option<(StepStatus, Option<Uuid>)>, reporting_agent: Uuid) -> bool {
-    match current {
-        None => true,
-        Some((status, row_agent)) => completion_is_current(status, row_agent, reporting_agent),
-    }
+/// `db_running` is what the database shows running on the agent — the authoritative
+/// count, so a `Cancel` that never reached the agent, or a completion this replica never
+/// saw, frees its slot as soon as the row leaves `running`. `reserved` is the offers
+/// this replica is building for the agent right now, not yet leased and so not yet
+/// counted. Pure so the arithmetic (and its saturation) can be pinned without a store.
+fn slots_available(concurrency: u32, db_running: i64, reserved: u32) -> bool {
+    let running = u32::try_from(db_running.max(0)).unwrap_or(u32::MAX);
+    running.saturating_add(reserved) < concurrency
 }
 
 /// `Some(backoff_seconds)` when a finished step should be requeued for another attempt.
@@ -1032,11 +1061,11 @@ fn labels_match(agent: &[String], required: &[String]) -> bool {
 mod tests {
     use super::*;
 
-    fn presence(concurrency: u32, inflight: u32) -> AgentPresence {
+    fn presence(concurrency: u32, reserved: u32) -> AgentPresence {
         AgentPresence {
             labels: vec![],
             concurrency,
-            inflight,
+            reserved,
             project_id: None,
         }
     }
@@ -1044,20 +1073,59 @@ mod tests {
     // --- concurrency slots ------------------------------------------------------------
 
     #[test]
+    fn an_idle_agent_with_a_free_slot_is_offered_work() {
+        assert!(slots_available(1, 0, 0));
+        assert!(slots_available(4, 2, 1));
+    }
+
+    #[test]
+    fn a_step_the_database_shows_running_holds_its_slot() {
+        // Whether or not this replica leased it, saw it finish, or delivered its
+        // Cancel: the row says running, so the slot is taken.
+        assert!(!slots_available(1, 1, 0));
+        assert!(!slots_available(4, 4, 0));
+    }
+
+    #[test]
+    fn a_slot_comes_back_the_moment_the_row_leaves_running() {
+        // The lost-Cancel case: the row is `cancelled`, so the count drops, and no
+        // in-memory release has to happen for the agent to get its capacity back.
+        assert!(!slots_available(1, 1, 0));
+        assert!(slots_available(1, 0, 0));
+    }
+
+    #[test]
+    fn an_offer_being_built_on_this_replica_counts_against_the_cap() {
+        // db_running has not caught up with a lease that is about to commit; the
+        // reservation covers that instant.
+        assert!(!slots_available(2, 1, 1));
+        assert!(slots_available(3, 1, 1));
+    }
+
+    #[test]
+    fn slot_arithmetic_cannot_overflow_into_free_capacity() {
+        assert!(!slots_available(u32::MAX, i64::MAX, 1));
+        assert!(!slots_available(u32::MAX, i64::from(u32::MAX), 1));
+        // A negative count is a store bug, not free capacity.
+        assert!(slots_available(1, -5, 0));
+    }
+
+    #[test]
     fn an_agent_reserves_up_to_its_concurrency_and_no_further() {
         let mut a = presence(2, 0);
         assert!(a.try_reserve_slot());
         assert!(a.try_reserve_slot());
         assert!(!a.try_reserve_slot(), "the cap must hold");
-        assert_eq!(a.inflight, 2, "a refused reservation must not count");
+        assert_eq!(a.reserved, 2, "a refused reservation must not count");
     }
 
     #[test]
     fn a_zero_concurrency_agent_is_never_offered_work() {
-        // An agent that reported concurrency 0 (or was drained) takes nothing.
+        // register_agent clamps to 1, but a presence built any other way still fails
+        // closed rather than open.
         let mut a = presence(0, 0);
         assert!(!a.try_reserve_slot());
-        assert_eq!(a.inflight, 0);
+        assert_eq!(a.reserved, 0);
     }
 
     #[test]
@@ -1076,7 +1144,7 @@ mod tests {
         let mut a = presence(1, 0);
         a.release_slot();
         a.release_slot();
-        assert_eq!(a.inflight, 0);
+        assert_eq!(a.reserved, 0);
         assert!(a.try_reserve_slot());
         assert!(
             !a.try_reserve_slot(),
@@ -1135,54 +1203,6 @@ mod tests {
             None,
             Uuid::new_v4()
         ));
-    }
-
-    // --- slot release -----------------------------------------------------------------
-
-    #[test]
-    fn a_step_whose_rows_were_deleted_still_gives_its_slot_back() {
-        // Deleting a project cancels and removes its runs. A step of that project
-        // running on a *global* agent — which survives the project — reports into
-        // nothing; the agent held the slot and must get it back, or a shared agent
-        // silently loses capacity until it reconnects.
-        assert!(releases_slot(None, Uuid::new_v4()));
-    }
-
-    #[test]
-    fn the_leaseholder_finishing_its_own_step_gives_the_slot_back() {
-        let agent = Uuid::new_v4();
-        assert!(releases_slot(
-            Some((StepStatus::Running, Some(agent))),
-            agent
-        ));
-    }
-
-    #[test]
-    fn a_late_report_does_not_give_back_a_slot_it_no_longer_holds() {
-        // The lease moved to another agent. Releasing here would let the original agent
-        // take work beyond its cap while still running the step it was reporting on.
-        let old_agent = Uuid::new_v4();
-        let new_agent = Uuid::new_v4();
-        assert!(!releases_slot(
-            Some((StepStatus::Running, Some(new_agent))),
-            old_agent
-        ));
-    }
-
-    #[test]
-    fn a_report_for_an_already_finished_step_does_not_release_again() {
-        let agent = Uuid::new_v4();
-        for status in [
-            StepStatus::Succeeded,
-            StepStatus::Failed,
-            StepStatus::Cancelled,
-            StepStatus::Skipped,
-        ] {
-            assert!(
-                !releases_slot(Some((status, Some(agent))), agent),
-                "{status:?} already released its slot once"
-            );
-        }
     }
 
     // --- retry policy -----------------------------------------------------------------

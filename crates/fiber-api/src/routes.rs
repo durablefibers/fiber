@@ -904,8 +904,10 @@ async fn retry_run(
 ) -> Result<impl IntoResponse, ApiError> {
     crate::access::require_run(&state, &user, id, ProjectRole::Writer).await?;
     let failed_only = body.map(|Json(b)| b.failed_only).unwrap_or(false);
+    // Through the scheduler: a retry is a new run in the original's concurrency group
+    // and has to supersede the older ones like any other start.
     let (run, steps) = state
-        .store
+        .scheduler
         .retry_run(id, failed_only)
         .await
         .map_err(ApiError::from)?;
@@ -2004,9 +2006,10 @@ impl IntoResponse for ApiError {
 mod concurrency_funnel {
     //! Starting a run has to go through the scheduler, which is where a new run cancels
     //! the older ones in its concurrency group. Four call sites reach this code — the
-    //! manual start, both webhook paths, and the schedule loop — and a fifth that called
-    //! the store directly would silently opt out of concurrency with nothing to show for
-    //! it. Audit the source rather than trust the next author to notice.
+    //! manual start, the retry, and both webhook paths (the schedule loop lives in the
+    //! scheduler itself) — and a fifth that called the store directly would silently opt
+    //! out of concurrency with nothing to show for it. Audit the source rather than
+    //! trust the next author to notice.
 
     /// Everything above the first `#[cfg(test)]`, so this module's own text — which
     /// necessarily contains the pattern it looks for — is not what gets audited.
@@ -2021,7 +2024,7 @@ mod concurrency_funnel {
         let lines: Vec<&str> = src.lines().map(str::trim).collect();
         let mut offenders = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            if !line.starts_with(".start_run") {
+            if !starts_a_run(line) {
                 continue;
             }
             // The receiver is the previous non-blank line: `.scheduler` or `.store`.
@@ -2038,22 +2041,34 @@ mod concurrency_funnel {
         assert!(
             offenders.is_empty(),
             "these start a run without the scheduler, skipping concurrency — use \
-             state.scheduler.start_run / start_run_for_commit: {offenders:?}"
+             state.scheduler.start_run / start_run_for_commit / retry_run: {offenders:?}"
         );
+    }
+
+    /// A retry creates a run too, and used to reach the store directly — which is how
+    /// a retried `main` build stopped superseding the next push.
+    fn starts_a_run(line: &str) -> bool {
+        line.starts_with(".start_run") || line.starts_with(".retry_run")
     }
 
     #[test]
     fn the_audit_can_see_the_calls_it_is_guarding() {
-        // A rename that made `.start_run` unfindable would leave the test above passing
-        // over nothing at all.
-        let n = handler_source()
+        // A rename that made `.start_run` / `.retry_run` unfindable would leave the
+        // test above passing over nothing at all.
+        let src = handler_source();
+        let starts = src
             .lines()
             .filter(|l| l.trim().starts_with(".start_run"))
             .count();
+        let retries = src
+            .lines()
+            .filter(|l| l.trim().starts_with(".retry_run"))
+            .count();
         assert!(
-            n >= 3,
-            "expected the manual and both webhook starts, found {n}"
+            starts >= 3,
+            "expected the manual and both webhook starts, found {starts}"
         );
+        assert_eq!(retries, 1, "expected exactly the retry route's call");
     }
 }
 
