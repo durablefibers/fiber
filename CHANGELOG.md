@@ -6,6 +6,22 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-09-19
+
+Four phases of the September hardening audit, and the first dependency advisory the new
+supply-chain gate caught.
+
+**Upgrade the API before the agents**, and read
+[operations](docs/operations.md#upgrades) first on a large install: this release adds
+migrations 015 and 016, changes what a lost lease costs a step, and makes a disconnect
+stop requeueing.
+
+Security: rustls moves to 0.23.45 for
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285), which accepted TLS
+1.3 handshake messages across encryption-level boundaries. It sits under reqwest, the
+S3 client and both WebSocket stacks, so it is on every connection the API, the agent and
+the CLI make.
+
 Adds migration 015: three indexes, one dropped index, a unique index on artifacts (after
 removing duplicate rows), and `CHECK` constraints on the two status columns, added
 `NOT VALID` so an old database with a stray status string still boots. Adds migration
