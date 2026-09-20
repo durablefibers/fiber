@@ -1,3 +1,7 @@
+mod run_bus;
+
+pub use run_bus::{EventHead, RunBus, RunSubscription, event_head};
+
 use anyhow::Result;
 use chrono::Utc;
 use fiber_core::{DueIndex, Store, has_schedule, next_due_from_triggers, schedule_trigger_label};
@@ -63,7 +67,14 @@ pub struct Scheduler {
     agents: Arc<RwLock<HashMap<Uuid, AgentPresence>>>,
     /// agent_id -> outbound WS sender
     connections: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<ServerMessage>>>>,
+    /// Control events (run and step status) for in-process consumers that watch the
+    /// whole instance — today the commit-status reporter. Log events are deliberately
+    /// not on it: the only thing that wants them is a run's viewers, who get them from
+    /// `run_bus`, and putting a build's output here would lag the reporter off every
+    /// run it is waiting for.
     events: broadcast::Sender<String>,
+    /// Per-run fan-out for `/ws/runs/{id}`.
+    run_bus: RunBus,
     /// Earliest schedule due per pipeline (memoturn DueIndex pattern).
     schedule_due: Arc<DueIndex<Uuid>>,
     /// Distinguishes this process so Redis echo is not double-delivered locally.
@@ -134,6 +145,7 @@ impl Scheduler {
             agents: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(HashMap::new())),
             events,
+            run_bus: RunBus::new(),
             schedule_due: Arc::new(DueIndex::new()),
             instance_id: Uuid::new_v4(),
         }
@@ -151,8 +163,16 @@ impl Scheduler {
         Ok(())
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+    /// Watch every run's control events on this instance. Not for viewers: one run's
+    /// stream is [`Scheduler::subscribe_run`].
+    pub fn subscribe_control(&self) -> broadcast::Receiver<String> {
         self.events.subscribe()
+    }
+
+    /// Watch one run. The channel is created on the first subscriber and dropped with
+    /// the last, so a viewer is never woken by another run's output.
+    pub fn subscribe_run(&self, run_id: Uuid) -> RunSubscription {
+        self.run_bus.subscribe(run_id)
     }
 
     /// Liveness probe for Redis (used by `/ready`).
@@ -164,12 +184,27 @@ impl Scheduler {
 
     pub async fn publish_event(&self, payload: &str) {
         // Local subscribers get the event immediately.
-        let _ = self.events.send(payload.to_string());
+        self.fan_out_local(payload);
         // Other API instances receive via Redis; envelope skips echo on this node.
         let envelope = format!("{}|{}", self.instance_id, payload);
         let mut redis = self.redis.clone();
         if let Err(e) = redis.publish::<_, _, ()>(EVENTS_CHANNEL, envelope).await {
             warn!(error = %e, "redis publish fiber:events failed");
+        }
+    }
+
+    /// Deliver one event to this instance's subscribers: always to the run's own
+    /// channel, and to the control bus unless it is log output.
+    ///
+    /// The payload is parsed once here, for the run id, instead of once per viewer per
+    /// event as it used to be.
+    fn fan_out_local(&self, payload: &str) {
+        let Some(head) = event_head(payload) else {
+            return;
+        };
+        self.run_bus.publish(head.run_id, payload);
+        if !head.is_log {
+            let _ = self.events.send(payload.to_string());
         }
     }
 
@@ -202,7 +237,7 @@ impl Scheduler {
             if payload.is_empty() {
                 continue;
             }
-            let _ = self.events.send(payload.to_string());
+            self.fan_out_local(payload);
         }
         Ok(())
     }
