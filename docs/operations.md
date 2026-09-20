@@ -293,6 +293,14 @@ and `scripts/install-agent.sh` can verify it. It used to be the one file the ins
 fetched unchecked, and it is the file that decides which binary runs as which user — a
 tampered unit is root on the build host no matter how carefully the tarball was verified.
 
+The unit has no attestation of its own — `publish` attests `SHA256SUMS`, not each asset —
+so the installer verifies `SHA256SUMS` itself with the same four `gh` flags before it lets
+that manifest vouch for the unit. Without that step an attacker who can edit an
+already-published release's assets could keep the real tarball hash in `SHA256SUMS`,
+substitute the hash of their own unit, and pass every check. When the manifest is not
+attested the installer takes the unit from git at the tag instead, which needs repository
+write to tamper with.
+
 ### What a release attests to
 
 From the first release after v0.6.2 the release workflow mints [GitHub build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
@@ -319,7 +327,10 @@ Three subjects are attested, each in the job that produces it:
 The per-tarball attestation is the authority; `SHA256SUMS` is a convenience. They are not
 equivalent, and the difference is which job signed them: a tarball is signed by `binaries`,
 which holds only `contents: read`, while `SHA256SUMS` is signed by `publish`, the most
-privileged job in the workflow. Verify the tarball directly when it matters.
+privileged job in the workflow. Verify the tarball directly when it matters. The one thing
+`SHA256SUMS` is the authority for is the systemd unit, which has no attestation of its own
+— which is exactly why the installer will not use it for that until it has verified the
+manifest's own attestation.
 
 Those three jobs — and only those — carry `id-token: write` and `attestations: write`, so
 a step added to `verify` or `images` later cannot quietly mint an attestation.

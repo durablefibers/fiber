@@ -60,12 +60,14 @@ CapabilityBoundingSet=
 # sockets, tcpdump), AF_VSOCK, or AF_ALG (kernel crypto — some crypto test suites and
 # cryptsetup use it) must add them in a drop-in.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# 0027, not 0077. The agent creates and clones the workspace under this umask and then
-# bind-mounts it into the step container: at 0077 the workspace is 0700, so any image
-# with a non-root USER, or FIBER_AGENT_DOCKER_USER set, fails at `cd /workspace` with
-# EACCES and nothing in the log explaining why. 0027 still denies other users, which is
-# all 0077 was buying — everything under /var/lib/fiber is already fiber-owned inside a
-# 0750 directory. See docs/configuration.md under FIBER_AGENT_DOCKER_USER.
+# 0027 rather than 0077. It costs nothing — /var/lib/fiber is already 0750 fiber:fiber,
+# so "other" gets nothing either way — and it is a precondition for a step container
+# reading the bind-mounted workspace. It is NOT on its own a fix: the agent creates and
+# clones the workspace as fiber:fiber, and `docker run` is issued without --group-add, so
+# a container running as some other uid/gid still gets EACCES on `cd /workspace`. Make the
+# container share the fiber gid (FIBER_AGENT_DOCKER_USER=<uid>:<fiber-gid>), or set
+# UMask=0022 in a drop-in and accept world-readable build files. See
+# docs/configuration.md under FIBER_AGENT_DOCKER_USER for the whole decision.
 UMask=0027
 
 # Considered and deliberately NOT set, because each one breaks ordinary builds:

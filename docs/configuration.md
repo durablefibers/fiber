@@ -115,15 +115,23 @@ what it is replacing; no crate reads them, and they are not deployment configura
 
 The agent creates and clones the step workspace itself and then bind-mounts it into the
 container, so the umask the *agent* runs under decides whether the container user can read
-it. `deploy/fiber-agent.service` sets `UMask=0027` for that reason: at `0077` the workspace
-is mode `0700`, and any image with a non-root `USER`, or any `FIBER_AGENT_DOCKER_USER`
-that is not the `fiber` uid, fails at `cd /workspace` with `EACCES` and nothing in the step
-log explaining why.
+it. `deploy/fiber-agent.service` sets `UMask=0027`, which makes the workspace `0750
+fiber:fiber` instead of `0700`.
 
-`0027` still denies every other user on the host, which is all `0077` was buying:
-everything under `/var/lib/fiber` is already `fiber`-owned inside a `0750` directory. If
-your images run as a user in no shared group and you need group access too, override with
-`UMask=0022` in a drop-in rather than lowering the state directory's mode.
+**That alone is not enough.** The agent issues `docker run` without `--group-add`, so a
+container running as some other uid/gid is in no group matching the host's `fiber` gid and
+still gets `EACCES` on `cd /workspace` — with nothing in the step log explaining why. Under
+the systemd unit you have two working configurations:
+
+| | Result |
+|---|---|
+| `FIBER_AGENT_DOCKER_USER=<uid>:<fiber-gid>` | Container shares the `fiber` group, reads the `0750` workspace. `getent group fiber` for the gid. Preferred. |
+| `UMask=0022` in a drop-in | Workspace is `0755`; any container user can read it, and so can every other user on the host. |
+
+`UMask=0027` is kept because it costs nothing on its own — `/var/lib/fiber` is already
+`0750 fiber:fiber`, so "other" gets nothing either way — not because it fixes the Docker
+case by itself. Leaving `FIBER_AGENT_DOCKER_USER` unset (the image default, usually root)
+also works, since root in the container ignores the mode.
 
 ### `SSH_AUTH_SOCK` under the systemd unit
 

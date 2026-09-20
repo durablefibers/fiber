@@ -30,8 +30,11 @@
 #      GitHub-hosted runner. Pinning the ref is what stops a release-page attacker
 #      replacing the assets with a genuine, still-validly-attested build of an older
 #      vulnerable tag. This is the only check a compromised release page cannot forge.
-#   4. The systemd unit comes from the same tag, and its hash from the same attested
-#      SHA256SUMS, because the unit decides which binary runs as which user.
+#   4. The systemd unit comes from the same tag. It has no attestation of its own, so
+#      it is taken from the release assets only when SHA256SUMS *itself* verified as
+#      attested; otherwise from git at that tag, which a release-page attacker does not
+#      control. The unit decides which binary runs as which user, so it is not allowed
+#      to rest on an unauthenticated list of hashes.
 #
 # Under `sudo`, `env_reset` drops GH_TOKEN and points HOME at /root, so `gh` is very
 # often present but not authenticated — in which case (3) does not happen. The script
@@ -195,12 +198,20 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 CHECKSUM_RESULT=""
+CHECKSUM_SOURCE=""
 PROVENANCE_RESULT=""
 ASSET_SHA256=""
 # Only true when the guarantee was actually obtained — a skip or an unusable `gh`
 # leaves these false, which is what --check-only's exit code reports.
 CHECKSUM_OK="false"
 PROVENANCE_OK="false"
+# True only when SHA256SUMS itself carries a valid attestation. The unit has no
+# attestation of its own, so this is the only thing standing between a release-page
+# attacker and a unit of their choosing — see the unit section.
+SUMS_ATTESTED="false"
+# A check that ran and came back wrong, as opposed to one that could not be run. The
+# two have to be told apart or --check-only's exit code lies about which happened.
+VERIFY_FAILED="false"
 UNIT_ORIGIN=""
 
 verify_checksum() {
@@ -230,16 +241,19 @@ Refusing to install unverified bits. Pass --insecure-skip-checksum to override."
   expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
   if [[ "$expected" != "$(printf '%s' "$ASSET_SHA256" | tr '[:upper:]' '[:lower:]')" ]]; then
     if [[ "$SKIP_CHECKSUM" == "true" ]]; then
+      VERIFY_FAILED="true"
       CHECKSUM_RESULT="SKIPPED — $source says $expected, the download is $ASSET_SHA256, and --insecure-skip-checksum was passed"
       echo "WARNING: $CHECKSUM_RESULT" >&2
       return 0
     fi
+    VERIFY_FAILED="true"
     die "checksum mismatch for $ASSET
   expected:   $expected   (from $source)
   downloaded: $ASSET_SHA256
 Do not install this. Re-download, and if it happens again report it."
   fi
   CHECKSUM_OK="true"
+  CHECKSUM_SOURCE="$source"
   CHECKSUM_RESULT="OK — matches $source from release $RESOLVED_TAG (integrity only: same origin as the tarball)"
   echo "checksum ok ($source)"
 }
@@ -249,6 +263,50 @@ Do not install this. Re-download, and if it happens again report it."
 # env_reset drops GH_TOKEN and HOME, making an unauthenticated `gh` the normal case —
 # the operator learned that provenance was skipped only in the summary, after the
 # agent was installed and running.
+GH_UNUSABLE_REASON=""
+
+# One place that decides whether provenance can be checked at all, so the tarball and
+# SHA256SUMS cannot disagree about it.
+gh_usable() {
+  if ! command -v gh >/dev/null 2>&1; then
+    GH_UNUSABLE_REASON="the gh CLI is not installed (https://cli.github.com)."
+    return 1
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    GH_UNUSABLE_REASON="gh is installed but not authenticated for this user. Under
+    sudo this is expected: env_reset drops GH_TOKEN and HOME points at /root. Use
+    'sudo --preserve-env=GH_TOKEN', or run --check-only as yourself first."
+    return 1
+  fi
+  # Both flags below are load-bearing, and an older gh accepts neither. Without this
+  # probe that shows up as a verification *failure*, i.e. "treat this as a tampered
+  # download", which sends the operator hunting for an attack that is not there.
+  local help
+  help="$(gh attestation verify --help 2>&1)"
+  if [[ "$help" != *"--source-ref"* || "$help" != *"--deny-self-hosted-runners"* ]]; then
+    GH_UNUSABLE_REASON="this gh is too old: 'gh attestation verify' has no --source-ref
+    and/or no --deny-self-hosted-runners, so an attestation could not be pinned to
+    $RESOLVED_TAG or to a GitHub-hosted runner. Upgrade gh, or verify on another machine."
+    return 1
+  fi
+  return 0
+}
+
+# Quiet, non-fatal. $1 = file to verify, $2 = where to put gh's output.
+#
+# --source-ref is what binds the attestation to the *version* being installed. Without
+# it, a genuine and still-validly-attested artifact from an older, vulnerable tag passes
+# both the checksum (swap SHA256SUMS too) and the provenance check.
+# --deny-self-hosted-runners makes the "GitHub-hosted runner" claim in the docs real.
+gh_verify() {
+  gh attestation verify "$1" --repo "$REPO" \
+    --signer-workflow "$SIGNER_WORKFLOW" \
+    --source-ref "refs/tags/$RESOLVED_TAG" \
+    --deny-self-hosted-runners \
+    >"$2" 2>&1
+}
+
+# Every "we did not check" path warns here and now.
 provenance_unavailable() {
   local why="$1"
   PROVENANCE_RESULT="NOT CHECKED — $why"
@@ -256,39 +314,51 @@ provenance_unavailable() {
   echo "WARNING: the checksum only proves this tarball matches the release page. Nothing" >&2
   echo "WARNING: here proves the release page itself was not tampered with." >&2
   echo "WARNING: verify as yourself instead:  install-agent.sh --check-only" >&2
-  if [[ "$REQUIRE_ATTESTATION" == "true" ]]; then
-    die "--require-attestation was passed and provenance could not be checked."
+}
+
+# The tarball has its own attestation, so nothing here depends on SHA256SUMS being
+# honest — but `fiber-agent.service` has none, and `publish` attests only the manifest.
+# Left unchecked, an attacker who can edit an already-published release's assets can
+# leave the genuine tarball alone, rewrite SHA256SUMS keeping the real tarball hash and
+# substituting the hash of their own unit, upload that unit, and watch the installer
+# print "checksum ok / provenance ok / unit checksum ok" before starting a unit whose
+# ExecStart= and User= they chose. No commit, no tag, invisible to anyone re-verifying
+# the tarball. So the manifest is only allowed to vouch for the unit once it has been
+# attested itself.
+verify_sums_attestation() {
+  [[ "$CHECKSUM_SOURCE" == "SHA256SUMS" ]] || return 0
+  if ! gh_usable; then
+    echo "note: SHA256SUMS was not attestation-checked, so the unit will come from git" >&2
+    echo "      rather than from the release assets ($GH_UNUSABLE_REASON)" >&2
+    return 0
   fi
+  if gh_verify "$TMP/SHA256SUMS" "$TMP/attest-sums.out"; then
+    SUMS_ATTESTED="true"
+    echo "SHA256SUMS provenance ok"
+    return 0
+  fi
+  echo "WARNING: SHA256SUMS carries no valid attestation for refs/tags/$RESOLVED_TAG." >&2
+  echo "WARNING: it will not be trusted to vouch for the systemd unit; the unit will" >&2
+  echo "WARNING: come from git at the tag instead, which an attacker holding only the" >&2
+  echo "WARNING: release page does not control." >&2
+  sed 's/^/  gh: /' "$TMP/attest-sums.out" >&2
 }
 
 verify_attestation() {
   local file="$1"
-  if ! command -v gh >/dev/null 2>&1; then
-    provenance_unavailable "the gh CLI is not installed (https://cli.github.com)."
+  if ! gh_usable; then
+    provenance_unavailable "$GH_UNUSABLE_REASON"
     return 0
   fi
-  if ! gh auth status >/dev/null 2>&1; then
-    provenance_unavailable "gh is installed but not authenticated for this user. Under
-    sudo this is expected: env_reset drops GH_TOKEN and HOME points at /root. Use
-    'sudo --preserve-env=GH_TOKEN', or run --check-only as yourself first."
-    return 0
-  fi
-  # --source-ref is what binds the attestation to the *version* being installed.
-  # Without it, a genuine and still-validly-attested tarball from an older, vulnerable
-  # tag passes both the checksum (swap SHA256SUMS too) and the provenance check.
-  # --deny-self-hosted-runners makes the "GitHub-hosted runner" claim in the docs real.
-  if gh attestation verify "$file" --repo "$REPO" \
-      --signer-workflow "$SIGNER_WORKFLOW" \
-      --source-ref "refs/tags/$RESOLVED_TAG" \
-      --deny-self-hosted-runners \
-      >"$TMP/attest.out" 2>&1; then
+  if gh_verify "$file" "$TMP/attest.out"; then
     PROVENANCE_OK="true"
     PROVENANCE_RESULT="VERIFIED — $SIGNER_WORKFLOW at refs/tags/$RESOLVED_TAG, GitHub-hosted runner"
     echo "provenance ok (gh attestation verify)"
     return 0
   fi
+  VERIFY_FAILED="true"
   if [[ "$SKIP_ATTESTATION" == "true" ]]; then
-    PROVENANCE_RESULT="SKIPPED — gh attestation verify failed and --insecure-skip-attestation was passed"
+    PROVENANCE_RESULT="FAILED, then SKIPPED — gh attestation verify failed and --insecure-skip-attestation was passed"
     echo "WARNING: $PROVENANCE_RESULT" >&2
     echo "WARNING: nothing proves this tarball came from $SIGNER_WORKFLOW." >&2
     sed 's/^/  gh: /' "$TMP/attest.out" >&2
@@ -331,11 +401,86 @@ else
   ASSET_SHA256="$(sha256_of "$TMP/$ASSET")"
   verify_checksum "$BASE"
   verify_attestation "$TMP/$ASSET"
+  verify_sums_attestation
   tar -xzf "$TMP/$ASSET" -C "$TMP"
 fi
 
 [[ -f "$TMP/fiber-agent" ]] || die "the tarball does not contain fiber-agent"
 BIN_SHA256="$(sha256_of "$TMP/fiber-agent")"
+
+# --- the unit -----------------------------------------------------------------
+
+# The unit decides which binary runs as which user, so where it comes from matters as
+# much as the binary does. Resolved *before* anything is written to the host, so a
+# failure here cannot leave a new binary paired with the old unit. In order:
+#   1. the checkout this script is running from
+#   2. the release asset — but only when SHA256SUMS itself verified as attested,
+#      because the unit has no attestation of its own and an unattested manifest is
+#      exactly what a release-page attacker would rewrite
+#   3. raw.githubusercontent.com at the resolved tag. Not a weaker fallback: it is the
+#      stronger of the two remote paths, because an attacker who can replace release
+#      assets does not thereby control the repository at that tag.
+UNIT_SRC=""
+
+# `$0` is the literal string "bash" under `curl | sudo bash -s --`, and `[[ -f bash ]]`
+# resolves it against the current directory: a planted ./bash next to a planted
+# ../deploy/fiber-agent.service would have installed an attacker's unit — with its own
+# ExecStart= and User=root — the next time an admin ran the documented command from
+# that directory. BASH_SOURCE[0] is unset for a script read from stdin and set only
+# when bash is executing a real file, so it cannot be spoofed that way. The basename
+# check is belt and braces.
+SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "$SELF" && -f "$SELF" && "$(basename "$SELF")" == "install-agent.sh" ]]; then
+  candidate="$(dirname "$SELF")/../deploy/fiber-agent.service"
+  if [[ -f "$candidate" ]]; then
+    UNIT_SRC="$candidate"
+    UNIT_ORIGIN="$candidate (this checkout, not the release)"
+  fi
+fi
+
+if [[ -z "$UNIT_SRC" ]]; then
+  resolve_tag
+  if [[ -n "${TARBALL:-}" ]]; then
+    echo "warning: --tarball has no tag of its own, so the unit is being paired with" >&2
+    echo "         release $RESOLVED_TAG. Run the installer from a checkout to avoid that." >&2
+  fi
+  unit_asset_url="https://github.com/$REPO/releases/download/$RESOLVED_TAG/fiber-agent.service"
+  unit_raw_url="https://raw.githubusercontent.com/$REPO/$RESOLVED_TAG/deploy/fiber-agent.service"
+  unit_expected=""
+  if [[ -f "$TMP/SHA256SUMS" && "$SUMS_ATTESTED" == "true" ]]; then
+    unit_expected="$(awk '$2 == "fiber-agent.service" || $2 == "*fiber-agent.service" {print $1; exit}' "$TMP/SHA256SUMS")"
+  fi
+  if [[ -n "$unit_expected" ]] && curl -fsSL "$unit_asset_url" -o "$TMP/fiber-agent.service" 2>/dev/null; then
+    unit_actual="$(sha256_of "$TMP/fiber-agent.service" | tr '[:upper:]' '[:lower:]')"
+    unit_expected="$(printf '%s' "$unit_expected" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$unit_expected" != "$unit_actual" ]]; then
+      die "checksum mismatch for fiber-agent.service
+  expected (SHA256SUMS): $unit_expected
+  downloaded:            $unit_actual
+Do not install this: the unit chooses what runs as which user."
+    fi
+    UNIT_SRC="$TMP/fiber-agent.service"
+    UNIT_ORIGIN="$unit_asset_url (sha256 in the attested SHA256SUMS)"
+    echo "unit checksum ok (attested SHA256SUMS)"
+  elif curl -fsSL "$unit_raw_url" -o "$TMP/fiber-agent.service"; then
+    UNIT_SRC="$TMP/fiber-agent.service"
+    UNIT_ORIGIN="$unit_raw_url (git at the tag; no hash to check it against)"
+    echo "note: the unit came from git at $RESOLVED_TAG, not from the release assets" >&2
+    echo "      ($unit_raw_url)." >&2
+    echo "      Either the release publishes no fiber-agent.service asset, or its" >&2
+    echo "      SHA256SUMS is not attested and so may not vouch for one. There is no" >&2
+    echo "      hash to check this copy against, but changing it needs repository write," >&2
+    echo "      not just the ability to edit a published release's assets." >&2
+  else
+    # Keeping whatever unit is already on disk would pair a new binary with an old
+    # unit, which is the exact mismatch this installer exists to prevent.
+    die "could not obtain deploy/fiber-agent.service for $RESOLVED_TAG from either
+  $unit_asset_url
+  $unit_raw_url
+Refusing to install a new binary against the unit already on disk. Re-run with
+network access, or from a checkout of the matching tag."
+  fi
+fi
 
 report() {
   echo
@@ -346,6 +491,13 @@ report() {
   echo "  sha256    $BIN_SHA256"
   echo "checksum:   $CHECKSUM_RESULT"
   echo "provenance: $PROVENANCE_RESULT"
+  if [[ "$CHECKSUM_SOURCE" == "SHA256SUMS" ]]; then
+    if [[ "$SUMS_ATTESTED" == "true" ]]; then
+      echo "SHA256SUMS: attested, so it may vouch for the systemd unit"
+    else
+      echo "SHA256SUMS: NOT attested, so it may not vouch for the systemd unit"
+    fi
+  fi
   if [[ -n "$UNIT_ORIGIN" ]]; then
     echo "unit:       $UNIT_ORIGIN"
   fi
@@ -356,13 +508,17 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
   report
   echo "--check-only: nothing was installed."
   # A verification command has to report verification in its exit code, or a script
-  # that calls it learns nothing. 0 = both guarantees; 2 = one could not be obtained
-  # (no usable gh, or an --insecure-skip-*); 1 = a check ran and failed, which the
-  # die() paths above already produced.
+  # that calls it learns nothing. 0 = both guarantees; 1 = a check ran and came back
+  # wrong (including one silenced by --insecure-skip-*, which changes whether we stop,
+  # not whether it failed); 2 = a check could not be run at all.
   if [[ "$CHECKSUM_OK" == "true" && "$PROVENANCE_OK" == "true" ]]; then
     exit 0
   fi
-  echo "--check-only: NOT fully verified — see the checksum/provenance lines above." >&2
+  if [[ "$VERIFY_FAILED" == "true" ]]; then
+    echo "--check-only: a check FAILED — see the lines above. Treat this download as hostile." >&2
+    exit 1
+  fi
+  echo "--check-only: NOT fully verified — a check could not be run; see above." >&2
   exit 2
 fi
 
@@ -392,74 +548,15 @@ if ! ldd --version 2>&1 | grep -qiE 'glibc|gnu libc'; then
   echo "warning: this build targets glibc; on musl (Alpine) it will fail to start" >&2
 fi
 
-# --- the unit -----------------------------------------------------------------
-
-# The unit decides which binary runs as which user, so where it comes from matters as
-# much as the binary does. Resolved *before* anything is written to the host, so a
-# failure here cannot leave a new binary paired with the old unit. In order:
-#   1. the checkout this script is running from
-#   2. the release asset, whose hash is in the attested SHA256SUMS
-#   3. raw.githubusercontent.com at the resolved tag — right tag, unverified
-UNIT_SRC=""
-
-# `$0` is the literal string "bash" under `curl | sudo bash -s --`, and `[[ -f bash ]]`
-# resolves it against the current directory: a planted ./bash next to a planted
-# ../deploy/fiber-agent.service would have installed an attacker's unit — with its own
-# ExecStart= and User=root — the next time an admin ran the documented command from
-# that directory. BASH_SOURCE[0] is unset for a script read from stdin and set only
-# when bash is executing a real file, so it cannot be spoofed that way. The basename
-# check is belt and braces.
-SELF="${BASH_SOURCE[0]:-}"
-if [[ -n "$SELF" && -f "$SELF" && "$(basename "$SELF")" == "install-agent.sh" ]]; then
-  candidate="$(dirname "$SELF")/../deploy/fiber-agent.service"
-  if [[ -f "$candidate" ]]; then
-    UNIT_SRC="$candidate"
-    UNIT_ORIGIN="$candidate (this checkout, not the release)"
-  fi
-fi
-
-if [[ -z "$UNIT_SRC" ]]; then
-  if [[ -n "${TARBALL:-}" ]]; then
-    echo "warning: --tarball has no tag to pair the unit with; taking it from the newest" >&2
-    echo "         release instead. Run the installer from a checkout to avoid that." >&2
-  fi
-  resolve_tag
-  unit_asset_url="https://github.com/$REPO/releases/download/$RESOLVED_TAG/fiber-agent.service"
-  unit_raw_url="https://raw.githubusercontent.com/$REPO/$RESOLVED_TAG/deploy/fiber-agent.service"
-  unit_expected=""
-  if [[ -f "$TMP/SHA256SUMS" ]]; then
-    unit_expected="$(awk '$2 == "fiber-agent.service" || $2 == "*fiber-agent.service" {print $1; exit}' "$TMP/SHA256SUMS")"
-  fi
-  if [[ -n "$unit_expected" ]] && curl -fsSL "$unit_asset_url" -o "$TMP/fiber-agent.service" 2>/dev/null; then
-    unit_actual="$(sha256_of "$TMP/fiber-agent.service" | tr '[:upper:]' '[:lower:]')"
-    unit_expected="$(printf '%s' "$unit_expected" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$unit_expected" != "$unit_actual" ]]; then
-      die "checksum mismatch for fiber-agent.service
-  expected (SHA256SUMS): $unit_expected
-  downloaded:            $unit_actual
-Do not install this: the unit chooses what runs as which user."
-    fi
-    UNIT_SRC="$TMP/fiber-agent.service"
-    UNIT_ORIGIN="$unit_asset_url (sha256 in SHA256SUMS)"
-    echo "unit checksum ok (SHA256SUMS)"
-  elif curl -fsSL "$unit_raw_url" -o "$TMP/fiber-agent.service"; then
-    UNIT_SRC="$TMP/fiber-agent.service"
-    UNIT_ORIGIN="$unit_raw_url (UNVERIFIED)"
-    echo "warning: release $RESOLVED_TAG does not publish fiber-agent.service as an asset," >&2
-    echo "         so the unit came from $unit_raw_url. It is the right tag, but its hash" >&2
-    echo "         is in no checksum manifest and covered by no attestation." >&2
-  else
-    # Keeping whatever unit is already on disk would pair a new binary with an old
-    # unit, which is the exact mismatch this installer exists to prevent.
-    die "could not obtain deploy/fiber-agent.service for $RESOLVED_TAG from either
-  $unit_asset_url
-  $unit_raw_url
-Refusing to install a new binary against the unit already on disk. Re-run with
-network access, or from a checkout of the matching tag."
-  fi
-fi
-
 # --- install ------------------------------------------------------------------
+
+# One gate, here rather than inside the "could not check" helper, because provenance can
+# also end up unverified via --insecure-skip-attestation after a real failure, or via
+# --tarball, neither of which goes through that helper. This is the last statement before
+# anything is written to the host.
+if [[ "$REQUIRE_ATTESTATION" == "true" && "$PROVENANCE_OK" != "true" ]]; then
+  die "--require-attestation was passed, but provenance did not verify: $PROVENANCE_RESULT"
+fi
 
 # Keep the binary we are replacing so a bad rollout is one `cp` away from undone.
 # `cp -p` rather than `mv`: the running process keeps its open inode either way, but a
@@ -473,6 +570,10 @@ install -m 0755 "$TMP/fiber-agent" "$BIN_DIR/fiber-agent"
 if [[ -f "$TMP/fiber" ]]; then
   install -m 0755 "$TMP/fiber" "$BIN_DIR/fiber"
 fi
+# Immediately after the binaries, not at the end: anything between them that trips
+# `set -e` would otherwise leave a new binary running under the old unit.
+echo "installing the unit from $UNIT_ORIGIN"
+install -m 0644 "$UNIT_SRC" "$SERVICE"
 
 id -u fiber >/dev/null 2>&1 || useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin fiber
 install -d -o fiber -g fiber -m 0750 "$STATE_DIR" "$STATE_DIR/workspaces"
@@ -502,9 +603,6 @@ if [[ "$USE_DOCKER" == "true" ]]; then
   getent group docker >/dev/null && usermod -aG docker fiber \
     || echo "warning: no docker group; Docker steps will fail" >&2
 fi
-
-echo "installing the unit from $UNIT_ORIGIN"
-install -m 0644 "$UNIT_SRC" "$SERVICE"
 
 systemctl daemon-reload
 # enable --now is a no-op on a running unit, so an upgrade would keep the old binary.

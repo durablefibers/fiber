@@ -89,13 +89,23 @@ This is still `curl | sudo bash`, so be clear about what each check is worth:
 | | Guarantee | Failure |
 |---|---|---|
 | **One tag** | `--version latest` is resolved to a concrete tag by following the `/releases/latest` redirect, and the tarball, the checksums and the systemd unit all come from *that* tag. If the unit cannot be obtained for that tag the install aborts, rather than pairing a new binary with the unit already on disk. | fatal |
-| **Checksum** | The tarball's SHA-256 must match the release's `SHA256SUMS` (or, on releases published before that file existed, the per-asset `.sha256`). Integrity only — both files come from the same release over the same channel, so it catches a truncated download, not a compromised release. The systemd unit is checked the same way, against the same `SHA256SUMS`. | fatal, unless `--insecure-skip-checksum` |
+| **Checksum** | The tarball's SHA-256 must match the release's `SHA256SUMS` (or, on releases published before that file existed, the per-asset `.sha256`). Integrity only — both files come from the same release over the same channel, so it catches a truncated download, not a compromised release. | fatal, unless `--insecure-skip-checksum` |
+| **Unit** | The systemd unit has no attestation of its own, so it comes from the release assets **only** when `SHA256SUMS` itself verified as attested; otherwise from git at the same tag. Either way the install aborts rather than reusing the unit already on disk. | fatal, **not** skippable |
 | **Provenance** | When `gh` is usable, `gh attestation verify` checks the tarball's build-provenance attestation, pinned to this repository, to `.github/workflows/release.yml`, to `refs/tags/<the tag being installed>` and to a GitHub-hosted runner. Ref-pinning is what stops an attacker serving a genuine, still-validly-attested build of an *older, vulnerable* tag. | fatal **if the check runs and fails**, unless `--insecure-skip-attestation`; see the caveat below if it cannot run |
 
 Two exceptions to "one tag", both announced in the output: running the script from a
-checkout takes the unit from that checkout, and a release older than this feature has no
-`fiber-agent.service` asset, so the unit comes from `raw.githubusercontent.com` at the
-right tag but unverified.
+checkout takes the unit from that checkout, and a release with no attested `SHA256SUMS`
+(or none at all) makes the installer take the unit from `raw.githubusercontent.com` at the
+right tag.
+
+That last case is a *stronger* path, not a weaker one, and it is the reason the unit is
+gated on an attested manifest. The unit decides which binary runs as which user. Someone
+who can edit an already-published release's assets — without any commit, tag or push —
+could otherwise leave the genuine tarball untouched, rewrite `SHA256SUMS` to keep the real
+tarball hash while substituting the hash of their own unit, and upload that unit. Every
+check would pass, including the tarball's provenance. Requiring `SHA256SUMS` to be attested
+closes that, and falling back to git closes it again, because editing the repository at a
+tag needs write access to the repository.
 
 **The provenance check is the one that quietly does not happen.** It needs `gh` installed
 *and authenticated as the user running the script* — and under `sudo`, `env_reset` drops

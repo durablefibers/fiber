@@ -46,14 +46,27 @@ minor versions may carry breaking changes.
   hosts verifying nothing.
 - **`deploy/fiber-agent.service` is now a release asset**, so its hash is in `SHA256SUMS`
   and the installer verifies it. It was the one file the installer fetched unchecked, and
-  it decides which binary runs as which user.
-- **`install-agent.sh --check-only`** resolves, downloads and verifies a release, prints
-  the tag, both digests and the unit's origin, and exits without touching the host. No
+  it decides which binary runs as which user. Because the unit has no attestation of its
+  own, the installer first verifies `SHA256SUMS` *itself* — same four `gh` flags — and
+  only then lets that manifest vouch for the unit. Otherwise someone able to edit an
+  already-published release's assets could keep the genuine tarball and its genuine
+  provenance, rewrite `SHA256SUMS` around a unit of their own, and have every check pass.
+  When the manifest is not attested the unit comes from git at the tag instead, which
+  needs repository write to tamper with.
+- **`install-agent.sh --check-only`** resolves, downloads and verifies a release and its
+  unit, prints the tag, both digests and where the unit came from, and exits without
+  touching the host. No
   root needed, and it runs on macOS. Its exit code is the result — `0` both guarantees,
-  `1` a check ran and failed, `2` a check could not be obtained — so it can gate a
-  deployment script. This is also the documented way to verify a download by hand.
+  `1` a check ran and came back wrong (including one silenced by `--insecure-skip-*`,
+  which changes whether the installer stops, not whether the check failed), `2` a check
+  could not be run at all — so it can gate a deployment script. It resolves the unit too,
+  so it exercises the whole trust chain. This is also the documented way to verify a
+  download by hand.
 - **`install-agent.sh --require-attestation`** refuses to install unless provenance
   actually verified, for hosts where "we could not check" is not an acceptable outcome.
+  It is one gate immediately before the install, so it also catches the paths that do not
+  go through the "could not check" branch — `--insecure-skip-attestation` after a real
+  failure, and `--tarball`.
 
 ### Changed
 
@@ -99,10 +112,13 @@ minor versions may carry breaking changes.
   `RestrictSUIDSGID` stops `dpkg-deb`/`rpmbuild` producing packages that contain a setuid
   file. Relax any of it in a drop-in under
   `/etc/systemd/system/fiber-agent.service.d/`, which also survives the next installer run.
-- `UMask` is `0027`, not `0077`: the agent creates the workspace and then bind-mounts it
-  into the step container, so at `0077` any image with a non-root `USER` — or any
-  `FIBER_AGENT_DOCKER_USER` — failed at `cd /workspace` with `EACCES`. Documented next to
-  `FIBER_AGENT_DOCKER_USER` in [configuration](docs/configuration.md).
+- `UMask` is `0027`, not `0077`. It costs nothing — `/var/lib/fiber` is already
+  `0750 fiber:fiber` — and it is a precondition for a step container reading the
+  bind-mounted workspace, but on its own it does not fix the Docker case: the agent
+  issues `docker run` without `--group-add`, so a container running as some other uid/gid
+  still gets `EACCES` on `cd /workspace`. The working configurations are
+  `FIBER_AGENT_DOCKER_USER=<uid>:<fiber-gid>` or `UMask=0022` in a drop-in, both
+  documented next to `FIBER_AGENT_DOCKER_USER` in [configuration](docs/configuration.md).
 - `ProtectHome=true` stays, so `FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` cannot reach a
   socket under `/run/user/<uid>` as shipped. [configuration](docs/configuration.md) now
   documents the caveat and a `BindPaths=` drop-in next to the variable.
