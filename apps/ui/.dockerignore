@@ -1,8 +1,18 @@
-node_modules
-dist
-dist-ssr
-.output
-.vinxi
-.git
-*.log
-.DS_Store
+# Allowlist, not a denylist: Dockerfile.ui ends with `COPY . .`, so anything left in
+# this context lands in the builder stage. Add a path here only when the build needs it.
+*
+
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!.npmrc
+!tsconfig.json
+!vite.config.ts
+!nginx.conf
+!public
+!src
+
+# Generated inside src/ or by a local `pnpm build`; never from the host.
+**/node_modules
+**/*.log
+**/.DS_Store

@@ -75,11 +75,24 @@ More: [CLI](./cli.md).
 
 ```bash
 cp deploy/.env.example deploy/.env
+```
+
+Now **fill in the four credentials** in `deploy/.env` — `FIBER_POSTGRES_PASSWORD`,
+`FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY` and
+`FIBER_ADMIN_PASSWORD`. They have no defaults on purpose; Compose refuses to read the
+file until each one has a value, naming the one it is missing. The S3 pair is only used
+by the optional MinIO profile, but it still needs a placeholder. Then generate the
+secrets key and start:
+
+```bash
 sed -i'' -e "s/^FIBER_SECRETS_KEY=.*/FIBER_SECRETS_KEY=$(openssl rand -hex 32)/" deploy/.env   # keep a backup of this key
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-Everything binds to `127.0.0.1` by default; see [operations → Deployment](./operations.md#deployment) for the reverse-proxy / TLS setup and how to expose it. MinIO artifacts are on by default in Compose. See [Artifacts](./artifacts.md).
+Log in as `admin` with the `FIBER_ADMIN_PASSWORD` you chose; it is applied only on the
+first boot of an empty database.
+
+Everything binds to `127.0.0.1` by default; see [operations → Deployment](./operations.md#deployment) for the reverse-proxy / TLS setup and how to expose it. Artifacts go to the local filesystem (a Docker volume); add `--profile minio` and `FIBER_S3_BUCKET=fiber-artifacts` for the MinIO path. See [Artifacts](./artifacts.md).
 
 To run pipelines on the Compose stack, add a worker: create an agent (Agents page or
 `fiber agents create --name compose --labels os=linux`), put its token in `deploy/.env` as

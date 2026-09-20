@@ -26,11 +26,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Runs as uid 10001, the same non-root uid as the agent stage. The only path the API
+# writes at runtime is FIBER_ARTIFACTS_DIR: the local artifact backend puts blobs there,
+# and main.rs create_dir_all()s it at boot even under the S3 backend (a no-op on a
+# directory that already exists). Everything else it touches is Postgres, Redis and the
+# network, so the rootfs can be mounted read-only — see deploy/docker-compose.yml.
+# Upgrading an existing deployment whose artifact volume was created by a root image
+# needs a one-shot chown; docs/operations.md#upgrades has the command.
 FROM runtime AS fiber-api
 COPY --from=builder /app/target/release/fiber-api /usr/local/bin/fiber-api
-RUN mkdir -p /data/artifacts
+RUN useradd --create-home --uid 10001 fiber \
+    && mkdir -p /data/artifacts \
+    && chown -R 10001:10001 /data/artifacts
+USER 10001
+WORKDIR /home/fiber
 ENV FIBER_ARTIFACTS_DIR=/data/artifacts
 EXPOSE 8080
+# /ready, not /health: it is the probe that means "Postgres answers and the background
+# loops are running". Compose overrides the timings; this is for a bare `docker run`.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=6 \
+    CMD curl -sf http://127.0.0.1:8080/ready || exit 1
 CMD ["fiber-api"]
 
 # The agent executes pipeline shell, so it ships git (workspace prep) and runs as a

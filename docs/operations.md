@@ -4,9 +4,14 @@
 
 `deploy/docker-compose.yml` is the reference deployment. Its defaults are chosen so that `docker compose up` on a shared host does not expose anything by accident:
 
-- Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password (`FIBER_REDIS_PASSWORD`).
+- **Four credentials have no default and must be set in `deploy/.env` before anything starts**: `FIBER_POSTGRES_PASSWORD`, `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY`, and `FIBER_ADMIN_PASSWORD`. `docker compose config` (and therefore `up`, `pull`, `logs`) fails with the name of the first one missing until they are. A default that works is a default nobody changes, and `FIBER_API_BIND=0.0.0.0` plus a published admin password is a public instance with a known login. The S3 pair is required even when MinIO is off — Compose interpolates the whole file before it filters by profile — so give it any non-empty placeholder if you do not use the object store.
+- Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password, which reaches it through a Compose `configs:` entry rather than `--requirepass` on the command line, where `ps` and `docker inspect` would show it.
 - `fiber-api` (`18080`) and `fiber-ui` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_UI_BIND=0.0.0.0` only for a trusted network.
-- Every service has `restart: unless-stopped`; the API waits for Postgres, Redis, **and** MinIO health.
+- **Artifacts go to the local filesystem by default** (the `fiber_artifacts` volume). MinIO is optional and sits behind a Compose profile: set `FIBER_S3_BUCKET=fiber-artifacts` and start it with `--profile minio`. See [artifacts](./artifacts.md).
+- **`fiber-api` and `fiber-ui` run unprivileged**: uid 10001 and uid 101, `read_only: true` rootfs with a tmpfs for the few scratch paths they need, `cap_drop: [ALL]`, `no-new-privileges`. The API writes nothing outside `FIBER_ARTIFACTS_DIR`; the UI image is `nginxinc/nginx-unprivileged` and listens on 8080 inside the container.
+- **Container logs are capped** at `max-size: 10m` × `max-file: 5` per service (~50 MB each). Docker's default keeps every line for ever, and a full host disk stops Postgres. Point the daemon at a real log system if you need more history.
+- Every service has `restart: unless-stopped`; the API waits for Postgres and Redis health, and for MinIO too when the `minio` profile is active.
+- Both images carry a `HEALTHCHECK` (API: `GET /ready`; UI: `GET /`), so `docker run` and non-Compose orchestrators get the same probe Compose uses.
 - `fiber-api` runs with `init: true` and `stop_grace_period: 30s`, so `docker stop` and a `compose up` of a new image deliver SIGTERM and the API drains (see [Shutdown and deploys](#shutdown-and-deploys)) instead of being killed after Docker's default 10 s.
 - Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
 - Set `FIBER_ADMIN_PASSWORD` **before the first boot**: it is applied only when the users table is empty. For an existing instance, change the admin password through the API/UI instead. The API warns at boot while the configured value is the default `fiber`.
@@ -284,10 +289,13 @@ which is where to look if an image ever goes single-architecture again.
 deployment needs no build toolchain:
 
 ```bash
-cp deploy/.env.example deploy/.env      # set FIBER_SECRETS_KEY and FIBER_ADMIN_PASSWORD
+cp deploy/.env.example deploy/.env      # fill the four credentials and FIBER_SECRETS_KEY
 docker compose -f deploy/docker-compose.yml pull
 docker compose -f deploy/docker-compose.yml up -d
 ```
+
+Every one of those commands reads the Compose file, so all four credentials must be in
+`deploy/.env` before the first `pull`.
 
 `FIBER_VERSION` in `deploy/.env` picks the tag. It defaults to `latest`; pin an exact
 version for a reproducible deployment. To build from the working tree instead, add
@@ -456,5 +464,20 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 - **A disconnect no longer requeues** (see [Shutdown and deploys](#shutdown-and-deploys)). Upgrade the API before the agents: a new agent against an old server behaves as before (it stops its steps on any close, because the old server sends no `lease_secs`), and an old agent against a new server is requeued on disconnect as before. Only new-on-new keeps a step running through a reconnect. While some API replicas are still old, their disconnect and stale-sweep paths still requeue.
 - Migration `016_queue_order.sql` adds one partial index, `step_runs (queued_at, id) WHERE status = 'queued'`, drops `idx_step_runs_queued` (no reader left), and backfills `queued_at` on any queued row a pre-012 path left without one. Seconds on any install; idempotent.
 - After 016, offers are made **oldest-queued first**, and an agent is offered steps until it is full on every heartbeat. A backlog that had been draining newest-run-first drains in queue order from the first heartbeat after the upgrade; nothing about in-flight steps changes.
+- **`fiber-api` now runs as uid 10001, not root.** New deployments need nothing. An existing deployment whose artifact directory was created by a root container has to hand it over once, or every artifact upload fails with `Permission denied`:
+
+  ```bash
+  # Compose, local-filesystem artifacts. A plain `docker run`, not `compose run`:
+  # the fiber-api service drops every capability, so even --user 0 inside it gets
+  # EPERM from chown. The volume is <compose project>_fiber_artifacts, and the
+  # project is named `fiber` in the Compose file.
+  docker run --rm -v fiber_fiber_artifacts:/data/artifacts alpine \
+    chown -R 10001:10001 /data/artifacts
+  # A bind mount or a host-run API instead: chown the directory itself
+  sudo chown -R 10001:10001 /srv/fiber/artifacts
+  ```
+
+  Whether this affects a Compose install depends on which backend it used. Until this version Compose set `FIBER_S3_BUCKET` unconditionally, so blobs went to MinIO and the `fiber_artifacts` volume held nothing — but the same upgrade **makes the local filesystem the default**, so an install that says nothing in `deploy/.env` switches backends and starts writing to that root-owned volume. Either run the `chown` above, or keep MinIO by setting `FIBER_S3_BUCKET=fiber-artifacts` in `deploy/.env` and bringing the stack up with `--profile minio`. Artifacts already in MinIO are not copied to the local disk (or the other way round); the rows keep pointing at the backend that stored them, so switching leaves older artifacts undownloadable until you switch back.
+- **The four Compose credentials are now required.** `FIBER_POSTGRES_PASSWORD`, `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY`/`FIBER_S3_SECRET_KEY` and `FIBER_ADMIN_PASSWORD` no longer default to `fiber` / `fiberfiber`; `docker compose` refuses to read the file until `deploy/.env` sets them. An existing deployment that relied on the defaults must write those same values into `deploy/.env` before the upgrade — Postgres keeps the password its volume was initialised with, and Redis keeps whatever the new config file says, so putting the old values back is the no-downtime path. Changing the Postgres password needs `ALTER ROLE fiber PASSWORD …` inside the container as well as the `.env` edit; `FIBER_ADMIN_PASSWORD` is read only on the first boot of an empty database, so for an existing instance any placeholder is fine.
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  
 - Agent tokens are hashes only — rotating requires distributing a new plaintext token

@@ -9,8 +9,19 @@ ok() { echo "OK  $*"; }
 fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
 
 # The deployment profile expects deploy/.env; supply throwaway values when absent.
+# The four credentials are required by deploy/docker-compose.yml (no working defaults),
+# so without these exports `docker compose` refuses to interpolate the file at all.
+# FIBER_ADMIN_PASSWORD has to stay `fiber`: _compose_pipeline.py logs in with it.
 export FIBER_SECRETS_KEY="${FIBER_SECRETS_KEY:-$(openssl rand -hex 32)}"
+export FIBER_POSTGRES_PASSWORD="${FIBER_POSTGRES_PASSWORD:-fiber}"
 export FIBER_REDIS_PASSWORD="${FIBER_REDIS_PASSWORD:-fiber}"
+export FIBER_S3_ACCESS_KEY="${FIBER_S3_ACCESS_KEY:-fiber}"
+export FIBER_S3_SECRET_KEY="${FIBER_S3_SECRET_KEY:-fiberfiber}"
+export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
+# Artifacts default to the local filesystem now that MinIO is optional; this smoke keeps
+# covering the S3 path, so it opts in and starts fiber-minio (naming a service enables
+# its profile).
+export FIBER_S3_BUCKET="${FIBER_S3_BUCKET:-fiber-artifacts}"
 
 echo "== compose build + up =="
 # Stop legacy Compose project that may own 15432/16379
