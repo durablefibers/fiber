@@ -62,7 +62,7 @@ libc = "0.2"
 argon2 = { version = "0.5", features = ["std"] }
 aes-gcm = "0.11"
 zeroize = { version = "1", features = ["derive"] }
-cron = "0.15"
+cron = "0.17"
 aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
 opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
