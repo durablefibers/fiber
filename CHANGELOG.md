@@ -87,6 +87,40 @@ large install.
   publish now fails in about two seconds instead of the client's 13 s default, so a
   cancel or completion cannot spend its request budget on one publish.
 
+- **A disconnect no longer requeues; a lease outlives its session.** Until now any drop
+  of the agent's WebSocket — an API deploy, a proxy idle timeout, a NAT hiccup — ended
+  every step in flight on both sides: the agent killed its steps and the server requeued
+  them at once, so a rolling API deploy restarted every running build and spent a retry
+  on each. Now the server only marks the agent offline; the steps stay `running` under
+  their leases, and the agent keeps executing them, buffers their output (10 000
+  messages; past that the oldest log lines go, never a completion or an artifact, with a
+  system line saying how many), reconnects with its usual backoff, renews the leases on
+  its first heartbeat back, and flushes the buffer in order. The server accepts the late
+  lines and completions as long as the row is still `running` under that agent, and
+  counts the steps it still holds before offering it more. An agent that has not
+  reconnected within the lease (300 s, less a 30 s margin) stops its steps without
+  reporting them, and the reclaim loop requeues the expired leases within the existing
+  `retries + 1` budget. See [operations](docs/operations.md#shutdown-and-deploys).
+
+  Two exits still requeue immediately, on purpose: an agent stopping on SIGTERM now sends
+  a new `Goodbye` message once its steps are gone, so a rolling *agent* restart hands the
+  work to another agent within seconds instead of after the lease; and a token rotation,
+  agent delete, or project delete ends the session with a requeue as before. The
+  stale-agent sweep (45 s without a heartbeat) now only marks the agent offline and closes
+  its socket; its leases expire on their own.
+
+  Wire: `Hello` gains `protocol_version` (`fiber_proto::PROTOCOL_VERSION` = 1; absent
+  from older agents and read as 0), `Welcome` gains `lease_secs`, `AgentMessage` gains
+  `Goodbye`, and `Offer`, `LogChunk`, `Artifact` and `StepComplete` gain `attempt` — the
+  server drops a message whose attempt is not the row's, so output an agent held through
+  a reclaim cannot land on, or close, the attempt that replaced it — all backward
+  compatible. The same attempt travels on the HTTP artifact routes as `X-Fiber-Attempt`
+  (upload) and an `attempt` body field (presign, complete). An agent with no `protocol_version` cancels its
+  steps on any close, so the server requeues its steps on disconnect exactly as before;
+  a new agent against a server that sends no `lease_secs` stops its steps on close as
+  before. Only new-on-new keeps a step running through a reconnect — upgrade the API
+  first, then the agents. `protocol_version` is logged on `Hello` and not yet stored.
+
 - **`make check` is the only definition of the gate.** The `Makefile` ran clippy without
   `--all-targets` and without `fiber-proto`, CI added both plus `RUSTFLAGS: -Dwarnings`,
   and the release workflow ran a third variant without `--locked` — so a warning in a
@@ -129,6 +163,26 @@ large install.
 
 ### Fixed
 
+- **A step given up after a long outage no longer hangs its run.** The agent killed such
+  a step and said nothing, so the row stayed `running` under it and the first heartbeat
+  after reconnecting renewed the lease again — and every one after that. Nothing reported
+  it, no lease ever expired, and the run hung until the 60-minute step-timeout backstop
+  while the agent kept the concurrency slot. It now reports the attempt `failed` with
+  `lease lost while the agent was disconnected`; the server takes the report only if it
+  has not already reclaimed the step, and the step retries under its existing budget.
+- **An artifact upload can no longer overwrite a later attempt's.** The three HTTP agent
+  artifact routes checked the lease but not the attempt, and an upload retrying through
+  an outage could land after the step was re-leased — `artifacts` is unique on
+  `(step_run_id, name)` and the object key is deterministic, so the abandoned attempt's
+  bytes replaced the live one's for a dependent step to restore. They now carry the
+  attempt (`X-Fiber-Attempt`, or an `attempt` field) and refuse a stale one with `401`.
+- **A rotated token now requeues on the socket's own replica.** The heartbeat that finds
+  the token invalid ends the session with an immediate requeue, so a rotation or delete
+  no longer depends on the Redis fan-out reaching the replica that holds the socket.
+- **The per-attempt log cap is per attempt, not per socket.** The counter behind
+  `FIBER_STEP_LOG_MAX_LINES` was kept per session, so an agent that reconnected
+  mid-attempt started a fresh budget each time; it is now seeded from the lines already
+  stored for that attempt.
 - **An offer that cannot be built is not sent.** The lease was taken first and the offer
   built second — from the run's snapshot, the project's secrets and its artifacts — and a
   failure reading any of them was swallowed: a database blip during a heartbeat sent an

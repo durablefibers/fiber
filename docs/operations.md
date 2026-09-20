@@ -53,10 +53,31 @@ socket by TCP timeout, particularly behind a proxy that would otherwise hold its
 half-open. The UI already reconnects 2 s after any close, so for browsers the frame is
 tidiness rather than a change in behaviour.
 
-An agent treats the Close like any other disconnect ([agents](./agents.md#lifecycle)):
-its in-flight steps are requeued and re-run when it reconnects. A deploy therefore still
-restarts the steps that were running at that moment; what it no longer does is cut off an
-artifact upload half-way, drop an HTTP response, or lose the last batch of traces.
+Restarting `fiber-api` does not restart the builds in flight. A step's lease belongs to
+the agent, not to the WebSocket session: when the socket drops, the agent keeps running
+the step, buffers its output, and reconnects with backoff (1 s → 30 s, jittered); its
+first heartbeat back renews the leases and the buffered lines and completions are flushed
+in order. The server accepts them as long as the step is still `running` under that agent.
+Nothing is requeued on disconnect — the agent is only marked offline — so a deploy costs
+the builds nothing but the reconnect delay. Measured on a debug build: the API killed and
+restarted under a 30 s step, the step finished on attempt 1 with every line present.
+
+The limit is the lease (**300 s**). An agent that has not reconnected 270 s after the
+drop stops its steps without reporting them; the reclaim loop requeues the expired leases
+on the server, within the same `retries + 1` budget a reported failure gets. Keep an API
+outage under that and no build notices; past it, the steps that were running are
+re-leased once the API is back. Two things still requeue at once, on purpose: an agent
+that exits on SIGTERM says `Goodbye` after stopping its steps (a rolling *agent* restart
+hands the work over within seconds), and a token rotation, agent delete, or project
+delete ends the session with an immediate requeue, since the agent's results could not
+be accepted anyway.
+
+During a mixed-version rolling upgrade of the API, a replica *older* than this behaviour
+still requeues on disconnect and on its stale-agent sweep. Upgrade every replica before
+counting on it. Agents older than protocol revision 1 (no `protocol_version` in `Hello`)
+cancel their steps on any close, and the server requeues their steps at once as before —
+upgrade agents to get the new behaviour on their side.
+
 Background loops are not drained. A scheduled run or a durable-fiber step interrupted
 mid-way is picked up by the replica that comes up next — that is what at-least-once
 means here.
@@ -115,7 +136,7 @@ A run that stays `running` is one of:
 - **Nothing to lease it** — its steps are `queued` and no online agent matches the labels / project pool. Check **Agents** for an online agent with every required label.
 - **Waiting on a retry backoff** — a failed step with `retries` is `queued` with `not_before` in the future (max 60 s).
 - **Hung step** — the attempt exceeds its `timeout_minutes` (default `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES`): the agent fails it at the deadline, and the server fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not. A whole-run `timeout_minutes` cancels the run with reason `run timed out`.
-- **Agent gone** — leases expire after 5 minutes without heartbeats and the step is re-queued (`step_attempts` shows `reclaimed`). A lost lease counts against the step's `retries` like a reported failure does, with one extra try: once the step has lost more than `retries + 1` leases it fails with `lease lost after N attempts` and the run finalises. A `retries: 0` step therefore survives one rolling agent restart or one network blip, while a step that reliably kills its agent (OOM, a Docker hang past the lease) stops after two leases instead of being re-leased forever. The same loop finalises any run still `running` whose every step is terminal.
+- **Agent gone** — leases expire after 5 minutes without heartbeats and the step is re-queued (`step_attempts` shows `reclaimed`). A disconnect alone does not requeue: the agent may be reconnecting, still running the step, and it renews the lease when it is back — so a step whose agent shows **offline** is not stuck until its lease has expired. A lost lease counts against the step's `retries` like a reported failure does, with one extra try: once the step has lost more than `retries + 1` leases it fails with `lease lost after N attempts` and the run finalises. A `retries: 0` step therefore survives one agent crash, while a step that reliably kills its agent (OOM, a Docker hang past the lease) stops after two leases instead of being re-leased forever. The same loop finalises any run still `running` whose every step is terminal.
 
 `GET /api/steps/{id}/attempts` lists every attempt with its agent, status, and error.
 
@@ -432,6 +453,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
   - Adds three indexes (`runs`, `artifacts`, `fibers`) and drops `idx_log_lines_step`, which nothing has read since 010. The builds hold a `SHARE` lock on their table for seconds on a typical install; `log_lines`, the only large table, is not indexed here.
   - The migration is idempotent (`IF NOT EXISTS` throughout), so a partially-applied environment converges on the next boot.
 - After 015, **a lost lease counts against `retries`** (see *Stuck runs*): a step fails once it has lost more than `retries + 1` leases. A step that was being re-leased forever before the upgrade fails on its next reclaim and its run finalises; nothing else about in-flight runs changes.
+- **A disconnect no longer requeues** (see [Shutdown and deploys](#shutdown-and-deploys)). Upgrade the API before the agents: a new agent against an old server behaves as before (it stops its steps on any close, because the old server sends no `lease_secs`), and an old agent against a new server is requeued on disconnect as before. Only new-on-new keeps a step running through a reconnect. While some API replicas are still old, their disconnect and stale-sweep paths still requeue.
 - Migration `016_queue_order.sql` adds one partial index, `step_runs (queued_at, id) WHERE status = 'queued'`, drops `idx_step_runs_queued` (no reader left), and backfills `queued_at` on any queued row a pre-012 path left without one. Seconds on any install; idempotent.
 - After 016, offers are made **oldest-queued first**, and an agent is offered steps until it is full on every heartbeat. A backlog that had been draining newest-run-first drains in queue order from the first heartbeat after the upgrade; nothing about in-flight steps changes.
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  

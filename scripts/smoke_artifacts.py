@@ -77,7 +77,13 @@ def main() -> None:
         if build_ok and not wiped:
             w = os.path.join(WS_DIR, rid)
             if os.path.isdir(w):
-                shutil.rmtree(w)
+                # The agent's own workspace GC releases this tree as the last step of
+                # the run leaves it, so a directory can vanish under the walk. That is
+                # the outcome this wants, not an error — but if anything is still there
+                # afterwards, remove it again and let a real failure raise.
+                shutil.rmtree(w, ignore_errors=True)
+                if os.path.isdir(w):
+                    shutil.rmtree(w)
                 print("WIPED workspace", w)
             wiped = True
         if status in ("succeeded", "failed", "cancelled"):

@@ -15,7 +15,10 @@ const EVENTS_CHANNEL: &str = "fiber:events";
 /// Agent-directed messages (cancel, disconnect) fanned out to every API instance, so
 /// the one holding the agent's socket delivers them.
 const AGENT_CMDS_CHANNEL: &str = "fiber:agent_cmds";
-const LEASE_SECS: i64 = 300;
+/// How long a step lease lives without a heartbeat renewing it. Also how long an agent
+/// that lost its socket keeps a step running while it reconnects (the server tells it
+/// in `Welcome`), so the two sides agree on when an attempt is over.
+pub const LEASE_SECS: i64 = 300;
 /// Ceiling on the per-attempt retry backoff, so a high `retries` cannot park a step for hours.
 const MAX_RETRY_BACKOFF_SECS: u64 = 60;
 /// Offers one fill may back out before it stops trying. Bounds the work of one heartbeat
@@ -116,6 +119,10 @@ pub enum AgentCommandKind {
     Cancel { step_run_id: Uuid },
     /// Terminate the agent's session here (token rotated, agent deleted).
     Disconnect { reason: String },
+    /// Close the agent's socket here but leave its leases alone (stale sweep). A
+    /// separate tag from `Disconnect` on purpose: a replica older than this variant
+    /// cannot parse it and ignores it, where a `Disconnect` would make it requeue.
+    DropSession { reason: String },
 }
 
 impl Scheduler {
@@ -264,7 +271,24 @@ impl Scheduler {
                 self.send_local(cmd.agent_id, ServerMessage::Error { message: reason })
                     .await;
                 // Requeue is idempotent (the originating instance already did it).
-                let _ = self.on_agent_disconnect(cmd.agent_id).await;
+                let _ = self
+                    .on_agent_disconnect(
+                        cmd.agent_id,
+                        DisconnectPolicy::RequeueNow {
+                            reason: "agent disconnected",
+                        },
+                    )
+                    .await;
+            }
+            AgentCommandKind::DropSession { reason } => {
+                if !self.has_connection(cmd.agent_id).await {
+                    return;
+                }
+                self.send_local(cmd.agent_id, ServerMessage::Error { message: reason })
+                    .await;
+                let _ = self
+                    .on_agent_disconnect(cmd.agent_id, DisconnectPolicy::KeepLeases)
+                    .await;
             }
         }
     }
@@ -284,6 +308,10 @@ impl Scheduler {
         concurrency: u32,
         project_id: Option<Uuid>,
     ) {
+        // Nothing about the agent's running steps is kept here: a lease outlives the
+        // session that took it, so every offer counts the rows the database shows
+        // running on the agent (`slots_available`), and a reconnect is not offered
+        // slots it is already using.
         let mut agents = self.agents.write().await;
         // A repeated Hello on a live session must not drop reservations still in flight.
         let reserved = agents.get(&agent_id).map(|a| a.reserved).unwrap_or(0);
@@ -334,9 +362,11 @@ impl Scheduler {
         conns.contains_key(&agent_id)
     }
 
-    /// Notify the agent and drop its outbound channel (writer exits; reads should stop).
-    /// End an agent's session wherever it is connected: locally now, and on every
-    /// other instance via `fiber:agent_cmds`. Its running steps are requeued.
+    /// End an agent's session wherever it is connected: locally now (the agent is told
+    /// why, then its outbound channel is dropped so the session ends on its next
+    /// message), and on every other instance via `fiber:agent_cmds`. Its running steps
+    /// are requeued at once: this is for a token that no longer authorises the agent
+    /// (rotated, deleted, project gone), whose results could not be accepted anyway.
     pub async fn force_disconnect_agent(&self, agent_id: Uuid, reason: &str) {
         self.send_local(
             agent_id,
@@ -345,10 +375,42 @@ impl Scheduler {
             },
         )
         .await;
-        let _ = self.on_agent_disconnect(agent_id).await;
+        let _ = self
+            .on_agent_disconnect(
+                agent_id,
+                DisconnectPolicy::RequeueNow {
+                    reason: "agent disconnected",
+                },
+            )
+            .await;
         self.publish_agent_command(&AgentCommand {
             agent_id,
             kind: AgentCommandKind::Disconnect {
+                reason: reason.to_string(),
+            },
+        })
+        .await;
+    }
+
+    /// Like [`force_disconnect_agent`](Self::force_disconnect_agent) but the agent's
+    /// leases stand: the session ends and the agent reconnects, and whatever it is
+    /// running carries on under the same lease. Fanned out as `DropSession`, which a
+    /// replica older than the variant ignores rather than requeueing on; the server
+    /// ping closes a wedged socket there within 45 s anyway.
+    async fn drop_agent_session(&self, agent_id: Uuid, reason: &str) {
+        self.send_local(
+            agent_id,
+            ServerMessage::Error {
+                message: reason.to_string(),
+            },
+        )
+        .await;
+        let _ = self
+            .on_agent_disconnect(agent_id, DisconnectPolicy::KeepLeases)
+            .await;
+        self.publish_agent_command(&AgentCommand {
+            agent_id,
+            kind: AgentCommandKind::DropSession {
                 reason: reason.to_string(),
             },
         })
@@ -383,9 +445,28 @@ impl Scheduler {
         self.unregister_connection(agent_id).await;
     }
 
-    /// Requeue steps orphaned when an agent disconnects mid-run.
-    pub async fn on_agent_disconnect(&self, agent_id: Uuid) -> Result<()> {
-        let reclaimed = self.store.requeue_agent_steps(agent_id).await?;
+    /// An agent's session ended. Presence and the connection go either way; what happens
+    /// to the steps it was running is the `policy`, decided by the caller from what it
+    /// knows about the agent (see [`disconnect_policy`]).
+    ///
+    /// With [`DisconnectPolicy::KeepLeases`] nothing about the steps changes: the agent
+    /// is still running them, still owns their rows, and renews the leases when it is
+    /// back. A lease it does not renew expires `LEASE_SECS` after the last heartbeat and
+    /// the reclaim loop requeues it then, with the attempt cap. That is what makes an
+    /// API restart, or a network blip, free for every build in flight.
+    pub async fn on_agent_disconnect(
+        &self,
+        agent_id: Uuid,
+        policy: DisconnectPolicy,
+    ) -> Result<()> {
+        // Registry cleanup first: it must not depend on a publish that can fail on a
+        // database blip, or a gone agent stays "connected" until the next stale sweep.
+        self.unregister_agent(agent_id).await;
+        let DisconnectPolicy::RequeueNow { reason } = policy else {
+            debug!(%agent_id, "agent disconnected; its leases stand until they expire");
+            return Ok(());
+        };
+        let reclaimed = self.store.requeue_agent_steps(agent_id, reason).await?;
         if !reclaimed.requeued.is_empty() || !reclaimed.failed.is_empty() {
             info!(
                 %agent_id,
@@ -394,9 +475,6 @@ impl Scheduler {
                 "reclaimed steps after agent disconnect"
             );
         }
-        // Registry cleanup first: it must not depend on a publish that can fail on a
-        // database blip, or a gone agent stays "connected" until the next stale sweep.
-        self.unregister_agent(agent_id).await;
         if let Err(e) = self.publish_reclaimed(reclaimed).await {
             warn!(%agent_id, error = %e, "could not publish reclaim after agent disconnect");
         }
@@ -798,6 +876,7 @@ impl Scheduler {
         self.on_step_complete(
             agent_id,
             step.id,
+            None,
             StepStatus::Failed,
             None,
             Some(reason.to_string()),
@@ -825,10 +904,13 @@ impl Scheduler {
         Ok(())
     }
 
+    /// `attempt` is what the agent echoed from its offer; `None` from an agent older
+    /// than the field.
     pub async fn on_step_complete(
         &self,
         agent_id: Uuid,
         step_run_id: Uuid,
+        attempt: Option<i32>,
         status: StepStatus,
         exit_code: Option<i32>,
         error: Option<String>,
@@ -843,11 +925,20 @@ impl Scheduler {
             return Ok(None);
         };
 
-        // Ignore late completes after cancel / reclaim / re-lease to another agent.
-        if !completion_is_current(current.status_enum(), current.agent_id, agent_id) {
-            debug!(
+        // Ignore late completes after cancel / reclaim / re-lease to another agent, or
+        // for an attempt the row has moved past.
+        if !completion_is_current(
+            current.status_enum(),
+            current.agent_id,
+            current.attempt,
+            agent_id,
+            attempt,
+        ) {
+            warn!(
                 %step_run_id,
                 status = %current.status,
+                row_attempt = current.attempt,
+                reported_attempt = ?attempt,
                 "ignoring late step complete"
             );
             return Ok(None);
@@ -1014,8 +1105,12 @@ impl Scheduler {
         let stale = self.store.mark_stale_agents_offline(stale_secs).await?;
         for agent_id in stale {
             info!(%agent_id, stale_secs, "marked agent offline (stale heartbeat)");
-            // Requeues here and drops the socket on whichever replica still holds it.
-            self.force_disconnect_agent(agent_id, "stale heartbeat — reconnect")
+            // Presence only. A socket somewhere may still be open to an agent that has
+            // stopped heartbeating; drop it so the agent reconnects. Its leases are not
+            // touched: `stale_secs` is well inside a lease, and an agent this far behind
+            // is as likely to be waiting out a reconnect as gone. If it is gone, the
+            // leases expire below on a later tick.
+            self.drop_agent_session(agent_id, "stale heartbeat — reconnect")
                 .await;
         }
 
@@ -1055,6 +1150,7 @@ impl Scheduler {
             self.on_step_complete(
                 agent_id,
                 t.step_run_id,
+                None,
                 StepStatus::Failed,
                 None,
                 Some(error),
@@ -1090,6 +1186,56 @@ impl TimeoutConfig {
     }
 }
 
+/// What a session's end does to the steps the agent holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectPolicy {
+    /// The rows stay `running` under the agent until it renews them or they expire.
+    KeepLeases,
+    /// Requeue them now (with the attempt cap), as an expired lease would. `reason`
+    /// closes the attempts.
+    RequeueNow { reason: &'static str },
+}
+
+/// What to do with an agent's steps when its socket closes.
+///
+/// `hello` is the `protocol_version` the agent declared in `Hello` (`Some(0)` when it
+/// sent the message without the field), or `None` when the session never got as far as
+/// `Hello`. From revision 1 an agent keeps its step tasks across sessions and renews
+/// their leases when it reconnects, so a close is not the end of its attempts — unless
+/// it said `Goodbye`, which means it has already stopped them and is exiting, and the
+/// steps should not wait out a lease nobody will renew. An older agent cancels its steps
+/// on any close, so for it a close *is* the end of the attempt and the old behaviour
+/// (requeue at once) is the right one; letting its leases expire would only delay the
+/// retry by `LEASE_SECS`.
+///
+/// A session that never said `Hello` holds nothing — but the same agent's *other*
+/// session may. An agent reconnecting while its previous socket is still draining, or a
+/// second process started with the same token, opens a socket that closes before or
+/// without `Hello`; requeueing on that close would take the live leases out from under
+/// the session that is renewing them. Nothing was learned about the agent, so nothing
+/// is done to its steps.
+pub fn disconnect_policy(hello: Option<u32>, goodbye: bool) -> DisconnectPolicy {
+    if goodbye {
+        return DisconnectPolicy::RequeueNow {
+            reason: "agent shut down",
+        };
+    }
+    match hello {
+        Some(v) if v < 1 => DisconnectPolicy::RequeueNow {
+            reason: "agent disconnected",
+        },
+        _ => DisconnectPolicy::KeepLeases,
+    }
+}
+
+/// Whether a message's `attempt` (echoed from the offer; `None` from older agents)
+/// refers to the attempt the row is on. A `step_run_id` is stable across attempts, so
+/// this is what keeps a line, artifact or completion that an agent held through a
+/// reclaim off the attempt that replaced it.
+pub fn attempt_is_current(reported: Option<i32>, row_attempt: i32) -> bool {
+    reported.is_none_or(|a| a == row_attempt)
+}
+
 /// Whether a `StepComplete` from `reporting_agent` still applies to the row as stored.
 ///
 /// CI steps are at-least-once: a lease can expire, the step be requeued, and a second
@@ -1099,9 +1245,13 @@ impl TimeoutConfig {
 fn completion_is_current(
     current: StepStatus,
     row_agent: Option<Uuid>,
+    row_attempt: i32,
     reporting_agent: Uuid,
+    reported_attempt: Option<i32>,
 ) -> bool {
-    current == StepStatus::Running && row_agent == Some(reporting_agent)
+    current == StepStatus::Running
+        && row_agent == Some(reporting_agent)
+        && attempt_is_current(reported_attempt, row_attempt)
 }
 
 /// Whether one more lease fits under `concurrency`.
@@ -1276,8 +1426,37 @@ mod tests {
         assert!(completion_is_current(
             StepStatus::Running,
             Some(agent),
-            agent
+            1,
+            agent,
+            Some(1)
         ));
+    }
+
+    #[test]
+    fn a_report_for_an_attempt_the_row_has_moved_past_is_dropped() {
+        // The agent finished attempt 1 while disconnected, the lease expired, the step
+        // was requeued and the same agent leased it again as attempt 2. The completion
+        // it held from attempt 1 arrives now: same step_run_id, same agent, row running
+        // — only the attempt tells it apart, and it must not close attempt 2.
+        let agent = Uuid::new_v4();
+        assert!(!completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            2,
+            agent,
+            Some(1)
+        ));
+        assert!(!attempt_is_current(Some(1), 2));
+        // An agent older than the field sends none: judged by the row alone, as before.
+        assert!(completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            2,
+            agent,
+            None
+        ));
+        assert!(attempt_is_current(None, 2));
+        assert!(attempt_is_current(Some(2), 2));
     }
 
     #[test]
@@ -1289,7 +1468,9 @@ mod tests {
         assert!(!completion_is_current(
             StepStatus::Running,
             Some(new_agent),
-            old_agent
+            2,
+            old_agent,
+            Some(2)
         ));
     }
 
@@ -1305,7 +1486,7 @@ mod tests {
             StepStatus::Pending,
         ] {
             assert!(
-                !completion_is_current(status, Some(agent), agent),
+                !completion_is_current(status, Some(agent), 1, agent, Some(1)),
                 "{status:?} must not accept a completion"
             );
         }
@@ -1317,8 +1498,88 @@ mod tests {
         assert!(!completion_is_current(
             StepStatus::Running,
             None,
-            Uuid::new_v4()
+            1,
+            Uuid::new_v4(),
+            Some(1)
         ));
+    }
+
+    #[test]
+    fn a_completion_after_a_reconnect_is_judged_by_the_row_not_the_session() {
+        // The agent lost its socket, reconnected, and reports. Nothing about the session
+        // reaches this predicate: while the row is still running under the agent the
+        // report stands, and once the reclaim loop has requeued it (status back to
+        // queued, agent_id cleared) the report is stale — whether or not the same agent
+        // then leases it again is a new attempt with its own report.
+        let agent = Uuid::new_v4();
+        assert!(completion_is_current(
+            StepStatus::Running,
+            Some(agent),
+            1,
+            agent,
+            Some(1)
+        ));
+        assert!(!completion_is_current(
+            StepStatus::Queued,
+            None,
+            1,
+            agent,
+            Some(1)
+        ));
+    }
+
+    // --- disconnect policy ------------------------------------------------------------
+
+    #[test]
+    fn a_current_agent_keeps_its_leases_across_a_disconnect() {
+        assert_eq!(
+            disconnect_policy(Some(fiber_proto::PROTOCOL_VERSION), false),
+            DisconnectPolicy::KeepLeases
+        );
+    }
+
+    #[test]
+    fn an_agent_that_said_goodbye_has_its_steps_requeued_at_once() {
+        // It has stopped its steps and is exiting; nothing will renew the leases.
+        assert_eq!(
+            disconnect_policy(Some(fiber_proto::PROTOCOL_VERSION), true),
+            DisconnectPolicy::RequeueNow {
+                reason: "agent shut down"
+            }
+        );
+        // Goodbye is its own word, whatever the revision.
+        assert!(matches!(
+            disconnect_policy(None, true),
+            DisconnectPolicy::RequeueNow { .. }
+        ));
+    }
+
+    #[test]
+    fn an_agent_without_a_protocol_version_is_requeued_on_close() {
+        // Older agents cancel their steps on any close, so a close is the end of the
+        // attempt; keeping the lease would only delay the retry by LEASE_SECS.
+        assert_eq!(
+            disconnect_policy(Some(0), false),
+            DisconnectPolicy::RequeueNow {
+                reason: "agent disconnected"
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_that_never_said_hello_touches_no_leases() {
+        // A second socket for the same token that closes before Hello: the agent's
+        // live session still holds and renews the leases; requeueing here would take
+        // them out from under it.
+        assert_eq!(disconnect_policy(None, false), DisconnectPolicy::KeepLeases);
+    }
+
+    #[test]
+    fn a_reconnected_agent_is_offered_only_the_slots_its_rows_leave_free() {
+        // The presence was cleared by the disconnect; the agent still runs two steps and
+        // the rows say so. Nothing is reserved yet on this replica.
+        assert!(!slots_available(2, 2, 0));
+        assert!(slots_available(3, 2, 0));
     }
 
     // --- retry policy -----------------------------------------------------------------

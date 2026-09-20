@@ -277,6 +277,529 @@ fn http_base(api_url: &str) -> String {
     }
 }
 
+/// Agent heartbeat period. The server renews every lease the agent holds on each one.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Messages held for the server while the socket is down. Past this the oldest log
+/// line is dropped for each new message; completions and artifacts are never dropped.
+/// At a few hundred bytes a line this is a few megabytes, and a step that produces
+/// more than this during a five-minute outage loses its oldest output, with a system
+/// line saying how much.
+const OUTBOX_CAP: usize = 10_000;
+
+/// What the outbox did with a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Enqueue {
+    Keep,
+    /// Admitted, and the oldest log line in the queue was dropped to make room.
+    DropOldestLog,
+    /// Admitted past the hard bound, and the oldest message that is not a completion
+    /// was dropped to make room.
+    DropOldest,
+    /// Not admitted: the queue is at its hard bound and holds nothing but completions.
+    Refused,
+}
+
+/// The step a queued message is about, if any.
+fn step_of(m: &AgentMessage) -> Option<Uuid> {
+    match m {
+        AgentMessage::Claim { step_run_id, .. }
+        | AgentMessage::LogChunk { step_run_id, .. }
+        | AgentMessage::Artifact { step_run_id, .. }
+        | AgentMessage::StepComplete { step_run_id, .. } => Some(*step_run_id),
+        AgentMessage::Hello { .. }
+        | AgentMessage::Heartbeat { .. }
+        | AgentMessage::Goodbye { .. } => None,
+    }
+}
+
+/// Outbound messages to the API, in order, kept across WebSocket sessions.
+///
+/// A session is not an attempt: a step keeps running through a reconnect and its lease
+/// is still live on the server, so its lines and its completion have to reach the server
+/// when the socket is back — in the order they happened. The bound protects the
+/// process, and only log lines pay for it.
+/// A queued message and the token identifying it while the writer has it in flight.
+#[derive(Debug)]
+struct Queued {
+    token: u64,
+    msg: AgentMessage,
+}
+
+#[derive(Debug)]
+struct Outbox {
+    queue: std::collections::VecDeque<Queued>,
+    cap: usize,
+    /// Handed out by `push`, never reused: `pop_sent` compares it so a message that
+    /// was purged mid-send cannot make the writer discard the one behind it.
+    next_token: u64,
+    /// Lines dropped per (step, attempt) since the last flush reported them.
+    dropped: HashMap<(Uuid, Option<i32>), u64>,
+}
+
+impl Outbox {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            cap,
+            next_token: 0,
+            dropped: HashMap::new(),
+        }
+    }
+
+    /// Admit `msg`, dropping the oldest log line first when the queue is full. Past the
+    /// cap a queue of completions and artifacts still grows — they are bounded by the
+    /// steps in flight, not by their output — up to a hard bound of twice the cap, past
+    /// which the oldest message that is not a completion goes, and a queue of nothing
+    /// but completions refuses the newcomer rather than lose a result already held.
+    fn push(&mut self, msg: AgentMessage) -> Enqueue {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.queue.push_back(Queued { token, msg });
+        if self.queue.len() <= self.cap {
+            return Enqueue::Keep;
+        }
+        let oldest_line = self
+            .queue
+            .iter()
+            .position(|q| matches!(q.msg, AgentMessage::LogChunk { .. }));
+        if let Some(i) = oldest_line {
+            if let Some(Queued {
+                msg:
+                    AgentMessage::LogChunk {
+                        step_run_id,
+                        attempt,
+                        ..
+                    },
+                ..
+            }) = self.queue.remove(i)
+            {
+                *self.dropped.entry((step_run_id, attempt)).or_default() += 1;
+            }
+            return Enqueue::DropOldestLog;
+        }
+        if self.queue.len() <= self.cap * 2 {
+            return Enqueue::Keep;
+        }
+        let oldest_other = self
+            .queue
+            .iter()
+            .position(|q| !matches!(q.msg, AgentMessage::StepComplete { .. }));
+        match oldest_other {
+            // The newcomer is the only non-completion: it is the one not admitted.
+            Some(i) if i + 1 == self.queue.len() => {
+                self.queue.pop_back();
+                Enqueue::Refused
+            }
+            Some(i) => {
+                self.queue.remove(i);
+                Enqueue::DropOldest
+            }
+            None => {
+                self.queue.pop_back();
+                Enqueue::Refused
+            }
+        }
+    }
+
+    /// The next message to send, serialised, with its token and without removing it:
+    /// it leaves the queue only once the socket has taken it, so a writer that dies
+    /// mid-send cannot lose it.
+    fn peek_front_text(&self) -> Option<(u64, Result<String, serde_json::Error>)> {
+        self.queue
+            .front()
+            .map(|q| (q.token, serde_json::to_string(&q.msg)))
+    }
+
+    /// Drop the front message, but only if it is still the one `token` named. The
+    /// writer releases the lock while the socket takes a message, and a purge in that
+    /// window shifts the queue: popping blind would discard a message never sent.
+    fn pop_sent(&mut self, token: u64) {
+        if self.queue.front().is_some_and(|q| q.token == token) {
+            self.queue.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    #[cfg(test)]
+    fn msgs(&self) -> impl Iterator<Item = &AgentMessage> {
+        self.queue.iter().map(|q| &q.msg)
+    }
+
+    /// Per-(step, attempt) count of lines dropped since the last call.
+    fn take_dropped(&mut self) -> HashMap<(Uuid, Option<i32>), u64> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Forget everything queued about a step — lines, claim, artifacts, and its
+    /// completion. Used when the step was given up on (its lease has ended or is about
+    /// to) and when a new offer for the same `step_run_id` arrives: anything still held
+    /// is about an earlier attempt, and delivered late it would either be dropped by
+    /// the server or, without the attempt check, close the attempt that replaced it.
+    fn purge_step(&mut self, step_run_id: Uuid) {
+        self.queue.retain(|q| step_of(&q.msg) != Some(step_run_id));
+        self.dropped.retain(|(s, _), _| *s != step_run_id);
+    }
+
+    /// Forget a step's buffered output, keeping everything that reports on it. Used
+    /// when a step is given up: its lines are worth nothing to an attempt the server
+    /// has moved past, while the report that the attempt is over is the whole point.
+    fn purge_step_logs(&mut self, step_run_id: Uuid) {
+        self.queue.retain(
+            |q| !matches!(&q.msg, AgentMessage::LogChunk { step_run_id: s, .. } if *s == step_run_id),
+        );
+        self.dropped.retain(|(s, _), _| *s != step_run_id);
+    }
+}
+
+/// Shared handle to the outbox for step tasks; `send` never blocks and never fails.
+#[derive(Clone)]
+struct Outbound {
+    outbox: Arc<Mutex<Outbox>>,
+    /// Woken on every push; the session's writer drains the queue on it.
+    wake: Arc<tokio::sync::Notify>,
+    /// Whether a session is established (Hello sent) right now. Step tasks read it to
+    /// decide whether an HTTP failure is worth waiting out.
+    connected: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Outbound {
+    fn new() -> Self {
+        Self {
+            outbox: Arc::new(Mutex::new(Outbox::with_capacity(OUTBOX_CAP))),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    fn send(&self, msg: AgentMessage) -> Enqueue {
+        let step = step_of(&msg);
+        let outcome = self
+            .outbox
+            .lock()
+            .map(|mut o| o.push(msg))
+            .unwrap_or(Enqueue::Keep);
+        match outcome {
+            Enqueue::DropOldest => warn!(
+                ?step,
+                "outbox past its hard bound; dropped the oldest message"
+            ),
+            Enqueue::Refused => warn!(?step, "outbox full of completions; message refused"),
+            Enqueue::Keep | Enqueue::DropOldestLog => {}
+        }
+        self.wake.notify_one();
+        outcome
+    }
+
+    fn purge_step(&self, step_run_id: Uuid) {
+        if let Ok(mut o) = self.outbox.lock() {
+            o.purge_step(step_run_id);
+        }
+    }
+
+    fn purge_step_logs(&self, step_run_id: Uuid) {
+        if let Ok(mut o) = self.outbox.lock() {
+            o.purge_step_logs(step_run_id);
+        }
+    }
+}
+
+/// How long a step keeps running after the socket is lost, before the agent gives it up.
+///
+/// The server reclaims a lease `lease_secs` after the last heartbeat it processed —
+/// which may be a heartbeat interval before the socket died, with one more heartbeat
+/// possibly lost in flight — and the first heartbeat after a reconnect needs a moment to
+/// land. Three intervals of margin cover that, so a step still running here is one the
+/// server still counts as this agent's. Without `lease_secs` the server is older than
+/// this contract and requeues on close; a step kept running here would then race the
+/// re-leased attempt, so the grace is zero and the step is stopped at once, as before.
+fn grace_after_disconnect(lease_secs: Option<u64>, heartbeat: Duration) -> Duration {
+    match lease_secs {
+        // Clamped: an absurd value would overflow `Instant + Duration` in the watchdog
+        // and, by panicking that task, quietly disable giving up at all.
+        Some(secs) => Duration::from_secs(secs.min(MAX_LEASE_SECS)).saturating_sub(heartbeat * 3),
+        None => Duration::ZERO,
+    }
+}
+
+/// Ceilings on one artifact transfer. Without them a connection the kernel never
+/// gives up on outlasts the lease grace entirely: the retry budget is only consulted
+/// between attempts, so one hung request is unbounded. Generous enough for a 64 MB
+/// artifact over a slow link.
+const ARTIFACT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ARTIFACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// An HTTP client for artifact transfers that cannot hang for ever.
+fn artifact_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(ARTIFACT_CONNECT_TIMEOUT)
+        .timeout(ARTIFACT_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .context("http client")
+}
+
+/// Upper bound on a `lease_secs` the agent will honour (a day).
+const MAX_LEASE_SECS: u64 = 86_400;
+/// Frames the server sends unprompted (a ping every 15 s from servers that carry
+/// `lease_secs`); silence this long means the socket is black-holed, and the session
+/// ends so the watchdog is armed rather than the lease outlived.
+const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// When a disconnected agent gives up its steps: `grace` after the last frame the server
+/// sent — the lease runs from work the server's loop actually did, and a frame back is
+/// that loop proving it is turning — or, if none was ever seen, after the disconnect
+/// itself. Anchored, not re-armed: a reconnect that fails, or one that connects and
+/// drops before the server says anything, does not move it.
+fn give_up_at(
+    last_server_frame: Option<tokio::time::Instant>,
+    disconnected_at: tokio::time::Instant,
+    grace: Duration,
+) -> tokio::time::Instant {
+    last_server_frame.unwrap_or(disconnected_at) + grace
+}
+
+/// Whether a session's end should start a lease watchdog: one per outage, and only
+/// while there is something to give up. A watchdog already running keeps its anchor;
+/// a second one per failed reconnect would fire on a session that has since healed.
+fn should_arm_watchdog(watchdog_alive: bool, steps_in_flight: u64) -> bool {
+    !watchdog_alive && steps_in_flight > 0
+}
+
+/// Everything that outlives one WebSocket session: the steps in flight, their cancel
+/// handles, the outbound queue, the per-run workspace state, and the concurrency cap.
+struct AgentState {
+    /// Process-wide concurrency cap: survives reconnects, so a flapping connection
+    /// cannot run more than --concurrency steps at once.
+    slots: Arc<tokio::sync::Semaphore>,
+    outbound: Outbound,
+    prepared: Arc<Mutex<HashSet<Uuid>>>,
+    workspaces: Arc<Workspaces>,
+    /// Cancel handles, keyed by the attempt they belong to: attempt 1's task can still
+    /// be winding down as attempt 2 is offered, and a key of `step_run_id` alone let
+    /// the older task's cleanup take the newer one's handle out.
+    cancels: Arc<Mutex<HashMap<StepAttemptKey, oneshot::Sender<()>>>>,
+    in_flight: Arc<AtomicU64>,
+    /// Attempts whose own outcome must not be reported: they were given up and the
+    /// report was queued here instead, so their task ends quietly.
+    abandoned: Arc<Mutex<HashSet<StepAttemptKey>>>,
+    /// Graceful drain: while set, finished step tasks do not report — the server is told
+    /// Goodbye instead and requeues the steps to another agent.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// From the last `Welcome`. `None` until a server has said, or when the server is
+    /// older than the field.
+    lease_secs: Option<u64>,
+    /// This agent's id, as the last `Welcome` gave it. Only informational on the wire
+    /// (the server binds identity from the token), but a report the agent synthesises
+    /// still carries it so it does not read as spoofed.
+    agent_id: Arc<Mutex<Uuid>>,
+    /// When a frame was last *received*. The lease watchdog counts from here rather
+    /// than from the agent's last written heartbeat: a write only reaches a buffer,
+    /// while a frame back — the server pings every 15 s — is the server's event loop
+    /// proving it is still turning, which is what renews the lease.
+    last_server_frame_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+    /// The start of the current outage, if in one. Set once per outage, cleared when a
+    /// session is established.
+    disconnected_at: Option<tokio::time::Instant>,
+    /// The one lease watchdog for the current outage.
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AgentState {
+    fn new(concurrency: u32) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize)),
+            outbound: Outbound::new(),
+            prepared: Arc::new(Mutex::new(HashSet::new())),
+            workspaces: Arc::new(Workspaces::default()),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            abandoned: Arc::new(Mutex::new(HashSet::new())),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lease_secs: None,
+            agent_id: Arc::new(Mutex::new(Uuid::nil())),
+            last_server_frame_at: Arc::new(Mutex::new(None)),
+            disconnected_at: None,
+            watchdog: None,
+        }
+    }
+
+    fn last_server_frame(&self) -> Option<tokio::time::Instant> {
+        self.last_server_frame_at.lock().ok().and_then(|g| *g)
+    }
+
+    /// A frame arrived: the server is alive and processing, which is what the lease
+    /// watchdog measures from.
+    fn note_server_frame(&self) {
+        if let Ok(mut g) = self.last_server_frame_at.lock() {
+            *g = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn agent_id(&self) -> Uuid {
+        self.agent_id
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| Uuid::nil())
+    }
+
+    /// A session is up (Hello sent): the outage, if any, is over. The watchdog goes;
+    /// but if its deadline had already passed, the server has reclaimed the steps and
+    /// they are given up here rather than run on for a lease that is gone.
+    ///
+    /// `anchor` is the last frame seen *before* this session — reading it here would
+    /// find the `Welcome` this session just took, and the deadline would never be past.
+    fn on_session_established(&mut self, anchor: Option<tokio::time::Instant>) {
+        self.outbound.connected.store(true, Ordering::SeqCst);
+        if let Some(w) = self.watchdog.take() {
+            w.abort();
+        }
+        let Some(started) = self.disconnected_at.take() else {
+            return;
+        };
+        let grace = grace_after_disconnect(self.lease_secs, HEARTBEAT_INTERVAL);
+        let now = tokio::time::Instant::now();
+        if now >= give_up_at(anchor, started, grace) {
+            let n = give_up_steps(
+                self.agent_id(),
+                &self.cancels,
+                &self.abandoned,
+                &self.outbound,
+            );
+            warn!(
+                steps = n,
+                "reconnected after the lease ran out; stopping in-flight steps and reporting them lost"
+            );
+        } else if self.steps_in_flight() > 0 {
+            info!(
+                steps = self.steps_in_flight(),
+                "reconnected with steps still running; resuming"
+            );
+        }
+    }
+
+    fn steps_in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Stop every step for shutdown. They are not reported either, but their lines are
+    /// kept: the socket is still up and Goodbye follows them.
+    fn cancel_all_for_shutdown(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        if let Ok(mut g) = self.cancels.lock() {
+            for (_, tx) in g.drain() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// A session ended. While the agent is reconnecting, a step from the last session keeps
+/// running until the lease it holds on the server can no longer be counted on; then it
+/// is stopped. One watchdog per outage, anchored at the last heartbeat before it, and
+/// aborted by `on_session_established`.
+fn arm_watchdog(st: &mut AgentState, disconnected_at: tokio::time::Instant) {
+    let alive = st.watchdog.as_ref().is_some_and(|w| !w.is_finished());
+    if !should_arm_watchdog(alive, st.steps_in_flight()) {
+        return;
+    }
+    let grace = grace_after_disconnect(st.lease_secs, HEARTBEAT_INTERVAL);
+    let cancels = Arc::clone(&st.cancels);
+    let abandoned = Arc::clone(&st.abandoned);
+    let outbound = st.outbound.clone();
+    let in_flight = Arc::clone(&st.in_flight);
+    let last_frame = Arc::clone(&st.last_server_frame_at);
+    let agent_id = st.agent_id();
+    info!(
+        steps = st.steps_in_flight(),
+        grace_secs = grace.as_secs(),
+        "disconnected with steps in flight; they keep running while the agent reconnects"
+    );
+    st.watchdog = Some(tokio::spawn(async move {
+        loop {
+            let last = last_frame.lock().ok().and_then(|g| *g);
+            let deadline = give_up_at(last, disconnected_at, grace);
+            tokio::time::sleep_until(deadline).await;
+            if in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            // Belt and braces against a stale watchdog: a session that is up keeps the
+            // leases renewed, and it is not this task's call to stop anything then.
+            if outbound.is_connected() {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                continue;
+            }
+            let n = give_up_steps(agent_id, &cancels, &abandoned, &outbound);
+            if n > 0 {
+                warn!(
+                    steps = n,
+                    grace_secs = grace.as_secs(),
+                    "not reconnected within the lease; stopping in-flight steps and queueing a lost-lease report for each"
+                );
+            }
+            return;
+        }
+    }));
+}
+
+/// A step and the attempt it was offered as. Messages are accepted per attempt, and a
+/// `step_run_id` is the same for every attempt of the step, so nothing the agent keys
+/// on a step alone survives a re-lease.
+type StepAttemptKey = (Uuid, Option<i32>);
+
+/// What the agent reports for an attempt it is giving up.
+///
+/// Going silent was worse than it looks: the row stayed `running` under this agent, and
+/// the first heartbeat after reconnecting renewed its lease — and every one after that
+/// — so no lease ever expired, the reclaim loop never saw it, nothing reported it, and
+/// the run hung until the step-timeout backstop while the agent kept the slot for a
+/// process it had already killed. A report ends the attempt on whichever side of the
+/// race the server is: if it has reclaimed and re-leased the step, the attempt on this
+/// message no longer matches the row and the server drops it; if it has not, the step
+/// fails now and retries under its own budget.
+fn give_up_report(agent_id: Uuid, step_run_id: Uuid, attempt: Option<i32>) -> AgentMessage {
+    AgentMessage::StepComplete {
+        agent_id,
+        step_run_id,
+        status: StepStatus::Failed,
+        exit_code: None,
+        error: Some("lease lost while the agent was disconnected".into()),
+        attempt,
+    }
+}
+
+/// Stop every step and report it lost. Its buffered *lines* go — they describe an
+/// attempt the server has finished with — but the report does not. Returns how many
+/// were stopped.
+fn give_up_steps(
+    agent_id: Uuid,
+    cancels: &Mutex<HashMap<StepAttemptKey, oneshot::Sender<()>>>,
+    abandoned: &Mutex<HashSet<StepAttemptKey>>,
+    outbound: &Outbound,
+) -> usize {
+    let Ok(mut g) = cancels.lock() else {
+        return 0;
+    };
+    let n = g.len();
+    for ((step_run_id, attempt), tx) in g.drain() {
+        // The task must not also report: this is the one report for the attempt.
+        if let Ok(mut a) = abandoned.lock() {
+            a.insert((step_run_id, attempt));
+        }
+        outbound.purge_step_logs(step_run_id);
+        outbound.send(give_up_report(agent_id, step_run_id, attempt));
+        let _ = tx.send(());
+    }
+    n
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -297,7 +820,7 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // SIGTERM / SIGINT → cancel in-flight steps, report them, then exit.
+    // SIGTERM / SIGINT → cancel in-flight steps, tell the server, then exit.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -305,13 +828,11 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Process-wide concurrency cap: survives reconnects, so a flapping connection cannot
-    // run more than --concurrency steps at once.
-    let slots = Arc::new(tokio::sync::Semaphore::new(args.concurrency.max(1) as usize));
+    let mut st = AgentState::new(args.concurrency);
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
-        match run_session(&args, &labels, shutdown_rx.clone(), Arc::clone(&slots)).await {
+        match run_session(&args, &labels, shutdown_rx.clone(), &mut st).await {
             Ok(()) => info!("session ended"),
             Err(e) => {
                 if is_unauthorized(&e) {
@@ -327,6 +848,12 @@ async fn main() -> Result<()> {
             info!("agent stopped");
             return Ok(());
         }
+        // The socket is gone; the steps are not. They run on under their leases until
+        // the next session renews them or the grace runs out. The outage is dated from
+        // its first session loss, not from each failed reconnect.
+        let now = tokio::time::Instant::now();
+        let since = *st.disconnected_at.get_or_insert(now);
+        arm_watchdog(&mut st, since);
         // A session that lasted a while was healthy: start the backoff over.
         if started.elapsed() > Duration::from_secs(30) {
             backoff = Duration::from_secs(1);
@@ -337,6 +864,12 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = sd.changed() => {
+                // No socket to say Goodbye on: stop the steps and let the leases expire.
+                st.cancel_all_for_shutdown();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while st.steps_in_flight() > 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 info!("agent stopped");
                 return Ok(());
             }
@@ -380,12 +913,111 @@ fn with_jitter(d: Duration) -> Duration {
     d * pct as u32 / 100
 }
 
+/// Owns the sink for one session: drains the outbox in order, sends heartbeats, and —
+/// if asked — a final message followed by a Close frame.
+async fn write_session(
+    mut sink: futures_util::stream::SplitSink<Ws, Message>,
+    outbound: Outbound,
+    agent_id: Uuid,
+    mut last: oneshot::Receiver<AgentMessage>,
+) -> Result<()> {
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // The first tick is immediate: a reconnect renews the leases straight after Hello.
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let hb = AgentMessage::Heartbeat { agent_id };
+                sink.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
+            }
+            _ = outbound.wake.notified() => {
+                flush_outbox(&mut sink, &outbound, agent_id).await?;
+            }
+            msg = &mut last => {
+                if let Ok(msg) = msg {
+                    // Whatever the steps said while stopping goes first.
+                    flush_outbox(&mut sink, &outbound, agent_id).await?;
+                    sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
+                    let _ = sink.send(Message::Close(None)).await;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Send everything queued, oldest first. A message leaves the queue only after the
+/// socket has taken it, so a writer aborted mid-send (the session ending underneath
+/// it) leaves the message for the next session. The server may or may not have read
+/// it by then, and a duplicate is what the server's own checks exist for (a second
+/// completion is ignored, a second artifact replaces the first, a repeated line is one
+/// line twice).
+async fn flush_outbox(
+    sink: &mut futures_util::stream::SplitSink<Ws, Message>,
+    outbound: &Outbound,
+    agent_id: Uuid,
+) -> Result<()> {
+    let dropped = outbound
+        .outbox
+        .lock()
+        .map(|mut o| o.take_dropped())
+        .unwrap_or_default();
+    for ((step_run_id, attempt), n) in dropped {
+        // Ordering on the server is by insertion, not `seq`, so this notice needs none.
+        let notice = AgentMessage::LogChunk {
+            agent_id,
+            step_run_id,
+            stream: "system".into(),
+            data: format!("{n} log lines dropped while the agent was disconnected from the API"),
+            seq: 0,
+            attempt,
+        };
+        sink.send(Message::Text(serde_json::to_string(&notice)?.into()))
+            .await?;
+    }
+    loop {
+        let next = outbound
+            .outbox
+            .lock()
+            .ok()
+            .and_then(|o| o.peek_front_text());
+        let (token, text) = match next {
+            None => return Ok(()),
+            Some((token, Ok(text))) => (token, text),
+            Some((token, Err(_))) => {
+                // Unserialisable: nothing the next session could do better with it.
+                if let Ok(mut o) = outbound.outbox.lock() {
+                    o.pop_sent(token);
+                }
+                continue;
+            }
+        };
+        sink.send(Message::Text(text.into())).await?;
+        // By token: the lock was released while the socket took it, and a purge in
+        // that window would otherwise make this discard a message never sent.
+        if let Ok(mut o) = outbound.outbox.lock() {
+            o.pop_sent(token);
+        }
+    }
+}
+
+/// Clears `connected` however `run_session` returns — an error, a close, or a drop.
+struct SessionGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One WebSocket session. Steps started here outlive it: on close they carry on under
+/// the state in `st`, and the next session picks them up.
 async fn run_session(
     args: &Args,
     labels: &[String],
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    slots: Arc<tokio::sync::Semaphore>,
+    st: &mut AgentState,
 ) -> Result<()> {
+    let _guard = SessionGuard(Arc::clone(&st.outbound.connected));
     let url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
     // The token goes in a header, not the query string: a URL ends up in proxy and server
     // access logs, and this token leases steps and receives project secrets. Servers older
@@ -402,6 +1034,9 @@ async fn run_session(
     })
     .context("build websocket request")?;
 
+    // Taken before the handshake: `Welcome` moves the anchor, and the give-up decision
+    // below is about how long this agent went without hearing from any session.
+    let anchor_before_session = st.last_server_frame();
     info!(api = %args.api_url, "connecting");
     let (ws, _) = connect_async(request).await.context("connect websocket")?;
     let (mut sink, mut stream) = ws.split();
@@ -409,9 +1044,18 @@ async fn run_session(
     let mut agent_id = Uuid::nil();
 
     if let Some(Ok(Message::Text(text))) = stream.next().await {
-        if let Ok(ServerMessage::Welcome { agent_id: id }) = serde_json::from_str(&text) {
+        if let Ok(ServerMessage::Welcome {
+            agent_id: id,
+            lease_secs,
+        }) = serde_json::from_str(&text)
+        {
             agent_id = id;
-            info!(%agent_id, "registered");
+            st.lease_secs = lease_secs;
+            if let Ok(mut g) = st.agent_id.lock() {
+                *g = agent_id;
+            }
+            st.note_server_frame();
+            info!(%agent_id, ?lease_secs, "registered");
         }
     }
 
@@ -421,58 +1065,66 @@ async fn run_session(
         // The local semaphore already clamps; report the same number, or the server
         // would register an online agent that is never offered anything.
         concurrency: args.concurrency.max(1),
+        protocol_version: fiber_proto::PROTOCOL_VERSION,
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
+    // Reconnected: the steps from the last session keep their leases (the writer's
+    // first heartbeat renews them) and their buffered output goes out now — unless the
+    // outage outlasted the lease, in which case they are stopped here.
+    st.on_session_established(anchor_before_session);
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMessage>();
-
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&msg) else {
-                continue;
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let prepared: Arc<Mutex<HashSet<Uuid>>> = Arc::new(Mutex::new(HashSet::new()));
-    let workspaces: Arc<Workspaces> = Arc::new(Workspaces::default());
-    let cancels: Arc<Mutex<HashMap<Uuid, oneshot::Sender<()>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let in_flight = Arc::new(AtomicU64::new(0));
-    // Graceful drain: while set, finished step tasks do not report — the socket is
-    // closed instead, and the server requeues the steps to another agent.
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let (last_tx, last_rx) = oneshot::channel::<AgentMessage>();
+    let mut writer = tokio::spawn(write_session(sink, st.outbound.clone(), agent_id, last_rx));
+    // A server that carries lease_secs also pings every 15 s; one that does not sends
+    // nothing between offers, so silence means nothing there.
+    let server_pings = st.lease_secs.is_some();
+    let mut idle = tokio::time::Instant::now() + SERVER_IDLE_TIMEOUT;
+    let grace = grace_after_disconnect(st.lease_secs, HEARTBEAT_INTERVAL);
+    // Anything queued while there was no socket goes out first.
+    st.outbound.wake.notify_one();
 
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                let _ = out_tx.send(AgentMessage::Heartbeat { agent_id });
+            res = &mut writer => {
+                // The socket rejected a write; the read side ends on its own soon, but
+                // there is no point waiting for it.
+                match res {
+                    Ok(Err(e)) => return Err(e).context("session write"),
+                    _ => return Ok(()),
+                }
             }
             _ = shutdown.changed() => {
-                let n = cancels.lock().map(|g| g.len()).unwrap_or(0);
+                let n = st.steps_in_flight();
                 warn!(in_flight = n, "shutting down: stopping in-flight steps; the server will requeue them");
-                // Do not report terminal status: closing the socket makes the server
-                // requeue these steps (a restart must not fail the build).
-                draining.store(true, Ordering::SeqCst);
-                if let Ok(mut g) = cancels.lock() {
-                    for (_, tx) in g.drain() {
-                        let _ = tx.send(());
-                    }
-                }
+                // Do not report terminal status: a restart must not fail the build. The
+                // server is told Goodbye once the processes are gone, so it requeues the
+                // steps now instead of when their leases expire.
+                st.cancel_all_for_shutdown();
                 // Wait until every step task has killed its process (bounded).
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-                while in_flight.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+                while st.steps_in_flight() > 0 && tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                writer.abort();
+                let _ = last_tx.send(AgentMessage::Goodbye { agent_id });
+                if tokio::time::timeout(Duration::from_secs(2), &mut writer).await.is_err() {
+                    writer.abort();
+                }
                 return Ok(());
             }
+            _ = tokio::time::sleep_until(idle), if server_pings => {
+                writer.abort();
+                bail!(
+                    "no frame from the server for {} s; treating the socket as lost",
+                    SERVER_IDLE_TIMEOUT.as_secs()
+                );
+            }
             msg = stream.next() => {
+                if matches!(msg, Some(Ok(_))) {
+                    idle = tokio::time::Instant::now() + SERVER_IDLE_TIMEOUT;
+                    // The server's loop is turning, so it is renewing leases too.
+                    st.note_server_frame();
+                }
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(&text) {
@@ -492,36 +1144,43 @@ async fn run_session(
                                 traceparent,
                                 working_directory,
                                 shell,
+                                attempt,
                             }) => {
-                                info!(%step_id, %step_name, %run_id, "offered step");
-                                let _ = out_tx.send(AgentMessage::Claim { agent_id, step_run_id });
+                                info!(%step_id, %step_name, %run_id, ?attempt, "offered step");
+                                // Anything still queued about this step_run_id is from an
+                                // earlier attempt the server has moved past.
+                                st.outbound.purge_step(step_run_id);
+                                let _ = st.outbound.send(AgentMessage::Claim { agent_id, step_run_id });
 
                                 let (cancel_tx, cancel_rx) = oneshot::channel();
-                                if let Ok(mut g) = cancels.lock() {
-                                    g.insert(step_run_id, cancel_tx);
+                                if let Ok(mut g) = st.cancels.lock() {
+                                    g.insert((step_run_id, attempt), cancel_tx);
                                 }
 
-                                let out_tx = out_tx.clone();
-                                let prepared = Arc::clone(&prepared);
-                                let cancels = Arc::clone(&cancels);
+                                let outbound = st.outbound.clone();
+                                let prepared = Arc::clone(&st.prepared);
+                                let cancels = Arc::clone(&st.cancels);
+                                let abandoned = Arc::clone(&st.abandoned);
                                 let workspace_dir = args.workspace_dir.clone();
                                 let http_api = http_base(&args.api_url);
                                 let token = args.token.clone();
-                                let slots = Arc::clone(&slots);
-                                let draining = Arc::clone(&draining);
-                                let in_flight = Arc::clone(&in_flight);
+                                let slots = Arc::clone(&st.slots);
+                                let draining = Arc::clone(&st.draining);
+                                let in_flight = Arc::clone(&st.in_flight);
                                 // The attempt's clock starts now, not when a local permit frees up.
                                 let offered_at = tokio::time::Instant::now();
                                 let redactor = Redactor::new(&env, &secret_keys);
                                 let exec = ExecConfig::from_args(args);
                                 in_flight.fetch_add(1, Ordering::SeqCst);
-                                let workspaces = Arc::clone(&workspaces);
+                                let workspaces = Arc::clone(&st.workspaces);
                                 tokio::spawn(async move {
                                     let _permit = slots.acquire_owned().await;
                                     let result = execute_step(
-                                        &out_tx,
+                                        &outbound,
                                         agent_id,
                                         step_run_id,
+                                        attempt,
+                                        grace,
                                         run_id,
                                         image.as_deref(),
                                         &run,
@@ -545,10 +1204,19 @@ async fn run_session(
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
-                                        g.remove(&step_run_id);
+                                        g.remove(&(step_run_id, attempt));
                                     }
                                     in_flight.fetch_sub(1, Ordering::SeqCst);
                                     if draining.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    // Given up on (lease gone): the server would ignore
+                                    // this report, or worse, apply it to a re-leased attempt.
+                                    if abandoned
+                                        .lock()
+                                        .map(|mut a| a.remove(&(step_run_id, attempt)))
+                                        .unwrap_or(false)
+                                    {
                                         return;
                                     }
 
@@ -563,6 +1231,7 @@ async fn run_session(
                                             },
                                             exit_code: Some(code),
                                             error: None,
+                                            attempt,
                                         },
                                         Err(e) if e.to_string().contains("cancelled") => {
                                             AgentMessage::StepComplete {
@@ -571,6 +1240,7 @@ async fn run_session(
                                                 status: StepStatus::Cancelled,
                                                 exit_code: None,
                                                 error: Some("cancelled".into()),
+                                                attempt,
                                             }
                                         }
                                         Err(e) if e.to_string().starts_with("timed out") => {
@@ -580,6 +1250,7 @@ async fn run_session(
                                                 status: StepStatus::Failed,
                                                 exit_code: None,
                                                 error: Some(redactor.apply(&e.to_string())),
+                                                attempt,
                                             }
                                         }
                                         // Redacted like log lines: an error string can pick
@@ -590,16 +1261,26 @@ async fn run_session(
                                             status: StepStatus::Failed,
                                             exit_code: None,
                                             error: Some(redactor.apply(&e.to_string())),
+                                            attempt,
                                         },
                                     };
-                                    let _ = out_tx.send(complete);
+                                    let _ = outbound.send(complete);
                                 });
                             }
                             Ok(ServerMessage::Cancel { step_run_id }) => {
                                 warn!(%step_run_id, "cancel requested");
-                                if let Ok(mut g) = cancels.lock() {
-                                    if let Some(tx) = g.remove(&step_run_id) {
-                                        let _ = tx.send(());
+                                // The message names no attempt, so every attempt of the
+                                // step running here is stopped — in practice one.
+                                if let Ok(mut g) = st.cancels.lock() {
+                                    let keys: Vec<StepAttemptKey> = g
+                                        .keys()
+                                        .filter(|(s, _)| *s == step_run_id)
+                                        .copied()
+                                        .collect();
+                                    for k in keys {
+                                        if let Some(tx) = g.remove(&k) {
+                                            let _ = tx.send(());
+                                        }
                                     }
                                 }
                             }
@@ -610,22 +1291,14 @@ async fn run_session(
                             Err(e) => warn!(error = %e, "bad server message"),
                         }
                     }
+                    // The session is over; the steps are not. They keep running under
+                    // their leases, their output queues in the outbox, and the next
+                    // session — or the lease watchdog — decides what becomes of them.
                     Some(Ok(Message::Close(_))) | None => {
-                        // Signal all in-flight steps to stop.
-                        if let Ok(mut g) = cancels.lock() {
-                            for (_, tx) in g.drain() {
-                                let _ = tx.send(());
-                            }
-                        }
                         writer.abort();
                         return Ok(());
                     }
                     Some(Err(e)) => {
-                        if let Ok(mut g) = cancels.lock() {
-                            for (_, tx) in g.drain() {
-                                let _ = tx.send(());
-                            }
-                        }
                         writer.abort();
                         return Err(e.into());
                     }
@@ -643,9 +1316,11 @@ async fn run_session(
 /// build output. Files move between steps as artifacts, not by sharing a checkout.
 #[allow(clippy::too_many_arguments)]
 async fn execute_step(
-    out_tx: &tokio::sync::mpsc::UnboundedSender<AgentMessage>,
+    out_tx: &Outbound,
     agent_id: Uuid,
     step_run_id: Uuid,
+    attempt: Option<i32>,
+    retry_budget: Duration,
     run_id: Uuid,
     image: Option<&str>,
     run: &str,
@@ -684,6 +1359,8 @@ async fn execute_step(
         out_tx,
         agent_id,
         step_run_id,
+        attempt,
+        retry_budget,
         run_id,
         image,
         run,
@@ -721,9 +1398,11 @@ async fn execute_step(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_step_inner(
-    out_tx: &tokio::sync::mpsc::UnboundedSender<AgentMessage>,
+    out_tx: &Outbound,
     agent_id: Uuid,
     step_run_id: Uuid,
+    attempt: Option<i32>,
+    retry_budget: Duration,
     run_id: Uuid,
     image: Option<&str>,
     run: &str,
@@ -757,6 +1436,7 @@ async fn execute_step_inner(
             stream: stream.into(),
             data: log_redactor.apply(&data),
             seq: log_seq.fetch_add(1, Ordering::Relaxed),
+            attempt,
         });
     };
     let deadline = timeout_minutes
@@ -806,7 +1486,16 @@ async fn execute_step_inner(
             );
         }
         if !restore.is_empty() {
-            restore_artifacts(http_api, token, work_dir, restore, &mut log).await?;
+            restore_artifacts(
+                http_api,
+                token,
+                work_dir,
+                restore,
+                out_tx,
+                retry_budget,
+                &mut log,
+            )
+            .await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -1021,6 +1710,7 @@ async fn execute_step_inner(
                 stream: "stdout".into(),
                 data: out_redactor.apply(&l),
                 seq: out_seq.fetch_add(1, Ordering::Relaxed),
+                attempt,
             });
         }
     });
@@ -1037,6 +1727,7 @@ async fn execute_step_inner(
                 stream: "stderr".into(),
                 data: err_redactor.apply(&l),
                 seq: err_seq.fetch_add(1, Ordering::Relaxed),
+                attempt,
             });
         }
     });
@@ -1069,8 +1760,30 @@ async fn execute_step_inner(
     // dependent step restores it and would fail later with a missing file instead.
     let mut artifact_failures = Vec::new();
     if code == 0 && !artifacts.is_empty() {
-        artifact_failures =
-            upload_artifacts(http_api, token, step_run_id, work_dir, artifacts, &mut log).await;
+        // Cancellable like the prep phase: an upload retrying through an outage would
+        // otherwise hold the concurrency permit — and keep the step counted as in
+        // flight — long after the step was given up.
+        let cancelled = tokio::select! {
+            failures = upload_artifacts(
+                http_api,
+                token,
+                step_run_id,
+                attempt,
+                work_dir,
+                artifacts,
+                out_tx,
+                retry_budget,
+                &mut log,
+            ) => {
+                artifact_failures = failures;
+                false
+            }
+            _ = &mut cancel => true,
+        };
+        if cancelled {
+            log("system", "step cancelled during artifact upload".into());
+            bail!("step cancelled");
+        }
     }
     drop(env_file);
     if !artifact_failures.is_empty() {
@@ -1226,12 +1939,11 @@ async fn restore_artifacts(
     token: &str,
     work_dir: &Path,
     restore: &[ArtifactRestore],
+    link: &Outbound,
+    retry_budget: Duration,
     log: &mut impl FnMut(&str, String),
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .context("http client")?;
+    let client = artifact_client()?;
     for art in restore {
         if art.name.contains("..") {
             log(
@@ -1245,47 +1957,15 @@ async fn restore_artifacts(
             "system",
             format!("restoring artifact {} ({} bytes)", art.name, art.size),
         );
-        // A failure here is usually the 307 to object storage, not the API itself: the
-        // presigned URL names the storage endpoint as the outside world reaches it. Ask
-        // the API for the bytes instead, the same way the upload falls back.
-        let resp = match client.get(&url).bearer_auth(token).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                log(
-                    "system",
-                    format!("{}: fetching through the API ({e})", art.name),
-                );
-                match client
-                    .get(format!("{url}?via=api"))
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e2) => {
-                        let msg = format!("RESTORE FAILED {}: network error: {e2}", art.name);
-                        log("system", msg.clone());
-                        bail!("{msg}");
-                    }
-                }
-            }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
-            let msg = if snippet.is_empty() {
-                format!("RESTORE FAILED {}: HTTP {status}", art.name)
-            } else {
-                format!("RESTORE FAILED {}: HTTP {status} — {snippet}", art.name)
-            };
-            log("system", msg.clone());
-            bail!("{msg}");
-        }
-        let bytes = match resp.bytes().await {
+        let what = format!("restore {}", art.name);
+        let bytes = match with_api_retry(link, retry_budget, &what, log, || {
+            fetch_artifact(client.clone(), url.clone(), token.to_string())
+        })
+        .await
+        {
             Ok(b) => b,
-            Err(e) => {
-                let msg = format!("RESTORE FAILED {}: read body: {e}", art.name);
+            Err(why) => {
+                let msg = format!("RESTORE FAILED {}: {why}", art.name);
                 log("system", msg.clone());
                 bail!("{msg}");
             }
@@ -1305,22 +1985,171 @@ async fn restore_artifacts(
     Ok(())
 }
 
+/// One download of a prior artifact. A failure on the direct URL is usually the 307 to
+/// object storage, not the API itself: the presigned URL names the storage endpoint as
+/// the outside world reaches it. Ask the API for the bytes instead, the same way the
+/// upload falls back.
+async fn fetch_artifact(
+    client: reqwest::Client,
+    url: String,
+    token: String,
+) -> Result<bytes::Bytes, ApiFailure> {
+    let resp = match client.get(&url).bearer_auth(&token).send().await {
+        Ok(r) => r,
+        Err(_) => client
+            .get(format!("{url}?via=api"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| ApiFailure::Transient(format!("network error: {e}")))?,
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        let msg = if snippet.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status} — {snippet}")
+        };
+        return Err(ApiFailure::from_status(status, msg));
+    }
+    resp.bytes()
+        .await
+        .map_err(|e| ApiFailure::Transient(format!("read body: {e}")))
+}
+
+/// Whether a failed call gets another go: only a transient failure, and only while the
+/// budget has time left in it. A `4xx` is a definite answer and retrying it would spend
+/// the whole grace to arrive at the same place.
+fn retry_again(transient: bool, elapsed: Duration, budget: Duration) -> bool {
+    transient && elapsed < budget
+}
+
+/// Why a call to the API failed, and whether it is worth another try.
+#[derive(Debug)]
+enum ApiFailure {
+    /// The API was unreachable or answered 5xx: the kind of failure an outage causes.
+    Transient(String),
+    /// A definite answer (4xx, a malformed body): trying again changes nothing.
+    Fatal(String),
+}
+
+impl ApiFailure {
+    fn from_status(status: reqwest::StatusCode, msg: String) -> Self {
+        if status.is_server_error() {
+            ApiFailure::Transient(msg)
+        } else {
+            ApiFailure::Fatal(msg)
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            ApiFailure::Transient(m) | ApiFailure::Fatal(m) => m,
+        }
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(self, ApiFailure::Transient(_))
+    }
+}
+
+/// Retry `op` on transient failures for up to `budget` from the first one — the same
+/// grace the step's lease allows, since a step that cannot reach the API is usually one
+/// whose agent is in the middle of an outage, and failing it would spend the run on the
+/// deploy that caused it. Without a session established the wait is a short poll for
+/// one (the socket and the HTTP path fail together); with one, an exponential backoff.
+async fn with_api_retry<T, F, Fut>(
+    link: &Outbound,
+    budget: Duration,
+    what: &str,
+    log: &mut impl FnMut(&str, String),
+    mut op: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ApiFailure>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    let mut announced = false;
+    loop {
+        // Each try is also bounded by what is left of the budget, so a request the
+        // client's own timeout would let run to 120 s cannot overrun the grace. A zero
+        // budget is not "no time to call": it is a server that named no lease, so there
+        // is nothing to overrun. Bounding the try by it would fail every artifact
+        // transfer against an older API without putting a request on the wire.
+        let remaining = budget.saturating_sub(started.elapsed());
+        let failure = if remaining.is_zero() {
+            match op().await {
+                Ok(v) => return Ok(v),
+                Err(f) => f,
+            }
+        } else {
+            match tokio::time::timeout(remaining, op()).await {
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(f)) => f,
+                Err(_) => {
+                    ApiFailure::Transient(format!("no answer within {} s", remaining.as_secs()))
+                }
+            }
+        };
+        let elapsed = started.elapsed();
+        if !retry_again(failure.is_transient(), elapsed, budget) {
+            if failure.is_transient() {
+                return Err(format!(
+                    "{} (gave up after {} s of retries)",
+                    failure.message(),
+                    elapsed.as_secs()
+                ));
+            }
+            return Err(failure.message().to_string());
+        }
+        if !announced {
+            announced = true;
+            log(
+                "system",
+                format!(
+                    "{what}: {}; retrying for up to {} s",
+                    failure.message(),
+                    budget.as_secs()
+                ),
+            );
+        }
+        let wait = if link.is_connected() {
+            backoff
+        } else {
+            Duration::from_secs(1)
+        };
+        tokio::time::sleep(wait.min(budget - elapsed)).await;
+        backoff = (backoff * 2).min(Duration::from_secs(15));
+    }
+}
+
 /// Upload each declared artifact, returning the ones that could not be stored.
 ///
 /// A path that does not exist is a warning, not a failure: a pipeline may legitimately
 /// declare an artifact its step only sometimes produces. Anything that exists but could
 /// not be stored — unreadable, over the size cap, or a failed transfer — is returned, and
 /// the caller fails the step.
+#[allow(clippy::too_many_arguments)]
 async fn upload_artifacts(
     http_api: &str,
     token: &str,
     step_run_id: Uuid,
+    attempt: Option<i32>,
     work_dir: &Path,
     artifacts: &[String],
+    link: &Outbound,
+    retry_budget: Duration,
     log: &mut impl FnMut(&str, String),
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let client = reqwest::Client::new();
+    let client = match artifact_client() {
+        Ok(c) => c,
+        Err(e) => return vec![format!("http client: {e}")],
+    };
     let proxy_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts");
     let presign_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts/presign");
     let complete_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts/complete");
@@ -1351,15 +2180,20 @@ async fn upload_artifacts(
                             "system",
                             format!("uploading artifact {rel} ({} bytes)", bytes.len()),
                         );
-                        match upload_one_artifact(
-                            &client,
-                            token,
-                            &presign_url,
-                            &complete_url,
-                            &proxy_url,
-                            rel,
-                            bytes::Bytes::from(bytes),
-                        )
+                        let bytes = bytes::Bytes::from(bytes);
+                        let what = format!("upload {rel}");
+                        match with_api_retry(link, retry_budget, &what, log, || {
+                            upload_one_artifact(
+                                client.clone(),
+                                token.to_string(),
+                                presign_url.clone(),
+                                complete_url.clone(),
+                                proxy_url.clone(),
+                                rel.to_string(),
+                                attempt,
+                                bytes.clone(),
+                            )
+                        })
                         .await
                         {
                             Ok(mode) => {
@@ -1392,42 +2226,47 @@ async fn upload_artifacts(
 /// off the storage network, or an agent behind a different boundary — falls back to sending
 /// the bytes through the API, which it can reach by definition, since that is where its
 /// offers come from. Isolating the agent should cost throughput, not artifacts.
+#[allow(clippy::too_many_arguments)]
 async fn upload_one_artifact(
-    client: &reqwest::Client,
-    token: &str,
-    presign_url: &str,
-    complete_url: &str,
-    proxy_url: &str,
-    rel: &str,
+    client: reqwest::Client,
+    token: String,
+    presign_url: String,
+    complete_url: String,
+    proxy_url: String,
+    rel: String,
+    attempt: Option<i32>,
     bytes: bytes::Bytes,
-) -> Result<String, String> {
+) -> Result<String, ApiFailure> {
     let size = bytes.len() as u64;
     let mode = match client
-        .post(presign_url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({ "path": rel, "size": size }))
+        .post(&presign_url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "path": rel, "size": size, "attempt": attempt }))
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => resp
             .json::<serde_json::Value>()
             .await
-            .map_err(|e| format!("presign parse {rel}: {e}"))?,
+            .map_err(|e| ApiFailure::Fatal(format!("presign parse {rel}: {e}")))?,
         Ok(resp) => {
-            return Err(format!("presign {rel} failed: HTTP {}", resp.status()));
+            return Err(ApiFailure::from_status(
+                resp.status(),
+                format!("presign {rel} failed: HTTP {}", resp.status()),
+            ));
         }
-        Err(e) => return Err(format!("presign {rel} failed: {e}")),
+        Err(e) => return Err(ApiFailure::Transient(format!("presign {rel} failed: {e}"))),
     };
 
     if mode.get("mode").and_then(|v| v.as_str()) == Some("presign") {
         let upload_url = mode
             .get("upload_url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("presign {rel}: missing upload_url"))?;
+            .ok_or_else(|| ApiFailure::Fatal(format!("presign {rel}: missing upload_url")))?;
         let stored_path = mode
             .get("stored_path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("presign {rel}: missing stored_path"))?;
+            .ok_or_else(|| ApiFailure::Fatal(format!("presign {rel}: missing stored_path")))?;
         // Cheap to clone: `Bytes` is refcounted, so the fallback costs no second copy.
         let unreachable = match client.put(upload_url).body(bytes.clone()).send().await {
             Ok(put) if put.status().is_success() => None,
@@ -1435,28 +2274,32 @@ async fn upload_one_artifact(
             Err(e) => Some(e.to_string()),
         };
         if let Some(why) = unreachable {
-            let via = upload_via_proxy(client, token, proxy_url, rel, bytes).await?;
+            let via = upload_via_proxy(&client, &token, &proxy_url, &rel, attempt, bytes).await?;
             return Ok(format!("{via} (presigned upload unreachable: {why})"));
         }
         let done = client
-            .post(complete_url)
-            .bearer_auth(token)
+            .post(&complete_url)
+            .bearer_auth(&token)
             .json(&serde_json::json!({
                 "path": rel,
                 "size": size,
                 "stored_path": stored_path,
+                "attempt": attempt,
             }))
             .send()
             .await
-            .map_err(|e| format!("complete {rel}: {e}"))?;
+            .map_err(|e| ApiFailure::Transient(format!("complete {rel}: {e}")))?;
         if !done.status().is_success() {
-            return Err(format!("complete {rel} failed: HTTP {}", done.status()));
+            return Err(ApiFailure::from_status(
+                done.status(),
+                format!("complete {rel} failed: HTTP {}", done.status()),
+            ));
         }
         return Ok("presign".into());
     }
 
     // Local backend, or object storage the API would rather proxy for.
-    upload_via_proxy(client, token, proxy_url, rel, bytes).await
+    upload_via_proxy(&client, &token, &proxy_url, &rel, attempt, bytes).await
 }
 
 /// Send the bytes through the API, which stores them with whatever backend it has.
@@ -1465,20 +2308,30 @@ async fn upload_via_proxy(
     token: &str,
     proxy_url: &str,
     rel: &str,
+    attempt: Option<i32>,
     bytes: bytes::Bytes,
-) -> Result<String, String> {
-    let resp = client
+) -> Result<String, ApiFailure> {
+    let mut req = client
         .put(proxy_url)
         .bearer_auth(token)
-        .header("X-Fiber-Artifact-Path", rel)
+        .header("X-Fiber-Artifact-Path", rel);
+    // Same contract as the `attempt` on the WebSocket messages: the server drops an
+    // upload for an attempt its row has moved past.
+    if let Some(a) = attempt {
+        req = req.header("X-Fiber-Attempt", a.to_string());
+    }
+    let resp = req
         .body(bytes)
         .send()
         .await
-        .map_err(|e| format!("upload {rel} failed: {e}"))?;
+        .map_err(|e| ApiFailure::Transient(format!("upload {rel} failed: {e}")))?;
     if resp.status().is_success() {
         Ok("proxy".into())
     } else {
-        Err(format!("upload {rel} failed: HTTP {}", resp.status()))
+        Err(ApiFailure::from_status(
+            resp.status(),
+            format!("upload {rel} failed: HTTP {}", resp.status()),
+        ))
     }
 }
 
@@ -1722,6 +2575,365 @@ fn _ws_ty(_: Ws) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log_chunk(step: Uuid, seq: u64) -> AgentMessage {
+        AgentMessage::LogChunk {
+            agent_id: Uuid::nil(),
+            step_run_id: step,
+            stream: "stdout".into(),
+            data: format!("line {seq}"),
+            seq,
+            attempt: Some(1),
+        }
+    }
+
+    fn complete(step: Uuid) -> AgentMessage {
+        AgentMessage::StepComplete {
+            agent_id: Uuid::nil(),
+            step_run_id: step,
+            status: StepStatus::Succeeded,
+            exit_code: Some(0),
+            error: None,
+            attempt: Some(1),
+        }
+    }
+
+    fn artifact(step: Uuid) -> AgentMessage {
+        AgentMessage::Artifact {
+            agent_id: Uuid::nil(),
+            step_run_id: step,
+            name: "a".into(),
+            path: "a".into(),
+            size: 1,
+            content_base64: Some("AA==".into()),
+            attempt: Some(1),
+        }
+    }
+
+    fn seqs(o: &Outbox) -> Vec<u64> {
+        o.msgs()
+            .filter_map(|m| match m {
+                AgentMessage::LogChunk { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // --- outbox: what survives a disconnect -------------------------------------------
+
+    #[test]
+    fn the_outbox_keeps_everything_below_its_cap_in_order() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(3);
+        assert_eq!(o.push(log_chunk(step, 0)), Enqueue::Keep);
+        assert_eq!(o.push(log_chunk(step, 1)), Enqueue::Keep);
+        assert_eq!(o.push(complete(step)), Enqueue::Keep);
+        assert_eq!(seqs(&o), vec![0, 1]);
+        assert!(matches!(
+            o.msgs().last(),
+            Some(AgentMessage::StepComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn past_the_cap_the_oldest_log_line_goes_first() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(3);
+        o.push(log_chunk(step, 0));
+        o.push(log_chunk(step, 1));
+        o.push(log_chunk(step, 2));
+        assert_eq!(o.push(log_chunk(step, 3)), Enqueue::DropOldestLog);
+        assert_eq!(
+            seqs(&o),
+            vec![1, 2, 3],
+            "the newest line is kept, the oldest dropped"
+        );
+        assert_eq!(o.take_dropped().get(&(step, Some(1))), Some(&1));
+    }
+
+    #[test]
+    fn completions_and_artifacts_grow_past_the_cap_and_never_reorder() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(2);
+        o.push(complete(step));
+        o.push(artifact(step));
+        // Full of messages that must reach the server: the cap yields, not the queue.
+        assert_eq!(o.push(complete(step)), Enqueue::Keep);
+        assert_eq!(o.queued(), 3);
+        // A line arriving now is the only droppable thing, and it is the newest: it is
+        // still admitted (the policy drops the *oldest* line, which is itself).
+        assert_eq!(o.push(log_chunk(step, 0)), Enqueue::DropOldestLog);
+        assert_eq!(seqs(&o), Vec::<u64>::new());
+        assert!(matches!(
+            o.msgs().next(),
+            Some(AgentMessage::StepComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn past_the_hard_bound_the_oldest_non_completion_goes_then_admission_is_refused() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(2);
+        o.push(artifact(step));
+        o.push(complete(step));
+        o.push(complete(step));
+        o.push(complete(step));
+        // Twice the cap is the hard bound: the artifact is the oldest non-completion.
+        assert_eq!(o.push(complete(step)), Enqueue::DropOldest);
+        assert_eq!(o.queued(), 4);
+        assert!(
+            o.msgs()
+                .all(|m| matches!(m, AgentMessage::StepComplete { .. }))
+        );
+        // Nothing but completions left: a result already held outranks the newcomer.
+        assert_eq!(o.push(artifact(step)), Enqueue::Refused);
+        assert_eq!(o.queued(), 4);
+    }
+
+    #[test]
+    fn purging_a_step_removes_everything_about_it_and_nothing_else() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(10);
+        o.push(log_chunk(a, 0));
+        o.push(log_chunk(b, 0));
+        o.push(complete(b));
+        o.push(complete(a));
+        o.push(artifact(a));
+        o.push(AgentMessage::Claim {
+            agent_id: Uuid::nil(),
+            step_run_id: a,
+        });
+        o.purge_step(a);
+        // Its completion too: a new offer for the step means the server has moved past
+        // the attempt that completion reports on.
+        assert_eq!(o.queued(), 2);
+        assert!(o.msgs().all(|m| step_of(m) == Some(b)));
+    }
+
+    #[test]
+    fn purging_a_step_s_logs_keeps_what_reports_on_it() {
+        // What a given-up step leaves behind: its lines are worthless to an attempt the
+        // server has finished with, its result is not.
+        let a = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(10);
+        o.push(log_chunk(a, 0));
+        o.push(complete(a));
+        o.push(log_chunk(a, 1));
+        o.purge_step_logs(a);
+        assert_eq!(o.queued(), 1);
+        assert!(matches!(
+            o.msgs().next(),
+            Some(AgentMessage::StepComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn a_message_purged_mid_send_does_not_take_the_next_one_with_it() {
+        // The writer holds no lock while the socket takes a message. If a purge empties
+        // the front in that window, popping blind would discard the message behind it —
+        // which was never sent, and may be a completion.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(10);
+        o.push(log_chunk(a, 0));
+        o.push(complete(b));
+        let (token, _) = o.peek_front_text().expect("a message to send");
+        o.purge_step(a);
+        o.pop_sent(token);
+        assert_eq!(o.queued(), 1, "b's completion is still queued");
+        assert!(matches!(
+            o.msgs().next(),
+            Some(AgentMessage::StepComplete { .. })
+        ));
+        // The ordinary path still pops what it sent.
+        let (token, _) = o.peek_front_text().expect("a message to send");
+        o.pop_sent(token);
+        assert_eq!(o.queued(), 0);
+    }
+
+    // --- giving up a step -------------------------------------------------------------
+
+    #[test]
+    fn a_given_up_step_is_reported_lost_on_its_own_attempt() {
+        let step = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        match give_up_report(agent, step, Some(2)) {
+            AgentMessage::StepComplete {
+                agent_id,
+                step_run_id,
+                status,
+                exit_code,
+                error,
+                attempt,
+            } => {
+                assert_eq!((agent_id, step_run_id), (agent, step));
+                // Failed, not cancelled: a cancel is a person's decision and would not
+                // retry. This spends an attempt from the step's own budget.
+                assert_eq!(status, StepStatus::Failed);
+                assert_eq!(exit_code, None);
+                assert_eq!(
+                    error.as_deref(),
+                    Some("lease lost while the agent was disconnected")
+                );
+                // The attempt is what makes it safe to send after a reclaim.
+                assert_eq!(attempt, Some(2));
+            }
+            other => panic!("expected a completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn giving_up_reports_every_attempt_and_drops_only_their_lines() {
+        // Going silent left the row running under this agent, and the next heartbeat
+        // renewed its lease for ever.
+        let one = Uuid::new_v4();
+        let two = Uuid::new_v4();
+        let cancels: Mutex<HashMap<StepAttemptKey, oneshot::Sender<()>>> =
+            Mutex::new(HashMap::new());
+        let abandoned: Mutex<HashSet<StepAttemptKey>> = Mutex::new(HashSet::new());
+        let outbound = Outbound::new();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        cancels.lock().unwrap().insert((one, Some(1)), tx1);
+        cancels.lock().unwrap().insert((two, Some(3)), tx2);
+        outbound.send(log_chunk(one, 0));
+        outbound.send(log_chunk(two, 0));
+
+        assert_eq!(
+            give_up_steps(Uuid::new_v4(), &cancels, &abandoned, &outbound),
+            2
+        );
+
+        // Both tasks were told to stop, and neither may report for itself.
+        assert!(rx1.is_terminated() || rx1.blocking_recv().is_ok());
+        assert!(rx2.is_terminated() || rx2.blocking_recv().is_ok());
+        let a = abandoned.lock().unwrap();
+        assert!(a.contains(&(one, Some(1))) && a.contains(&(two, Some(3))));
+        // Two reports, no lines.
+        let o = outbound.outbox.lock().unwrap();
+        assert_eq!(o.queued(), 2);
+        assert!(
+            o.msgs()
+                .all(|m| matches!(m, AgentMessage::StepComplete { .. }))
+        );
+        let attempts: Vec<Option<i32>> = o
+            .msgs()
+            .filter_map(|m| match m {
+                AgentMessage::StepComplete { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert!(attempts.contains(&Some(1)) && attempts.contains(&Some(3)));
+    }
+
+    // --- how long to keep running after a disconnect ---------------------------------
+
+    #[test]
+    fn a_lease_from_the_server_gives_a_grace_short_of_the_lease() {
+        // 300 s lease, 10 s heartbeats: the last renewal the server saw may be an
+        // interval old, one more may be in flight, and the first one after a reconnect
+        // needs a moment to land — three intervals of margin.
+        assert_eq!(
+            grace_after_disconnect(Some(300), Duration::from_secs(10)),
+            Duration::from_secs(270)
+        );
+    }
+
+    #[test]
+    fn an_old_server_gets_no_grace() {
+        // No lease_secs in Welcome: that server requeues on close, so a step kept
+        // running here would race the re-leased attempt. Cancel at once, as before.
+        assert_eq!(
+            grace_after_disconnect(None, Duration::from_secs(10)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_lease_shorter_than_the_margin_saturates_to_zero() {
+        assert_eq!(
+            grace_after_disconnect(Some(20), Duration::from_secs(10)),
+            Duration::ZERO
+        );
+    }
+
+    // --- retrying the API through an outage ------------------------------------------
+
+    #[test]
+    fn a_definite_answer_is_not_retried_however_much_budget_is_left() {
+        // A 4xx is the server's decision; retrying spends the whole grace to arrive at
+        // the same place, and the step is failed at the end of it either way.
+        assert!(!retry_again(
+            false,
+            Duration::ZERO,
+            Duration::from_secs(270)
+        ));
+        assert!(matches!(
+            ApiFailure::from_status(reqwest::StatusCode::BAD_REQUEST, "x".into()),
+            ApiFailure::Fatal(_)
+        ));
+        assert!(matches!(
+            ApiFailure::from_status(reqwest::StatusCode::UNAUTHORIZED, "x".into()),
+            ApiFailure::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn a_server_error_is_retried_until_the_budget_runs_out() {
+        let budget = Duration::from_secs(270);
+        assert!(matches!(
+            ApiFailure::from_status(reqwest::StatusCode::BAD_GATEWAY, "x".into()),
+            ApiFailure::Transient(_)
+        ));
+        assert!(ApiFailure::Transient("down".into()).is_transient());
+        assert!(retry_again(true, Duration::from_secs(269), budget));
+        assert!(!retry_again(true, budget, budget));
+        assert!(!retry_again(true, Duration::from_secs(300), budget));
+    }
+
+    #[test]
+    fn an_absurd_lease_is_clamped_so_the_deadline_cannot_overflow() {
+        let grace = grace_after_disconnect(Some(u64::MAX), Duration::from_secs(10));
+        assert_eq!(grace, Duration::from_secs(MAX_LEASE_SECS - 30));
+        // The watchdog adds this to an Instant; it must not panic.
+        let _ = give_up_at(None, tokio::time::Instant::now(), grace);
+    }
+
+    // --- the watchdog: one per outage, anchored at the last heartbeat ----------------
+
+    #[test]
+    fn the_deadline_counts_from_the_last_heartbeat_the_socket_took() {
+        let grace = Duration::from_secs(270);
+        let now = tokio::time::Instant::now();
+        let heartbeat = now - Duration::from_secs(8);
+        // The server's lease clock started at that heartbeat, not at the close.
+        assert_eq!(give_up_at(Some(heartbeat), now, grace), heartbeat + grace);
+        // Never wrote one: the close is all there is to count from.
+        assert_eq!(give_up_at(None, now, grace), now + grace);
+    }
+
+    #[test]
+    fn a_failed_reconnect_does_not_move_the_deadline() {
+        // The anchor is the outage's first loss; later attempts pass the same value.
+        let grace = Duration::from_secs(270);
+        let first_loss = tokio::time::Instant::now();
+        let later_attempt = first_loss + Duration::from_secs(25);
+        assert_eq!(
+            give_up_at(None, first_loss, grace),
+            first_loss + grace,
+            "the deadline is a function of the first loss alone"
+        );
+        assert_ne!(give_up_at(None, later_attempt, grace), first_loss + grace);
+    }
+
+    #[test]
+    fn one_watchdog_per_outage_and_only_with_something_to_give_up() {
+        assert!(should_arm_watchdog(false, 1));
+        // A second one per failed reconnect would fire on a session that has healed.
+        assert!(!should_arm_watchdog(true, 1));
+        assert!(!should_arm_watchdog(false, 0));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

@@ -21,13 +21,31 @@ metadata:
 | `crates/fiber-cli/src/main.rs` | Spawns an agent and validates YAML against the same definition types |
 | `apps/ui/src/lib/api.ts` | Hand-mirrors these shapes for the UI — **no codegen, silent drift** |
 
-`fiber-scheduler` also constructs `ServerMessage` values when dispatching offers.
+`fiber-scheduler` also constructs `ServerMessage` values when dispatching offers, reads
+`Hello.protocol_version` (through `disconnect_policy`) to decide whether a close ends the
+agent's attempts, and checks the `attempt` echoed on `LogChunk` / `Artifact` /
+`StepComplete` against the row (`attempt_is_current`) — a `step_run_id` is the same across
+attempts, so that field is what keeps a message held through a reclaim off the attempt
+that replaced it. Every new step-scoped message must carry it. `fiber-cli` and `api.ts` do not touch `Hello`, `Welcome`, or `Goodbye`
+today (`wire-drift.test.ts` mirrors only the definition and status types) — check again
+before assuming that.
+
+## `protocol_version`
+
+`Hello` carries `protocol_version`, the agent's copy of `fiber_proto::PROTOCOL_VERSION`.
+`#[serde(default)]`, so an agent older than the field is revision `0`. Each revision is a
+promise about agent behaviour, documented on the constant — `1` means the agent keeps its
+steps and outbound queue across sessions, renews leases on reconnect, sends `Goodbye`
+before a deliberate exit, and reads `Welcome.lease_secs`. When you change what the agent
+promises, bump the constant and document the new revision there; the server logs the
+value on `Hello` and may one day refuse a revision it no longer supports. It is not stored
+on the `agents` row (no column yet).
 
 ## The compatibility rule that actually matters
 
 **An old agent talks to a new API and vice versa.** Agents are separate long-lived processes on other machines, often not upgraded in lockstep with the control plane. Therefore:
 
-- Add new fields as `Option<T>` or with `#[serde(default)]`. A required new field on an existing message breaks every deployed agent instantly.
+- Add new fields as `Option<T>` or with `#[serde(default)]`. A required new field on an existing message breaks every deployed agent instantly. When a new field changes what the other side may assume (`Welcome.lease_secs` tells the agent it may keep running through a disconnect), the receiver must treat its *absence* as the old contract, and say so in the field's doc comment.
 - Add new message variants rather than repurposing existing ones, and make unknown variants non-fatal on the receiving side where possible.
 - Never rename a serialized field without a transition release — the wire name is the contract, not the Rust identifier.
 - Never change the meaning of an existing field while keeping its name and type. That is the failure mode no test catches.
