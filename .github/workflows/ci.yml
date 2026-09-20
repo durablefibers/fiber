@@ -251,7 +251,9 @@ jobs:
         run: |
           set -euo pipefail
           set -a; . scripts/dev-env.sh; set +a
-          env | grep -E '^(FIBER_|RUST_LOG)=' >> "$GITHUB_ENV"
+          # `FIBER_` needs a name after it: `^(FIBER_|RUST_LOG)=` asks for a variable
+          # literally called FIBER_, matches only RUST_LOG, and exports nothing useful.
+          env | grep -E '^(FIBER_[A-Z0-9_]+|RUST_LOG)=' >> "$GITHUB_ENV"
 
       - name: start fiber-api
         run: |
