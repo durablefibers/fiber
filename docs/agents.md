@@ -196,13 +196,15 @@ lines, keeping the first 2 000 and saying how many it dropped.
 
 `seq` is assigned where the line is read, counts from zero per attempt across `stdout`,
 `stderr` and the agent's own `system` lines, and is never renumbered — a batch re-sent
-after a reconnect carries the numbers it had the first time. **`seq`, not storage order,
-is what a step's log is sorted by**: the agent's own notes go out at once while piped
-output waits up to a flush interval behind them, so a cancel's "killing step process"
-would otherwise be stored above the output that preceded it. `GET /api/steps/{id}/logs`
-orders each page by `(attempt, seq, id)`; every system notice the agent or the server
-inserts — dropped lines, lines that could not be stored — carries the `seq` of the gap it
-is reporting, so it lands where the gap is.
+after a reconnect carries the numbers it had the first time.
+
+A step's log is read back in **storage order** (`log_lines.id`), which is also the cursor
+`fiber logs --follow` and the UI resume from, and `seq` agrees with it: while a step is
+running the agent's own notes travel down the same channel as its piped output, so a
+cancel's "killing step process" cannot overtake the output that preceded it. Notes from
+before the pipes exist (workspace prep) go straight out and are first by definition. Every
+notice inserted after the fact — dropped lines, lines that could not be stored — carries
+the `seq` of the gap it reports, so the two orders never disagree.
 
 The server stores a batch in one statement and publishes one event for it, where before
 it cost two queries and a Redis publish per line. An agent older than the batch keeps
@@ -216,9 +218,10 @@ the control plane can store blocks on its own `write`, which is what stops
 `yes | head -n 10000000` from buffering gigabytes. With the socket **down** there is
 nothing to wait for and the outbox bound applies instead — 10 000 lines or 8 MB, oldest
 first, with a system line saying how many were lost and where. The same notice appears if
-the socket is up but has not drained within 30 s, and after a cancel or timeout the agent
-gives the buffered output 10 s to reach the server before dropping the rest, so a kill is
-still reported promptly.
+the socket is up but has not drained within 30 s. Once a step's process is gone the agent
+waits for the buffered output to reach the server — 60 s after an ordinary exit, 10 s
+after a cancel or timeout, which have to be reported promptly — and says so if it gives
+up with output still queued.
 
 Two caps sit past that. `FIBER_STEP_LOG_MAX_LINES` (default 50 000) bounds the lines
 stored per **attempt**, counted across sessions, with one `system` line at the cap saying

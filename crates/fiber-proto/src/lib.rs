@@ -235,11 +235,14 @@ pub struct ArtifactRestore {
 /// One line of step output inside a [`AgentMessage::LogBatch`].
 ///
 /// `stream` is `stdout`, `stderr` or `system`; `seq` is assigned by the agent and counts
-/// from zero per attempt across all three. It is what a step's log is **ordered by** —
-/// `Store::list_logs` sorts each page `(attempt, seq, id)` — because storage order is not
-/// emission order: the agent's own `system` notes go out at once while piped output waits
-/// behind a flush interval. Anything that inserts a line after the fact (a dropped-lines
-/// notice) must carry the `seq` of the place it belongs, not zero.
+/// from zero per attempt across all three.
+///
+/// A step's log is read back in **storage order** (`log_lines.id`), because that is the
+/// cursor every follower resumes from. `seq` agrees with it rather than replacing it: the
+/// agent sends its own `system` notes down the same channel as the step's piped output
+/// while a step is running, so nothing overtakes what it describes. A line inserted after
+/// the fact — a dropped-lines notice — still carries the `seq` of the place it belongs,
+/// so the two orders do not disagree.
 ///
 /// Batching does not renumber anything: a line carries the `seq` it was given when it was
 /// read, whichever batch it ends up in and however many times that batch is sent.

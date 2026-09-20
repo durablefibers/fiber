@@ -48,7 +48,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | GET | `/api/runs/{id}/steps` | reader |
 | GET | `/api/runs/{id}/artifacts` | reader |
 | GET | `/api/artifacts/{id}/download` | reader |
-| GET | `/api/steps/{id}/logs` | reader — `?attempt=N` `&after_id=<id>` `&limit=` (default 1000, max 5000). Without `after_id` returns the **newest** `limit` lines |
+| GET | `/api/steps/{id}/logs` | reader — `?attempt=N` `&after_id=<id>` `&limit=` (default 1000, max 5000). Without `after_id` returns the **newest** `limit` lines. Always ordered by `id`, so the last line of a page is the cursor for the next `after_id` |
 | GET | `/api/steps/{id}/attempts` | reader |
 
 ## Secrets & webhooks

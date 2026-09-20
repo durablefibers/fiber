@@ -47,8 +47,11 @@ large install.
   by winning a race against the consumer's `git fetch`, and anything that shortens the
   gap between a step finishing and the next one starting makes it fail on a control plane
   that is working correctly. It now removes the producer's own (terminal) step directory,
-  which cannot race anything and proves the same thing, and asserts that the wipe
-  happened.
+  which cannot race anything — except that the agent already removes each step's
+  workspace as that step finishes, so there was never anything there to wipe and the
+  external wipe only ever raced the agent's own GC. The smoke now asserts the two facts
+  that are true by the end of the run instead: no workspace survives it, and a consumer's
+  log says it restored its inputs.
 
 ### Changed
 
@@ -81,7 +84,10 @@ large install.
   indication the other 40 000 had existed; it now arrives whole. With the socket down
   nothing has changed in kind — the outbox still drops its oldest lines, now bounded by
   bytes (8 MB) as well as lines (10 000), and still says how many went.
-  A batch is capped at 2 000 lines server-side (the agent flushes at 500), since a
+  A step that exited waits up to 60 s for its buffered output to reach the server (10 s
+  after a cancel or timeout, which must be reported promptly) and says so if it gives up
+  with output still queued, rather than holding its concurrency slot for as long as a
+  stalled socket takes. A batch is capped at 2 000 lines server-side (the agent flushes at 500), since a
   hostile agent could otherwise put a 64 MiB frame on the wire that parses to a million
   of them; the excess is dropped with a notice. A batch the database refuses is reported
   on the next one that lands, rather than leaving a silent hole.
@@ -95,12 +101,14 @@ large install.
   **A run page opened before the upgrade stops tailing live** until it is reloaded or the
   step's log is refetched: the old bundle only knows `log`. Nothing is lost — the lines
   are stored and appear on reload.
-- **A step's log is ordered by `seq`, not by when a row was written.** Batching made the
-  two diverge: the agent's own `system` notes go out immediately while piped output waits
-  behind a flush interval, so a cancel's "killing step process" was stored above the
-  output that preceded it. `GET /api/steps/{id}/logs` now sorts each page
-  `(attempt, seq, id)`, and every notice the agent or the server inserts after the fact
-  carries the `seq` of the gap it reports rather than zero.
+- **A step's own notes travel with its output.** Batching had made storage order stop
+  meaning emission order — the agent's `system` notes went out immediately while piped
+  output waited behind a flush interval, so a cancel's "killing step process" was stored
+  above the output that preceded it. While a step is running those notes now go down the
+  same channel as its pipes, so `id` order is emission order again and
+  `GET /api/steps/{id}/logs` keeps ordering by `id` alone — which it must, because the
+  last line of a page is the cursor `fiber logs --follow` and the UI resume from. Notices
+  inserted after the fact carry the `seq` of the gap they report.
 - **An agent newer than the server unpacks its batches.** `Welcome` now carries the
   server's `protocol_version`; absent means "older than `log_batch`", and the agent sends
   that server one `log_chunk` per line, each keeping its `seq`. Without it a rev-2 agent

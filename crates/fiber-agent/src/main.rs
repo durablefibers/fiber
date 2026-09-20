@@ -314,6 +314,12 @@ const LOG_BACKPRESSURE_MAX: Duration = Duration::from_secs(30);
 /// rest is dropped. A cancel has to be reported promptly: the permit is held and the run
 /// reads "cancelling" until it is.
 const KILL_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+/// Longest a step that exited on its own waits for its buffered output to reach the
+/// server. Generous, because all of this output belongs in the log and the child is
+/// already gone — but not unbounded: a connected socket that is not draining makes the
+/// batcher wait `LOG_BACKPRESSURE_MAX` per flush, and ten thousand buffered lines is
+/// minutes of holding the concurrency permit for a step that has finished.
+const EXIT_DRAIN_BUDGET: Duration = Duration::from_secs(60);
 /// The protocol revision that introduced `LogBatch`. A server below it gets one
 /// `LogChunk` per line.
 const LOG_BATCH_PROTOCOL: u32 = 2;
@@ -752,6 +758,19 @@ impl Outbound {
         if let Ok(mut o) = self.outbox.lock() {
             o.purge_step_logs(step_run_id);
         }
+    }
+}
+
+/// The `&'static str` for a stream name the step task uses.
+///
+/// `RawLine` carries `&'static str` because the pumps only ever produce two values;
+/// the step task's own notes are always `system`, and anything else it invents would be
+/// a bug rather than a new stream.
+fn system_stream(stream: &str) -> &'static str {
+    match stream {
+        "stdout" => "stdout",
+        "stderr" => "stderr",
+        _ => "system",
     }
 }
 
@@ -1422,6 +1441,12 @@ async fn flush_outbox(
     outbound: &Outbound,
     agent_id: Uuid,
 ) -> Result<()> {
+    // Read before anything is built: the notice is a one-line batch, and against a
+    // server that cannot parse one it would be rejected — on exactly the sessions the
+    // fallback exists for, and exactly when the outbox has been dropping lines. It
+    // would also raise the "upgrade the API before the agents" error on a session
+    // whose real output is being delivered perfectly well as chunks.
+    let batches = outbound.server_takes_batches();
     let dropped = outbound
         .outbox
         .lock()
@@ -1430,19 +1455,31 @@ async fn flush_outbox(
     for (i, ((step_run_id, attempt), d)) in dropped.iter().enumerate() {
         // `at_seq` puts the notice where the gap is: readers order a step's log by
         // `seq`, not by when a row was stored.
-        let notice = AgentMessage::LogBatch {
-            agent_id,
-            step_run_id: *step_run_id,
-            attempt: *attempt,
-            lines: vec![LogLineWire {
+        let data = format!(
+            "{} log lines dropped here: the agent's outbound buffer was full \
+             (the API was unreachable, or was not keeping up)",
+            d.count
+        );
+        let notice = if batches {
+            AgentMessage::LogBatch {
+                agent_id,
+                step_run_id: *step_run_id,
+                attempt: *attempt,
+                lines: vec![LogLineWire {
+                    stream: "system".into(),
+                    data,
+                    seq: d.at_seq,
+                }],
+            }
+        } else {
+            AgentMessage::LogChunk {
+                agent_id,
+                step_run_id: *step_run_id,
                 stream: "system".into(),
-                data: format!(
-                    "{} log lines dropped here: the agent's outbound buffer was full \
-                     (the API was unreachable, or was not keeping up)",
-                    d.count
-                ),
+                data,
                 seq: d.at_seq,
-            }],
+                attempt: *attempt,
+            }
         };
         let frame = match serde_json::to_string(&notice) {
             Ok(f) => f,
@@ -1459,7 +1496,6 @@ async fn flush_outbox(
             bail!("sending a dropped-lines notice failed");
         }
     }
-    let batches = outbound.server_takes_batches();
     loop {
         let next = outbound
             .outbox
@@ -1953,18 +1989,44 @@ async fn execute_step_inner(
     let seq = Arc::new(AtomicU64::new(0));
     let log_seq = Arc::clone(&seq);
     let log_redactor = redactor.clone();
-    // A batch of one. These are the agent's own notes (prep, timeout, kill, artifacts),
-    // never more than a handful per step, so there is nothing to coalesce — and going
-    // through the same message keeps one shape on the wire for all step output.
+    // Filled while the step's pipes are being read, so the agent's own notes take the
+    // same route as the step's output and reach the table in the order they happened.
+    // Storage order is what every reader uses — `list_logs` pages by `id`, and the
+    // cursor a follower resumes from is the last row of a page — so a note that
+    // overtakes the output it describes is stored above it, and no amount of sorting
+    // on read can fix that without breaking the cursor.
+    let log_lines_tx: Arc<Mutex<Option<mpsc::Sender<RawLine>>>> = Arc::new(Mutex::new(None));
+    let closure_tx = Arc::clone(&log_lines_tx);
     let mut log = |stream: &str, data: String| {
+        let data = log_redactor.apply(&data);
+        let seq = log_seq.fetch_add(1, Ordering::Relaxed);
+        // `try_send`, because this is a sync closure called from a dozen places and
+        // some of them hold no runtime slot to yield. Full means ten thousand lines are
+        // already queued, in which case going straight to the outbox can put this note
+        // ahead of them — the alternative is losing it, and a note about a timeout or a
+        // kill is the one line you want most.
+        if let Ok(g) = closure_tx.lock()
+            && let Some(tx) = g.as_ref()
+            && tx
+                .try_send(RawLine {
+                    stream: system_stream(stream),
+                    seq,
+                    data: data.clone(),
+                })
+                .is_ok()
+        {
+            return;
+        }
+        // Before the pipes exist (workspace prep) and after they are drained: nothing
+        // is buffered behind this, so straight to the outbox is in order by definition.
         let _ = out_tx.send(AgentMessage::LogBatch {
             agent_id,
             step_run_id,
             attempt,
             lines: vec![LogLineWire {
                 stream: stream.into(),
-                data: log_redactor.apply(&data),
-                seq: log_seq.fetch_add(1, Ordering::Relaxed),
+                data,
+                seq,
             }],
         });
     };
@@ -2245,7 +2307,24 @@ async fn execute_step_inner(
         Arc::clone(&seq),
         line_tx.clone(),
     ));
-    let err_handle = tokio::spawn(pump_lines(stderr, "stderr", Arc::clone(&seq), line_tx));
+    let err_handle = tokio::spawn(pump_lines(
+        stderr,
+        "stderr",
+        Arc::clone(&seq),
+        line_tx.clone(),
+    ));
+    // From here the step task's own notes go down the same channel as the output, so
+    // they are stored between the lines they were written between. `line_tx` itself is
+    // dropped: the slot's clone and the pumps' are the only senders, and the slot has
+    // to be cleared before the drain or the batcher never sees the channel close.
+    if let Ok(mut g) = log_lines_tx.lock() {
+        *g = Some(line_tx);
+    }
+    let stop_logging = || {
+        if let Ok(mut g) = log_lines_tx.lock() {
+            g.take();
+        }
+    };
 
     // Both pumps, then the batcher: the pumps hold the only senders, so awaiting them
     // closes the channel and the batcher flushes whatever is left and returns. Every
@@ -2278,15 +2357,27 @@ async fn execute_step_inner(
     }
     let code = tokio::select! {
         status = child.wait() => {
+            stop_logging();
             // Drained before the `?`: an error from `wait` must not enqueue the step's
-            // completion ahead of the output that explains it.
-            drain(out_handle, err_handle, batcher, None).await;
-            status?.code().unwrap_or(1)
+            // completion ahead of the output that explains it. Bounded, generously: a
+            // socket that is up but not draining could otherwise hold the concurrency
+            // permit for as long as the buffered output takes, which at
+            // `LOG_BACKPRESSURE_MAX` per flush is minutes after the child is gone.
+            let flushed = drain(out_handle, err_handle, batcher, Some(EXIT_DRAIN_BUDGET)).await;
+            let code = status?.code().unwrap_or(1);
+            if !flushed {
+                log("system", format!(
+                    "log buffer not flushed within {}s of the step exiting; the rest of this step's output was dropped",
+                    EXIT_DRAIN_BUDGET.as_secs()
+                ));
+            }
+            code
         }
         _ = &mut cancel => {
             // Said before the kill, so it is worth reading; the last few milliseconds of
             // the step's own output may still be in a batch behind it.
             log("system", "killing step process".into());
+            stop_logging();
             kill_step(&mut child, docker_container.as_deref()).await;
             if !drain(out_handle, err_handle, batcher, Some(KILL_DRAIN_BUDGET)).await {
                 log("system", "log buffer not flushed within the cancel deadline; the rest of this step's output was dropped".into());
@@ -2296,6 +2387,7 @@ async fn execute_step_inner(
         _ = sleep_until_opt(deadline) => {
             let msg = timed_out_msg();
             log("system", format!("{msg}; killing step process"));
+            stop_logging();
             kill_step(&mut child, docker_container.as_deref()).await;
             if !drain(out_handle, err_handle, batcher, Some(KILL_DRAIN_BUDGET)).await {
                 log("system", "log buffer not flushed within the timeout deadline; the rest of this step's output was dropped".into());

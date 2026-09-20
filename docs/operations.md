@@ -127,7 +127,10 @@ needs.
 `GET /api/steps/{id}/logs` returns the newest 1000 lines by default. `?attempt=N` narrows
 to one attempt — `seq` restarts per attempt, so a retried step's output interleaves
 otherwise — and `?after_id=<id>` returns what followed a line you already have, which is
-how you tail a live step.
+how you tail a live step. Pages are ordered by `id` and nothing else, so the last line of
+a page is the cursor to pass as the next `after_id`; the agent assigns `seq` in emission
+order and sends its own notes down the same channel as the step's output, so `id` order
+is emission order too.
 
 ## Stuck runs
 
