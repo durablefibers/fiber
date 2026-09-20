@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /app
 # corepack takes the pnpm version from `packageManager` in package.json, which is the
 # same version .github/workflows/ci.yml resolves (pnpm/action-setup reads the same
