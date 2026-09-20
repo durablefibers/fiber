@@ -1353,6 +1353,30 @@ async fn send_bounded(
 /// hold a session open through a deploy's drain.
 const RUN_EVENTS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a run-stream session does when its channel hands it an error instead of an event.
+#[derive(Debug, PartialEq, Eq)]
+enum LagAction {
+    /// Tell the viewer it has a hole and keep the socket. It refetches the step's log
+    /// from the last id it holds, which is the only way to close the gap — the events
+    /// themselves are gone.
+    Resync(u64),
+    /// Nothing more will arrive; end the session.
+    Close,
+}
+
+/// Falling behind is not a reason to hang up.
+///
+/// Closing on `Lagged` was the whole of the bug: a viewer that went slow for a moment —
+/// or, before the bus was split per run, one that was merely watching while some other
+/// build was chatty — lost its socket, and every line published in the gap with it. The
+/// browser reconnected two seconds later having no idea it had missed anything.
+fn lag_action(err: &tokio::sync::broadcast::error::RecvError) -> LagAction {
+    match err {
+        tokio::sync::broadcast::error::RecvError::Lagged(n) => LagAction::Resync(*n),
+        tokio::sync::broadcast::error::RecvError::Closed => LagAction::Close,
+    }
+}
+
 async fn handle_run_events(
     socket: WebSocket,
     state: AppState,
@@ -1362,7 +1386,9 @@ async fn handle_run_events(
     // Held to the end of the function: shutdown waits for it to drop.
     let _session = session;
     let (mut sink, mut stream) = socket.split();
-    let mut sub = state.scheduler.subscribe();
+    // Subscribed before the snapshot below, so an event that lands while it is being
+    // read is queued rather than missed.
+    let mut sub = state.scheduler.subscribe_run(run_id);
 
     if let Ok(Some(run)) = state.store.get_run(run_id).await {
         let ev = RunEvent::RunUpdated {
@@ -1416,20 +1442,24 @@ async fn handle_run_events(
             }
             ev = sub.recv() => {
                 match ev {
+                    // The channel carries this run only, so there is nothing to filter
+                    // and nothing to parse: the payload goes straight out.
                     Ok(payload) => {
-                        if let Ok(parsed) = serde_json::from_str::<RunEvent>(&payload) {
-                            let matches = match &parsed {
-                                RunEvent::RunUpdated { run_id: rid, .. } => *rid == run_id,
-                                RunEvent::StepUpdated { run_id: rid, .. } => *rid == run_id,
-                                RunEvent::Log { run_id: rid, .. } => *rid == run_id,
-                                RunEvent::LogBatch { run_id: rid, .. } => *rid == run_id,
-                            };
-                            if matches && !send_bounded(&mut sink, payload).await {
+                        if !send_bounded(&mut sink, payload).await {
+                            break;
+                        }
+                    }
+                    Err(e) => match lag_action(&e) {
+                        LagAction::Resync(missed) => {
+                            let ev = RunEvent::Resync { run_id, missed };
+                            if let Ok(text) = serde_json::to_string(&ev)
+                                && !send_bounded(&mut sink, text).await
+                            {
                                 break;
                             }
                         }
-                    }
-                    Err(_) => break,
+                        LagAction::Close => break,
+                    },
                 }
             }
         }
@@ -1440,6 +1470,36 @@ async fn handle_run_events(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn falling_behind_asks_the_viewer_to_resync_instead_of_hanging_up() {
+        use tokio::sync::broadcast::error::RecvError;
+        // Any size of gap: the viewer closes it by refetching from the last id it
+        // holds, so there is no number of dropped events that is better served by
+        // taking its socket away.
+        for missed in [1u64, 42, 10_000] {
+            assert_eq!(
+                lag_action(&RecvError::Lagged(missed)),
+                LagAction::Resync(missed)
+            );
+        }
+        // A closed channel is the process going away; there is nothing left to send.
+        assert_eq!(lag_action(&RecvError::Closed), LagAction::Close);
+    }
+
+    #[test]
+    fn a_resync_frame_is_a_run_event_the_viewer_already_parses() {
+        // The run page switches on `type`; a frame shaped any other way would be
+        // dropped by the `JSON.parse` handler and the gap would stay silent.
+        let text = serde_json::to_string(&RunEvent::Resync {
+            run_id: Uuid::nil(),
+            missed: 3,
+        })
+        .expect("serializable");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(v["type"], json!("resync"));
+        assert_eq!(v["run_id"], json!(Uuid::nil()));
+    }
 
     #[test]
     fn an_unstored_artifact_names_itself_without_leaking_its_cause() {

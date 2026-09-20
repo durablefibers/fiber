@@ -1102,6 +1102,29 @@ impl Store {
         .await?)
     }
 
+    /// Runs that reached a terminal status at or after `since`, oldest first.
+    ///
+    /// For the commit-status reporter to recover from a gap in the event bus: a run that
+    /// finished while the reporter was lagged would otherwise leave a required check
+    /// pending forever, because the terminal event it was waiting for is gone.
+    pub async fn list_runs_finished_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Run>> {
+        Ok(sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+            "SELECT {RUN_COLS} FROM runs
+                 WHERE finished_at >= $1
+                   AND status IN ('succeeded', 'failed', 'cancelled')
+                 ORDER BY finished_at
+                 LIMIT $2"
+        )))
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn list_step_runs(&self, run_id: Uuid) -> Result<Vec<StepRun>> {
         let mut conn = self.pool.acquire().await?;
         list_step_runs_on(&mut conn, run_id).await

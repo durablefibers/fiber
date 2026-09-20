@@ -452,6 +452,19 @@ pub enum RunEvent {
         attempt: Option<i32>,
         lines: Vec<LogEventLine>,
     },
+    /// The viewer fell behind its run's fan-out and `missed` events were dropped before
+    /// it could read them.
+    ///
+    /// Not a close: the socket stays open and the viewer catches up by refetching the
+    /// step's log from the last id it holds. A consumer that does not know this variant
+    /// ignores the frame, which leaves it exactly where the old server left it — except
+    /// that the old server closed the socket instead of saying anything.
+    Resync {
+        run_id: Uuid,
+        /// Events dropped, as the bus counted them. Diagnostic only; the viewer refetches
+        /// by id rather than trusting the number.
+        missed: u64,
+    },
 }
 
 /// One line inside [`RunEvent::LogBatch`], as stored.
@@ -685,6 +698,20 @@ mod tests {
             .unwrap()["type"],
             json!("run_updated")
         );
+    }
+
+    #[test]
+    fn a_resync_names_the_run_and_stays_a_run_event() {
+        // The run page matches `type` as a string literal (apps/ui, convention 9), and
+        // `apps/ui/src/lib/wire-drift.test.ts` asserts every tag here appears there.
+        let v = serde_json::to_value(RunEvent::Resync {
+            run_id: Uuid::nil(),
+            missed: 7,
+        })
+        .unwrap();
+        assert_eq!(v["type"], json!("resync"));
+        assert_eq!(v["missed"], json!(7));
+        assert_eq!(v["run_id"], json!(Uuid::nil()));
     }
 
     #[test]

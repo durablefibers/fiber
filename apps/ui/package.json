@@ -23,6 +23,7 @@
     "@tanstack/react-router-devtools": "latest",
     "@tanstack/react-router-ssr-query": "latest",
     "@tanstack/react-start": "latest",
+    "@tanstack/react-virtual": "^3.14.13",
     "@tanstack/router-plugin": "latest",
     "@xyflow/react": "^12.11.6",
     "class-variance-authority": "^0.7.1",
