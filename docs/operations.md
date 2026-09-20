@@ -278,9 +278,103 @@ offer, which is where to look when spans do not join up.
 
 Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and
 `fiber-agent` (tagged `X.Y.Z`, `X.Y`, and `latest`) and attaches agent + CLI binaries
-(`fiber-agent-<target>.tar.gz` with a `.sha256`) for linux x86_64/arm64 and macOS arm64 to the
-GitHub release. `scripts/install-agent.sh` consumes those assets. The tag must match the
-workspace version in `Cargo.toml` or the release fails before publishing anything.
+(`fiber-agent-<target>.tar.gz`, each with a `.sha256`, plus `fiber-agent.service` and one
+`SHA256SUMS` over the whole set) for linux x86_64/arm64 and macOS arm64 to the GitHub release. `scripts/install-agent.sh`
+consumes those assets. The tag must match the workspace version in `Cargo.toml` or the
+release fails before publishing anything.
+
+The per-asset `.sha256` files are kept alongside `SHA256SUMS`: installers already on hosts
+fetch `<asset>.sha256`, and an older copy of the installer treats a *missing* checksum as a
+warning rather than an error, so dropping them would silently downgrade those hosts to no
+verification at all.
+
+`deploy/fiber-agent.service` is published as an asset too, so its hash is in `SHA256SUMS`
+and `scripts/install-agent.sh` can verify it. It used to be the one file the installer
+fetched unchecked, and it is the file that decides which binary runs as which user — a
+tampered unit is root on the build host no matter how carefully the tarball was verified.
+
+The unit has no attestation of its own — `publish` attests `SHA256SUMS`, not each asset —
+so the installer verifies `SHA256SUMS` itself with the same four `gh` flags before it lets
+that manifest vouch for the unit. Without that step an attacker who can edit an
+already-published release's assets could keep the real tarball hash in `SHA256SUMS`,
+substitute the hash of their own unit, and pass every check. When the manifest is not
+attested the installer takes the unit from git at the tag instead, which needs repository
+write to tamper with.
+
+### What a release attests to
+
+From the first release after v0.6.2 the release workflow mints [GitHub build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+for what it publishes. Each attestation is a signed statement that a specific digest came out
+of `durablefibers/fiber/.github/workflows/release.yml` on a GitHub-hosted runner, at a named
+commit. It does not say the code is good; it says a release page cannot be swapped underneath
+you without the swap being detectable.
+
+**Provenance is not a code review, and not a defence against repository write.** Anyone
+who can push a `v*` tag gets a valid attestation for whatever that tag contains. The
+statement is "this artifact came out of that workflow, in that repository, at that ref, on
+a GitHub-hosted runner" — it makes substitution and repackaging detectable, nothing more.
+The per-job scoping of `id-token`/`attestations` below limits scope creep inside the
+workflow; it does not contain the tag's own code, since `binaries` builds that code.
+
+Three subjects are attested, each in the job that produces it:
+
+| Subject | Job | Why there |
+|---|---|---|
+| `fiber-agent-<target>.tar.gz` | `binaries` | Minted in the job that ran `cargo build`, so the provenance describes the build, not a later repackaging. |
+| `SHA256SUMS` | `publish` | The manifest exists nowhere else; attesting it means one verification covers the hashes of every asset. |
+| `ghcr.io/durablefibers/<image>` index digest | `manifest` | The digest a tag resolves to. The per-architecture images that `images` pushes are untagged, so provenance on those digests could not be looked up from anything an operator types. |
+
+The per-tarball attestation is the authority; `SHA256SUMS` is a convenience. They are not
+equivalent, and the difference is which job signed them: a tarball is signed by `binaries`,
+which holds only `contents: read`, while `SHA256SUMS` is signed by `publish`, the most
+privileged job in the workflow. Verify the tarball directly when it matters. The one thing
+`SHA256SUMS` is the authority for is the systemd unit, which has no attestation of its own
+— which is exactly why the installer will not use it for that until it has verified the
+manifest's own attestation.
+
+Those three jobs — and only those — carry `id-token: write` and `attestations: write`, so
+a step added to `verify` or `images` later cannot quietly mint an attestation.
+
+Checking a release. Every recipe pins the workflow, the ref and the runner type: `--repo`
+on its own accepts an attestation from *any* workflow in the repository, and without
+`--source-ref` a genuine attested build of an older, vulnerable tag verifies happily.
+
+```bash
+tag=vX.Y.Z
+common=(--repo durablefibers/fiber
+        --signer-workflow durablefibers/fiber/.github/workflows/release.yml
+        --source-ref "refs/tags/$tag"
+        --deny-self-hosted-runners)
+
+# a binary — the authoritative check
+gh attestation verify fiber-agent-x86_64-unknown-linux-gnu.tar.gz "${common[@]}"
+
+# the checksum manifest, then every asset against it
+gh attestation verify SHA256SUMS "${common[@]}"
+sha256sum -c SHA256SUMS          # macOS: shasum -a 256 -c SHA256SUMS
+
+# an image (resolves the tag to its index digest for you)
+gh attestation verify "oci://ghcr.io/durablefibers/fiber-api:${tag#v}" "${common[@]}"
+```
+
+Because the installer and these recipes pin `--source-ref`, a **re-publish must be
+dispatched against the tag**, not against a branch:
+
+```bash
+gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z
+```
+
+That is the better habit anyway: dispatching from a branch would run that branch's
+`release.yml` while publishing assets labelled with the tag.
+
+The image attestation is also pushed to GHCR as a referrer, so
+`docker buildx imagetools inspect ghcr.io/durablefibers/fiber-api:X.Y.Z --raw` and cosign can
+find it without going through GitHub's API. That second push is best-effort
+(`continue-on-error`) and runs as a separate step from the required one, so a GHCR
+referrers outage costs the convenience copy and not the release.
+
+`scripts/install-agent.sh` does the binary check automatically when `gh` is present and
+authenticated — see [agents](./agents.md#what-it-verifies).
 
 Images cover `linux/amd64` and `linux/arm64`. Each architecture is built on a runner of that
 architecture and the two are joined into one manifest list, so `docker pull` picks the right

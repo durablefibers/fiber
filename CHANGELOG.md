@@ -6,6 +6,123 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **The installer could be made to install an attacker's systemd unit as root.** Under the
+  documented `curl … | sudo bash -s --`, `$0` is the literal string `bash`, so the
+  local-checkout test `[[ -f "$0" ]]` resolved against the *current directory*: a local
+  user or a CI step that planted `./bash` and `../deploy/fiber-agent.service` got their
+  unit — with its own `ExecStart=` and `User=` — installed and started the next time an
+  administrator ran the documented command from that directory. The test now uses
+  `BASH_SOURCE[0]`, which is unset for a script read from stdin, and additionally requires
+  the basename to be `install-agent.sh`. Introduced in this release cycle; no published
+  release shipped it.
+
+### Added
+
+- **Build provenance on everything a release publishes.** The release workflow mints
+  [GitHub build attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+  with `actions/attest-build-provenance` for each `fiber-agent-<target>.tar.gz` (in the
+  job that ran `cargo build`), for the new `SHA256SUMS` (in the publishing job), and for
+  the container-image index digest that `ghcr.io/durablefibers/fiber-{api,agent}:X.Y.Z`
+  resolves to (in the job that assembles the manifest list). A `.sha256` next to a
+  tarball proves the two files agree; an attestation proves who built them, which is the
+  guarantee a compromised release page cannot forge. Verify with:
+
+  ```
+  gh attestation verify <file> --repo durablefibers/fiber \
+    --signer-workflow durablefibers/fiber/.github/workflows/release.yml \
+    --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+  ```
+
+  `id-token: write` and `attestations: write` are granted to those three jobs only, so a
+  step added to `verify` or `images` later cannot quietly mint an attestation. Provenance
+  is not a defence against repository write — anyone who can push a `v*` tag gets a valid
+  attestation for it; it makes substitution and repackaging detectable.
+- **One `SHA256SUMS` per release**, covering every published asset, assembled in the
+  publishing job where the whole set is visible for the first time. The per-asset
+  `.sha256` files stay: installers already on hosts fetch those, and an older installer
+  treats a missing checksum as a warning, so removing them would quietly leave those
+  hosts verifying nothing.
+- **`deploy/fiber-agent.service` is now a release asset**, so its hash is in `SHA256SUMS`
+  and the installer verifies it. It was the one file the installer fetched unchecked, and
+  it decides which binary runs as which user. Because the unit has no attestation of its
+  own, the installer first verifies `SHA256SUMS` *itself* — same four `gh` flags — and
+  only then lets that manifest vouch for the unit. Otherwise someone able to edit an
+  already-published release's assets could keep the genuine tarball and its genuine
+  provenance, rewrite `SHA256SUMS` around a unit of their own, and have every check pass.
+  When the manifest is not attested the unit comes from git at the tag instead, which
+  needs repository write to tamper with.
+- **`install-agent.sh --check-only`** resolves, downloads and verifies a release and its
+  unit, prints the tag, both digests and where the unit came from, and exits without
+  touching the host. No
+  root needed, and it runs on macOS. Its exit code is the result — `0` both guarantees,
+  `1` a check ran and came back wrong (including one silenced by `--insecure-skip-*`,
+  which changes whether the installer stops, not whether the check failed), `2` a check
+  could not be run at all — so it can gate a deployment script. It resolves the unit too,
+  so it exercises the whole trust chain. This is also the documented way to verify a
+  download by hand.
+- **`install-agent.sh --require-attestation`** refuses to install unless provenance
+  actually verified, for hosts where "we could not check" is not an acceptable outcome.
+  It is one gate immediately before the install, so it also catches the paths that do not
+  go through the "could not check" branch — `--insecure-skip-attestation` after a real
+  failure, and `--tarball`.
+
+### Changed
+
+- **`scripts/install-agent.sh` verifies instead of trusting.** `--version latest` is now
+  resolved to a concrete tag by following the `/releases/latest` redirect, and the
+  tarball, the checksums *and* the systemd unit all come from that one tag — previously
+  the unit was fetched from `main`, so a host could end up running a released binary
+  under an unreleased unit. If the unit cannot be obtained for that tag the install now
+  aborts rather than pairing a new binary with the unit already on disk. A missing or
+  mismatched checksum is fatal rather than a warning.
+- **Provenance verification is pinned to the version being installed.** `gh attestation
+  verify` is called with `--source-ref refs/tags/<tag>` and `--deny-self-hosted-runners`
+  as well as `--signer-workflow`. Without the ref pin, an attacker who can write to the
+  release page can serve a genuine, still-validly-attested tarball and `SHA256SUMS` from
+  an *older, vulnerable* tag and pass every check. A consequence: a re-publish must be
+  dispatched against the tag — `gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`
+  — which also pins `release.yml` itself to the tag.
+- **"We did not check" is now said before the install, not after it.** When `gh` is
+  missing or unauthenticated the script warns immediately and names the cause; under
+  `sudo` that is the *normal* case, because `env_reset` drops `GH_TOKEN` and points
+  `HOME` at `/root`. The documented command now uses
+  `sudo --preserve-env=FIBER_AGENT_TOKEN,GH_TOKEN`, which also keeps the agent token out
+  of sudo's argv (`sudo VAR=… bash` did not). `gh` is still not required to install.
+- **The installer bootstraps from a tag.** `docs/agents.md` now resolves the latest tag
+  and fetches `scripts/install-agent.sh` from it rather than from `main`: the script
+  performs every check above, so pinning the binary while taking the verifier from a
+  moving branch only moved the problem.
+- **Upgrades are reversible.** The installer keeps the binary it replaces as
+  `/usr/local/bin/fiber-agent.prev` (and `fiber.prev`) and records
+  `FIBER_AGENT_INSTALLED_VERSION` / `FIBER_AGENT_INSTALLED_SHA256` in
+  `/etc/fiber/agent.env`, so a re-run prints what it is upgrading from and a bad rollout
+  is one `cp` away from undone.
+- **`deploy/fiber-agent.service` is hardened further**: `ProtectKernelModules`,
+  `ProtectKernelLogs`, `ProtectClock`, `RestrictRealtime`, `RestrictSUIDSGID`,
+  `LockPersonality`, `SystemCallArchitectures=native`, an empty `CapabilityBoundingSet=`,
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` and `UMask=0027`. Steps
+  are repo-supplied shell, so `MemoryDenyWriteExecute` (breaks every JIT) and
+  `RestrictNamespaces` (breaks `unshare` and rootless container tooling) are deliberately
+  left off, along with `PrivateDevices`, `ProcSubset=pid`,
+  `SystemCallFilter=@system-service` and `ProtectSystem=strict`; the unit file records why
+  for each. Two that *are* set can still bite a build and are documented in
+  [agents](docs/agents.md): `SystemCallArchitectures=native` stops 32-bit binaries, and
+  `RestrictSUIDSGID` stops `dpkg-deb`/`rpmbuild` producing packages that contain a setuid
+  file. Relax any of it in a drop-in under
+  `/etc/systemd/system/fiber-agent.service.d/`, which also survives the next installer run.
+- `UMask` is `0027`, not `0077`. It costs nothing — `/var/lib/fiber` is already
+  `0750 fiber:fiber` — and it is a precondition for a step container reading the
+  bind-mounted workspace, but on its own it does not fix the Docker case: the agent
+  issues `docker run` without `--group-add`, so a container running as some other uid/gid
+  still gets `EACCES` on `cd /workspace`. The working configurations are
+  `FIBER_AGENT_DOCKER_USER=<uid>:<fiber-gid>` or `UMask=0022` in a drop-in, both
+  documented next to `FIBER_AGENT_DOCKER_USER` in [configuration](docs/configuration.md).
+- `ProtectHome=true` stays, so `FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` cannot reach a
+  socket under `/run/user/<uid>` as shipped. [configuration](docs/configuration.md) now
+  documents the caveat and a `BindPaths=` drop-in next to the variable.
+
 ### Added
 
 - **A `resync` frame on `/ws/runs/{id}`.** When a viewer falls behind the run's event

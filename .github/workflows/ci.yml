@@ -52,6 +52,29 @@ jobs:
       - name: check (fmt + clippy)
         run: make check
 
+      # scripts/install-agent.sh is the root of the release trust chain — it is what
+      # decides whether a downloaded binary and unit are installed — and until now
+      # nothing in CI looked at it. shellcheck is preinstalled on the runner image.
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      # actionlint also runs shellcheck over every `run:` block. Pinned by version and
+      # checked against the published checksum rather than taken from a mutable action
+      # tag or Docker Hub tag; `actionlint_*_checksums.txt` on the release carries it.
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tgz="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tgz}"
+          echo "${ACTIONLINT_SHA256}  ${tgz}" | sha256sum -c -
+          tar -xzf "$tgz" actionlint
+          ./actionlint -color
+          rm -f "$tgz" actionlint
+
       - name: test
         run: make test-rust
 

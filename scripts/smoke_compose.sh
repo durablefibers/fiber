@@ -35,7 +35,7 @@ pkill -x fiber-api 2>/dev/null || true
 
 echo "== wait ready =="
 READY=0
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
   if curl -sf http://127.0.0.1:18080/ready >/tmp/fiber-compose-ready.json 2>/dev/null; then
     if python3 -c 'import json; d=json.load(open("/tmp/fiber-compose-ready.json")); raise SystemExit(0 if d.get("ok") else 1)'; then
       ok "api /ready"
@@ -60,7 +60,7 @@ fi
 # instant nginx's container appears — before it has bound the port. The API check above
 # retries and this one did not, which on a cold runner lost the race by ~50ms.
 CODE=000
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   CODE=$(curl -sf -o /dev/null -w "%{http_code}" http://127.0.0.1:3100/ || true)
   if [[ "$CODE" == "200" ]]; then
     break
@@ -115,7 +115,7 @@ else
     fail "start a step to restart the api under"
   else
     "${COMPOSE[@]}" restart fiber-api
-    for i in $(seq 1 60); do
+    for _ in $(seq 1 60); do
       if curl -sf http://127.0.0.1:18080/ready >/dev/null 2>&1; then
         break
       fi
