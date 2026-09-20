@@ -5,53 +5,93 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default. Nothing in CI publishes anything; the jobs that need more
+# (there are none here today) have to say so themselves, and `release.yml` is where
+# `packages: write` / `contents: write` live.
+permissions:
+  contents: read
+
+# One run per ref. A force-push supersedes the run it replaces instead of queueing
+# behind it, which on a 25-minute smoke is most of the queue.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+
+# Every `uses:` is pinned to a commit SHA with the tag in a trailing comment: a tag is
+# mutable and `@master` is a branch, so either lets whoever controls it run code here.
+# Dependabot (github-actions ecosystem, .github/dependabot.yml) moves the SHA and the
+# comment together.
+#
+# Runners are pinned too. `ubuntu-latest` becomes Ubuntu 26.04 on 19 October 2026, and a
+# runner image that changes under a release build is the same class of problem as a
+# floating action tag — we would rather move it deliberately.
 
 jobs:
+  # ⚠ `check` is pinned as a required status check by the `main` ruleset. Renaming this
+  # job blocks every pull request until the ruleset is updated in the same change.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Toolchain version comes from rust-toolchain.toml (kept in step with deploy/Dockerfile).
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: fmt
-        run: cargo fmt --check
-
-      # --all-targets so test code is linted like everything else, and fiber-proto is
-      # included now that it carries tests of its own.
-      - name: clippy
-        run: >
-          cargo clippy --all-targets
-          -p fiber-api -p fiber-agent -p fiber-cli
-          -p fiber-core -p fiber-scheduler -p fiber-durable -p fiber-proto
-          -- -D warnings
+      # THE gate, and the only definition of it: `make check` here is byte-for-byte the
+      # `make check` a contributor runs (fmt --check, then clippy --workspace
+      # --all-targets --locked -- -D warnings). Do not spell cargo out again in this
+      # file — that is how the Makefile and CI drifted apart in the first place.
+      - name: check (fmt + clippy)
+        run: make check
 
       - name: test
-        run: cargo test --workspace
+        run: make test-rust
 
       - name: build
-        run: cargo build -p fiber-api -p fiber-agent -p fiber-cli
+        run: make build
 
+      # `--locked` above refuses to *change* the lockfile, but a build can still leave it
+      # rewritten if someone committed one that does not match Cargo.toml. Catch that here
+      # rather than three jobs later in `docker`.
+      - name: Cargo.lock is unchanged
+        run: git diff --exit-code Cargo.lock
+
+  # Supply chain: RUSTSEC advisories, the licence allowlist, and "every crate came from
+  # crates.io". Config and rationale live in deny.toml; run `cargo deny check` locally
+  # after `cargo install cargo-deny --locked`. Not part of `make check`, which has to
+  # work without the network.
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
+  # ⚠ `ui` is pinned as a required status check by the `main` ruleset — see `check`.
   ui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: apps/ui
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No `version:` — the pnpm to use is `packageManager` in apps/ui/package.json, so
+      # CI, `corepack` in apps/ui/Dockerfile.ui and a contributor's shell all resolve the
+      # same resolver for the same lockfile. `defaults.run.working-directory` does not
+      # reach action inputs, hence the explicit path.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 9
-      - uses: actions/setup-node@v7
+          package_json_file: apps/ui/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -65,49 +105,67 @@ jobs:
         run: pnpm test
       - name: build
         run: pnpm build
+      # `routeTree.gen.ts` is generated by the router plugin during the build and
+      # committed. If the two disagree, the routes CI just tested are not the routes in
+      # the tree, and the difference only shows up in the browser.
+      - name: routeTree.gen.ts is unchanged
+        run: git diff --exit-code src/routeTree.gen.ts
 
+  # ⚠ `docker` is pinned as a required status check by the `main` ruleset — see `check`.
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # One cache scope per image. They shared the default scope, so each build evicted
+      # the one before it and the next run started cold; `smoke` then reuses these.
       - name: build fiber-api image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Dockerfile
           target: fiber-api
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=fiber-api
+          cache-to: type=gha,mode=max,scope=fiber-api
       - name: build fiber-agent image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Dockerfile
           target: fiber-agent
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=fiber-agent
+          cache-to: type=gha,mode=max,scope=fiber-agent
       - name: build fiber-ui image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: apps/ui
           file: apps/ui/Dockerfile.ui
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=fiber-ui
+          cache-to: type=gha,mode=max,scope=fiber-ui
 
-  # End-to-end: the unit suites are all pure, so nothing in CI previously ran a real
+  # End-to-end: the unit suites are all pure, so nothing else in CI runs a real
   # pipeline. This brings the whole Compose stack up and drives one through a
   # containerised agent — the only check here that exercises the SQL, the WebSocket
   # protocol, and the agent together.
   smoke:
-    runs-on: ubuntu-latest
+    # Not for ordering's sake: `docker` populates the three type=gha cache scopes that
+    # the `x-bake` blocks in deploy/docker-compose.yml import, so `up --build` here is a
+    # cache hit instead of a second cold release build of the whole graph.
+    needs: [docker]
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      # Makes `docker compose up --build` delegate to `docker buildx bake`, which is the
+      # only builder that reads `x-bake`. Set here and not in the Compose file so a
+      # contributor's `make smoke-compose` keeps using the plain builder and never has to
+      # care that the GitHub Actions cache exists.
+      COMPOSE_BAKE: "true"
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: compose smoke
         run: bash scripts/smoke_compose.sh
       - name: compose logs
@@ -118,3 +176,167 @@ jobs:
           FIBER_SECRETS_KEY: "00000000000000000000000000000000000000000000000000000000000000ff"
           FIBER_REDIS_PASSWORD: fiber
         run: docker compose -f deploy/docker-compose.yml logs --tail=200
+
+  # The other half of end-to-end, and the half nothing ran automatically before: authz,
+  # agent pools and artifacts against a host-built fiber-api and a host-built agent, with
+  # Postgres and Redis as service containers matching deploy/docker-compose.yml. The
+  # compose smoke proves the stack boots and runs one pipeline; this proves the
+  # role gate, the project-scoped agent pools, and artifact upload/restore.
+  #
+  # Deliberately NOT a required status check — see the pull request description. Making
+  # it one means editing the `main` ruleset, which pins job names.
+  smoke-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      # Same image and same host ports as deploy/docker-compose.yml, so scripts/dev-env.sh
+      # needs no CI-specific overrides.
+      fiber-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fiber
+          POSTGRES_PASSWORD: fiber
+          POSTGRES_DB: fiber
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U fiber -d fiber"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      fiber-redis:
+        image: redis:7-alpine
+        env:
+          # Compose keeps the password out of the probe's argv the same way; the probe
+          # has to keep working after the password is set below.
+          REDISCLI_AUTH: fiber
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping | grep -q PONG"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: "1.98"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: build fiber-api, fiber-agent, fiber-cli
+        run: make build
+
+      # A service container cannot be given a command, so `--requirepass` cannot be set
+      # the way Compose sets it. Set it at runtime instead, over the inline protocol, so
+      # FIBER_REDIS_URL carries a password here exactly as it does in dev and in Compose
+      # — an API that only works against an unauthenticated Redis would pass otherwise.
+      - name: redis requires a password
+        run: |
+          python3 - <<'PY'
+          import socket, sys
+          s = socket.create_connection(("127.0.0.1", 16379), 10)
+          s.sendall(b"CONFIG SET requirepass fiber\r\n")
+          reply = s.recv(64)
+          print(reply)
+          sys.exit(0 if reply.startswith(b"+OK") else 1)
+          PY
+
+      # One source of truth for the dev environment. Exporting it into $GITHUB_ENV keeps
+      # every later step (and `make smoke`, which shells out to the Python smokes) on the
+      # same values a contributor gets from `source scripts/dev-env.sh`.
+      - name: dev environment
+        run: |
+          set -euo pipefail
+          set -a; . scripts/dev-env.sh; set +a
+          # `FIBER_` needs a name after it: `^(FIBER_|RUST_LOG)=` asks for a variable
+          # literally called FIBER_, matches only RUST_LOG, and exports nothing useful.
+          env | grep -E '^(FIBER_[A-Z0-9_]+|RUST_LOG)=' >> "$GITHUB_ENV"
+
+      - name: start fiber-api
+        run: |
+          set -euo pipefail
+          nohup ./target/debug/fiber-api > /tmp/fiber-api.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sf "$FIBER_API_URL/ready" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)'; then
+              echo "fiber-api ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "fiber-api never became ready" >&2
+          tail -100 /tmp/fiber-api.log >&2
+          exit 1
+
+      # smoke_artifacts.py needs an agent that is already online (smoke_agent_pools.py
+      # and smoke_concurrency.py start their own). Labels match what those pipelines ask
+      # for.
+      - name: start fiber-agent
+        run: |
+          set -euo pipefail
+          creds=$(python3 - <<'PY'
+          import json, os, urllib.request
+          api = os.environ["FIBER_API_URL"].rstrip("/")
+
+          def post(path, body, tok=None):
+              h = {"Content-Type": "application/json"}
+              if tok:
+                  h["Authorization"] = f"Bearer {tok}"
+              r = urllib.request.Request(api + path, data=json.dumps(body).encode(), headers=h, method="POST")
+              with urllib.request.urlopen(r, timeout=30) as resp:
+                  return json.loads(resp.read().decode())
+
+          admin = post("/api/auth/login", {"username": "admin", "password": "fiber"})["token"]
+          agent = post("/api/agents", {"name": "ci-host", "labels": ["os=linux", "pool=smoke"], "concurrency": 2}, admin)
+          print(admin)
+          print(agent["token"])
+          print(agent["agent"]["id"])
+          PY
+          )
+          admin_token=$(echo "$creds" | sed -n 1p)
+          agent_token=$(echo "$creds" | sed -n 2p)
+          agent_id=$(echo "$creds" | sed -n 3p)
+          # ws:// because the agent dials the WebSocket endpoint; the Makefile's `agent`
+          # target does the same rewrite for host runs.
+          FIBER_AGENT_TOKEN="$agent_token" FIBER_AGENT_NAME=ci-host \
+            FIBER_AGENT_LABELS="os=linux,pool=smoke" FIBER_AGENT_CONCURRENCY=2 \
+            FIBER_API_URL="ws://127.0.0.1:18080" \
+            nohup ./target/debug/fiber-agent > /tmp/fiber-agent.log 2>&1 &
+          # Ask the API, not the agent's own log: `online` is the state smoke_artifacts.py
+          # requires, and a registered agent the server has not marked online yet would
+          # still fail it.
+          AGENT_ID="$agent_id" ADMIN_TOKEN="$admin_token" python3 - <<'PY'
+          import json, os, sys, time, urllib.request
+          api = os.environ["FIBER_API_URL"].rstrip("/")
+          want = os.environ["AGENT_ID"]
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              r = urllib.request.Request(
+                  api + "/api/agents",
+                  headers={"Authorization": "Bearer " + os.environ["ADMIN_TOKEN"]},
+              )
+              with urllib.request.urlopen(r, timeout=10) as resp:
+                  agents = json.loads(resp.read().decode())
+              if any(a.get("id") == want and a.get("online") for a in agents):
+                  print("fiber-agent online")
+                  sys.exit(0)
+              time.sleep(0.5)
+          sys.exit("fiber-agent never came online")
+          PY
+
+      # authz + artifacts + concurrency + pools. `smoke-pools` runs last because it
+      # terminates every fiber-agent on the host before starting its own.
+      - name: make smoke
+        run: make smoke
+
+      - name: logs
+        if: failure()
+        run: |
+          echo "=== fiber-api ==="; tail -300 /tmp/fiber-api.log || true
+          echo "=== fiber-agent ==="; tail -200 /tmp/fiber-agent.log || true
+          for f in /tmp/fiber-agent-*.log; do
+            [ -e "$f" ] || continue
+            echo "=== $f ==="; tail -100 "$f"
+          done

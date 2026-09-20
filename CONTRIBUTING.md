@@ -19,10 +19,15 @@ agent so pipelines can actually execute. `make help` lists every target.
 Run what CI runs, before you push:
 
 ```bash
-make check     # cargo fmt --check + clippy -D warnings
-make test      # cargo test --workspace + the ui vitest suite
+make check     # cargo fmt --check + clippy --workspace --all-targets --locked -D warnings
+make test      # cargo test --workspace --locked + the ui vitest suite
 cd apps/ui && pnpm check && pnpm exec tsc --noEmit && pnpm build
 ```
+
+`make check` is not "roughly what CI runs" — both `.github/workflows/ci.yml` and
+`.github/workflows/release.yml` literally call it, so the gate has one definition, in the
+`Makefile`. If you touch a dependency, also run `make deny` (needs
+`cargo install cargo-deny --locked`); CI runs it as the `deny` job.
 
 Changes to the API, scheduler, agent, or artifact path are not covered by unit tests. Run
 the end-to-end smokes against a live stack instead:

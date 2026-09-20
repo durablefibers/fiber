@@ -15,6 +15,14 @@ import urllib.request
 # 18080 — which, when you are running a second API on another port to check a change,
 # is the old build, and the smoke passes without having tested anything you wrote.
 API = os.environ.get("FIBER_API_URL", "http://127.0.0.1:18080").rstrip("/")
+# The agent dials the same host over WebSocket. Derived, not hardcoded, for the reason
+# above: a fixed ws://127.0.0.1:18080 aimed the agent at a different server than the one
+# being asserted against.
+WS = API.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+# Same DSN the API was started with. The `s3://` path assertion below reads the artifacts
+# table directly, and hardcoding the dev DSN meant it either could not run in CI or
+# silently queried a different database than the API wrote to.
+DSN = os.environ.get("FIBER_DATABASE_URL", "postgres://fiber:fiber@127.0.0.1:15432/fiber")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 WS_DIR = os.path.join(ROOT, "data", "workspaces")
 FAILS = 0
@@ -58,12 +66,29 @@ def check(name: str, cond: bool, detail: object = None) -> None:
         print(f"FAIL {name}: {detail}")
 
 
+def wait_online(token: str, agent_id: str, timeout: float = 30.0) -> bool:
+    """Poll until the API reports the agent online, instead of sleeping and hoping.
+
+    A fixed wait is a bet on registration latency: too short and the run starts with no
+    agent attached and fails as if the scheduler were broken; too long and every smoke
+    pays the worst case.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, agents = req("GET", "/api/agents", token=token)
+        if code == 200 and isinstance(agents, list):
+            if any(a.get("id") == agent_id and a.get("online") for a in agents):
+                return True
+        time.sleep(0.25)
+    return False
+
+
 def start_agent(agent_token: str) -> subprocess.Popen:
     env = os.environ.copy()
     env.update(
         {
             "FIBER_AGENT_TOKEN": agent_token,
-            "FIBER_API_URL": "ws://127.0.0.1:18080",
+            "FIBER_API_URL": WS,
             "FIBER_AGENT_USE_DOCKER": "false",
             "FIBER_AGENT_LABELS": "os=linux",
             "FIBER_AGENT_NAME": "s3-smoke",
@@ -177,7 +202,7 @@ def main() -> int:
         pass
     time.sleep(0.5)
     proc = start_agent(agent_tok)
-    time.sleep(1.5)
+    check("agent online", wait_online(admin, agent_id), "never came online")
 
     code, started = req(
         "POST",
@@ -233,7 +258,7 @@ def main() -> int:
         row = sp.check_output(
             [
                 "psql",
-                "postgres://fiber:fiber@127.0.0.1:15432/fiber",
+                DSN,
                 "-Atc",
                 f"SELECT path FROM artifacts WHERE run_id = '{rid}' LIMIT 1",
             ],

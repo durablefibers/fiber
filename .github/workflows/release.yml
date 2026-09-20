@@ -15,6 +15,21 @@ on:
         description: "Existing tag to (re)publish"
         required: true
 
+# Read-only by default; `images`, `manifest` and `publish` each widen it themselves to
+# exactly what they push. Without this, a job that forgets to declare `permissions:`
+# inherits whatever the repository default is — which for a workflow that pushes GHCR
+# images and release binaries is the wrong way round.
+permissions:
+  contents: read
+
+# Serialise per tag, and never cancel: a half-published release (images pushed, binaries
+# not) is worse than a queued one, so `cancel-in-progress` is deliberately false. The
+# group is the ref so a `workflow_dispatch` re-publish of the same tag queues behind the
+# original instead of racing it.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   # Build records are a debugging aid we do not use, and they were ending up attached to
@@ -26,21 +41,22 @@ jobs:
   # A tag can point at a commit that never went through `main`, so re-run the gate here
   # rather than trusting that CI saw it.
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # Inherits the workflow's `contents: read`; it only checks out and builds.
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       # Toolchain version comes from rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: tag matches the workspace version
         id: version
@@ -55,9 +71,11 @@ jobs:
             exit 1
           fi
 
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace
+      # The same `make check` as .github/workflows/ci.yml and as a contributor's shell.
+      # This job used to run a third variant of clippy (no --all-targets, no --locked),
+      # so a tag could publish code that `make check` would have rejected.
+      - run: make check
+      - run: make test-rust
 
   # One native runner per architecture: a Rust build under QEMU is far too slow. Each
   # job pushes an untagged image by digest; `manifest` below joins them into one tag.
@@ -76,26 +94,26 @@ jobs:
         # rather than adding a job of its own. Four jobs: each image on each runner.
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             platform: linux/amd64
           - arch: arm64
             runner: ubuntu-22.04-arm
             platform: linux/arm64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Dockerfile
@@ -115,7 +133,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ matrix.name }}-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -125,7 +143,7 @@ jobs:
   # The tags live here, applied once to a manifest list covering both architectures.
   manifest:
     needs: images
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -133,22 +151,22 @@ jobs:
       matrix:
         name: [fiber-api, fiber-agent]
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests
           pattern: digests-${{ matrix.name }}-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
           # Explicit source so a workflow_dispatch re-publish tags the same versions a
@@ -175,6 +193,8 @@ jobs:
           # the log rather than only to whoever tries to pull it.
           docker buildx imagetools inspect "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
 
+  # Inherits the workflow's `contents: read`. Uploading a workflow artifact does not use
+  # GITHUB_TOKEN, so nothing here needs write anywhere.
   binaries:
     needs: verify
     strategy:
@@ -191,16 +211,16 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }} -p fiber-agent -p fiber-cli
@@ -222,7 +242,7 @@ jobs:
             shasum -a 256 "$out" > "$out.sha256"
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Prefixed so `publish` can ask for exactly these. It downloaded everything
           # before, which swept in the build records the image jobs upload — whether they
@@ -236,15 +256,15 @@ jobs:
   # One publisher: three matrix jobs racing to create the same release is not safe.
   publish:
     needs: binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           pattern: binaries-*
@@ -288,7 +308,7 @@ jobs:
           pathlib.Path("RELEASE_NOTES.md").write_text(body + "\n")
           EOF
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: RELEASE_NOTES.md

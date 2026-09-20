@@ -13,6 +13,30 @@ removing duplicate rows), and `CHECK` constraints on the two status columns, add
 `idx_step_runs_queued`. See [operations](docs/operations.md#upgrades) before upgrading a
 large install.
 
+### Added
+
+- **A supply-chain gate.** `deny.toml` at the repo root and a `deny` job in CI
+  (`EmbarkStudios/cargo-deny-action`) fail the build on a RustSec advisory or a yanked
+  crate, hold licences to an allowlist derived from the tree (permissive only — Fiber
+  ships Apache-2.0 binaries and images, and a copyleft transitive would change what an
+  operator may do with them), and allow crates.io as the only source, so a git dependency
+  cannot reach a released binary. `make deny` runs the same thing locally. It found one
+  real advisory on the way in: **RUSTSEC-2026-0285**, TLS 1.3 handshake messages accepted
+  across encryption-level boundaries in `rustls` 0.23.43, reached through `reqwest`,
+  `aws-sdk-s3`, `axum`'s WebSocket stack and `tokio-tungstenite` — i.e. every TLS
+  connection the API, the agent and the CLI make. Fixed by `rustls` 0.23.45 in
+  `Cargo.lock`; the `ignore` list is empty.
+- **A host smoke job in CI.** `smoke-host` brings up Postgres 17 and Redis 7 as service
+  containers on the same ports as `deploy/docker-compose.yml`, builds and runs
+  `fiber-api` and an agent, and runs `make smoke` — authz, artifacts, concurrency groups
+  and agent pools. Until now the only end-to-end coverage that ran automatically was the
+  Compose smoke, which starts one pipeline and never touches the role gate or the
+  project-scoped pools. It is not a required status check yet; the `main` ruleset pins
+  job names and has to be edited separately.
+- **Generated files are checked in CI.** `apps/ui/src/routeTree.gen.ts` after the UI
+  build and `Cargo.lock` after a `--locked` build must both be unchanged. A stale
+  committed route tree means the routes CI tested are not the routes in the tree.
+
 ### Changed
 
 - **An agent fills every free slot in one heartbeat.** Offers were made one per
@@ -62,6 +86,46 @@ large install.
   endpoint is unauthenticated until the signature is checked. With Redis down, an event
   publish now fails in about two seconds instead of the client's 13 s default, so a
   cancel or completion cannot spend its request budget on one publish.
+
+- **`make check` is the only definition of the gate.** The `Makefile` ran clippy without
+  `--all-targets` and without `fiber-proto`, CI added both plus `RUSTFLAGS: -Dwarnings`,
+  and the release workflow ran a third variant without `--locked` — so a warning in a
+  `#[cfg(test)]` module passed locally and failed in CI, and a `Cargo.toml` edit with a
+  stale lockfile passed `check` and failed two jobs later. One definition now
+  (`cargo clippy --workspace --all-targets --locked -- -D warnings`), and both workflows
+  call `make check`; `--locked` is on the test and build targets too.
+- **Every GitHub Actions `uses:` is pinned to a commit SHA**, with the tag in a trailing
+  comment that Dependabot maintains. The worst case was `dtolnay/rust-toolchain@master` —
+  a *branch* — in the release job that pushes GHCR images and release binaries with
+  `packages: write` / `contents: write`. Both workflows now also declare
+  `permissions: contents: read` at the top, so a job that needs more has to say so
+  (`images` and `manifest` take `packages: write`, `publish` takes `contents: write`, and
+  nothing else widens anything), and both have `concurrency:` groups — CI cancels the run
+  a force-push superseded, release deliberately does not, because a half-published
+  release is worse than a queued one.
+- **Runners are `ubuntu-24.04`, not `ubuntu-latest`.** `ubuntu-latest` migrates to Ubuntu
+  26.04 on 19 October 2026; a runner image that changes under a release build is the same
+  class of problem as a floating action tag. The release `binaries` matrix keeps
+  `ubuntu-22.04` on purpose — the agent has to run on hosts older than the runner.
+- **One pnpm version.** `"packageManager": "pnpm@10.34.5"` in `apps/ui/package.json` is
+  now the single source: CI's `pnpm/action-setup` reads it (the pinned `version: 9` is
+  gone) and `corepack` in `apps/ui/Dockerfile.ui` reads it. CI was validating the
+  lockfile with pnpm 9 while the image built it with a 10.16+ resolver.
+- **MinIO is pinned** to `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` instead of
+  `:latest`, so a fresh host brings up the MinIO the smoke tested, and Dependabot watches
+  `/apps/ui` as well as `/deploy` — `node:22-alpine` and `nginx:alpine` in the image that
+  serves the UI were the only base images nothing tracked.
+- **The CI smoke reuses the images the `docker` job built.** It ran in parallel with
+  `docker` and rebuilt the entire release graph from scratch under a 25-minute timeout;
+  it now runs after it and imports the same `type=gha` layer cache (one scope per image —
+  the three builds previously shared one scope and evicted each other).
+- **The pool and S3 smokes derive the agent WebSocket URL from `FIBER_API_URL` and the
+  DSN from `FIBER_DATABASE_URL`.** Both hardcoded `ws://127.0.0.1:18080` and the dev
+  connection string, so against a second API on another port the assertions and the agent
+  talked to different servers and the smoke passed anyway. Their fixed `sleep`s before
+  negative assertions are polls: "the project-scoped agent does not take project B's
+  step" is now checked continuously across a full offer cycle and fails the moment it is
+  violated, rather than being sampled once after four seconds.
 
 ### Fixed
 

@@ -51,7 +51,11 @@ services:
     # quay.io, not Docker Hub: `minio/minio` there now refuses anonymous pulls with
     # "pull access denied ... repository does not exist", so a machine without the image
     # already cached — a new contributor, or CI — cannot bring the stack up at all.
-    image: quay.io/minio/minio:latest
+    # Pinned, not `:latest`: a fresh host would otherwise pull a MinIO nobody has
+    # smoke-tested, and the presign behaviour the artifact path depends on is exactly the
+    # sort of thing a server release changes. This digest-equivalent tag is what `:latest`
+    # resolved to when it was pinned; Dependabot's docker ecosystem watches /deploy.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -78,6 +82,13 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: fiber-api
+      # Read only by `docker buildx bake` — which is what `docker compose up --build`
+      # becomes when COMPOSE_BAKE=true, and that is set only in the CI smoke job. A
+      # plain `make smoke-compose` uses the ordinary builder and ignores this block, so
+      # nobody needs a GitHub Actions cache token to bring the stack up.
+      x-bake:
+        cache-from:
+          - type=gha,scope=fiber-api
     restart: unless-stopped
     environment:
       FIBER_DATABASE_URL: postgres://fiber:${FIBER_POSTGRES_PASSWORD:-fiber}@fiber-postgres:5432/fiber
@@ -143,6 +154,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: fiber-agent
+      x-bake:
+        cache-from:
+          - type=gha,scope=fiber-agent
     restart: unless-stopped
     environment:
       FIBER_API_URL: ws://fiber-api:8080
@@ -174,6 +188,9 @@ services:
       dockerfile: Dockerfile.ui
       args:
         VITE_FIBER_API_URL: ${VITE_FIBER_API_URL:-http://localhost:18080}
+      x-bake:
+        cache-from:
+          - type=gha,scope=fiber-ui
     restart: unless-stopped
     ports:
       - "${FIBER_UI_BIND:-127.0.0.1}:3100:80"

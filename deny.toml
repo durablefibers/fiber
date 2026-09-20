@@ -1,0 +1,80 @@
+# cargo-deny: the supply-chain gate. Run it the same way CI does:
+#
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+# CI runs it in the `deny` job of .github/workflows/ci.yml (EmbarkStudios/cargo-deny-action,
+# SHA-pinned). It is deliberately not part of `make check`: it needs the RustSec advisory
+# database over the network, and `make check` has to work on a plane.
+
+[graph]
+# What we actually ship: fiber-api / fiber-agent containers and Linux agent hosts, plus
+# the aarch64-apple-darwin release binary and every developer's Mac. Without this the
+# graph also carries the wasm-, Windows- and Redox-only crates, whose licences nothing
+# here ever links.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# RustSec advisories are a hard failure, and so is a yanked crate: yanking is how a
+# compromised release is pulled back, and `--locked` means we would otherwise keep
+# building with it.
+yanked = "deny"
+unmaintained = "workspace"
+# Every entry needs a reason and a link, and is a statement that there is no upgrade
+# path yet — not a way to make the job green.
+ignore = []
+
+[licenses]
+# Derived from the tree, not guessed: this list is exactly the set of identifiers needed
+# to satisfy every expression `cargo metadata` reports, and no more. Regenerate the
+# evidence with:
+#   cargo metadata --format-version 1 --all-features \
+#     | python3 -c 'import json,sys,collections; c=collections.Counter(p["license"] for p in json.load(sys.stdin)["packages"]); [print(v,k) for k,v in sorted(c.items())]'
+#
+# Everything here is permissive. Copyleft is absent on purpose: Fiber ships binaries and
+# container images under Apache-2.0, and a GPL/AGPL/MPL transitive would change what an
+# operator may do with them. `MIT OR Apache-2.0 OR LGPL-2.1-or-later` (r-efi) resolves to
+# MIT here precisely because LGPL is not allowed.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",          # redis, subtle, sha1_smol, and part of aws-lc-sys
+  "BSL-1.0",               # xxhash-rust is BSL-1.0 only
+  "ISC",                   # aws-lc-rs / aws-lc-sys
+  "MIT",
+  "Unicode-3.0",           # the ICU crates and unicode-ident
+  "Zlib",                  # foldhash is Zlib only
+]
+# Deliberately absent: CDLA-Permissive-2.0. `webpki-root-certs` carries it and is in
+# `cargo metadata`, but not in the graph for any target above, and an allowance that is
+# never matched is a warning on every run. Add it back if a target ever links it.
+confidence-threshold = 0.93
+# No per-crate exceptions today. If one becomes necessary it belongs here with a reason,
+# so the allowlist above stays the answer to "what may every crate be licensed under".
+exceptions = []
+
+[bans]
+# Duplicate versions are a fact of a 400-crate graph, not a supply-chain problem.
+multiple-versions = "allow"
+# A wildcard on a registry dependency would make the build non-reproducible, so this
+# should be "deny" — but the only wildcards here are the intra-workspace `path`
+# dependencies in the root Cargo.toml, and `allow-wildcard-paths` exempts those only for
+# crates marked `publish = false`. Marking them would mean editing every
+# `crates/*/Cargo.toml` to add `publish.workspace = true`; until then this reports rather
+# than fails. There is no wildcard on anything from crates.io — check the `bans` output
+# if you add a dependency.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only. A git dependency — however convenient — is an unreviewed, unyanked,
+# unauditable input to a binary operators install with `curl | sudo bash`.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
