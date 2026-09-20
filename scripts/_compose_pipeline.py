@@ -58,7 +58,13 @@ def run_pipeline() -> int:
                 "id": "hello",
                 "name": "hello",
                 "needs": [],
-                "run": "echo compose-smoke-ok",
+                # The artifact is the point as much as the echo: storing it exercises the
+                # shipped default backend — the local filesystem, written by uid 10001
+                # under a read-only rootfs into a Docker volume. Nothing else covers that
+                # combination end to end, and it is the one that used to lose artifacts
+                # into the API's log while the build stayed green.
+                "run": "echo compose-smoke-ok | tee out.txt",
+                "artifacts": ["out.txt"],
                 "labels": ["os=linux"],
                 "timeout_minutes": 5,
             }
@@ -103,7 +109,15 @@ def run_pipeline() -> int:
         print(f"run={status} step={step['status']} error={step.get('error')} logs={logs[-5:]}",
               file=sys.stderr)
         return 1
-    print(f"run {run_id} succeeded on the compose agent")
+
+    # A green step whose artifact was never stored is exactly the failure this covers,
+    # so assert the row exists rather than trusting the status.
+    artifacts = req("GET", f"/api/runs/{run_id}/artifacts", token)
+    names = [a["name"] for a in artifacts]
+    if "out.txt" not in names:
+        print(f"run {run_id} succeeded but stored no out.txt: {names}", file=sys.stderr)
+        return 1
+    print(f"run {run_id} succeeded on the compose agent, artifacts={names}")
     return 0
 
 

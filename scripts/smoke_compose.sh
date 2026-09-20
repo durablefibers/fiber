@@ -21,8 +21,10 @@ export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
 # FIBER_S3_BUCKET is deliberately NOT set: this smoke runs the shipped default, which is
 # the local filesystem backend writing to a Docker volume as uid 10001 under a read-only
 # rootfs. That combination is what an operator gets by default, so it is the one that
-# needs end-to-end coverage; the S3 path is covered by `make smoke-s3`. MinIO is still
-# started below so the `minio` profile is exercised, but nothing depends on it.
+# needs end-to-end coverage; the S3 path is covered by `make smoke-s3`. The pipeline
+# below declares an artifact and the run asserts it was stored, so this is a real test of
+# that backend rather than of the container merely starting. MinIO is still started below
+# so the `minio` profile is exercised, but nothing depends on it.
 
 echo "== compose build + up =="
 # Stop legacy Compose project that may own 15432/16379

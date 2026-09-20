@@ -546,11 +546,15 @@ async fn owned_step(
     Some(step)
 }
 
-/// What the step says when the server could not store one of its artifacts. The name
-/// matters more than the cause: it tells the pipeline author which `artifacts:` entry is
-/// missing, and the cause tells the operator whether it is theirs to fix.
-fn artifact_store_failure(rel: &str, err: &anyhow::Error) -> String {
-    format!("artifact {rel} could not be stored: {err}")
+/// What the step says when the server could not store one of its artifacts.
+///
+/// The name is the part the pipeline author needs — it says which `artifacts:` entry is
+/// missing. The cause is deliberately not here: this string is persisted as the step's
+/// `error` and any project `reader` can fetch it, and the cause is a backend or sqlx
+/// chain that can name a bucket, an endpoint or a database. That goes to the server log,
+/// the same split `ApiError::Internal` makes for HTTP responses.
+fn artifact_store_failure(rel: &str) -> String {
+    format!("artifact {rel} could not be stored; see the server log")
 }
 
 /// Like `owned_step`, but the lease must still be live. Used for artifacts (and,
@@ -1124,8 +1128,13 @@ async fn handle_agent(
                             Err(e) => Err(e),
                         };
                         if let Err(e) = stored {
-                            let reason = artifact_store_failure(&rel, &e);
-                            error!(%step_run_id, %agent_id, "{reason}; failing the step");
+                            let reason = artifact_store_failure(&rel);
+                            // `{e:#}` for the whole chain: the outer context alone is
+                            // "s3 put_object", which says nothing an operator can act on.
+                            error!(
+                                %step_run_id, %agent_id, artifact = %rel, error = format!("{e:#}"),
+                                "could not store an artifact; failing the step"
+                            );
                             // The step is over for this socket either way.
                             forget_step(&step_logs, step_run_id);
                             match state
@@ -1140,11 +1149,19 @@ async fn handle_agent(
                                 )
                                 .await
                             {
-                                // The agent keeps running the step; its own
-                                // StepComplete is then a late completion for an attempt
-                                // the row has moved past, which `on_step_complete`
-                                // already drops.
-                                Ok(_) => fill_agent(&state, agent_id, &tx).await,
+                                Ok(_) => {
+                                    // Tell the agent to stop, as the timeout backstop
+                                    // does. Without it the step keeps running while the
+                                    // server offers its next attempt — onto the same
+                                    // per-step workspace path, whose cleanup when the
+                                    // first process finally exits deletes the second
+                                    // attempt's checkout underneath it.
+                                    state
+                                        .scheduler
+                                        .cancel_step_on_agent(agent_id, step_run_id)
+                                        .await;
+                                    fill_agent(&state, agent_id, &tx).await;
+                                }
                                 Err(e) => {
                                     warn!(error = %e, %step_run_id, "failing the step for an unstored artifact failed")
                                 }
@@ -1425,15 +1442,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn an_unstored_artifact_names_itself_and_its_cause_on_the_step() {
-        // This string is the whole diagnosis a pipeline author gets: which artifact is
-        // missing, and whether the cause is theirs or the operator's.
-        let reason = artifact_store_failure(
-            "dist/app.tgz",
-            &anyhow::anyhow!("Permission denied (os error 13)"),
-        );
+    fn an_unstored_artifact_names_itself_without_leaking_its_cause() {
+        // The pipeline author needs to know which artifact is missing; the cause is the
+        // operator's and goes to the server log.
+        let reason = artifact_store_failure("dist/app.tgz");
         assert!(reason.contains("dist/app.tgz"), "{reason}");
-        assert!(reason.contains("Permission denied"), "{reason}");
+        // The cause belongs in the server log: a reader of this project must not be
+        // handed a bucket name, an endpoint or a database error.
+        for leaked in ["Permission denied", "os error", "s3", "bucket", "database"] {
+            assert!(
+                !reason.to_ascii_lowercase().contains(leaked),
+                "{reason} leaks {leaked}"
+            );
+        }
     }
 
     #[test]
