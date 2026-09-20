@@ -39,6 +39,8 @@ pub struct ReportLedger {
     watermark: DateTime<Utc>,
     /// When the last re-scan ran.
     last_rescan: DateTime<Utc>,
+    /// A lag has been seen that no re-scan has covered yet.
+    owed: bool,
     recent: VecDeque<Uuid>,
     seen: HashSet<Uuid>,
 }
@@ -50,9 +52,34 @@ impl ReportLedger {
             // Behind by a full interval, so the first lag re-scans at once rather than
             // waiting out a window the process has not yet lived through.
             last_rescan: now - RESCAN_MIN_INTERVAL,
+            owed: false,
             recent: VecDeque::new(),
             seen: HashSet::new(),
         }
+    }
+
+    /// Record that the bus dropped events. The re-scan that answers it may not be
+    /// allowed to run yet; the debt is kept until one does.
+    pub fn note_lag(&mut self) {
+        self.owed = true;
+    }
+
+    /// Claim the right to re-scan now, if one is owed and the rate limit allows it.
+    ///
+    /// Clearing the debt and starting the rate-limit window here, rather than after the
+    /// query, is what keeps a burst of lags to one scan: the query and the GitHub calls
+    /// that follow take long enough that a second lag would otherwise queue a second
+    /// scan of the same window behind the first.
+    pub fn take_rescan(&mut self, now: DateTime<Utc>) -> bool {
+        if !self.owed || !self.due_for_rescan(now) {
+            return false;
+        }
+        self.owed = false;
+        self.last_rescan = now;
+        // Not `now`: a run finishing in the instant between this line and the query
+        // would otherwise fall into neither this scan nor the next.
+        self.watermark = now - RESCAN_SLACK;
+        true
     }
 
     /// Take responsibility for reporting `run_id`. `false` when it has already been
@@ -80,30 +107,40 @@ impl ReportLedger {
     pub fn rescan_from(&self) -> DateTime<Utc> {
         self.watermark
     }
-
-    /// Record that a re-scan covered everything up to `now`.
-    pub fn note_rescan(&mut self, now: DateTime<Utc>) {
-        self.last_rescan = now;
-        // Not `now`: a run finishing in the instant between the query and this line
-        // would otherwise fall into neither this scan nor the next.
-        self.watermark = now - RESCAN_SLACK;
-    }
 }
 
 pub async fn report_loop(store: Store, scheduler: Arc<fiber_scheduler::Scheduler>) {
     let mut events = scheduler.subscribe_control();
     let mut ledger = ReportLedger::new(Utc::now());
+    // The debt a lag leaves has to be paid even if no further event ever arrives — a
+    // quiet instance is exactly where one missed terminal event strands a check — so the
+    // loop wakes on its own as well as on the bus.
+    let mut ticker = tokio::time::interval(
+        RESCAN_MIN_INTERVAL
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(30)),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick is immediate
     loop {
-        let payload = match events.recv().await {
-            Ok(p) => p,
-            // The missed events may have included the only announcement of a finished
-            // run, so go and look for one rather than keep waiting for it.
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!(missed = n, "commit status reporter lagged");
+        let payload = tokio::select! {
+            ev = events.recv() => match ev {
+                Ok(p) => p,
+                // The missed events may have included the only announcement of a
+                // finished run, so go and look for one rather than keep waiting for it.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(missed = n, "commit status reporter lagged");
+                    ledger.note_lag();
+                    rescan(&store, &mut ledger).await;
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            _ = ticker.tick() => {
+                // Pays a debt the rate limit refused when the lag happened.
                 rescan(&store, &mut ledger).await;
                 continue;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
         let Ok(RunEvent::RunUpdated { run_id, status }) = serde_json::from_str(&payload) else {
             continue;
@@ -120,24 +157,27 @@ pub async fn report_loop(store: Store, scheduler: Arc<fiber_scheduler::Scheduler
 }
 
 /// Post for every run that finished in the window the bus may have dropped.
+///
+/// A no-op unless a lag is outstanding and the rate limit allows a query.
 async fn rescan(store: &Store, ledger: &mut ReportLedger) {
-    let now = Utc::now();
-    if !ledger.due_for_rescan(now) {
-        return;
-    }
-    let runs = match store
-        .list_runs_finished_since(ledger.rescan_from(), RESCAN_LIMIT)
-        .await
-    {
+    let from = {
+        if !ledger.take_rescan(Utc::now()) {
+            return;
+        }
+        ledger.rescan_from()
+    };
+    let runs = match store.list_runs_finished_since(from, RESCAN_LIMIT).await {
         Ok(runs) => runs,
         Err(e) => {
             warn!(error = %e, "re-scan for missed commit statuses");
+            // Put the debt back so the next tick tries again: a database that was
+            // briefly unhappy must not be the reason a required check stays pending.
+            // The rate limit still holds, so this is one retry per window, and the
+            // window's slack still covers the runs the failed query would have found.
+            ledger.note_lag();
             return;
         }
     };
-    // Set before posting: a GitHub call takes long enough that a second lag would
-    // otherwise queue a second scan of the same window behind this one.
-    ledger.note_rescan(now);
     for run in runs {
         if ledger.claim(run.id) {
             crate::github::report_run_status(store, &run).await;
@@ -165,19 +205,38 @@ mod tests {
     }
 
     #[test]
-    fn the_first_lag_is_re_scanned_immediately_and_the_next_is_rate_limited() {
+    fn nothing_is_scanned_until_a_lag_says_something_was_missed() {
         let mut ledger = ReportLedger::new(at(0));
         assert!(
-            ledger.due_for_rescan(at(0)),
+            !ledger.take_rescan(at(0)),
+            "a healthy reporter must not query on every tick"
+        );
+        ledger.note_lag();
+        assert!(
+            ledger.take_rescan(at(0)),
             "a lag in the first seconds of the process still has to be answered"
         );
-        ledger.note_rescan(at(0));
+    }
+
+    #[test]
+    fn a_lag_inside_the_rate_limit_window_is_owed_rather_than_dropped() {
+        // The bug this guards: a second lag arriving 5 s after a scan used to be
+        // swallowed with nothing recorded, so the terminal event it hid stranded a
+        // check exactly as before.
+        let mut ledger = ReportLedger::new(at(0));
+        ledger.note_lag();
+        assert!(ledger.take_rescan(at(0)));
+        ledger.note_lag();
+        assert!(!ledger.take_rescan(at(5)), "one query, not one per event");
+        assert!(!ledger.take_rescan(at(29)));
         assert!(
-            !ledger.due_for_rescan(at(1)),
-            "one query, not one per event"
+            ledger.take_rescan(at(30)),
+            "the debt from the lag at 5 s is paid when the window opens"
         );
-        assert!(!ledger.due_for_rescan(at(29)));
-        assert!(ledger.due_for_rescan(at(30)));
+        assert!(
+            !ledger.take_rescan(at(90)),
+            "and paying it once is enough; nothing is owed now"
+        );
     }
 
     #[test]
@@ -188,7 +247,8 @@ mod tests {
             ledger.rescan_from() < at(1_000) - ChronoDuration::minutes(1),
             "the initial window has to reach back past the lag that triggered it"
         );
-        ledger.note_rescan(at(1_000));
+        ledger.note_lag();
+        assert!(ledger.take_rescan(at(1_000)));
         assert!(
             ledger.rescan_from() <= at(1_000) - RESCAN_SLACK,
             "and the next window overlaps this one, so a run finishing during the \

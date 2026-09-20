@@ -11,9 +11,10 @@ minor versions may carry breaking changes.
 - **A `resync` frame on `/ws/runs/{id}`.** When a viewer falls behind the run's event
   channel, the server now says so and keeps the socket instead of closing it. The run
   page answers by refetching the selected step's log from the last line id it holds
-  (`after_id`), and does the same after a reconnect, so a gap is a pause rather than
-  missing output. A client that does not know the frame ignores it.
-  See [api](docs/api.md#websockets).
+  (`after_id`) **and** re-reading the run, its steps and its artifacts — the same channel
+  carries the status transitions, so a gap could otherwise leave a finished run showing
+  as running until someone reloaded. It does the same after a reconnect. A client that
+  does not know the frame ignores it. See [api](docs/api.md#websockets).
 
 ### Changed
 

@@ -62,10 +62,18 @@ function rustStructFields(source: string, name: string): string[] {
   return fields
 }
 
+/** `Foo` -> `foo`, `LogBatch` -> `log_batch`: what `rename_all = "snake_case"` does. */
+function snakeCase(variant: string): string {
+  return variant.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+}
+
 /**
  * Wire tags of a `#[serde(tag = "type")]` enum whose variants carry fields.
  *
- * `rustEnumWireNames` only sees unit variants (`Foo,`); these close with `},`.
+ * `rustEnumWireNames` only sees unit variants (`Foo,`); these close with `},`. Both
+ * honour `#[serde(rename = "...")]` on the variant, which is the name that actually
+ * crosses the boundary — a renamed variant the UI still matches by its Rust name is a
+ * frame silently dropped.
  */
 function rustEnumTags(source: string, name: string): string[] {
   const start = source.indexOf(`pub enum ${name} {`)
@@ -74,17 +82,23 @@ function rustEnumTags(source: string, name: string): string[] {
   const body = source.slice(open + 1, source.indexOf("\n}", open))
   const tags: string[] = []
   let depth = 0
+  let rename: string | null = null
   for (const line of body.split("\n")) {
     const trimmed = line.trim()
     if (depth === 0) {
+      const renamed = trimmed.match(/#\[serde\([^\])]*rename\s*=\s*"([^"]+)"/)
+      if (renamed) rename = renamed[1]
       const variant = trimmed.match(/^([A-Z][A-Za-z0-9]*)\s*\{/)
-      if (variant) tags.push(variant[1])
+      if (variant) {
+        tags.push(rename ?? snakeCase(variant[1]))
+        rename = null
+      }
     }
     depth += (line.match(/\{/g) ?? []).length
     depth -= (line.match(/\}/g) ?? []).length
   }
   if (tags.length === 0) throw new Error(`no variants parsed from ${name}`)
-  return tags.map((v) => v.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase())
+  return tags
 }
 
 /** Variant names of a snake_case-renamed `pub enum`, as they appear on the wire. */
@@ -93,11 +107,19 @@ function rustEnumWireNames(source: string, name: string): string[] {
   if (start === -1) throw new Error(`enum ${name} not found in the Rust source`)
   const open = source.indexOf("{", start)
   const body = source.slice(open + 1, source.indexOf("\n}", open))
-  return body
-    .split("\n")
-    .map((l) => l.trim().match(/^([A-Z][A-Za-z0-9]*)\s*,/)?.[1])
-    .filter((v): v is string => Boolean(v))
-    .map((v) => v.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase())
+  const names: string[] = []
+  let rename: string | null = null
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim()
+    const renamed = trimmed.match(/#\[serde\([^\])]*rename\s*=\s*"([^"]+)"/)
+    if (renamed) rename = renamed[1]
+    const variant = trimmed.match(/^([A-Z][A-Za-z0-9]*)\s*,/)?.[1]
+    if (variant) {
+      names.push(rename ?? snakeCase(variant))
+      rename = null
+    }
+  }
+  return names
 }
 
 /** Property names declared anywhere inside an exported TS type, nested objects included. */
@@ -228,6 +250,35 @@ describe("the run-stream events", () => {
         `the run page never matches msg.type === "${tag}"`
       ).toBe(true)
     }
+  })
+
+  it("reads a renamed variant as its wire name, not its Rust name", () => {
+    // Guards the parser itself, against a fixture rather than the real source: without
+    // this, adding `#[serde(rename = "...")]` to a variant would leave the tests above
+    // comparing Rust names and passing while every frame of that kind was dropped.
+    const fixture = `
+pub enum Fixture {
+    PlainVariant {
+        run_id: Uuid,
+    },
+    #[serde(rename = "renamed_on_the_wire")]
+    RustName {
+        run_id: Uuid,
+    },
+}
+`
+    expect(rustEnumTags(fixture, "Fixture")).toEqual([
+      "plain_variant",
+      "renamed_on_the_wire",
+    ])
+    const units = `
+pub enum Unit {
+    Plain,
+    #[serde(rename = "other")]
+    Renamed,
+}
+`
+    expect(rustEnumWireNames(units, "Unit")).toEqual(["plain", "other"])
   })
 
   it("mirrors every field of a batch's lines", () => {

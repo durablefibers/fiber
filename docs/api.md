@@ -117,8 +117,10 @@ events before this subscriber read them — a client too slow to keep up, or a b
 than the run's channel. It is not an error and the socket stays open; there is nothing to
 retry, because the events are gone. Close the gap by refetching from the last line id
 held: `GET /api/steps/{id}/logs?attempt=…&after_id=<last id>`, whose page is ordered by
-`id` and whose last line is the cursor for the next request. A client that does not know
-the frame ignores it and behaves as before. Do the same on a reconnect: a socket that
-dropped missed whatever was published while it was down.
+`id` and whose last line is the cursor for the next request. The same channel carries
+`run_updated` and `step_updated`, so re-read `GET /api/runs/{id}` as well — a gap can
+swallow the transitions that finish a run, and nothing republishes them. Do all of it on
+a reconnect too: a socket that dropped missed whatever was published while it was down. A
+client that does not know the frame ignores it and behaves as before.
 
 Message shapes: `crates/fiber-proto`.

@@ -92,8 +92,9 @@ The view is built for a build that talks faster than a browser can paint. Incomi
 are committed once per animation frame rather than once per event, and only the rows on
 screen are in the DOM, so a step printing thousands of lines a second does not stall the
 tab. When the server says the stream lagged, or the socket drops and comes back, the page
-refetches from the last line id it holds rather than waiting for the next event — so a
-gap shows up as a pause, not as missing output.
+refetches from the last line id it holds and re-reads the run's own state rather than
+waiting for the next event — so a gap shows up as a pause, not as missing output or a
+run stuck on "running".
 
 **Re-run** starts a fresh run from the same snapshot; on a failed run, **Re-run failed
 steps** carries the succeeded ones over.

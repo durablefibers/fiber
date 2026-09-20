@@ -305,8 +305,7 @@ function RunPage() {
       if (pending.length > MAX_LOG_ROWS) {
         pending.splice(0, pending.length - MAX_LOG_ROWS)
       }
-      const last = rows[rows.length - 1]
-      if (last.id > 0) logCursorRef.current = last.id
+      logCursorRef.current = nextLogCursor(rows, logCursorRef.current)
       if (cancelFlushRef.current) return
       if (typeof requestAnimationFrame === "function") {
         const handle = requestAnimationFrame(() => flushLogs())
@@ -332,6 +331,26 @@ function RunPage() {
   }, [])
 
   /**
+   * Re-read the run and its steps from the API.
+   *
+   * The same channel carries `run_updated` and `step_updated`, so a gap can swallow the
+   * transitions that finish a run. Nothing republishes them and nothing else polls for
+   * them — the one-second timer only redraws elapsed time — so without this a run whose
+   * completion fell in the gap stays "running", its cells stay running and Cancel stays
+   * live until someone reloads the page.
+   */
+  const refreshRunState = useCallback(async () => {
+    try {
+      const detail = await api.getRun(runId)
+      setRun(detail.run)
+      setSteps(detail.steps)
+      setArtifacts(await api.listArtifacts(runId))
+    } catch {
+      // The next event, resync or reconnect tries again.
+    }
+  }, [runId])
+
+  /**
    * Close a gap by asking the server, from the last id the viewer holds.
    *
    * Runs when the server says the stream lagged (`resync`) and when the socket comes
@@ -339,7 +358,10 @@ function RunPage() {
    * nothing will republish them. Live lines are held back while it runs so that a page
    * of older ids cannot arrive after a newer line and be discarded as already seen.
    */
-  const catchUpLogs = useCallback(async () => {
+  const catchUp = useCallback(async () => {
+    // Unconditional: the status transitions in the gap matter even when no step is
+    // selected, or when the viewer is reading an older attempt that does not tail.
+    void refreshRunState()
     const cur = selectedRef.current
     const step = stepsRef.current.find((s) => s.id === cur || s.step_id === cur)
     if (!step || !viewingLatestAttemptRef.current || catchingUpRef.current) {
@@ -378,7 +400,7 @@ function RunPage() {
         heldLogsRef.current = []
       }
     }
-  }, [queueLogs])
+  }, [queueLogs, refreshRunState])
 
   // Nothing should still be scheduled once the page is gone.
   useEffect(
@@ -454,7 +476,7 @@ function RunPage() {
       ws.onopen = () => {
         // A reconnect means a window where events went nowhere. The first connect is
         // not one: the log-fetch effect below is already loading the step.
-        if (connectedOnceRef.current) void catchUpLogs()
+        if (connectedOnceRef.current) void catchUp()
         connectedOnceRef.current = true
       }
       ws.onmessage = (ev) => {
@@ -509,7 +531,7 @@ function RunPage() {
           // burst larger than its queue. The socket stays open; what is missing is
           // fetched by id rather than guessed at.
           if (msg.type === "resync") {
-            void catchUpLogs()
+            void catchUp()
           }
           if (msg.type === "log" || msg.type === "log_batch") {
             const incoming =
@@ -558,7 +580,7 @@ function RunPage() {
       if (retry) window.clearTimeout(retry)
       ws?.close()
     }
-  }, [runId, catchUpLogs, queueLogs])
+  }, [runId, catchUp, queueLogs])
 
   useEffect(() => {
     const step = steps.find((s) => s.id === selected || s.step_id === selected)
@@ -647,6 +669,13 @@ function RunPage() {
     // The log id, so a row keeps its identity as the buffer's head is trimmed.
     getItemKey: (index) => shownLogs[index]?.id ?? index,
   })
+
+  // Wrapping changes every row's height, and the virtualiser's cache for rows that are
+  // off screen is not invalidated by the class change alone: the total size and the
+  // scrollbar would drift until each one happened to be scrolled back into view.
+  useEffect(() => {
+    logVirtualizer.measure()
+  }, [wrapLogs, logVirtualizer])
 
   useEffect(() => {
     if (!followLogs) return

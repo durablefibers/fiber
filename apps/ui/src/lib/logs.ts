@@ -26,21 +26,32 @@ export function renderLogLine(
   return `[${stream ?? "out"}] ${data}`
 }
 
-/** The highest id in `rows`, or null when none of them came from the server. */
-export function highestLogId(rows: LogRow[]): number | null {
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const id = rows[i].id
-    if (id > 0) return id
+/**
+ * The highest id in `rows`, or null when none of them came from the server.
+ *
+ * A real maximum, not the last positive row: the buffer is normally ordered, but a
+ * catch-up appends a page behind lines that arrived live, and reading the tail would
+ * then report a cursor lower than what is actually held — which re-appends the same
+ * lines on the next resync.
+ */
+export function highestLogId(rows: { id: number }[]): number | null {
+  let max: number | null = null
+  for (const row of rows) {
+    if (row.id > 0 && (max === null || row.id > max)) max = row.id
   }
-  return null
+  return max
 }
 
 /**
  * Append `incoming` to `prev`, dropping what is already held and capping the total.
  *
  * Ids are strictly increasing per step, so anything at or below the highest id already
- * held has been seen — which is what makes a catch-up fetch after a resync safe to run
- * while live lines are still arriving.
+ * held has been seen. The high-water mark advances **within** `incoming` as well, not
+ * just against `prev`: a catch-up commits the fetched pages and the live lines it held
+ * back in the same batch, and the held ones are by construction a subset of the fetched
+ * ones — the server stores a line before it publishes it. Comparing only against `prev`
+ * printed that overlap twice and left the buffer out of order, which made the next
+ * resync worse than the one before.
  */
 export function appendLogRows(
   prev: LogRow[],
@@ -48,9 +59,19 @@ export function appendLogRows(
   cap: number = MAX_LOG_ROWS
 ): LogRow[] {
   if (incoming.length === 0) return prev
-  const held = highestLogId(prev)
-  const fresh =
-    held === null ? incoming : incoming.filter((r) => r.id <= 0 || r.id > held)
+  let held = highestLogId(prev)
+  const fresh: LogRow[] = []
+  for (const row of incoming) {
+    // A line from a replica too old to send ids cannot be recognised, so it is always
+    // kept; it also must not move the mark.
+    if (row.id <= 0) {
+      fresh.push(row)
+      continue
+    }
+    if (held !== null && row.id <= held) continue
+    fresh.push(row)
+    held = row.id
+  }
   if (fresh.length === 0) return prev
   const next = [...prev, ...fresh]
   return next.length > cap ? next.slice(next.length - cap) : next
@@ -59,14 +80,20 @@ export function appendLogRows(
 /**
  * The cursor to pass as the next `after_id`.
  *
- * The **last** line of the page, not the largest id in it: the server orders a page by
- * `id`, and taking anything else — or reordering the page first — would either re-request
- * lines already held or skip the ones between. An empty page leaves the cursor alone.
+ * The highest id in the page. For a page as the server returns it — ordered by `id`,
+ * contiguous, its last line the cursor for the next request — that *is* the last line,
+ * so the 4a contract holds; taking the maximum rather than the position is what keeps it
+ * holding when the page ends in a line that carries no id, and what stops the cursor
+ * regressing below what the buffer already holds. Nothing here reorders a page: the
+ * order lines are appended in is the order they arrived.
+ *
+ * An empty page, or one with no server ids in it, leaves the cursor alone.
  */
 export function nextLogCursor(
   page: { id: number }[],
   current: number | null
 ): number | null {
-  const last = page[page.length - 1]
-  return last ? last.id : current
+  const highest = highestLogId(page)
+  if (highest === null) return current
+  return current === null ? highest : Math.max(current, highest)
 }

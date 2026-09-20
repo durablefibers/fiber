@@ -15,14 +15,21 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Events one run's viewers may fall behind by before the slowest of them is told to
-/// resync. Per run, so the figure is now about a single build's output rather than the
-/// whole instance's.
-const RUN_CHANNEL_CAPACITY: usize = 1024;
+/// resync.
+///
+/// Smaller than the 1024 of the shared bus this replaces, because the figure now buys
+/// something different. There it was the whole instance's margin against every other
+/// run's noise; here a viewer can only fall behind its own build, and the buffered bytes
+/// are paid **per watched run** — a `log_batch` reaches ~64 KB, so 1024 slots per run
+/// would put a ceiling in the tens of megabytes on a busy instance. A few hundred
+/// batches is already seconds of one build's output, and past it the answer is a resync
+/// rather than a bigger buffer.
+const RUN_CHANNEL_CAPACITY: usize = 256;
 
 /// Just enough of a serialized `RunEvent` to route it.
 ///
@@ -44,17 +51,27 @@ struct RawHead {
     run_id: Uuid,
 }
 
+/// Wire tags of the `RunEvent` variants that are step output rather than a status
+/// transition.
+///
+/// A list of strings, because routing reads the tag off the payload without building the
+/// enum. `every_run_event_is_classified` in this module's tests pins it to `RunEvent`
+/// with an exhaustive `match`, so a new log-shaped variant fails to compile there rather
+/// than quietly landing on the control bus — which is the condition that lags the
+/// commit-status reporter off the terminal events it is waiting for.
+const LOG_TAGS: [&str; 2] = ["log", "log_batch"];
+
 /// Route one serialized `RunEvent`. `None` for anything that is not one — a payload from
 /// a newer replica included, which this instance must not guess at.
 pub fn event_head(payload: &str) -> Option<EventHead> {
     let raw: RawHead = serde_json::from_str(payload).ok()?;
     Some(EventHead {
         run_id: raw.run_id,
-        is_log: raw.kind == "log" || raw.kind == "log_batch",
+        is_log: LOG_TAGS.contains(&raw.kind.as_str()),
     })
 }
 
-type Channels = Arc<Mutex<HashMap<Uuid, broadcast::Sender<String>>>>;
+type Channels = Arc<RwLock<HashMap<Uuid, broadcast::Sender<String>>>>;
 
 /// Per-run event channels, created on demand.
 #[derive(Clone)]
@@ -76,7 +93,7 @@ impl RunBus {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(HashMap::new())),
             capacity,
         }
     }
@@ -84,7 +101,7 @@ impl RunBus {
     /// Start receiving `run_id`'s events. The channel exists for as long as at least one
     /// [`RunSubscription`] holds it.
     pub fn subscribe(&self, run_id: Uuid) -> RunSubscription {
-        let mut channels = self.lock();
+        let mut channels = self.write();
         let tx = channels
             .entry(run_id)
             .or_insert_with(|| broadcast::channel(self.capacity).0);
@@ -97,22 +114,33 @@ impl RunBus {
 
     /// Hand `payload` to this run's viewers. A run nobody is watching costs one lookup
     /// and allocates nothing.
+    ///
+    /// The sender is cloned out under a read lock and the guard dropped before the copy
+    /// and the send: this is the hot path for every log batch on the instance, and
+    /// holding one exclusive lock across it would serialise the fan-out of every run
+    /// through the thing this module exists to parallelise. Sending through a clone that
+    /// another thread removes in the same instant is harmless — removal only happens
+    /// when the last receiver is leaving, so the event has nowhere it needed to go.
     pub fn publish(&self, run_id: Uuid, payload: &str) {
-        let channels = self.lock();
-        if let Some(tx) = channels.get(&run_id) {
+        let tx = self.read().get(&run_id).cloned();
+        if let Some(tx) = tx {
             let _ = tx.send(payload.to_string());
         }
     }
 
     /// Runs with a live channel. Fan-out is only ever paid for these.
     pub fn tracked_runs(&self) -> usize {
-        self.lock().len()
+        self.read().len()
     }
 
     /// A poisoned lock here would mean a panic while holding it, which cannot happen:
-    /// nothing inside the guard can panic and no `.await` is reached under it.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, broadcast::Sender<String>>> {
-        self.channels.lock().unwrap_or_else(|e| e.into_inner())
+    /// nothing inside either guard can panic and no `.await` is reached under one.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<Uuid, broadcast::Sender<String>>> {
+        self.channels.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<Uuid, broadcast::Sender<String>>> {
+        self.channels.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -131,12 +159,10 @@ impl RunSubscription {
 
 impl Drop for RunSubscription {
     fn drop(&mut self) {
-        let Ok(mut channels) = self.channels.lock() else {
-            return;
-        };
+        let mut channels = self.channels.write().unwrap_or_else(|e| e.into_inner());
         // `self.rx` is still alive here — fields drop after this body — so the last
-        // subscriber sees a count of one. Removal happens under the same lock
-        // `subscribe` takes, so a viewer arriving in this instant either finds the
+        // subscriber sees a count of one. Removal takes the same write lock
+        // `subscribe` does, so a viewer arriving in this instant either finds the
         // entry and joins it, or misses it and creates a new one; it can never be
         // handed a channel this drop is about to throw away.
         if let Some(tx) = channels.get(&self.run_id)
@@ -153,6 +179,61 @@ mod tests {
 
     fn run() -> Uuid {
         Uuid::new_v4()
+    }
+
+    /// Step output, decided variant by variant. No wildcard arm: a `RunEvent` added
+    /// without a decision here does not compile, which is the only way a list of tag
+    /// strings can be kept honest.
+    fn is_step_output(ev: &fiber_proto::RunEvent) -> bool {
+        match ev {
+            fiber_proto::RunEvent::Log { .. } | fiber_proto::RunEvent::LogBatch { .. } => true,
+            fiber_proto::RunEvent::RunUpdated { .. }
+            | fiber_proto::RunEvent::StepUpdated { .. }
+            | fiber_proto::RunEvent::Resync { .. } => false,
+        }
+    }
+
+    #[test]
+    fn every_run_event_is_classified_the_way_its_variant_says() {
+        use fiber_proto::{RunEvent, RunStatus, StepStatus};
+        let id = Uuid::new_v4();
+        let events = [
+            RunEvent::RunUpdated {
+                run_id: id,
+                status: RunStatus::Succeeded,
+            },
+            RunEvent::StepUpdated {
+                run_id: id,
+                step_run_id: id,
+                step_id: "build".into(),
+                status: StepStatus::Running,
+            },
+            RunEvent::Log {
+                run_id: id,
+                step_run_id: id,
+                stream: "stdout".into(),
+                data: "hello".into(),
+                seq: 1,
+                at: chrono::Utc::now(),
+                attempt: Some(1),
+            },
+            RunEvent::LogBatch {
+                run_id: id,
+                step_run_id: id,
+                attempt: Some(1),
+                lines: vec![],
+            },
+            RunEvent::Resync {
+                run_id: id,
+                missed: 4,
+            },
+        ];
+        for ev in &events {
+            let payload = serde_json::to_string(ev).expect("serializable");
+            let head = event_head(&payload).expect("every run event is routable");
+            assert_eq!(head.run_id, id, "{payload}");
+            assert_eq!(head.is_log, is_step_output(ev), "{payload}");
+        }
     }
 
     #[test]
