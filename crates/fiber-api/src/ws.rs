@@ -633,7 +633,6 @@ async fn handle_agent(
         }
     });
 
-    let _ = state.store.set_agent_online(agent_id, true).await;
     // Log a spoofed agent_id once per session, not once per log line.
     let mut spoof_logged = false;
     // Lines already stored per (step, attempt), so the cap costs a counter rather than a
@@ -731,6 +730,7 @@ async fn handle_agent(
                     .scheduler
                     .register_connection(agent_id, tx.clone())
                     .await;
+                let _ = state.store.set_agent_online(agent_id, true).await;
                 let _ = state.store.touch_agent(agent_id).await;
                 fill_agent(&state, agent_id, &tx).await;
             }
@@ -917,10 +917,12 @@ async fn handle_agent(
         }
     }
 
-    // Presence belongs to the session that registered it. A socket that closed before
-    // Hello registered nothing — it is a reconnect racing its own predecessor, or a
-    // second process on the same token — and marking the agent offline from here would
-    // report the *live* session's agent as gone.
+    // The online flag belongs to the session that set it, in the Hello arm. A socket
+    // that closed before Hello never set it — it is a reconnect racing its own
+    // predecessor, or a second process on the same token — and clearing it from here
+    // would report the *live* session's agent as gone. The registry entry and the
+    // connection are dropped either way, by `on_agent_disconnect` below: this socket
+    // took the connection slot when it opened, so it owns the cleanup.
     if agent_protocol.is_some() {
         let _ = state.store.set_agent_online(agent_id, false).await;
     }

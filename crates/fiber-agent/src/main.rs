@@ -553,17 +553,17 @@ const MAX_LEASE_SECS: u64 = 86_400;
 /// ends so the watchdog is armed rather than the lease outlived.
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// When a disconnected agent gives up its steps: `grace` after the last heartbeat the
-/// socket accepted — the server's lease runs from a heartbeat it processed, and a
-/// session that got Hello out but never a heartbeat renewed nothing — or, if none was
-/// ever written, after the disconnect itself. Anchored, not re-armed: a reconnect that
-/// fails, or one that connects and drops before a heartbeat, does not move it.
+/// When a disconnected agent gives up its steps: `grace` after the last frame the server
+/// sent — the lease runs from work the server's loop actually did, and a frame back is
+/// that loop proving it is turning — or, if none was ever seen, after the disconnect
+/// itself. Anchored, not re-armed: a reconnect that fails, or one that connects and
+/// drops before the server says anything, does not move it.
 fn give_up_at(
-    last_heartbeat: Option<tokio::time::Instant>,
+    last_server_frame: Option<tokio::time::Instant>,
     disconnected_at: tokio::time::Instant,
     grace: Duration,
 ) -> tokio::time::Instant {
-    last_heartbeat.unwrap_or(disconnected_at) + grace
+    last_server_frame.unwrap_or(disconnected_at) + grace
 }
 
 /// Whether a session's end should start a lease watchdog: one per outage, and only
@@ -653,7 +653,10 @@ impl AgentState {
     /// A session is up (Hello sent): the outage, if any, is over. The watchdog goes;
     /// but if its deadline had already passed, the server has reclaimed the steps and
     /// they are given up here rather than run on for a lease that is gone.
-    fn on_session_established(&mut self) {
+    ///
+    /// `anchor` is the last frame seen *before* this session — reading it here would
+    /// find the `Welcome` this session just took, and the deadline would never be past.
+    fn on_session_established(&mut self, anchor: Option<tokio::time::Instant>) {
         self.outbound.connected.store(true, Ordering::SeqCst);
         if let Some(w) = self.watchdog.take() {
             w.abort();
@@ -663,7 +666,7 @@ impl AgentState {
         };
         let grace = grace_after_disconnect(self.lease_secs, HEARTBEAT_INTERVAL);
         let now = tokio::time::Instant::now();
-        if now >= give_up_at(self.last_server_frame(), started, grace) {
+        if now >= give_up_at(anchor, started, grace) {
             let n = give_up_steps(
                 self.agent_id(),
                 &self.cancels,
@@ -1031,6 +1034,9 @@ async fn run_session(
     })
     .context("build websocket request")?;
 
+    // Taken before the handshake: `Welcome` moves the anchor, and the give-up decision
+    // below is about how long this agent went without hearing from any session.
+    let anchor_before_session = st.last_server_frame();
     info!(api = %args.api_url, "connecting");
     let (ws, _) = connect_async(request).await.context("connect websocket")?;
     let (mut sink, mut stream) = ws.split();
@@ -1066,7 +1072,7 @@ async fn run_session(
     // Reconnected: the steps from the last session keep their leases (the writer's
     // first heartbeat renews them) and their buffered output goes out now — unless the
     // outage outlasted the lease, in which case they are stopped here.
-    st.on_session_established();
+    st.on_session_established(anchor_before_session);
 
     let (last_tx, last_rx) = oneshot::channel::<AgentMessage>();
     let mut writer = tokio::spawn(write_session(sink, st.outbound.clone(), agent_id, last_rx));
@@ -2070,12 +2076,24 @@ where
     let mut announced = false;
     loop {
         // Each try is also bounded by what is left of the budget, so a request the
-        // client's own timeout would let run to 120 s cannot overrun the grace.
+        // client's own timeout would let run to 120 s cannot overrun the grace. A zero
+        // budget is not "no time to call": it is a server that named no lease, so there
+        // is nothing to overrun. Bounding the try by it would fail every artifact
+        // transfer against an older API without putting a request on the wire.
         let remaining = budget.saturating_sub(started.elapsed());
-        let failure = match tokio::time::timeout(remaining, op()).await {
-            Ok(Ok(v)) => return Ok(v),
-            Ok(Err(f)) => f,
-            Err(_) => ApiFailure::Transient(format!("no answer within {} s", remaining.as_secs())),
+        let failure = if remaining.is_zero() {
+            match op().await {
+                Ok(v) => return Ok(v),
+                Err(f) => f,
+            }
+        } else {
+            match tokio::time::timeout(remaining, op()).await {
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(f)) => f,
+                Err(_) => {
+                    ApiFailure::Transient(format!("no answer within {} s", remaining.as_secs()))
+                }
+            }
         };
         let elapsed = started.elapsed();
         if !retry_again(failure.is_transient(), elapsed, budget) {

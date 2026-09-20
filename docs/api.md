@@ -86,6 +86,7 @@ Base URL default: `http://127.0.0.1:18080`. JSON bodies. User routes need `Autho
 | PUT | `/api/agent/steps/{step_run_id}/artifacts` | Proxy upload + `X-Fiber-Artifact-Path`, and `X-Fiber-Attempt`; step must be **running, leased to this agent, and on that attempt** |
 | POST | `/api/agent/steps/{step_run_id}/artifacts/presign` | S3 presign or `{ mode: "proxy" }`; body carries `attempt`; same check |
 | POST | `/api/agent/steps/{step_run_id}/artifacts/complete` | After presigned PUT; body carries `attempt`; same check |
+| GET | `/api/agent/artifacts/{id}/download` | Restore download. Redirects to object storage when it is configured; `?via=api` streams the bytes through the API instead, for an agent that cannot reach the storage endpoint. Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
 
 A `step_run_id` is the same for every attempt of the step, so these three carry the
 attempt the offer named — `X-Fiber-Attempt` on the PUT, an `attempt` field in the two
@@ -93,7 +94,6 @@ JSON bodies — and an upload for an attempt the row has moved past is `401`. Wi
 an upload left over from an attempt the agent was disconnected through would overwrite
 the current attempt's artifact of the same name. Omitting it is accepted (an agent older
 than the field) and checked as before.
-| GET | `/api/agent/artifacts/{id}/download` | Restore download. Redirects to object storage when it is configured; `?via=api` streams the bytes through the API instead, for an agent that cannot reach the storage endpoint. Only artifacts of a run in which this agent currently holds a running step; `404` otherwise |
 
 ## WebSockets
 
