@@ -100,7 +100,7 @@ than the field) and checked as before.
 | Path | Auth | Notes |
 |---|---|---|
 | `/ws/agent` | `Authorization: Bearer <agent token>` | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
-| `/ws/runs/{id}` | `Sec-WebSocket-Protocol: fiber.token.<session token>` | Live run/step/log events (`run_updated`, `step_updated`, `log_batch`, and `log` from a replica older than the batch). The server echoes the protocol to complete the handshake |
+| `/ws/runs/{id}` | `Sec-WebSocket-Protocol: fiber.token.<session token>` | Live run/step/log events (`run_updated`, `step_updated`, `log_batch`, `resync`, and `log` from a replica older than the batch). The server echoes the protocol to complete the handshake |
 
 `/ws/agent` still accepts `?token=`, so an agent older than the server keeps working, but
 the query string is deprecated: a URL ends up in proxy and server access logs and a token
@@ -111,5 +111,16 @@ session token is the whole user's authority for two weeks, and nothing needed it
 A browser cannot set headers on a WebSocket, which is why the run event stream uses a
 subprotocol rather than `Authorization`. Ordinary access-log formats record the request line
 but not arbitrary headers, so this keeps the token out of them.
+
+`resync` (`{"type":"resync","run_id":"…","missed":N}`) means the server dropped `missed`
+events before this subscriber read them — a client too slow to keep up, or a burst larger
+than the run's channel. It is not an error and the socket stays open; there is nothing to
+retry, because the events are gone. Close the gap by refetching from the last line id
+held: `GET /api/steps/{id}/logs?attempt=…&after_id=<last id>`, whose page is ordered by
+`id` and whose last line is the cursor for the next request. The same channel carries
+`run_updated` and `step_updated`, so re-read `GET /api/runs/{id}` as well — a gap can
+swallow the transitions that finish a run, and nothing republishes them. Do all of it on
+a reconnect too: a socket that dropped missed whatever was published while it was down. A
+client that does not know the frame ignores it and behaves as before.
 
 Message shapes: `crates/fiber-proto`.

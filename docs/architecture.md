@@ -43,6 +43,15 @@
 5. **Complete** — Agent reports status; scheduler unlocks dependents or skips on failure (fail-fast).
 6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers; agent-directed messages (cancel, disconnect) fan out on `fiber:agent_cmds` to whichever instance holds the agent's socket.
 
+Inside an instance the fan-out is **per run**. An event is parsed once, for its run id,
+and handed to a `broadcast` channel that exists only while that run has viewers; a second
+channel carries the status transitions (not the log output) to in-process consumers such
+as the commit-status reporter. A viewer is therefore never woken by another run's build,
+and never falls behind because of one. When a viewer does fall behind its own run — a
+slow tab, a burst larger than the channel — the server sends a `resync` frame and keeps
+the socket, and the viewer refetches the step's log from the last id it holds. Dropping
+events is survivable; dropping the socket was not, because nothing republishes a line.
+
 ## Durability model
 
 - **CI steps are at-least-once.** Leases expire; stale agents are reclaimed; steps may re-run. Make `run` idempotent.

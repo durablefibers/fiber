@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router"
+import { useVirtualizer } from "@tanstack/react-virtual"
 import { Ban, Copy, Download, ExternalLink, RotateCw } from "lucide-react"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import { AppShell } from "@/components/app-shell"
 import { DagCanvas } from "@/components/dag-canvas"
@@ -17,6 +18,13 @@ import {
   statusColor,
 } from "@/lib/api"
 import { parseMatrixBindings } from "@/lib/dag-layout"
+import {
+  appendLogRows,
+  type LogRow,
+  MAX_LOG_ROWS,
+  nextLogCursor,
+  renderLogLine,
+} from "@/lib/logs"
 import { useExpand } from "@/lib/use-expand"
 import { cn } from "@/lib/utils"
 
@@ -53,6 +61,20 @@ function formatDuration(
   return `${h}h ${m % 60}m`
 }
 
+/**
+ * Lines the catch-up fetch asks for at a time, and how many pages it will walk.
+ *
+ * `MAX_LOG_ROWS` is all the viewer keeps, so one page is already more than the screen
+ * can hold; the extra pages exist for the case where the gap is larger than a page and
+ * the tail is what matters.
+ */
+const CATCH_UP_LIMIT = 500
+const CATCH_UP_PAGES = 4
+/** Fallback flush cadence where there is no animation frame to batch against. */
+const LOG_FLUSH_MS = 50
+/** Starting guess for a log row's height, in px; wrapped rows are measured for real. */
+const LOG_ROW_ESTIMATE = 18
+
 function isActiveStatus(status?: string) {
   return status === "pending" || status === "queued" || status === "running"
 }
@@ -75,7 +97,7 @@ function RunPage() {
   const [steps, setSteps] = useState<StepRun[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [selected, setSelected] = useState<string | null>(stepSearch ?? null)
-  const [logs, setLogs] = useState<string[]>([])
+  const [logs, setLogs] = useState<LogRow[]>([])
   const [attempts, setAttempts] = useState<StepAttempt[]>([])
   const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(
     null
@@ -92,6 +114,31 @@ function RunPage() {
   const logViewportRef = useRef<HTMLDivElement | null>(null)
   stepsRef.current = steps
   selectedRef.current = selected
+
+  /**
+   * The live log buffer's bookkeeping, all outside React state.
+   *
+   * A fast step publishes faster than React can render, so incoming lines are parked in
+   * `pendingLogs` and committed once per animation frame rather than once per event.
+   * `logCursor` is the highest `log_lines.id` the viewer holds: it is what a resync or a
+   * reconnect refetches from, so a gap is closed by asking rather than by hoping the
+   * next event arrives.
+   */
+  const pendingLogsRef = useRef<LogRow[]>([])
+  const cancelFlushRef = useRef<(() => void) | null>(null)
+  const logCursorRef = useRef<number | null>(null)
+  /** Live lines held back while a catch-up fetch is in flight, so the two cannot
+   * interleave and leave the buffer out of order. */
+  const heldLogsRef = useRef<LogRow[]>([])
+  const catchingUpRef = useRef(false)
+  /** Bumped whenever the step or attempt on screen changes, so an in-flight catch-up
+   * for the previous one cannot land in the new buffer. */
+  const logGenRef = useRef(0)
+  /** Keys for lines from a replica too old to send ids. Never deduplicated, only kept
+   * distinct. */
+  const synthIdRef = useRef(0)
+  const selectedAttemptNumRef = useRef<number | undefined>(undefined)
+  const connectedOnceRef = useRef(false)
 
   const selectStep = (id: string | null) => {
     setSelected(id)
@@ -197,12 +244,14 @@ function RunPage() {
   const shownLogs = useMemo(() => {
     const needle = logFilter.trim().toLowerCase()
     if (!needle) return logs
-    return logs.filter((l) => l.toLowerCase().includes(needle))
+    return logs.filter((l) => l.text.toLowerCase().includes(needle))
   }, [logs, logFilter])
 
   const copyLogs = async () => {
     try {
-      await navigator.clipboard.writeText(shownLogs.join("\n"))
+      await navigator.clipboard.writeText(
+        shownLogs.map((l) => l.text).join("\n")
+      )
       toast.success(`Copied ${shownLogs.length} lines`)
     } catch {
       toast.error("Clipboard unavailable")
@@ -213,8 +262,8 @@ function RunPage() {
     () =>
       logs.filter(
         (l) =>
-          l.includes("RESTORE FAILED") ||
-          /\[system\].*restore .+ failed/i.test(l)
+          l.text.includes("RESTORE FAILED") ||
+          /\[system\].*restore .+ failed/i.test(l.text)
       ),
     [logs]
   )
@@ -229,6 +278,138 @@ function RunPage() {
   viewingLatestAttemptRef.current =
     attempts.length === 0 ||
     selectedAttemptId === attempts[attempts.length - 1]?.id
+  selectedAttemptNumRef.current = selectedAttempt?.attempt
+
+  /** Commit whatever has accumulated since the last frame. */
+  const flushLogs = useCallback(() => {
+    cancelFlushRef.current = null
+    const batch = pendingLogsRef.current
+    if (batch.length === 0) return
+    pendingLogsRef.current = []
+    setLogs((prev) => appendLogRows(prev, batch))
+  }, [])
+
+  /**
+   * Queue lines for the next frame.
+   *
+   * One `setLogs` per event copied the whole buffer and re-rendered every row, which put
+   * the ceiling on live viewing at a couple of hundred lines a second — well under what
+   * a build produces. An animation frame coalesces a burst into one render; a hidden tab
+   * gets no frames at all, so the queue is capped at what the buffer would keep anyway.
+   */
+  const queueLogs = useCallback(
+    (rows: LogRow[]) => {
+      if (rows.length === 0) return
+      const pending = pendingLogsRef.current
+      pending.push(...rows)
+      if (pending.length > MAX_LOG_ROWS) {
+        pending.splice(0, pending.length - MAX_LOG_ROWS)
+      }
+      logCursorRef.current = nextLogCursor(rows, logCursorRef.current)
+      if (cancelFlushRef.current) return
+      if (typeof requestAnimationFrame === "function") {
+        const handle = requestAnimationFrame(() => flushLogs())
+        cancelFlushRef.current = () => cancelAnimationFrame(handle)
+      } else {
+        const handle = window.setTimeout(() => flushLogs(), LOG_FLUSH_MS)
+        cancelFlushRef.current = () => window.clearTimeout(handle)
+      }
+    },
+    [flushLogs]
+  )
+
+  /** Drop everything the buffer holds and abandon any catch-up still in flight. */
+  const resetLogs = useCallback(() => {
+    logGenRef.current += 1
+    catchingUpRef.current = false
+    cancelFlushRef.current?.()
+    cancelFlushRef.current = null
+    pendingLogsRef.current = []
+    heldLogsRef.current = []
+    logCursorRef.current = null
+    setLogs([])
+  }, [])
+
+  /**
+   * Re-read the run and its steps from the API.
+   *
+   * The same channel carries `run_updated` and `step_updated`, so a gap can swallow the
+   * transitions that finish a run. Nothing republishes them and nothing else polls for
+   * them — the one-second timer only redraws elapsed time — so without this a run whose
+   * completion fell in the gap stays "running", its cells stay running and Cancel stays
+   * live until someone reloads the page.
+   */
+  const refreshRunState = useCallback(async () => {
+    try {
+      const detail = await api.getRun(runId)
+      setRun(detail.run)
+      setSteps(detail.steps)
+      setArtifacts(await api.listArtifacts(runId))
+    } catch {
+      // The next event, resync or reconnect tries again.
+    }
+  }, [runId])
+
+  /**
+   * Close a gap by asking the server, from the last id the viewer holds.
+   *
+   * Runs when the server says the stream lagged (`resync`) and when the socket comes
+   * back after a drop: in both cases events were published that this tab never saw, and
+   * nothing will republish them. Live lines are held back while it runs so that a page
+   * of older ids cannot arrive after a newer line and be discarded as already seen.
+   */
+  const catchUp = useCallback(async () => {
+    // Unconditional: the status transitions in the gap matter even when no step is
+    // selected, or when the viewer is reading an older attempt that does not tail.
+    void refreshRunState()
+    const cur = selectedRef.current
+    const step = stepsRef.current.find((s) => s.id === cur || s.step_id === cur)
+    if (!step || !viewingLatestAttemptRef.current || catchingUpRef.current) {
+      return
+    }
+    const gen = logGenRef.current
+    const attempt = selectedAttemptNumRef.current
+    catchingUpRef.current = true
+    try {
+      let cursor = logCursorRef.current
+      for (let page = 0; page < CATCH_UP_PAGES; page++) {
+        const lines = await api.listLogs(step.id, {
+          attempt,
+          afterId: cursor ?? undefined,
+          limit: CATCH_UP_LIMIT,
+        })
+        if (gen !== logGenRef.current) return
+        if (lines.length === 0) break
+        queueLogs(
+          lines.map((l) => ({
+            id: l.id,
+            text: renderLogLine(l.stream, l.data),
+          }))
+        )
+        // The page is ordered by id and its last line is the next `after_id`.
+        cursor = nextLogCursor(lines, cursor)
+        if (lines.length < CATCH_UP_LIMIT) break
+      }
+    } catch {
+      // Leave the cursor where it is; the next resync or reconnect tries again.
+    } finally {
+      if (gen === logGenRef.current) {
+        catchingUpRef.current = false
+        // Behind the fetched pages, and deduplicated against them by id.
+        queueLogs(heldLogsRef.current)
+        heldLogsRef.current = []
+      }
+    }
+  }, [queueLogs, refreshRunState])
+
+  // Nothing should still be scheduled once the page is gone.
+  useEffect(
+    () => () => {
+      cancelFlushRef.current?.()
+      cancelFlushRef.current = null
+    },
+    []
+  )
 
   const refreshArtifacts = async () => {
     try {
@@ -292,6 +473,12 @@ function RunPage() {
     const connect = () => {
       if (closed) return
       ws = new WebSocket(api.runEventsUrl(runId), api.runEventsProtocols())
+      ws.onopen = () => {
+        // A reconnect means a window where events went nowhere. The first connect is
+        // not one: the log-fetch effect below is already loading the step.
+        if (connectedOnceRef.current) void catchUp()
+        connectedOnceRef.current = true
+      }
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data as string) as {
@@ -301,7 +488,7 @@ function RunPage() {
             step_run_id?: string
             data?: string
             stream?: string
-            lines?: { stream?: string; data?: string }[]
+            lines?: { id?: number; stream?: string; data?: string }[]
           }
           if (msg.type === "run_updated" && msg.status) {
             setRun((r) => (r ? { ...r, status: msg.status! } : r))
@@ -340,6 +527,12 @@ function RunPage() {
           // its output and the server stores and publishes it a batch at a time. A
           // replica older than the batch still publishes single lines, so both arrive
           // during a rolling deploy.
+          // The server dropped events this viewer had not read yet — a slow tab, or a
+          // burst larger than its queue. The socket stays open; what is missing is
+          // fetched by id rather than guessed at.
+          if (msg.type === "resync") {
+            void catchUp()
+          }
           if (msg.type === "log" || msg.type === "log_batch") {
             const incoming =
               msg.type === "log"
@@ -361,8 +554,14 @@ function RunPage() {
             ) {
               const rendered = incoming
                 .filter((l) => l.data !== undefined)
-                .map((l) => `[${l.stream ?? "out"}] ${l.data}`)
-              setLogs((prev) => [...prev, ...rendered].slice(-800))
+                .map((l) => ({
+                  // A replica older than `log_batch` sends no id; it only needs to be
+                  // a distinct React key, and it must never look newer than a real one.
+                  id: l.id ?? --synthIdRef.current,
+                  text: renderLogLine(l.stream, l.data as string),
+                }))
+              if (catchingUpRef.current) heldLogsRef.current.push(...rendered)
+              else queueLogs(rendered)
             }
           }
         } catch {
@@ -377,10 +576,11 @@ function RunPage() {
     connect()
     return () => {
       closed = true
+      connectedOnceRef.current = false
       if (retry) window.clearTimeout(retry)
       ws?.close()
     }
-  }, [runId])
+  }, [runId, catchUp, queueLogs])
 
   useEffect(() => {
     const step = steps.find((s) => s.id === selected || s.step_id === selected)
@@ -407,29 +607,36 @@ function RunPage() {
 
   // Logs are fetched per attempt: `seq` restarts each attempt, so a retried step's
   // output would otherwise interleave. Refetches when the viewer picks another attempt.
+  //
+  // Deliberately *not* keyed on `steps`: that array gets a new identity on every
+  // `step_updated`, so a 50-cell matrix refetched the selected step's log a hundred
+  // times over a run. The step run's id is what actually decides which log to load.
+  const selectedStepId = selectedStep?.id
+  const selectedAttemptNum = selectedAttempt?.attempt
   useEffect(() => {
-    const step = steps.find((s) => s.id === selected || s.step_id === selected)
-    if (!step) {
-      setLogs([])
-      return
-    }
-    let cancelled = false
+    resetLogs()
+    if (!selectedStepId) return
+    const gen = logGenRef.current
     void api
-      .listLogs(step.id, { attempt: selectedAttempt?.attempt })
+      .listLogs(selectedStepId, { attempt: selectedAttemptNum })
       .then((lines) => {
-        if (cancelled) return
-        setLogs(lines.map((l) => `[${l.stream}] ${l.data}`))
+        if (gen !== logGenRef.current) return
+        setLogs(
+          lines.map((l) => ({
+            id: l.id,
+            text: renderLogLine(l.stream, l.data),
+          }))
+        )
+        // The page's last line is where a later resync resumes from.
+        logCursorRef.current = nextLogCursor(lines, null)
         setFollowLogs(true)
       })
       .catch((e) => {
-        if (!cancelled) {
+        if (gen === logGenRef.current) {
           setError(e instanceof Error ? e.message : "Could not load logs")
         }
       })
-    return () => {
-      cancelled = true
-    }
-  }, [selected, steps, selectedAttempt?.attempt])
+  }, [selectedStepId, selectedAttemptNum, resetLogs])
 
   // Refresh attempts when step reaches a terminal status via WS.
   useEffect(() => {
@@ -447,14 +654,41 @@ function RunPage() {
       .catch(() => setAttempts([]))
   }, [selectedStep?.id, selectedStep?.status, selectedStep?.attempt])
 
+  /**
+   * Only the rows on screen are in the DOM.
+   *
+   * A build can leave 800 lines in the buffer, and re-laying all of them out on every
+   * frame is what made a fast step unwatchable. Rows are measured rather than assumed:
+   * with wrapping on, a long line is several rows tall.
+   */
+  const logVirtualizer = useVirtualizer({
+    count: shownLogs.length,
+    getScrollElement: () => logViewportRef.current,
+    estimateSize: () => LOG_ROW_ESTIMATE,
+    overscan: 24,
+    // The log id, so a row keeps its identity as the buffer's head is trimmed.
+    getItemKey: (index) => shownLogs[index]?.id ?? index,
+  })
+
+  // Wrapping changes every row's height, and the virtualiser's cache for rows that are
+  // off screen is not invalidated by the class change alone: the total size and the
+  // scrollbar would drift until each one happened to be scrolled back into view.
+  useEffect(() => {
+    logVirtualizer.measure()
+  }, [wrapLogs, logVirtualizer])
+
   useEffect(() => {
     if (!followLogs) return
     // Scroll the log viewport itself rather than `scrollIntoView`, which walks up to
     // the nearest scrollable ancestor — when the panes stack on a narrow screen that
     // is the page, and following the tail would drag the canvas out of view.
+    if (shownLogs.length > 0) {
+      logVirtualizer.scrollToIndex(shownLogs.length - 1, { align: "end" })
+      return
+    }
     const el = logViewportRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [shownLogs, followLogs])
+  }, [shownLogs, followLogs, logVirtualizer])
 
   const onLogScroll = () => {
     const el = logViewportRef.current
@@ -782,9 +1016,9 @@ function RunPage() {
                 <div className="rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-200">
                   <div className="font-medium">Artifact restore failed</div>
                   <ul className="mt-1 space-y-0.5 font-mono text-[10px] text-rose-100/90">
-                    {restoreFailures.map((l, i) => (
-                      <li key={i} className="break-all">
-                        {l.replace(/^\[system\]\s*/, "")}
+                    {restoreFailures.map((l) => (
+                      <li key={l.id} className="break-all">
+                        {l.text.replace(/^\[system\]\s*/, "")}
                       </li>
                     ))}
                   </ul>
@@ -947,14 +1181,32 @@ function RunPage() {
                 No lines match “{logFilter}”.
               </span>
             ) : (
-              shownLogs.map((l, i) => (
-                <div
-                  key={i}
-                  className={`${wrapLogs ? "whitespace-pre-wrap" : "whitespace-pre"} ${logLineClass(l)}`}
-                >
-                  {l}
-                </div>
-              ))
+              <div
+                className="relative w-full"
+                style={{ height: logVirtualizer.getTotalSize() }}
+              >
+                {logVirtualizer.getVirtualItems().map((item) => {
+                  const line = shownLogs[item.index]
+                  if (!line) return null
+                  return (
+                    <div
+                      key={item.key}
+                      data-index={item.index}
+                      ref={logVirtualizer.measureElement}
+                      className={`absolute top-0 left-0 ${wrapLogs ? "whitespace-pre-wrap" : "whitespace-pre"} ${logLineClass(line.text)}`}
+                      style={{
+                        transform: `translateY(${item.start}px)`,
+                        // `max-content` keeps the viewport's horizontal scroll working
+                        // when wrapping is off, where a row is wider than the pane.
+                        width: wrapLogs ? "100%" : "max-content",
+                        minWidth: "100%",
+                      }}
+                    >
+                      {line.text}
+                    </div>
+                  )
+                })}
+              </div>
             )}
           </div>
         </aside>

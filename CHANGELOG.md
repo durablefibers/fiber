@@ -123,6 +123,43 @@ minor versions may carry breaking changes.
   socket under `/run/user/<uid>` as shipped. [configuration](docs/configuration.md) now
   documents the caveat and a `BindPaths=` drop-in next to the variable.
 
+### Added
+
+- **A `resync` frame on `/ws/runs/{id}`.** When a viewer falls behind the run's event
+  channel, the server now says so and keeps the socket instead of closing it. The run
+  page answers by refetching the selected step's log from the last line id it holds
+  (`after_id`) **and** re-reading the run, its steps and its artifacts — the same channel
+  carries the status transitions, so a gap could otherwise leave a finished run showing
+  as running until someone reloaded. It does the same after a reconnect. A client that
+  does not know the frame ignores it. See [api](docs/api.md#websockets).
+
+### Changed
+
+- **The run-event fan-out is per run.** Every `/ws/runs/{id}` subscriber used to sit on
+  one process-wide 1024-slot broadcast, JSON-parse every event of every run to compare
+  `run_id`, and treat falling behind as fatal. One chatty build could therefore close the
+  socket of a viewer watching a completely different run, and the lines published in the
+  gap were never shown. Events are now parsed once, for their run id, and delivered to a
+  channel that exists only while that run has viewers; log output no longer travels on
+  the instance-wide bus at all.
+- **The commit-status reporter recovers from a gap.** A lag used to mean the reporter
+  missed the terminal event it was waiting for, and a required check stayed pending
+  forever. It now re-scans for runs that reached a terminal status in the window the gap
+  covers (rate-limited, and de-duplicated against what it has already posted).
+- **The run page's log view survives a fast build.** Lines are batched into one commit
+  per animation frame instead of one `setLogs` per event, rows are keyed by log id and
+  virtualised, and the log-fetch effect no longer depends on the `steps` array — a
+  50-cell matrix used to refetch the selected step's log on every `step_updated`. Adds
+  `@tanstack/react-virtual` (and its one dependency, `@tanstack/virtual-core`).
+
+### Fixed
+
+- `wire-drift.test.ts` now also reads `fiber-core/src/models.rs` and
+  `fiber-durable/src/types.rs`, and covers `ConcurrencyConfig` (which had already
+  drifted), the `RunEvent` tags the run page matches as string literals, and
+  `FiberStatus`. Fields the UI deliberately does not mirror are listed with a reason and
+  checked for staleness.
+
 ## [0.6.2] — 2026-09-19
 
 Four phases of the September hardening audit, and the first dependency advisory the new
