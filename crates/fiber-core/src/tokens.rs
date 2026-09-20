@@ -2,7 +2,11 @@ use argon2::Argon2;
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
 };
-use rand::RngCore;
+// rand 0.10 renamed the core trait: upstream `rand_core::RngCore` is now `rand_core::Rng`,
+// and rand's old extension trait `Rng` became `RngExt`. `fill_bytes` lives on this one.
+// Note this is *not* the `rand_core` that `argon2::password_hash` re-exports below — that
+// is rand_core 0.6, a separate major resolved separately, with its own `OsRng`.
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 pub fn generate_token() -> String {
@@ -78,6 +82,32 @@ pub fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token bytes must come from a cryptographically secure generator.
+    ///
+    /// rand 0.10 made `SmallRng` (Xoshiro256++, *not* a CSPRNG) available unconditionally
+    /// by removing the `small_rng` feature gate, so "it compiles and returns 32 bytes" no
+    /// longer implies the entropy is fit to mint a credential. This bound fails to compile
+    /// if the generator behind `rand::rng()` is ever swapped for one that is not.
+    #[test]
+    fn token_entropy_comes_from_a_csprng() {
+        fn assert_crypto<R: rand::CryptoRng>(_: &R) {}
+        assert_crypto(&rand::rng());
+    }
+
+    #[test]
+    fn tokens_are_32_bytes_of_hex_behind_their_prefix() {
+        for (token, prefix) in [
+            (generate_token(), "fiber_agent_"),
+            (generate_session_token(), "fiber_sess_"),
+        ] {
+            let hex_part = token.strip_prefix(prefix).expect("prefix");
+            assert_eq!(hex_part.len(), 64, "32 bytes, hex-encoded");
+            assert_eq!(hex::decode(hex_part).expect("hex").len(), 32);
+            // Two calls must not collide; a constant generator would fail here.
+            assert_ne!(token, generate_token());
+        }
+    }
 
     #[test]
     fn argon2_roundtrip() {
