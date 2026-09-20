@@ -30,12 +30,64 @@ TimeoutStopSec=30
 
 # Steps are repo-supplied shell, so this is a boundary, not a sandbox: anyone who can
 # write a fiber.yml runs code here. Keep agents on hosts you would grant those people.
+#
+# Everything below is chosen to survive an *ordinary* build — compilers, package
+# managers, test suites, Docker steps. A directive that makes `cargo test` or
+# `npm ci` fail is the wrong trade here, however good it looks in a hardening guide.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# The agent needs no capabilities at all: it opens an outbound socket, writes under
+# /var/lib/fiber, and forks shells. Combined with NoNewPrivileges this also means a
+# setuid binary in a build (sudo, ping, newgrp) gains nothing.
+CapabilityBoundingSet=
+# AF_NETLINK is not optional: glibc's NSS and every Go binary use it to enumerate
+# interfaces and resolve names, so dropping it breaks DNS in a way that looks like a
+# network outage. AF_UNIX carries the Docker socket. Builds that need AF_PACKET (raw
+# sockets, tcpdump) or AF_VSOCK must add them in a drop-in.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Build output and restored artifacts are readable by the fiber user only. Step
+# containers run under the Docker daemon, not this unit, so this does not reach them.
+UMask=0077
+
+# Considered and deliberately NOT set, because each one breaks ordinary builds:
+#
+#   MemoryDenyWriteExecute=true   Kills every JIT — the JVM, V8/Node, LuaJIT, PyPy,
+#                                 .NET, and any test that mmaps PROT_WRITE|PROT_EXEC.
+#   RestrictNamespaces=...        Breaks rootless containers, `unshare`, bubblewrap,
+#                                 buildah/podman and `docker buildx` userns builds.
+#   PrivateDevices=true           Hides /dev/kvm, /dev/fuse and loop devices, so
+#                                 emulator tests and image builds stop working.
+#   ProcSubset=pid                Hides /proc/meminfo and /proc/cpuinfo, which the JVM,
+#                                 Node and most build tools read to size themselves.
+#   SystemCallFilter=@system-service  Blocks @mount/@sandbox: chroot, unshare, fakeroot
+#                                 and several package managers fail with EPERM.
+#   ProtectSystem=strict          Would make /opt and /srv read-only too; toolchains
+#                                 installed there (JDKs, SDKs) become unusable.
+#
+# ProtectHome=true hides /home, /root and /run/user/*. The agent's own home is
+# /var/lib/fiber, so this costs nothing — except that a user's SSH agent socket lives
+# under /run/user/<uid>, so FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK cannot work as
+# shipped. That is deliberate: a build host reaching into a human's login session is
+# exactly what this directive is for. If you need it, re-expose only the socket in a
+# drop-in (/etc/systemd/system/fiber-agent.service.d/ssh-agent.conf):
+#
+#   [Service]
+#   BindPaths=/run/user/1000/keyring/ssh
+#   Environment=FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK
+#
+# and confirm a step can actually reach it before relying on it. See
+# docs/configuration.md under FIBER_AGENT_ENV_PASSTHROUGH.
 
 [Install]
 WantedBy=multi-user.target

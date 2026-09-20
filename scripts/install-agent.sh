@@ -6,10 +6,32 @@
 #
 # Create the token first (instance admin):
 #   fiber agents create --name build-01 --labels os=linux
+#
+# What this verifies before it writes anything to the host:
+#
+#   1. `--version latest` is resolved to a concrete tag by following the
+#      /releases/latest redirect, and *every* file — tarball, checksums and the
+#      systemd unit — is then fetched from that one tag. A host can no longer end up
+#      running a released binary with `main`'s unit.
+#   2. The tarball's SHA-256 must match the release's `SHA256SUMS` (or the per-asset
+#      `.sha256` on releases published before SHA256SUMS existed). A missing or
+#      mismatched checksum is fatal. This is integrity, not provenance: both files
+#      come from the same release over the same channel.
+#   3. Provenance: if the `gh` CLI is installed and authenticated, the tarball's
+#      build-provenance attestation is verified with `gh attestation verify`, which
+#      proves the bits were produced by this repository's release workflow. This is
+#      the only check here that a compromised release page cannot forge. Without
+#      `gh` the script says so explicitly rather than pretending.
+#
+# `--check-only` runs 1-3 and exits without touching the host — use it to verify a
+# download by hand, or from a non-root shell.
 set -euo pipefail
 
 REPO="${FIBER_REPO:-durablefibers/fiber}"
 VERSION="${FIBER_VERSION:-latest}"
+# Binds an attestation to the workflow that is allowed to produce releases, not just
+# to the repository. Override for a fork that publishes from a different path.
+SIGNER_WORKFLOW="${FIBER_SIGNER_WORKFLOW:-$REPO/.github/workflows/release.yml}"
 API_URL=""
 TOKEN="${FIBER_AGENT_TOKEN:-}"
 NAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo fiber-agent)"
@@ -20,6 +42,9 @@ BIN_DIR="/usr/local/bin"
 ETC_DIR="/etc/fiber"
 STATE_DIR="/var/lib/fiber"
 SERVICE="/etc/systemd/system/fiber-agent.service"
+CHECK_ONLY="false"
+SKIP_CHECKSUM="false"
+SKIP_ATTESTATION="false"
 
 usage() {
   cat <<'USAGE'
@@ -33,12 +58,22 @@ Usage: install-agent.sh --api-url <url> --token <token> [options]
   --docker           Enable Docker steps (needs docker + group membership)
   --version VER      Release tag to install                   [default: latest]
   --tarball PATH     Install from a local release tarball instead of downloading
+  --check-only       Resolve, download and verify a release, then exit (no root)
   --uninstall        Stop, disable, and remove the service
+
+Escape hatches — each one prints exactly which guarantee it is giving up:
+
+  --insecure-skip-checksum      Install even if the release publishes no checksum,
+                                or if it does not match.
+  --insecure-skip-attestation   Install even if `gh attestation verify` fails
+                                (e.g. a release published before attestations).
 
 The token is read from $FIBER_AGENT_TOKEN when --token is omitted; prefer that, since
 argv is world-readable in ps for the life of the script.
 USAGE
 }
+
+die() { echo "$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,14 +85,21 @@ while [[ $# -gt 0 ]]; do
     --docker) USE_DOCKER="true"; shift ;;
     --version) VERSION="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
+    --check-only) CHECK_ONLY="true"; shift ;;
+    --insecure-skip-checksum) SKIP_CHECKSUM="true"; shift ;;
+    --insecure-skip-attestation) SKIP_ATTESTATION="true"; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-[[ $EUID -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 1; }
-command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
+command -v curl >/dev/null || die "curl is required"
+
+if [[ "$CHECK_ONLY" != "true" ]]; then
+  [[ $EUID -eq 0 ]] || die "run as root (sudo), or pass --check-only to verify a download only"
+  command -v systemctl >/dev/null || die "systemd is required"
+fi
 
 if [[ -n "${UNINSTALL:-}" ]]; then
   systemctl disable --now fiber-agent 2>/dev/null || true
@@ -68,6 +110,198 @@ if [[ -n "${UNINSTALL:-}" ]]; then
   exit 0
 fi
 
+# --- platform -----------------------------------------------------------------
+
+case "$(uname -s)" in
+  Linux) ;;
+  Darwin)
+    # A macOS host cannot run the unit, but it can verify a macOS release asset.
+    [[ "$CHECK_ONLY" == "true" ]] ||
+      die "this installer targets Linux + systemd; see docs/agents.md for other hosts"
+    ;;
+  *) die "this installer targets Linux + systemd; see docs/agents.md for other hosts" ;;
+esac
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64|Linux/amd64) TARGET="x86_64-unknown-linux-gnu" ;;
+  Linux/aarch64|Linux/arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+  Darwin/arm64) TARGET="aarch64-apple-darwin" ;;
+  *) die "unsupported platform: $(uname -s) $(uname -m)" ;;
+esac
+
+# The asset keeps its published name so a checksum manifest, which records that name,
+# verifies without rewriting.
+ASSET="fiber-agent-$TARGET.tar.gz"
+
+# --- release resolution -------------------------------------------------------
+
+RESOLVED_TAG=""
+
+# `latest` is a redirect, not a tag. Resolve it once, up front, and build every URL
+# from the result: the tarball, the checksums and the systemd unit all come from the
+# same tag. Fetching the unit from `main` (what this script used to do) could pair a
+# released binary with an unreleased unit.
+resolve_tag() {
+  [[ -n "$RESOLVED_TAG" ]] && return 0
+  if [[ "$VERSION" != "latest" ]]; then
+    RESOLVED_TAG="$VERSION"
+    return 0
+  fi
+  local effective
+  effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$REPO/releases/latest")" ||
+    die "could not reach https://github.com/$REPO/releases/latest to resolve 'latest'"
+  RESOLVED_TAG="${effective##*/}"
+  case "$RESOLVED_TAG" in
+    v[0-9]*) ;;
+    *) die "'latest' resolved to '$RESOLVED_TAG' via $effective, which is not a version tag" ;;
+  esac
+  echo "latest resolves to $RESOLVED_TAG"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "neither sha256sum nor shasum is available; cannot verify anything"
+  fi
+}
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+CHECKSUM_RESULT=""
+PROVENANCE_RESULT=""
+ASSET_SHA256=""
+
+verify_checksum() {
+  local base="$1" expected="" source=""
+  if curl -fsSL "$base/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
+    source="SHA256SUMS"
+    # `sha256sum` writes "<hash>  <name>"; the binary-mode marker is a leading '*'.
+    expected="$(awk -v f="$ASSET" '$2 == f || $2 == "*" f {print $1; exit}' "$TMP/SHA256SUMS")"
+  elif curl -fsSL "$base/$ASSET.sha256" -o "$TMP/$ASSET.sha256" 2>/dev/null; then
+    source="$ASSET.sha256"
+    expected="$(awk '{print $1; exit}' "$TMP/$ASSET.sha256")"
+  fi
+
+  if [[ -z "$expected" ]]; then
+    if [[ "$SKIP_CHECKSUM" == "true" ]]; then
+      CHECKSUM_RESULT="SKIPPED — release $RESOLVED_TAG publishes no checksum for $ASSET and --insecure-skip-checksum was passed"
+      echo "WARNING: $CHECKSUM_RESULT" >&2
+      echo "WARNING: you are trusting the transport and the release page, nothing else." >&2
+      return 0
+    fi
+    die "no published checksum for $ASSET in release $RESOLVED_TAG (looked for SHA256SUMS and $ASSET.sha256).
+Refusing to install unverified bits. Pass --insecure-skip-checksum to override."
+  fi
+
+  # Lowercased through tr, not ${x,,}: macOS still ships bash 3.2 and --check-only
+  # is meant to run there.
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$expected" != "$(printf '%s' "$ASSET_SHA256" | tr '[:upper:]' '[:lower:]')" ]]; then
+    if [[ "$SKIP_CHECKSUM" == "true" ]]; then
+      CHECKSUM_RESULT="SKIPPED — $source says $expected, the download is $ASSET_SHA256, and --insecure-skip-checksum was passed"
+      echo "WARNING: $CHECKSUM_RESULT" >&2
+      return 0
+    fi
+    die "checksum mismatch for $ASSET
+  expected ($source): $expected
+  downloaded:          $ASSET_SHA256
+Do not install this. Re-download, and if it happens again report it."
+  fi
+  CHECKSUM_RESULT="OK — matches $source from release $RESOLVED_TAG (integrity only: same origin as the tarball)"
+  echo "checksum ok ($source)"
+}
+
+verify_attestation() {
+  local file="$1"
+  if ! command -v gh >/dev/null 2>&1; then
+    PROVENANCE_RESULT="NOT CHECKED — the gh CLI is not installed, so nothing here proves who built this tarball.
+    Install gh (https://cli.github.com), run 'gh auth login', and re-run to get build provenance."
+    return 0
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    PROVENANCE_RESULT="NOT CHECKED — gh is installed but not authenticated ('gh auth login'), so the attestation API was not queried."
+    return 0
+  fi
+  if gh attestation verify "$file" --repo "$REPO" --signer-workflow "$SIGNER_WORKFLOW" \
+      >"$TMP/attest.out" 2>&1; then
+    PROVENANCE_RESULT="VERIFIED — built by $SIGNER_WORKFLOW (GitHub build provenance)"
+    echo "provenance ok (gh attestation verify)"
+    return 0
+  fi
+  if [[ "$SKIP_ATTESTATION" == "true" ]]; then
+    PROVENANCE_RESULT="SKIPPED — gh attestation verify failed and --insecure-skip-attestation was passed"
+    echo "WARNING: $PROVENANCE_RESULT" >&2
+    echo "WARNING: nothing proves this tarball came from $SIGNER_WORKFLOW." >&2
+    sed 's/^/  gh: /' "$TMP/attest.out" >&2
+    return 0
+  fi
+  echo "gh attestation verify failed for $file:" >&2
+  sed 's/^/  gh: /' "$TMP/attest.out" >&2
+  die "no valid build provenance for $ASSET from $SIGNER_WORKFLOW.
+Releases up to and including v0.6.2 carry no attestations — for those, pass
+--insecure-skip-attestation (the checksum is still enforced). Otherwise treat this
+as a tampered download."
+}
+
+# --- fetch and verify ---------------------------------------------------------
+
+# What gets recorded and reported. For a release this is the tag; for --tarball there is
+# no tag, and RESOLVED_TAG stays empty so the unit fetch below can still resolve one.
+INSTALLED_FROM=""
+
+if [[ -n "${TARBALL:-}" ]]; then
+  [[ -f "$TARBALL" ]] || die "no such tarball: $TARBALL"
+  ASSET_SHA256="$(sha256_of "$TARBALL")"
+  echo "installing from $TARBALL (sha256 $ASSET_SHA256)"
+  CHECKSUM_RESULT="NOT CHECKED — you supplied the file with --tarball; there is nothing to compare it to"
+  PROVENANCE_RESULT="NOT CHECKED — you supplied the file with --tarball; you own its provenance"
+  INSTALLED_FROM="local-tarball"
+  tar -xzf "$TARBALL" -C "$TMP"
+else
+  resolve_tag
+  INSTALLED_FROM="$RESOLVED_TAG"
+  BASE="https://github.com/$REPO/releases/download/$RESOLVED_TAG"
+  echo "downloading $BASE/$ASSET"
+  if ! curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"; then
+    echo "download failed — no published release for this platform yet?" >&2
+    echo "Build the tarball yourself and pass --tarball, or see:" >&2
+    echo "  https://github.com/$REPO/blob/$RESOLVED_TAG/docs/agents.md#from-source" >&2
+    exit 1
+  fi
+  ASSET_SHA256="$(sha256_of "$TMP/$ASSET")"
+  verify_checksum "$BASE"
+  verify_attestation "$TMP/$ASSET"
+  tar -xzf "$TMP/$ASSET" -C "$TMP"
+fi
+
+[[ -f "$TMP/fiber-agent" ]] || die "the tarball does not contain fiber-agent"
+BIN_SHA256="$(sha256_of "$TMP/fiber-agent")"
+
+report() {
+  echo
+  echo "release:    $INSTALLED_FROM   ($REPO)"
+  echo "asset:      $ASSET"
+  echo "  sha256    $ASSET_SHA256"
+  echo "fiber-agent binary"
+  echo "  sha256    $BIN_SHA256"
+  echo "checksum:   $CHECKSUM_RESULT"
+  echo "provenance: $PROVENANCE_RESULT"
+  echo
+}
+
+if [[ "$CHECK_ONLY" == "true" ]]; then
+  report
+  echo "--check-only: nothing was installed."
+  exit 0
+fi
+
+# --- settings -----------------------------------------------------------------
+
+PREV_VERSION="unknown"
 # Re-running is the upgrade path: keep settings that were not passed this time.
 if [[ -f "$ETC_DIR/agent.env" ]]; then
   # shellcheck disable=SC1091
@@ -78,65 +312,33 @@ if [[ -f "$ETC_DIR/agent.env" ]]; then
   [[ "$LABELS" == "os=linux" ]] && LABELS="${FIBER_AGENT_LABELS:-$LABELS}"
   [[ "$CONCURRENCY" == "2" ]] && CONCURRENCY="${FIBER_AGENT_CONCURRENCY:-$CONCURRENCY}"
   [[ "$USE_DOCKER" == "false" ]] && USE_DOCKER="${FIBER_AGENT_USE_DOCKER:-$USE_DOCKER}"
+  PREV_VERSION="${FIBER_AGENT_INSTALLED_VERSION:-unknown}"
   echo "reusing settings from $ETC_DIR/agent.env for anything not passed"
+  echo "upgrading from $PREV_VERSION to $INSTALLED_FROM"
 fi
 
-[[ -n "$API_URL" ]] || { echo "--api-url is required" >&2; exit 1; }
-[[ -n "$TOKEN" ]] || { echo "--token is required (or set FIBER_AGENT_TOKEN)" >&2; exit 1; }
-
-case "$(uname -s)" in
-  Linux) ;;
-  *) echo "this installer targets Linux + systemd; see docs/agents.md for other hosts" >&2; exit 1 ;;
-esac
-case "$(uname -m)" in
-  x86_64|amd64) TARGET="x86_64-unknown-linux-gnu" ;;
-  aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
+[[ -n "$API_URL" ]] || die "--api-url is required"
+[[ -n "$TOKEN" ]] || die "--token is required (or set FIBER_AGENT_TOKEN)"
 
 command -v git >/dev/null || echo "warning: git is not installed; pipelines with a workspace will fail" >&2
 if ! ldd --version 2>&1 | grep -qiE 'glibc|gnu libc'; then
   echo "warning: this build targets glibc; on musl (Alpine) it will fail to start" >&2
 fi
 
-# The asset keeps its published name so the .sha256 manifest (which records that name)
-# verifies without rewriting.
-ASSET="fiber-agent-$TARGET.tar.gz"
-if [[ "$VERSION" == "latest" ]]; then
-  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-else
-  URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
-fi
+# --- install ------------------------------------------------------------------
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-if [[ -n "${TARBALL:-}" ]]; then
-  [[ -f "$TARBALL" ]] || { echo "no such tarball: $TARBALL" >&2; exit 1; }
-  echo "installing from $TARBALL"
-  tar -xzf "$TARBALL" -C "$TMP"
-else
-echo "downloading $URL"
-if ! curl -fsSL "$URL" -o "$TMP/$ASSET"; then
-  echo "download failed — no published release for this platform yet?" >&2
-  echo "Build the tarball yourself and pass --tarball, or see:" >&2
-  echo "  https://github.com/$REPO/blob/main/docs/agents.md#from-source" >&2
-  exit 1
-fi
-if curl -fsSL "$URL.sha256" -o "$TMP/$ASSET.sha256" 2>/dev/null; then
-  if (cd "$TMP" && sha256sum -c "$ASSET.sha256" >/dev/null 2>&1); then
-    echo "checksum ok"
-  else
-    echo "checksum mismatch for $ASSET" >&2
-    exit 1
+# Keep the binary we are replacing so a bad rollout is one `cp` away from undone.
+# `cp -p` rather than `mv`: the running process keeps its open inode either way, but a
+# copy leaves a working binary in place if the install below fails.
+for bin in fiber-agent fiber; do
+  if [[ -f "$BIN_DIR/$bin" ]]; then
+    cp -p "$BIN_DIR/$bin" "$BIN_DIR/$bin.prev"
   fi
-else
-  echo "warning: no published checksum for this release" >&2
-fi
-tar -xzf "$TMP/$ASSET" -C "$TMP"
-fi
+done
 install -m 0755 "$TMP/fiber-agent" "$BIN_DIR/fiber-agent"
-[[ -f "$TMP/fiber" ]] && install -m 0755 "$TMP/fiber" "$BIN_DIR/fiber"
+if [[ -f "$TMP/fiber" ]]; then
+  install -m 0755 "$TMP/fiber" "$BIN_DIR/fiber"
+fi
 
 id -u fiber >/dev/null 2>&1 || useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin fiber
 install -d -o fiber -g fiber -m 0750 "$STATE_DIR" "$STATE_DIR/workspaces"
@@ -153,6 +355,10 @@ FIBER_AGENT_CONCURRENCY=$CONCURRENCY
 FIBER_AGENT_USE_DOCKER=$USE_DOCKER
 FIBER_AGENT_WORKSPACE_DIR=$STATE_DIR/workspaces
 RUST_LOG=info,fiber_agent=info
+# Written by scripts/install-agent.sh. Read back on the next run so an upgrade can say
+# what it is replacing; the agent itself ignores them.
+FIBER_AGENT_INSTALLED_VERSION=$INSTALLED_FROM
+FIBER_AGENT_INSTALLED_SHA256=$BIN_SHA256
 ENV
 chown root:fiber "$ETC_DIR/agent.env"
 chmod 0640 "$ETC_DIR/agent.env"
@@ -163,14 +369,31 @@ if [[ "$USE_DOCKER" == "true" ]]; then
     || echo "warning: no docker group; Docker steps will fail" >&2
 fi
 
-# Pair the unit with the version being installed, not with main.
-UNIT_REF="${VERSION}"
-[[ "$UNIT_REF" == "latest" ]] && UNIT_REF="main"
-UNIT_URL="https://raw.githubusercontent.com/$REPO/$UNIT_REF/deploy/fiber-agent.service"
-if [[ -f "$(dirname "$0")/../deploy/fiber-agent.service" ]]; then
-  install -m 0644 "$(dirname "$0")/../deploy/fiber-agent.service" "$SERVICE"
+# The unit comes from the same tag as the binary. A checkout beats the network, but
+# only when this script is a real file — piped through `bash` it is not, and `$0`
+# would resolve relative to whatever directory the operator happened to be in.
+LOCAL_UNIT=""
+if [[ -f "$0" ]]; then
+  candidate="$(dirname "$0")/../deploy/fiber-agent.service"
+  [[ -f "$candidate" ]] && LOCAL_UNIT="$candidate"
+fi
+if [[ -n "$LOCAL_UNIT" ]]; then
+  echo "installing the unit from $LOCAL_UNIT"
+  install -m 0644 "$LOCAL_UNIT" "$SERVICE"
 else
-  curl -fsSL "$UNIT_URL" -o "$SERVICE"
+  if [[ -n "${TARBALL:-}" ]]; then
+    echo "warning: --tarball has no tag to pair the unit with; taking it from the newest" >&2
+    echo "         release instead. Run the installer from a checkout to avoid that." >&2
+  fi
+  resolve_tag
+  UNIT_URL="https://raw.githubusercontent.com/$REPO/$RESOLVED_TAG/deploy/fiber-agent.service"
+  echo "installing the unit from $UNIT_URL"
+  if ! curl -fsSL "$UNIT_URL" -o "$TMP/fiber-agent.service"; then
+    [[ -f "$SERVICE" ]] || die "could not fetch the unit from $UNIT_URL and none is installed"
+    echo "warning: could not fetch $UNIT_URL; keeping the existing $SERVICE" >&2
+  else
+    install -m 0644 "$TMP/fiber-agent.service" "$SERVICE"
+  fi
 fi
 
 systemctl daemon-reload
@@ -179,6 +402,9 @@ systemctl enable fiber-agent
 systemctl restart fiber-agent
 sleep 2
 systemctl --no-pager --lines=10 status fiber-agent || true
-echo
+report
 echo "installed. logs: journalctl -u fiber-agent -f"
 echo "settings:      $ETC_DIR/agent.env   (systemctl restart fiber-agent after editing)"
+if [[ -f "$BIN_DIR/fiber-agent.prev" ]]; then
+  echo "rollback:      cp -p $BIN_DIR/fiber-agent.prev $BIN_DIR/fiber-agent && systemctl restart fiber-agent"
+fi

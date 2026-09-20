@@ -15,10 +15,18 @@ on:
         description: "Existing tag to (re)publish"
         required: true
 
-# Read-only by default; `images`, `manifest` and `publish` each widen it themselves to
-# exactly what they push. Without this, a job that forgets to declare `permissions:`
-# inherits whatever the repository default is — which for a workflow that pushes GHCR
-# images and release binaries is the wrong way round.
+# Read-only by default; `binaries`, `images`, `manifest` and `publish` each widen it
+# themselves to exactly what they push. Without this, a job that forgets to declare
+# `permissions:` inherits whatever the repository default is — which for a workflow that
+# pushes GHCR images and release binaries is the wrong way round.
+#
+# Attestation adds two scopes, and they are deliberately *not* here:
+#   `id-token: write`      mints the OIDC token Sigstore uses to certify who built this.
+#   `attestations: write`  stores the resulting bundle against the repository.
+# `verify` runs the gate on a tag that may never have gone through `main`, so it is the
+# one job most likely to execute unreviewed code; it keeps `contents: read` and nothing
+# else. Granting either scope at the workflow level would hand an OIDC identity to every
+# job in the run, including that one.
 permissions:
   contents: read
 
@@ -82,6 +90,10 @@ jobs:
   images:
     needs: verify
     runs-on: ${{ matrix.runner }}
+    # No `id-token`/`attestations` here on purpose. These jobs push *untagged*
+    # per-architecture images by digest; nothing an operator ever names resolves to one
+    # of those digests, so an attestation on them could not be looked up. `manifest`
+    # attests the index digest that `ghcr.io/…:X.Y.Z` actually resolves to.
     permissions:
       contents: read
       packages: write
@@ -144,9 +156,14 @@ jobs:
   manifest:
     needs: images
     runs-on: ubuntu-24.04
+    # `packages: write` pushes the manifest list *and* the attestation referrer next to
+    # it in GHCR; `id-token`/`attestations` mint and store the provenance itself. This
+    # job never touches release assets, so it has no `contents: write`.
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         name: [fiber-api, fiber-agent]
@@ -176,6 +193,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ github.event.inputs.tag || github.ref_name }}
 
       - name: create and push the manifest list
+        id: manifest
         working-directory: /tmp/digests
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
@@ -189,14 +207,42 @@ jobs:
           tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           # shellcheck disable=SC2086
           docker buildx imagetools create $tags $refs
+          first=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           # Print the platforms so a regression to a single architecture is visible in
           # the log rather than only to whoever tries to pull it.
-          docker buildx imagetools inspect "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          docker buildx imagetools inspect "$first"
+          # The index digest, which is what `docker pull <tag>` and
+          # `gh attestation verify oci://<tag>` both resolve to. Attesting the
+          # per-architecture digests instead would produce provenance nobody can reach
+          # from a tag.
+          index=$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)
+          case "$index" in
+            sha256:*) ;;
+            *) echo "could not read the index digest for $first (got '$index')" >&2; exit 1 ;;
+          esac
+          echo "index digest: $index"
+          echo "digest=$index" >> "$GITHUB_OUTPUT"
 
-  # Inherits the workflow's `contents: read`. Uploading a workflow artifact does not use
-  # GITHUB_TOKEN, so nothing here needs write anywhere.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          # Also store the bundle as a referrer in GHCR, so the image can be verified
+          # from the registry alone (`docker buildx imagetools inspect`, cosign) and not
+          # only through GitHub's attestation API.
+          push-to-registry: true
+
   binaries:
     needs: verify
+    # Uploading a workflow artifact does not use GITHUB_TOKEN, so the only reason this
+    # job is not read-only is provenance: the attestation has to be minted in the job
+    # that actually ran `cargo build`, or it certifies the wrong thing. `contents: read`
+    # is still all the repository access it gets — it cannot publish a release, push a
+    # package, or write a comment.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -242,6 +288,14 @@ jobs:
             shasum -a 256 "$out" > "$out.sha256"
           fi
 
+      # Provenance for the tarball, signed by this job's OIDC identity. This is the
+      # only guarantee in the release that a compromised release page cannot forge: a
+      # `.sha256` published next to the tarball proves the two files agree, not who
+      # built them. `scripts/install-agent.sh` checks it with `gh attestation verify`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: fiber-agent-${{ matrix.target }}.tar.gz
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Prefixed so `publish` can ask for exactly these. It downloaded everything
@@ -257,8 +311,15 @@ jobs:
   publish:
     needs: binaries
     runs-on: ubuntu-24.04
+    # `contents: write` creates the release. The attestation scopes cover one subject
+    # only — SHA256SUMS, which is assembled here and therefore exists in no other job.
+    # Everything it lists was already attested by `binaries`; this makes the list itself
+    # verifiable, so an operator can check one file's provenance and then trust the
+    # hashes in it for every asset.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -279,6 +340,28 @@ jobs:
           [ -n "$(ls -A dist)" ] || { echo "no binaries downloaded" >&2; exit 1; }
           find dist -type f -empty -print -exec false {} + || {
             echo "refusing to publish an empty asset" >&2; exit 1; }
+
+      # One manifest over every asset, written here rather than per build job: the three
+      # `binaries` jobs each know only their own tarball, so nothing upstream can produce
+      # a list an operator can check a whole release against in one command.
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          : > SHA256SUMS.part
+          for f in *; do
+            if [ "$f" != SHA256SUMS.part ]; then
+              sha256sum "$f" >> SHA256SUMS.part
+            fi
+          done
+          sort -k2 SHA256SUMS.part > SHA256SUMS
+          rm -f SHA256SUMS.part
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
 
       # The release notes are this version's CHANGELOG section, not the whole file.
       - name: release notes

@@ -6,6 +6,62 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Build provenance on everything a release publishes.** The release workflow mints
+  [GitHub build attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+  with `actions/attest-build-provenance` for each `fiber-agent-<target>.tar.gz` (in the
+  job that ran `cargo build`), for the new `SHA256SUMS` (in the publishing job), and for
+  the container-image index digest that `ghcr.io/durablefibers/fiber-{api,agent}:X.Y.Z`
+  resolves to (in the job that assembles the manifest list). A `.sha256` next to a
+  tarball proves the two files agree; an attestation proves who built them, which is the
+  guarantee a compromised release page cannot forge. Verify with
+  `gh attestation verify <file> --repo durablefibers/fiber --signer-workflow durablefibers/fiber/.github/workflows/release.yml`.
+  `id-token: write` and `attestations: write` are granted to those three jobs only — not
+  at the workflow level, and in particular not to `verify`, which runs the gate on a tag
+  that may never have gone through `main`.
+- **One `SHA256SUMS` per release**, covering every published asset, assembled in the
+  publishing job where the whole set is visible for the first time. The per-asset
+  `.sha256` files stay: installers already on hosts fetch those, and an older installer
+  treats a missing checksum as a warning, so removing them would quietly leave those
+  hosts verifying nothing.
+- **`install-agent.sh --check-only`** resolves, downloads and verifies a release, prints
+  the tag and both digests, and exits without touching the host. No root needed, and it
+  runs on macOS. This is also the documented way to verify a download by hand.
+
+### Changed
+
+- **`scripts/install-agent.sh` verifies instead of trusting.** `--version latest` is now
+  resolved to a concrete tag by following the `/releases/latest` redirect, and the
+  tarball, the checksums *and* the systemd unit all come from that one tag — previously
+  the unit was fetched from `main`, so a host could end up running a released binary
+  under an unreleased unit. A missing or mismatched checksum is now fatal rather than a
+  warning. When the `gh` CLI is installed and authenticated the tarball's provenance
+  attestation is verified too, and when it is not, the script says so explicitly rather
+  than leaving you to guess which guarantee you got; `gh` is not required to install.
+  Two explicit escape hatches, `--insecure-skip-checksum` and
+  `--insecure-skip-attestation`, each print exactly what they are giving up — the second
+  is needed to install v0.6.2 or earlier, which carry no attestations.
+- **Upgrades are reversible.** The installer keeps the binary it replaces as
+  `/usr/local/bin/fiber-agent.prev` (and `fiber.prev`) and records
+  `FIBER_AGENT_INSTALLED_VERSION` / `FIBER_AGENT_INSTALLED_SHA256` in
+  `/etc/fiber/agent.env`, so a re-run prints what it is upgrading from and a bad rollout
+  is one `cp` away from undone.
+- **`deploy/fiber-agent.service` is hardened further**: `ProtectKernelModules`,
+  `ProtectKernelLogs`, `ProtectClock`, `RestrictRealtime`, `RestrictSUIDSGID`,
+  `LockPersonality`, `SystemCallArchitectures=native`, an empty `CapabilityBoundingSet=`,
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` and `UMask=0077`. Steps
+  are repo-supplied shell, so `MemoryDenyWriteExecute` (breaks every JIT) and
+  `RestrictNamespaces` (breaks rootless containers) are deliberately left off, along with
+  `PrivateDevices`, `ProcSubset=pid`, `SystemCallFilter=@system-service` and
+  `ProtectSystem=strict`; the unit file records why for each. Builds that need a
+  capability, a raw socket or `/dev/kvm` should add it in a drop-in under
+  `/etc/systemd/system/fiber-agent.service.d/`, which also survives the next installer
+  run.
+- `ProtectHome=true` stays, so `FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` cannot reach a
+  socket under `/run/user/<uid>` as shipped. [configuration](docs/configuration.md) now
+  documents the caveat and a `BindPaths=` drop-in next to the variable.
+
 ## [0.6.2] — 2026-09-19
 
 Four phases of the September hardening audit, and the first dependency advisory the new

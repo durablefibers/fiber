@@ -65,19 +65,90 @@ curl -fsSL https://raw.githubusercontent.com/durablefibers/fiber/main/scripts/in
 Pass the token in the environment rather than as `--token`: argv is world-readable in
 `ps` for as long as the script runs.
 
-Downloads the release binary for the host architecture (verifying its checksum), creates the
-`fiber` system user, checks the tarball against its published `.sha256` (integrity, not
-provenance — both come from the same release), writes `/etc/fiber/agent.env` (mode `0640`,
-root-owned so the token is not world-readable), installs [`deploy/fiber-agent.service`](../deploy/fiber-agent.service), and
-enables it. Add `--docker` to allow `image:` steps (adds `fiber` to the `docker` group).
-`--uninstall` removes the service, keeping `/etc/fiber` and `/var/lib/fiber`.
+Downloads the release binary for the host architecture, creates the `fiber` system user,
+writes `/etc/fiber/agent.env` (mode `0640`, root-owned so the token is not world-readable),
+installs [`deploy/fiber-agent.service`](../deploy/fiber-agent.service), and enables it. Add
+`--docker` to allow `image:` steps (adds `fiber` to the `docker` group). `--uninstall`
+removes the service, keeping `/etc/fiber` and `/var/lib/fiber`.
+
+#### What it verifies
+
+This is still `curl | sudo bash`, so be clear about what each check is worth:
+
+| | Guarantee | Failure |
+|---|---|---|
+| **One tag** | `--version latest` is resolved to a concrete tag by following the `/releases/latest` redirect, and the tarball, the checksums and the systemd unit are all fetched from *that* tag. Earlier versions took the unit from `main`, so a host could run a released binary under an unreleased unit. | fatal |
+| **Checksum** | The tarball's SHA-256 must match the release's `SHA256SUMS` (or, on releases published before that file existed, the per-asset `.sha256`). Integrity only — both files come from the same release over the same channel, so it catches a truncated download, not a compromised release. | fatal, unless `--insecure-skip-checksum` |
+| **Provenance** | If the [`gh` CLI](https://cli.github.com) is installed and authenticated, `gh attestation verify` checks the tarball's build-provenance attestation against `durablefibers/fiber/.github/workflows/release.yml`. This is the only check a compromised release page cannot forge. | fatal, unless `--insecure-skip-attestation` |
+
+`gh` is **not** required. Without it the script prints `provenance: NOT CHECKED` and names
+what is missing, so you always know which of the two guarantees you got. Releases up to and
+including **v0.6.2** carry no attestations at all; install those with
+`--insecure-skip-attestation` (the checksum is still enforced).
+
+It finishes by printing the resolved tag, the tarball digest, and the digest of the
+`fiber-agent` binary it installed.
+
+#### Verifying a download by hand
+
+`--check-only` runs the whole resolve-download-verify path and exits without touching the
+host. It needs no root, and works on macOS as well as Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/durablefibers/fiber/main/scripts/install-agent.sh \
+  | bash -s -- --check-only
+```
+
+```
+latest resolves to vX.Y.Z
+downloading https://github.com/durablefibers/fiber/releases/download/vX.Y.Z/fiber-agent-x86_64-unknown-linux-gnu.tar.gz
+checksum ok (SHA256SUMS)
+provenance ok (gh attestation verify)
+
+release:    vX.Y.Z   (durablefibers/fiber)
+asset:      fiber-agent-x86_64-unknown-linux-gnu.tar.gz
+  sha256    …
+fiber-agent binary
+  sha256    …
+checksum:   OK — matches SHA256SUMS from release vX.Y.Z (integrity only: same origin as the tarball)
+provenance: VERIFIED — built by durablefibers/fiber/.github/workflows/release.yml (GitHub build provenance)
+```
+
+Or do it yourself, without the script:
+
+```bash
+tag=vX.Y.Z
+base=https://github.com/durablefibers/fiber/releases/download/$tag
+curl -fsSLO "$base/fiber-agent-x86_64-unknown-linux-gnu.tar.gz"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify fiber-agent-x86_64-unknown-linux-gnu.tar.gz \
+  --repo durablefibers/fiber \
+  --signer-workflow durablefibers/fiber/.github/workflows/release.yml
+```
+
+See [operations](./operations.md#images-and-releases) for what a release attests to and
+how to verify the container images.
+
+#### Upgrading and rolling back
 
 Re-running it is the upgrade path: settings you do not pass again are read back from
-`/etc/fiber/agent.env`, and the service is restarted so the new binary takes effect.
+`/etc/fiber/agent.env`, and the service is restarted so the new binary takes effect. The
+installer records `FIBER_AGENT_INSTALLED_VERSION` and `FIBER_AGENT_INSTALLED_SHA256` in
+that file, so a re-run prints what it is upgrading from (the agent itself ignores both).
+
+The binary it replaces is kept as `/usr/local/bin/fiber-agent.prev` (and `fiber.prev`), so
+a bad rollout is one copy away from undone:
+
+```bash
+sudo cp -p /usr/local/bin/fiber-agent.prev /usr/local/bin/fiber-agent
+sudo systemctl restart fiber-agent
+```
 
 It installs from a published release, so it needs one to exist for the host platform
 (linux x86_64 / arm64). For an air-gapped host, or before the first release, pass a tarball you
-built yourself — `cargo build --release -p fiber-agent -p fiber-cli` then
+built yourself — `--tarball` skips both the checksum and the provenance check and says so,
+because you supplied the bits — `cargo build --release -p fiber-agent -p fiber-cli` then
 `tar -C target/release -czf fiber-agent.tar.gz fiber-agent fiber`:
 
 ```bash
@@ -90,10 +161,23 @@ sudo systemctl restart fiber-agent    # after editing /etc/fiber/agent.env
 ```
 
 The unit sets `RestartPreventExitStatus=2`, so an agent whose token was revoked stops instead of
-restart-looping, and `TimeoutStopSec=30` so SIGTERM can stop steps before the kill. It also runs
-with `ProtectSystem=full` and `NoNewPrivileges=true`: `/usr` and `/etc` are read-only to steps and
-`sudo` does not work, so a pipeline that expects to install packages system-wide will fail here.
-Relax those in a drop-in if your builds need it.
+restart-looping, and `TimeoutStopSec=30` so SIGTERM can stop steps before the kill.
+
+It is also hardened, and the hardening is visible to your builds. `ProtectSystem=full` and
+`NoNewPrivileges=true` make `/usr` and `/etc` read-only and stop `sudo` working, so a
+pipeline that installs packages system-wide fails here. `CapabilityBoundingSet=` drops every
+capability (no `ping`, no binding ports below 1024). `RestrictAddressFamilies=` allows
+`AF_UNIX AF_INET AF_INET6 AF_NETLINK` only, so raw/packet sockets fail. `UMask=0077` makes
+files a step creates readable by the `fiber` user only. `ProtectHome=true` hides `/home`,
+`/root` and `/run/user/*` — see [configuration](./configuration.md) under
+`FIBER_AGENT_ENV_PASSTHROUGH` for what that costs an SSH agent socket.
+
+`MemoryDenyWriteExecute` and `RestrictNamespaces` are deliberately **not** set: the first
+breaks every JIT (JVM, Node, .NET), the second breaks rootless containers and `unshare`.
+The unit file lists the rest of what was considered and rejected, with reasons.
+
+Relax any of it in a drop-in (`/etc/systemd/system/fiber-agent.service.d/`) if your builds
+need it — a drop-in survives the next `install-agent.sh` run, edits to the unit do not.
 
 ### Container
 

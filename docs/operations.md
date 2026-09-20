@@ -278,9 +278,59 @@ offer, which is where to look when spans do not join up.
 
 Tagging `vX.Y.Z` runs the gate, then publishes `ghcr.io/durablefibers/fiber-api` and
 `fiber-agent` (tagged `X.Y.Z`, `X.Y`, and `latest`) and attaches agent + CLI binaries
-(`fiber-agent-<target>.tar.gz` with a `.sha256`) for linux x86_64/arm64 and macOS arm64 to the
-GitHub release. `scripts/install-agent.sh` consumes those assets. The tag must match the
-workspace version in `Cargo.toml` or the release fails before publishing anything.
+(`fiber-agent-<target>.tar.gz`, each with a `.sha256`, plus one `SHA256SUMS` over the whole
+set) for linux x86_64/arm64 and macOS arm64 to the GitHub release. `scripts/install-agent.sh`
+consumes those assets. The tag must match the workspace version in `Cargo.toml` or the
+release fails before publishing anything.
+
+The per-asset `.sha256` files are kept alongside `SHA256SUMS`: installers already on hosts
+fetch `<asset>.sha256`, and an older copy of the installer treats a *missing* checksum as a
+warning rather than an error, so dropping them would silently downgrade those hosts to no
+verification at all.
+
+### What a release attests to
+
+From the first release after v0.6.2 the release workflow mints [GitHub build provenance](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+for what it publishes. Each attestation is a signed statement that a specific digest came out
+of `durablefibers/fiber/.github/workflows/release.yml` on a GitHub-hosted runner, at a named
+commit. It does not say the code is good; it says a release page cannot be swapped underneath
+you without the swap being detectable.
+
+Three subjects are attested, each in the job that produces it:
+
+| Subject | Job | Why there |
+|---|---|---|
+| `fiber-agent-<target>.tar.gz` | `binaries` | Minted in the job that ran `cargo build`, so the provenance describes the build, not a later repackaging. |
+| `SHA256SUMS` | `publish` | The manifest exists nowhere else; attesting it means one verification covers the hashes of every asset. |
+| `ghcr.io/durablefibers/<image>` index digest | `manifest` | The digest a tag resolves to. The per-architecture images that `images` pushes are untagged, so provenance on those digests could not be looked up from anything an operator types. |
+
+Those three jobs — and only those — carry `id-token: write` and `attestations: write`. The
+`verify` job, which runs the gate on a tag that may never have gone through `main`, stays
+`contents: read`.
+
+Checking a release:
+
+```bash
+# a binary
+gh attestation verify fiber-agent-x86_64-unknown-linux-gnu.tar.gz \
+  --repo durablefibers/fiber \
+  --signer-workflow durablefibers/fiber/.github/workflows/release.yml
+
+# the checksum manifest, then every asset against it
+gh attestation verify SHA256SUMS --repo durablefibers/fiber
+sha256sum --ignore-missing -c SHA256SUMS
+
+# an image (resolves the tag to its index digest for you)
+gh attestation verify oci://ghcr.io/durablefibers/fiber-api:X.Y.Z \
+  --repo durablefibers/fiber
+```
+
+The image attestation is also pushed to GHCR as a referrer, so
+`docker buildx imagetools inspect ghcr.io/durablefibers/fiber-api:X.Y.Z --raw` and cosign can
+find it without going through GitHub's API.
+
+`scripts/install-agent.sh` does the binary check automatically when `gh` is present and
+authenticated — see [agents](./agents.md#what-it-verifies).
 
 Images cover `linux/amd64` and `linux/arm64`. Each architecture is built on a runner of that
 architecture and the two are joined into one manifest list, so `docker pull` picks the right

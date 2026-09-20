@@ -96,7 +96,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_AGENT_CONCURRENCY` | `1` | Max parallel steps |
 | `FIBER_AGENT_USE_DOCKER` | `true` | Docker vs host shell |
 | `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Root for per-step work dirs |
-| `FIBER_AGENT_ENV_PASSTHROUGH` | empty | Comma-separated names to pass from the agent's environment into steps, on top of the built-in allowlist (shell basics, proxy and CA settings). Everything else is cleared — use this for `SSH_AUTH_SOCK`, `CARGO_HOME`, `JAVA_HOME`, `NVM_DIR` and similar |
+| `FIBER_AGENT_ENV_PASSTHROUGH` | empty | Comma-separated names to pass from the agent's environment into steps, on top of the built-in allowlist (shell basics, proxy and CA settings). Everything else is cleared — use this for `SSH_AUTH_SOCK`, `CARGO_HOME`, `JAVA_HOME`, `NVM_DIR` and similar. **Under systemd, `SSH_AUTH_SOCK` needs a drop-in** — see below |
 | `FIBER_AGENT_WORKSPACE_TTL_HOURS` | `24` | Sweep run workspaces older than this at startup; `0` disables |
 | `FIBER_AGENT_DOCKER_USER` | image default | `--user` for step containers |
 | `FIBER_AGENT_DOCKER_NETWORK` | `bridge` | `--network`; `none` isolates steps from the network |
@@ -107,7 +107,40 @@ file passes the variable through as an empty string and each reader falls back.
 
 Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned, mode `0640`);
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,
-`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`).
+`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`). The installer also writes
+`FIBER_AGENT_INSTALLED_VERSION` and `FIBER_AGENT_INSTALLED_SHA256` there so a re-run can say
+what it is replacing; no crate reads them, and they are not deployment configuration.
+
+### `SSH_AUTH_SOCK` under the systemd unit
+
+`deploy/fiber-agent.service` sets `ProtectHome=true`, which makes `/home`, `/root` and
+`/run/user/*` inaccessible to the agent and to every step it runs. A login session's SSH
+agent socket lives under `/run/user/<uid>`, so
+
+```
+FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK
+```
+
+passes the *name* of a socket the step cannot open, and git fails with a confusing
+"Permission denied (publickey)" rather than a missing-file error.
+
+This is deliberate — a build host reaching into a human's login session is what
+`ProtectHome=` exists to prevent — so the unit keeps it and you opt out per host. Re-expose
+exactly the socket in a drop-in, never the whole directory:
+
+```ini
+# /etc/systemd/system/fiber-agent.service.d/ssh-agent.conf
+[Service]
+BindPaths=/run/user/1000/keyring/ssh
+Environment=FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK
+```
+
+`systemctl daemon-reload && systemctl restart fiber-agent`, then prove it with a one-line
+step (`ssh-add -l`) before relying on it: the socket path differs between distributions and
+desktop environments, and it changes when that user logs out. A deploy key in
+`/var/lib/fiber/.ssh` with a `core.sshCommand` in the pipeline is the more durable answer
+for an unattended build host. A drop-in also survives the next `install-agent.sh` run;
+edits to the unit file itself do not.
 
 ## fiber-cli / ui
 
