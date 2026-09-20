@@ -235,9 +235,14 @@ pub struct ArtifactRestore {
 /// One line of step output inside a [`AgentMessage::LogBatch`].
 ///
 /// `stream` is `stdout`, `stderr` or `system`; `seq` is assigned by the agent and counts
-/// from zero per attempt across all three, so a viewer can interleave them in emission
-/// order. Batching does not renumber anything: a line carries the `seq` it was given when
-/// it was read, whichever batch it ends up in and however many times that batch is sent.
+/// from zero per attempt across all three. It is what a step's log is **ordered by** —
+/// `Store::list_logs` sorts each page `(attempt, seq, id)` — because storage order is not
+/// emission order: the agent's own `system` notes go out at once while piped output waits
+/// behind a flush interval. Anything that inserts a line after the fact (a dropped-lines
+/// notice) must carry the `seq` of the place it belongs, not zero.
+///
+/// Batching does not renumber anything: a line carries the `seq` it was given when it was
+/// read, whichever batch it ends up in and however many times that batch is sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogLineWire {
     pub stream: String,
@@ -348,6 +353,13 @@ pub enum ServerMessage {
         /// which requeue on disconnect — the agent then stops its steps on any close.
         #[serde(default)]
         lease_secs: Option<u64>,
+        /// [`PROTOCOL_VERSION`] of the server. Absent means revision 1 or older, which
+        /// is the only thing the agent needs from it: such a server cannot parse
+        /// [`AgentMessage::LogBatch`] and would answer `Error { "invalid message" }`,
+        /// losing the output, so the agent sends that server one `LogChunk` per line
+        /// instead. Read it as a floor, never as a promise about a newer server.
+        #[serde(default)]
+        protocol_version: Option<u32>,
     },
     Offer {
         step_run_id: Uuid,
@@ -559,6 +571,7 @@ mod tests {
             serde_json::to_value(ServerMessage::Welcome {
                 agent_id: Uuid::nil(),
                 lease_secs: Some(300),
+                protocol_version: Some(PROTOCOL_VERSION),
             })
             .unwrap()["type"],
             json!("welcome")
@@ -614,6 +627,37 @@ mod tests {
             v,
             ServerMessage::Welcome {
                 lease_secs: None,
+                protocol_version: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_welcome_without_protocol_version_means_no_log_batch() {
+        // The agent reads the absence as "this server predates `log_batch`" and falls
+        // back to one chunk per line. Getting this wrong loses every line of every
+        // build against an older replica, silently.
+        let old: ServerMessage = serde_json::from_value(json!({
+            "type": "welcome", "agent_id": Uuid::nil(), "lease_secs": 300
+        }))
+        .unwrap();
+        let ServerMessage::Welcome {
+            protocol_version, ..
+        } = old
+        else {
+            panic!("expected a welcome");
+        };
+        assert_eq!(protocol_version, None);
+        let new: ServerMessage = serde_json::from_value(json!({
+            "type": "welcome", "agent_id": Uuid::nil(), "lease_secs": 300,
+            "protocol_version": 2
+        }))
+        .unwrap();
+        assert!(matches!(
+            new,
+            ServerMessage::Welcome {
+                protocol_version: Some(2),
                 ..
             }
         ));

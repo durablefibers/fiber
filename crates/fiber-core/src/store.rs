@@ -1649,8 +1649,10 @@ impl Store {
         if lines.is_empty() {
             return Ok(Vec::new());
         }
-        let streams: Vec<String> = lines.iter().map(|l| l.stream.clone()).collect();
-        let data: Vec<String> = lines.iter().map(|l| l.data.clone()).collect();
+        // Borrowed, not cloned: a 500-line batch is up to 64 KB of `data`, and copying
+        // it into fresh `Vec<String>`s to hand to the driver doubled that for nothing.
+        let streams: Vec<&str> = lines.iter().map(|l| l.stream.as_str()).collect();
+        let data: Vec<&str> = lines.iter().map(|l| l.data.as_str()).collect();
         let seqs: Vec<i64> = lines.iter().map(|l| l.seq as i64).collect();
         let mut rows = sqlx::query_as::<_, LogLine>(
             "INSERT INTO log_lines (run_id, step_run_id, stream, data, seq, attempt)
@@ -1688,20 +1690,34 @@ impl Store {
         limit: i64,
     ) -> Result<Vec<LogLine>> {
         const COLS: &str = "id, run_id, step_run_id, stream, data, seq, created_at, attempt";
+        /// Emission order, not storage order. `seq` is assigned where the line was
+        /// produced and is what says when it happened; `id` only says when it reached
+        /// the table, and batching made the two diverge — the agent's own `system`
+        /// lines go out at once while a step's piped output waits up to a flush
+        /// interval behind them, so "killing step process" was stored above the output
+        /// that preceded it. Sorted per page rather than in SQL: the page is chosen by
+        /// `id` (which is what `after_id` and "the last N" mean) and ordered for the
+        /// reader afterwards.
+        fn for_display(mut rows: Vec<LogLine>) -> Vec<LogLine> {
+            rows.sort_by_key(|r| (r.attempt, r.seq, r.id));
+            rows
+        }
         if let Some(after) = after_id {
-            return Ok(sqlx::query_as::<_, LogLine>(AssertSqlSafe(format!(
-                "SELECT {COLS} FROM log_lines
+            return Ok(for_display(
+                sqlx::query_as::<_, LogLine>(AssertSqlSafe(format!(
+                    "SELECT {COLS} FROM log_lines
                  WHERE step_run_id = $1 AND id > $2
                    AND ($3::int IS NULL OR attempt = $3)
                  ORDER BY id
                  LIMIT $4"
-            )))
-            .bind(step_run_id)
-            .bind(after)
-            .bind(attempt)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?);
+                )))
+                .bind(step_run_id)
+                .bind(after)
+                .bind(attempt)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+            ));
         }
         let mut tail = sqlx::query_as::<_, LogLine>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM log_lines
@@ -1715,7 +1731,7 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         tail.reverse();
-        Ok(tail)
+        Ok(for_display(tail))
     }
 
     pub async fn create_artifact(

@@ -37,6 +37,19 @@ large install.
   build and `Cargo.lock` after a `--locked` build must both be unchanged. A stale
   committed route tree means the routes CI tested are not the routes in the tree.
 
+### Fixed
+
+- **The artifacts smoke wiped a workspace a step was using.** It removed
+  `data/workspaces/<run_id>` — including `.repo`, the reference clone every step of the
+  run fetches from and the working directory of whichever step is preparing — as soon as
+  the producing step reported success. A dependent step is routinely already `running` by
+  then, and it died with `fatal: unable to get current working directory`. It passed only
+  by winning a race against the consumer's `git fetch`, and anything that shortens the
+  gap between a step finishing and the next one starting makes it fail on a control plane
+  that is working correctly. It now removes the producer's own (terminal) step directory,
+  which cannot race anything and proves the same thing, and asserts that the wipe
+  happened.
+
 ### Changed
 
 - **Log ingest is batched end to end.** A line cost two Postgres round trips and an
@@ -48,7 +61,7 @@ large install.
   it. The `owned_step` lookup and the per-attempt line counter are cached per
   `(socket, step_run_id, attempt)` and dropped when the step completes or is cancelled;
   the counter map used to grow for the life of the socket. Measured on a throwaway
-  database with a 50 000-line step: **122–609 lines/s before, 6 000–10 200 after**, and
+  database with a 50 000-line step: **122–609 lines/s before, 6 000–32 000 after**, and
   **2.0 Postgres transactions per line before, 0.005–0.011 after**. `log_chunk` is still
   accepted and takes the same path, so an agent that has not been upgraded is unaffected;
   `PROTOCOL_VERSION` is now `2`.
@@ -68,6 +81,10 @@ large install.
   indication the other 40 000 had existed; it now arrives whole. With the socket down
   nothing has changed in kind — the outbox still drops its oldest lines, now bounded by
   bytes (8 MB) as well as lines (10 000), and still says how many went.
+  A batch is capped at 2 000 lines server-side (the agent flushes at 500), since a
+  hostile agent could otherwise put a 64 MiB frame on the wire that parses to a million
+  of them; the excess is dropped with a notice. A batch the database refuses is reported
+  on the next one that lands, rather than leaving a silent hole.
   `log_lines` still has no unique key: a message re-sent after a session ended mid-flush
   is stored twice, as before — at most one message per interrupted session, but now up to
   500 lines of it rather than one. The lines keep their original `seq`.
@@ -75,6 +92,24 @@ large install.
   which is also one slot of the 1024-slot broadcast rather than five hundred. `log` is
   still forwarded, so a replica running the older code during a rolling deploy keeps
   feeding open run pages, and `RunEvent::Log` now carries the `attempt` it belongs to.
+  **A run page opened before the upgrade stops tailing live** until it is reloaded or the
+  step's log is refetched: the old bundle only knows `log`. Nothing is lost — the lines
+  are stored and appear on reload.
+- **A step's log is ordered by `seq`, not by when a row was written.** Batching made the
+  two diverge: the agent's own `system` notes go out immediately while piped output waits
+  behind a flush interval, so a cancel's "killing step process" was stored above the
+  output that preceded it. `GET /api/steps/{id}/logs` now sorts each page
+  `(attempt, seq, id)`, and every notice the agent or the server inserts after the fact
+  carries the `seq` of the gap it reports rather than zero.
+- **An agent newer than the server unpacks its batches.** `Welcome` now carries the
+  server's `protocol_version`; absent means "older than `log_batch`", and the agent sends
+  that server one `log_chunk` per line, each keeping its `seq`. Without it a rev-2 agent
+  against a pre-batch API lost every line of every build silently — the server answered
+  `Error { "invalid message" }` and the agent had already dropped the message, because
+  the outbox pops on a successful send, not on an acknowledgement. The expansion happens
+  in the writer, not where the batch is built, so a batch queued against a new replica
+  and re-sent to an old one mid-deploy is also covered, and that `Error` is now logged at
+  `error!` naming the likely cause.
 
 - **An agent fills every free slot in one heartbeat.** Offers were made one per
   heartbeat, so a concurrency-4 agent took forty seconds to fill and a new step waited up

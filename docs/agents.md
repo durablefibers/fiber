@@ -6,7 +6,7 @@ An agent's identity is the token it connected with. The server binds `agent_id` 
 
 A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
-`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **1**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row.
+`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **2**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path).
 
 ## Pools
 
@@ -191,19 +191,34 @@ there and marked with a visible truncation marker; reading resumes at the next n
 The server applies the same cap again to whatever an agent sends it.
 
 Lines are coalesced into a `log_batch` message and flushed on whichever comes first:
-**50 ms**, **64 KB**, or **500 lines**. `seq` is assigned where the line is read, counts
-from zero per attempt across `stdout`, `stderr` and the agent's own `system` lines, and is
-never renumbered — a batch re-sent after a reconnect carries the numbers it had the first
-time. The server stores a batch in one statement and publishes one event for it, where
-before it cost two queries and a Redis publish per line. An agent older than the batch
-keeps sending one `log_chunk` per line and the server handles it identically.
+**50 ms**, **64 KB**, or **500 lines**. The server refuses a batch of more than 2 000
+lines, keeping the first 2 000 and saying how many it dropped.
+
+`seq` is assigned where the line is read, counts from zero per attempt across `stdout`,
+`stderr` and the agent's own `system` lines, and is never renumbered — a batch re-sent
+after a reconnect carries the numbers it had the first time. **`seq`, not storage order,
+is what a step's log is sorted by**: the agent's own notes go out at once while piped
+output waits up to a flush interval behind them, so a cancel's "killing step process"
+would otherwise be stored above the output that preceded it. `GET /api/steps/{id}/logs`
+orders each page by `(attempt, seq, id)`; every system notice the agent or the server
+inserts — dropped lines, lines that could not be stored — carries the `seq` of the gap it
+is reporting, so it lands where the gap is.
+
+The server stores a batch in one statement and publishes one event for it, where before
+it cost two queries and a Redis publish per line. An agent older than the batch keeps
+sending one `log_chunk` per line and the server handles it identically; an agent newer
+than the *server* unpacks its batches back into chunks, decided per session from
+`Welcome.protocol_version`.
 
 Between the pipes and the batcher is a bounded queue, and the agent waits for room in its
 outbox rather than dropping output while a session is up: a step that prints faster than
 the control plane can store blocks on its own `write`, which is what stops
 `yes | head -n 10000000` from buffering gigabytes. With the socket **down** there is
 nothing to wait for and the outbox bound applies instead — 10 000 lines or 8 MB, oldest
-first, with a system line saying how many were lost.
+first, with a system line saying how many were lost and where. The same notice appears if
+the socket is up but has not drained within 30 s, and after a cancel or timeout the agent
+gives the buffered output 10 s to reach the server before dropping the rest, so a kill is
+still reported promptly.
 
 Two caps sit past that. `FIBER_STEP_LOG_MAX_LINES` (default 50 000) bounds the lines
 stored per **attempt**, counted across sessions, with one `system` line at the cap saying

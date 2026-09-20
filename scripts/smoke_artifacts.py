@@ -73,9 +73,27 @@ def main() -> None:
         steps = run.get("steps") or req("GET", f"/api/runs/{rid}/steps", token=token)
         summary = " ".join(f"{s['step_id']}={s['status']}" for s in steps)
         print(f"t={i} run={status} {summary}")
-        build_ok = any(s["step_id"] == "build" and s["status"] == "succeeded" for s in steps)
-        if build_ok and not wiped:
-            w = os.path.join(WS_DIR, rid)
+        # Wipe the producer's own workspace, not the whole run's.
+        #
+        # This used to `rm -rf data/workspaces/<run_id>`, which also takes `.repo` —
+        # the reference clone every step of the run fetches from, and the working
+        # directory of whichever step is preparing right then. A dependent step is
+        # routinely already `running` by the time this poll observes `build` as
+        # succeeded, and it died with `fatal: unable to get current working directory`.
+        # It passed only by winning a race: the wipe had to land in the gap between the
+        # producer finishing and the consumer's `git fetch` starting. Anything that
+        # shortens that gap (faster log ingest, for one) makes the smoke fail on a
+        # product that is working correctly.
+        #
+        # A terminal step's directory has nothing running in it, so removing it cannot
+        # race anything, and it still proves the point: the artifacts `build` wrote are
+        # gone from the disk, so a later step that has them restored them.
+        build = next(
+            (s for s in steps if s["step_id"] == "build" and s["status"] == "succeeded"),
+            None,
+        )
+        if build and not wiped:
+            w = os.path.join(WS_DIR, rid, build["id"])
             if os.path.isdir(w):
                 # The agent's own workspace GC releases this tree as the last step of
                 # the run leaves it, so a directory can vanish under the walk. That is
@@ -84,7 +102,7 @@ def main() -> None:
                 shutil.rmtree(w, ignore_errors=True)
                 if os.path.isdir(w):
                     shutil.rmtree(w)
-                print("WIPED workspace", w)
+            print("WIPED workspace", w)
             wiped = True
         if status in ("succeeded", "failed", "cancelled"):
             break
@@ -213,6 +231,7 @@ def main() -> None:
                 upload_hits += 1
     print(f"log_hits restore={restore_hits} upload={upload_hits}")
     assert upload_hits >= 2, "expected HTTP uploads from build/sign"
+    assert wiped, "the producer's workspace was never wiped; the restore proves nothing"
     assert restore_hits >= 1, "expected at least one restore after workspace wipe"
 
     # Only on a pass: a failed smoke keeps its project, because the pipelines, runs and

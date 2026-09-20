@@ -310,6 +310,13 @@ const LOG_FLUSH_BYTES: usize = 64 * 1024;
 /// drop-oldest policy take over. A bound, not a target: it exists so a wedged socket
 /// that has not yet been noticed cannot hold a step's pipes shut forever.
 const LOG_BACKPRESSURE_MAX: Duration = Duration::from_secs(30);
+/// Longest a killed step waits for its buffered output to reach the server before the
+/// rest is dropped. A cancel has to be reported promptly: the permit is held and the run
+/// reads "cancelling" until it is.
+const KILL_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+/// The protocol revision that introduced `LogBatch`. A server below it gets one
+/// `LogChunk` per line.
+const LOG_BATCH_PROTOCOL: u32 = 2;
 
 /// What the outbox did with a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,7 +370,7 @@ struct Outbox {
     /// was purged mid-send cannot make the writer discard the one behind it.
     next_token: u64,
     /// Lines dropped per (step, attempt) since the last flush reported them.
-    dropped: HashMap<(Uuid, Option<i32>), u64>,
+    dropped: HashMap<(Uuid, Option<i32>), Dropped>,
     queued_lines: usize,
     queued_bytes: usize,
 }
@@ -377,6 +384,23 @@ fn log_weight(m: &AgentMessage) -> (usize, usize) {
             (lines.len(), lines.iter().map(|l| l.data.len()).sum())
         }
         _ => (0, 0),
+    }
+}
+
+/// Output lost from the queue for one (step, attempt), and where it was lost.
+///
+/// `at_seq` is the `seq` of the newest line dropped, so the notice reporting the gap
+/// sorts into the log where the gap is rather than wherever it happens to be stored.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Dropped {
+    count: u64,
+    at_seq: u64,
+}
+
+impl Dropped {
+    fn record(&mut self, count: u64, at_seq: u64) {
+        self.count += count;
+        self.at_seq = self.at_seq.max(at_seq);
     }
 }
 
@@ -409,8 +433,12 @@ impl Outbox {
         self.queued_lines > self.cap || self.queued_bytes > self.max_bytes
     }
 
-    fn has_room(&self) -> bool {
-        self.queued_lines < self.cap && self.queued_bytes < self.max_bytes
+    /// Room for a whole batch, not just for one more line. Waiting on `has_room()`
+    /// alone let a 500-line batch into a queue one line under the budget, and the
+    /// eviction that followed took up to 500 lines off the front — possibly another
+    /// step's — while the socket was up and could have been waited for.
+    fn has_room_for(&self, lines: usize, bytes: usize) -> bool {
+        self.queued_lines + lines <= self.cap && self.queued_bytes + bytes <= self.max_bytes
     }
 
     /// Recount from the queue. Cheap enough at the cap, and the alternative is two
@@ -455,14 +483,25 @@ impl Outbox {
                 AgentMessage::LogChunk {
                     step_run_id,
                     attempt,
+                    seq,
                     ..
-                } => *self.dropped.entry((step_run_id, attempt)).or_default() += 1,
+                } => self
+                    .dropped
+                    .entry((step_run_id, attempt))
+                    .or_default()
+                    .record(1, seq),
                 AgentMessage::LogBatch {
                     step_run_id,
                     attempt,
                     lines,
                     ..
-                } => *self.dropped.entry((step_run_id, attempt)).or_default() += lines.len() as u64,
+                } => {
+                    let last = lines.last().map(|l| l.seq).unwrap_or(0);
+                    self.dropped
+                        .entry((step_run_id, attempt))
+                        .or_default()
+                        .record(lines.len() as u64, last);
+                }
                 _ => {}
             }
             evicted = true;
@@ -499,13 +538,45 @@ impl Outbox {
         outcome
     }
 
-    /// The next message to send, serialised, with its token and without removing it:
-    /// it leaves the queue only once the socket has taken it, so a writer that dies
-    /// mid-send cannot lose it.
-    fn peek_front_text(&self) -> Option<(u64, Result<String, serde_json::Error>)> {
-        self.queue
-            .front()
-            .map(|q| (q.token, serde_json::to_string(&q.msg)))
+    /// The frames the next message becomes on this session, with its token and without
+    /// removing it: it leaves the queue only once the socket has taken all of them, so
+    /// a writer that dies mid-send cannot lose it.
+    ///
+    /// Usually one frame. When `server_batches` is false — the server predates
+    /// `LogBatch`, which a rolling deploy makes possible for a message queued while
+    /// talking to a newer replica — a batch is unpacked here into one `LogChunk` per
+    /// line, each keeping its original `seq`. This is the last point at which the
+    /// session's capabilities are known, which is why the expansion lives here and not
+    /// where the batch was built.
+    fn peek_front_frames(
+        &self,
+        server_batches: bool,
+    ) -> Option<(u64, Result<Vec<String>, serde_json::Error>)> {
+        let q = self.queue.front()?;
+        if let AgentMessage::LogBatch {
+            agent_id,
+            step_run_id,
+            attempt,
+            lines,
+        } = &q.msg
+            && !server_batches
+        {
+            let frames = lines
+                .iter()
+                .map(|l| {
+                    serde_json::to_string(&AgentMessage::LogChunk {
+                        agent_id: *agent_id,
+                        step_run_id: *step_run_id,
+                        stream: l.stream.clone(),
+                        data: l.data.clone(),
+                        seq: l.seq,
+                        attempt: *attempt,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            return Some((q.token, frames));
+        }
+        Some((q.token, serde_json::to_string(&q.msg).map(|t| vec![t])))
     }
 
     /// Drop the front message, but only if it is still the one `token` named. The
@@ -534,9 +605,22 @@ impl Outbox {
         self.queue.iter().map(|q| &q.msg)
     }
 
-    /// Per-(step, attempt) count of lines dropped since the last call.
-    fn take_dropped(&mut self) -> HashMap<(Uuid, Option<i32>), u64> {
+    /// Per-(step, attempt) lines dropped since the last call.
+    fn take_dropped(&mut self) -> HashMap<(Uuid, Option<i32>), Dropped> {
         std::mem::take(&mut self.dropped)
+    }
+
+    /// Put counts back after their notices failed to reach the server. Taking them out
+    /// and then losing them is worse than never counting: the gap in the log becomes
+    /// unmarked, and a flapping reconnect — which is what produces the gaps — is
+    /// exactly when the send fails.
+    fn restore_dropped(&mut self, counts: HashMap<(Uuid, Option<i32>), Dropped>) {
+        for (key, d) in counts {
+            self.dropped
+                .entry(key)
+                .or_default()
+                .record(d.count, d.at_seq);
+        }
     }
 
     /// Forget everything queued about a step — lines, claim, artifacts, and its
@@ -573,6 +657,12 @@ struct Outbound {
     /// Whether a session is established (Hello sent) right now. Step tasks read it to
     /// decide whether an HTTP failure is worth waiting out.
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the server on the other end of the current session can parse
+    /// `LogBatch`, from `Welcome.protocol_version`. False for a server that predates it
+    /// — and for no session at all — so the writer expands a batch into one `LogChunk`
+    /// per line rather than have the server answer `Error { "invalid message" }` and
+    /// lose the build's entire log. Set per session, cleared with `connected`.
+    server_batches: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Outbound {
@@ -585,11 +675,16 @@ impl Outbound {
             wake: Arc::new(tokio::sync::Notify::new()),
             drained: Arc::new(tokio::sync::Notify::new()),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            server_batches: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn server_takes_batches(&self) -> bool {
+        self.server_batches.load(Ordering::SeqCst)
     }
 
     fn send(&self, msg: AgentMessage) -> Enqueue {
@@ -611,8 +706,12 @@ impl Outbound {
         outcome
     }
 
-    fn has_room(&self) -> bool {
-        self.outbox.lock().map(|o| o.has_room()).unwrap_or(true)
+    fn has_room_for(&self, msg: &AgentMessage) -> bool {
+        let (lines, bytes) = log_weight(msg);
+        self.outbox
+            .lock()
+            .map(|o| o.has_room_for(lines, bytes))
+            .unwrap_or(true)
     }
 
     /// Queue a batch of output, waiting for room instead of dropping the oldest lines.
@@ -629,9 +728,15 @@ impl Outbound {
     /// socket that is up but not draining cannot wedge the step.
     async fn send_batch(&self, msg: AgentMessage) -> Enqueue {
         let deadline = tokio::time::Instant::now() + LOG_BACKPRESSURE_MAX;
-        while self.is_connected() && !self.has_room() && tokio::time::Instant::now() < deadline {
-            // Polled rather than purely notified: `connected` can go false while this
-            // waits, and a missed notification would otherwise hold the step's pipes.
+        while self.is_connected()
+            && !self.has_room_for(&msg)
+            && tokio::time::Instant::now() < deadline
+        {
+            // Polled rather than purely notified, and the 25 ms is load-bearing:
+            // `notify_waiters` stores no permit, so a wake that lands between the
+            // check above and the registration below is lost, and `connected` can go
+            // false while this waits. Without the timeout either would hold the step's
+            // pipes shut until the outer bound.
             let _ = tokio::time::timeout(Duration::from_millis(25), self.drained.notified()).await;
         }
         self.send(msg)
@@ -725,7 +830,17 @@ async fn pump_lines<R>(
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
+                    // In the build log too, not only the agent's: a step whose output
+                    // simply stops, with the agent's own journal on another host, is
+                    // the kind of thing nobody diagnoses.
                     warn!(error = %e, stream, "reading step output failed");
+                    let _ = tx
+                        .send(RawLine {
+                            stream: "system",
+                            seq: seq.fetch_add(1, Ordering::Relaxed),
+                            data: format!("reading the step's {stream} failed: {e}"),
+                        })
+                        .await;
                     break;
                 }
             }
@@ -1312,32 +1427,48 @@ async fn flush_outbox(
         .lock()
         .map(|mut o| o.take_dropped())
         .unwrap_or_default();
-    for ((step_run_id, attempt), n) in dropped {
-        // Ordering on the server is by insertion, not `seq`, so this notice needs none.
+    for (i, ((step_run_id, attempt), d)) in dropped.iter().enumerate() {
+        // `at_seq` puts the notice where the gap is: readers order a step's log by
+        // `seq`, not by when a row was stored.
         let notice = AgentMessage::LogBatch {
             agent_id,
-            step_run_id,
-            attempt,
+            step_run_id: *step_run_id,
+            attempt: *attempt,
             lines: vec![LogLineWire {
                 stream: "system".into(),
                 data: format!(
-                    "{n} log lines dropped while the agent was disconnected from the API"
+                    "{} log lines dropped here: the agent's outbound buffer was full \
+                     (the API was unreachable, or was not keeping up)",
+                    d.count
                 ),
-                seq: 0,
+                seq: d.at_seq,
             }],
         };
-        sink.send(Message::Text(serde_json::to_string(&notice)?.into()))
-            .await?;
+        let frame = match serde_json::to_string(&notice) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if sink.send(Message::Text(frame.into())).await.is_err() {
+            // The counts are already out of the map, and a flapping reconnect — the
+            // thing that produces the gaps — is exactly when this fails. Losing them
+            // here leaves an unmarked hole in the log, so put back everything not yet
+            // reported and let the next session say it.
+            if let Ok(mut o) = outbound.outbox.lock() {
+                o.restore_dropped(dropped.iter().skip(i).map(|(k, v)| (*k, *v)).collect());
+            }
+            bail!("sending a dropped-lines notice failed");
+        }
     }
+    let batches = outbound.server_takes_batches();
     loop {
         let next = outbound
             .outbox
             .lock()
             .ok()
-            .and_then(|o| o.peek_front_text());
-        let (token, text) = match next {
+            .and_then(|o| o.peek_front_frames(batches));
+        let (token, frames) = match next {
             None => return Ok(()),
-            Some((token, Ok(text))) => (token, text),
+            Some((token, Ok(frames))) => (token, frames),
             Some((token, Err(_))) => {
                 // Unserialisable: nothing the next session could do better with it.
                 if let Ok(mut o) = outbound.outbox.lock() {
@@ -1346,9 +1477,12 @@ async fn flush_outbox(
                 continue;
             }
         };
-        sink.send(Message::Text(text.into())).await?;
-        // By token: the lock was released while the socket took it, and a purge in
-        // that window would otherwise make this discard a message never sent.
+        for frame in frames {
+            sink.send(Message::Text(frame.into())).await?;
+        }
+        // By token, and only once every frame is away: the lock was released while the
+        // socket took them, and a purge in that window would otherwise make this
+        // discard a message never sent.
         if let Ok(mut o) = outbound.outbox.lock() {
             o.pop_sent(token);
         }
@@ -1357,12 +1491,18 @@ async fn flush_outbox(
     }
 }
 
-/// Clears `connected` however `run_session` returns — an error, a close, or a drop.
-struct SessionGuard(Arc<std::sync::atomic::AtomicBool>);
+/// Clears the per-session flags however `run_session` returns — an error, a close, or
+/// a drop. `server_batches` is one of them: the next session may be a different
+/// replica, and assuming the old one's capabilities is how a rolling deploy loses logs.
+struct SessionGuard {
+    connected: Arc<std::sync::atomic::AtomicBool>,
+    server_batches: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.connected.store(false, Ordering::SeqCst);
+        self.server_batches.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1374,7 +1514,10 @@ async fn run_session(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     st: &mut AgentState,
 ) -> Result<()> {
-    let _guard = SessionGuard(Arc::clone(&st.outbound.connected));
+    let _guard = SessionGuard {
+        connected: Arc::clone(&st.outbound.connected),
+        server_batches: Arc::clone(&st.outbound.server_batches),
+    };
     let url = Url::parse(&format!("{}/ws/agent", args.api_url.trim_end_matches('/')))?;
     // The token goes in a header, not the query string: a URL ends up in proxy and server
     // access logs, and this token leases steps and receives project secrets. Servers older
@@ -1404,6 +1547,7 @@ async fn run_session(
         if let Ok(ServerMessage::Welcome {
             agent_id: id,
             lease_secs,
+            protocol_version,
         }) = serde_json::from_str(&text)
         {
             agent_id = id;
@@ -1411,8 +1555,18 @@ async fn run_session(
             if let Ok(mut g) = st.agent_id.lock() {
                 *g = agent_id;
             }
+            // Absent, or older than the revision that introduced it: this server cannot
+            // parse a batch, so the writer unpacks them for it.
+            let batches = protocol_version.is_some_and(|v| v >= LOG_BATCH_PROTOCOL);
+            st.outbound.server_batches.store(batches, Ordering::SeqCst);
+            if !batches {
+                warn!(
+                    ?protocol_version,
+                    "server does not accept batched logs; sending one line per message"
+                );
+            }
             st.note_server_frame();
-            info!(%agent_id, ?lease_secs, "registered");
+            info!(%agent_id, ?lease_secs, ?protocol_version, "registered");
         }
     }
 
@@ -1642,7 +1796,20 @@ async fn run_session(
                                 }
                             }
                             Ok(ServerMessage::Error { message }) => {
-                                warn!(%message, "server error");
+                                if message == "invalid message" {
+                                    // The message is already gone: the writer pops on a
+                                    // successful `send`, not on an ack. Loud, because
+                                    // the visible symptom is a green build with an
+                                    // empty log and nothing pointing at the cause.
+                                    error!(
+                                        %message,
+                                        "the server rejected a message it could not parse — \
+                                         it is probably older than this agent; upgrade the \
+                                         API before the agents"
+                                    );
+                                } else {
+                                    warn!(%message, "server error");
+                                }
                             }
                             Ok(ServerMessage::Welcome { .. }) => {}
                             Err(e) => warn!(error = %e, "bad server message"),
@@ -2083,32 +2250,56 @@ async fn execute_step_inner(
     // Both pumps, then the batcher: the pumps hold the only senders, so awaiting them
     // closes the channel and the batcher flushes whatever is left and returns. Every
     // line the step wrote is queued before anything below reports on the step.
-    let drain = async |out: tokio::task::JoinHandle<()>,
-                       err: tokio::task::JoinHandle<()>,
-                       batcher: tokio::task::JoinHandle<()>| {
-        let _ = out.await;
-        let _ = err.await;
-        let _ = batcher.await;
-    };
+    /// Wait for the pipes to end and the batcher to flush, at most `budget`.
+    ///
+    /// Unbounded on a normal exit: the child is gone, so the output is finite and all
+    /// of it belongs in the log. Bounded after a kill: the batcher can wait
+    /// `LOG_BACKPRESSURE_MAX` per flush for room in the outbox, and a socket that is up
+    /// but not draining turns ten thousand buffered lines into minutes of waiting —
+    /// with the concurrency permit still held and the run still saying "cancelling".
+    async fn drain(
+        out: tokio::task::JoinHandle<()>,
+        err: tokio::task::JoinHandle<()>,
+        batcher: tokio::task::JoinHandle<()>,
+        budget: Option<Duration>,
+    ) -> bool {
+        let all = async {
+            let _ = out.await;
+            let _ = err.await;
+            let _ = batcher.await;
+        };
+        match budget {
+            None => {
+                all.await;
+                true
+            }
+            Some(b) => tokio::time::timeout(b, all).await.is_ok(),
+        }
+    }
     let code = tokio::select! {
         status = child.wait() => {
-            let status = status?;
-            drain(out_handle, err_handle, batcher).await;
-            status.code().unwrap_or(1)
+            // Drained before the `?`: an error from `wait` must not enqueue the step's
+            // completion ahead of the output that explains it.
+            drain(out_handle, err_handle, batcher, None).await;
+            status?.code().unwrap_or(1)
         }
         _ = &mut cancel => {
             // Said before the kill, so it is worth reading; the last few milliseconds of
             // the step's own output may still be in a batch behind it.
             log("system", "killing step process".into());
             kill_step(&mut child, docker_container.as_deref()).await;
-            drain(out_handle, err_handle, batcher).await;
+            if !drain(out_handle, err_handle, batcher, Some(KILL_DRAIN_BUDGET)).await {
+                log("system", "log buffer not flushed within the cancel deadline; the rest of this step's output was dropped".into());
+            }
             bail!("step cancelled");
         }
         _ = sleep_until_opt(deadline) => {
             let msg = timed_out_msg();
             log("system", format!("{msg}; killing step process"));
             kill_step(&mut child, docker_container.as_deref()).await;
-            drain(out_handle, err_handle, batcher).await;
+            if !drain(out_handle, err_handle, batcher, Some(KILL_DRAIN_BUDGET)).await {
+                log("system", "log buffer not flushed within the timeout deadline; the rest of this step's output was dropped".into());
+            }
             bail!("{msg}");
         }
     };
@@ -3101,6 +3292,74 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_count_survives_a_failed_notice_and_marks_where_the_gap_is() {
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(2);
+        o.push(log_batch(step, &[10, 11]));
+        o.push(log_batch(step, &[12, 13]));
+        let taken = o.take_dropped();
+        let d = taken[&(step, Some(1))];
+        assert_eq!(d.count, 2);
+        // The newest dropped line: the notice sorts into the log where the gap is,
+        // which is what readers ordering by `seq` need from it.
+        assert_eq!(d.at_seq, 11);
+        assert!(o.take_dropped().is_empty(), "taken means taken");
+        // The notice did not reach the server; the count must not go with it.
+        o.restore_dropped(taken);
+        let again = o.take_dropped();
+        assert_eq!(again[&(step, Some(1))].count, 2);
+        assert_eq!(again[&(step, Some(1))].at_seq, 11);
+    }
+
+    #[test]
+    fn an_old_server_gets_one_chunk_per_line_under_one_token() {
+        // A server that predates `LogBatch` answers `Error { "invalid message" }` and
+        // the line is already gone — the writer pops on a successful send, not on an
+        // ack — so a whole build's log disappears with nothing to point at. The batch
+        // is unpacked here, at the last point the session's capabilities are known,
+        // because a rolling deploy can hand a batch queued against a new replica to an
+        // old one.
+        let step = Uuid::new_v4();
+        let mut o = Outbox::with_capacity(100);
+        o.push(log_batch(step, &[7, 8, 9]));
+
+        let (new_token, new_frames) = o.peek_front_frames(true).expect("a message");
+        assert_eq!(new_frames.unwrap().len(), 1, "a new server takes the batch");
+
+        let (token, frames) = o.peek_front_frames(false).expect("a message");
+        assert_eq!(token, new_token, "one token: the batch is one queue entry");
+        let frames = frames.expect("serialisable");
+        assert_eq!(frames.len(), 3);
+        let parsed: Vec<AgentMessage> = frames
+            .iter()
+            .map(|f| serde_json::from_str(f).unwrap())
+            .collect();
+        let seqs: Vec<u64> = parsed
+            .iter()
+            .map(|m| match m {
+                AgentMessage::LogChunk {
+                    seq,
+                    step_run_id: s,
+                    attempt,
+                    stream,
+                    ..
+                } => {
+                    assert_eq!(*s, step);
+                    assert_eq!(*attempt, Some(1));
+                    assert_eq!(stream, "stdout");
+                    *seq
+                }
+                other => panic!("expected chunks, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![7, 8, 9], "the original seqs, in order");
+        // Nothing leaves the queue until the writer says so.
+        assert_eq!(o.queued(), 1);
+        o.pop_sent(token);
+        assert_eq!(o.queued(), 0);
+    }
+
+    #[test]
     fn sending_a_message_gives_its_room_back() {
         // The budget has to follow the queue. Charged for messages already on the wire,
         // the outbox looks full forever and every batch waits out the back-pressure
@@ -3108,10 +3367,10 @@ mod tests {
         let step = Uuid::new_v4();
         let mut o = Outbox::with_limits(10, 1_000);
         o.push(log_batch(step, &(0..10).collect::<Vec<_>>()));
-        assert!(!o.has_room(), "the whole 10-line budget is queued");
-        let (token, _) = o.peek_front_text().expect("a message to send");
+        assert!(!o.has_room_for(1, 0), "the whole 10-line budget is queued");
+        let (token, _) = o.peek_front_frames(true).expect("a message to send");
         o.pop_sent(token);
-        assert!(o.has_room(), "the queue is empty; so is the budget");
+        assert!(o.has_room_for(1, 0), "the queue is empty; so is the budget");
         assert_eq!((o.queued_lines, o.queued_bytes), (0, 0));
     }
 
@@ -3125,7 +3384,7 @@ mod tests {
         let step = Uuid::new_v4();
         out.connected.store(true, Ordering::SeqCst);
         // Fill it to the line budget.
-        while out.has_room() {
+        while out.has_room_for(&log_batch(step, &[0])) {
             out.send(log_batch(step, &[0]));
         }
         let waiting = out.clone();
@@ -3151,7 +3410,7 @@ mod tests {
         // length of an outage is worse than losing its oldest output.
         let out = Outbound::new();
         let step = Uuid::new_v4();
-        while out.has_room() {
+        while out.has_room_for(&log_batch(step, &[0])) {
             out.send(log_batch(step, &[0]));
         }
         let outcome = tokio::time::timeout(
@@ -3174,7 +3433,10 @@ mod tests {
         o.push(log_batch(step, &(8..12).collect::<Vec<_>>()));
         // 12 lines over a 10-line budget: the older batch goes, whole.
         assert_eq!(o.queued(), 1);
-        assert_eq!(o.take_dropped().get(&(step, Some(1))), Some(&8));
+        assert_eq!(
+            o.take_dropped().get(&(step, Some(1))).map(|d| d.count),
+            Some(8)
+        );
     }
 
     #[test]
@@ -3195,7 +3457,10 @@ mod tests {
         o.push(big(0));
         o.push(big(1));
         assert_eq!(o.queued(), 1, "6 000 bytes over a 4 096-byte budget");
-        assert_eq!(o.take_dropped().get(&(step, Some(1))), Some(&1));
+        assert_eq!(
+            o.take_dropped().get(&(step, Some(1))).map(|d| d.count),
+            Some(1)
+        );
     }
 
     fn log_chunk(step: Uuid, seq: u64) -> AgentMessage {
@@ -3270,7 +3535,10 @@ mod tests {
             vec![1, 2, 3],
             "the newest line is kept, the oldest dropped"
         );
-        assert_eq!(o.take_dropped().get(&(step, Some(1))), Some(&1));
+        assert_eq!(
+            o.take_dropped().get(&(step, Some(1))).map(|d| d.count),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3360,7 +3628,7 @@ mod tests {
         let mut o = Outbox::with_capacity(10);
         o.push(log_chunk(a, 0));
         o.push(complete(b));
-        let (token, _) = o.peek_front_text().expect("a message to send");
+        let (token, _) = o.peek_front_frames(true).expect("a message to send");
         o.purge_step(a);
         o.pop_sent(token);
         assert_eq!(o.queued(), 1, "b's completion is still queued");
@@ -3369,7 +3637,7 @@ mod tests {
             Some(AgentMessage::StepComplete { .. })
         ));
         // The ordinary path still pops what it sent.
-        let (token, _) = o.peek_front_text().expect("a message to send");
+        let (token, _) = o.peek_front_frames(true).expect("a message to send");
         o.pop_sent(token);
         assert_eq!(o.queued(), 0);
     }

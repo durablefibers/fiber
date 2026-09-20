@@ -580,6 +580,10 @@ async fn leased_step(
 #[derive(Debug)]
 struct StepLog {
     run_id: Uuid,
+    /// Lines an earlier batch of this attempt could not be stored for. Reported on the
+    /// next batch that does land: the budget was spent when they were planned, so
+    /// without this the gap is silent and the counter has already moved past it.
+    unstored: u64,
     /// Lines already stored for this attempt, including by an earlier session: the cap
     /// is per attempt, not per socket.
     stored: u64,
@@ -594,15 +598,58 @@ fn forget_step(logs: &StepLogs, step_run_id: Uuid) {
     }
 }
 
+/// Lines one `LogBatch` may carry.
+///
+/// The agent flushes at 500, so four times that is generous for anything honest. A
+/// hostile one can put a 64 MiB frame on the wire, which parses to on the order of a
+/// million lines and becomes three arrays of them before a single row is written.
+const MAX_BATCH_LINES: usize = 4 * 500;
+
 /// Which lines of a batch to store, and what the attempt's count becomes.
 ///
 /// A runaway step could otherwise write until the disk filled. Past the cap the lines are
 /// dropped, with one line saying so — silence would look like the step stopped producing
 /// output. Every line is also cut to `MAX_LOG_LINE_BYTES`: the agent caps its own, but a
 /// hostile or old one does not, and a 60 MB line is a 60 MB row and a 60 MB broadcast.
-fn plan_log_batch(lines: Vec<LogLineWire>, stored: u64, cap: u64) -> (Vec<LogLineWire>, u64) {
+fn plan_log_batch(
+    mut lines: Vec<LogLineWire>,
+    stored: u64,
+    cap: u64,
+    unstored: u64,
+) -> (Vec<LogLineWire>, u64) {
     let mut seen = stored;
-    let mut out = Vec::with_capacity(lines.len());
+    let mut over = 0usize;
+    if lines.len() > MAX_BATCH_LINES {
+        over = lines.len() - MAX_BATCH_LINES;
+        lines.truncate(MAX_BATCH_LINES);
+    }
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    // Ahead of the batch, and inside the cap like any other line: a gap the server made
+    // is worth a row, and saying nothing is what made the last one invisible.
+    if unstored > 0 {
+        let seq = lines.first().map(|l| l.seq).unwrap_or(0);
+        seen += 1;
+        if seen <= cap {
+            out.push(LogLineWire {
+                stream: "system".into(),
+                data: format!("{unstored} log lines could not be stored and were lost"),
+                seq,
+            });
+        }
+    }
+    if over > 0 {
+        let seq = lines.first().map(|l| l.seq).unwrap_or(0);
+        seen += 1;
+        if seen <= cap {
+            out.push(LogLineWire {
+                stream: "system".into(),
+                data: format!(
+                    "{over} log lines dropped: the agent sent more than {MAX_BATCH_LINES} in one batch"
+                ),
+                seq,
+            });
+        }
+    }
     for line in lines {
         seen += 1;
         if seen > cap {
@@ -648,44 +695,57 @@ async fn ingest_log_batch(
     // agent older than the `attempt` field takes the `owned_step` path every time — the
     // row is the only thing that can say which attempt it meant.
     let cached = attempt.and_then(|a| {
-        logs.lock()
-            .ok()
-            .and_then(|m| m.get(&(step_run_id, a)).map(|e| (a, e.run_id, e.stored)))
+        logs.lock().ok().and_then(|m| {
+            m.get(&(step_run_id, a))
+                .map(|e| (a, e.run_id, e.stored, e.unstored))
+        })
     });
-    let (row_attempt, run_id, stored) = match cached {
+    let (row_attempt, run_id, stored, unstored) = match cached {
         Some(hit) => hit,
         None => {
             let Some(step) = owned_step(state, agent_id, step_run_id, attempt).await else {
                 return;
             };
             let key = (step_run_id, step.attempt);
-            let known = logs.lock().ok().and_then(|m| m.get(&key).map(|e| e.stored));
-            let stored = match known {
-                Some(n) => n,
-                None => state
-                    .store
-                    .count_log_lines(step_run_id, step.attempt)
-                    .await
-                    .map(|n| u64::try_from(n).unwrap_or(0))
-                    .unwrap_or(0),
+            let known = logs
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&key).map(|e| (e.stored, e.unstored)));
+            let (stored, unstored) = match known {
+                Some(hit) => hit,
+                None => (
+                    state
+                        .store
+                        .count_log_lines(step_run_id, step.attempt)
+                        .await
+                        .map(|n| u64::try_from(n).unwrap_or(0))
+                        .unwrap_or(0),
+                    0,
+                ),
             };
             if let Ok(mut m) = logs.lock() {
                 m.entry(key).or_insert(StepLog {
                     run_id: step.run_id,
                     stored,
+                    unstored,
                 });
             }
-            (step.attempt, step.run_id, stored)
+            (step.attempt, step.run_id, stored, unstored)
         }
     };
 
-    let (to_store, seen) = plan_log_batch(lines, stored, cap);
+    let lost = lines.len() as u64;
+    let (to_store, seen) = plan_log_batch(lines, stored, cap, unstored);
     // Spent whether or not the insert lands: a failing insert retried by the agent must
     // not get a fresh budget.
     if let Ok(mut m) = logs.lock()
         && let Some(e) = m.get_mut(&(step_run_id, row_attempt))
     {
         e.stored = seen;
+        // Reported by the batch just planned. Cleared whether or not that batch lands,
+        // because a failure below charges the whole batch — this notice included —
+        // back again.
+        e.unstored = 0;
     }
     if to_store.is_empty() {
         return;
@@ -697,7 +757,15 @@ async fn ingest_log_batch(
     {
         Ok(rows) => rows,
         Err(e) => {
-            warn!(error = %e, %step_run_id, "storing step output failed");
+            // The budget is already spent and the lines are gone. Carry the count so
+            // the next batch that does land reports the hole rather than leaving it
+            // silent.
+            warn!(error = %e, %step_run_id, lines = lost, "storing step output failed");
+            if let Ok(mut m) = logs.lock()
+                && let Some(entry) = m.get_mut(&(step_run_id, row_attempt))
+            {
+                entry.unstored = entry.unstored.saturating_add(lost);
+            }
             return;
         }
     };
@@ -743,6 +811,9 @@ async fn handle_agent(
         // The agent keeps a step running for this long after losing its socket; past
         // it the reclaim loop has requeued the step and the agent stops its copy.
         lease_secs: u64::try_from(fiber_scheduler::LEASE_SECS).ok(),
+        // What this server can parse. The agent falls back to one `LogChunk` per line
+        // when it is absent, so an older replica in a rolling deploy still gets output.
+        protocol_version: Some(fiber_proto::PROTOCOL_VERSION),
     };
     if sink
         .send(Message::Text(
@@ -1342,7 +1413,7 @@ mod tests {
     #[test]
     fn a_batch_keeps_its_lines_in_order_with_their_own_seq() {
         let lines = (0..4).map(|i| wire(10 + i, "x")).collect();
-        let (out, seen) = plan_log_batch(lines, 0, 1_000);
+        let (out, seen) = plan_log_batch(lines, 0, 1_000, 0);
         assert_eq!(
             out.iter().map(|l| l.seq).collect::<Vec<_>>(),
             vec![10, 11, 12, 13],
@@ -1357,7 +1428,7 @@ mod tests {
         // A hostile or old agent does not cap its own lines, and a 60 MB line is a 60 MB
         // row and a 60 MB broadcast payload.
         let huge = "a".repeat(fiber_proto::limits::MAX_LOG_LINE_BYTES * 2);
-        let (out, _) = plan_log_batch(vec![wire(0, &huge)], 0, 1_000);
+        let (out, _) = plan_log_batch(vec![wire(0, &huge)], 0, 1_000, 0);
         assert_eq!(out[0].data.len(), fiber_proto::limits::MAX_LOG_LINE_BYTES);
         assert!(
             out[0]
@@ -1371,7 +1442,7 @@ mod tests {
         // The cap is per attempt, and a batch may cross it in the middle. The line *at*
         // the cap becomes the notice; everything after it is dropped silently.
         let lines = (0..10).map(|i| wire(i, "out")).collect();
-        let (out, seen) = plan_log_batch(lines, 0, 5);
+        let (out, seen) = plan_log_batch(lines, 0, 5, 0);
         assert_eq!(out.len(), 5);
         assert_eq!(out[4].stream, "system");
         assert!(
@@ -1382,15 +1453,52 @@ mod tests {
         assert!(out[..4].iter().all(|l| l.data == "out"));
         // The counter keeps climbing past the cap so a later batch is not readmitted.
         assert_eq!(seen, 10);
-        let (later, _) = plan_log_batch(vec![wire(99, "more")], seen, 5);
+        let (later, _) = plan_log_batch(vec![wire(99, "more")], seen, 5, 0);
         assert!(later.is_empty());
     }
 
     #[test]
     fn a_batch_that_starts_at_the_cap_stores_nothing() {
-        let (out, seen) = plan_log_batch(vec![wire(0, "x"), wire(1, "y")], 50_000, 50_000);
+        let (out, seen) = plan_log_batch(vec![wire(0, "x"), wire(1, "y")], 50_000, 50_000, 0);
         assert!(out.is_empty());
         assert_eq!(seen, 50_002);
+    }
+
+    #[test]
+    fn an_oversized_batch_is_cut_and_the_cut_is_reported() {
+        // A 64 MiB frame parses to on the order of a million lines, and every one of
+        // them is cloned into an array before a row is written.
+        let lines = (0..MAX_BATCH_LINES as u64 + 50)
+            .map(|i| wire(i, "x"))
+            .collect();
+        let (out, _) = plan_log_batch(lines, 0, 1_000_000, 0);
+        assert_eq!(
+            out.len(),
+            MAX_BATCH_LINES + 1,
+            "the kept lines plus one notice"
+        );
+        assert_eq!(out[0].stream, "system");
+        assert!(out[0].data.contains("50 log lines dropped"), "{:?}", out[0]);
+    }
+
+    #[test]
+    fn lines_a_failed_insert_lost_are_reported_on_the_next_batch() {
+        // The budget was spent when they were planned, so without this the hole is
+        // silent — and the attempt's counter has already moved past it.
+        let (out, seen) = plan_log_batch(vec![wire(9, "next")], 4, 1_000, 500);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].stream, "system");
+        assert!(
+            out[0].data.contains("500 log lines could not be stored"),
+            "{:?}",
+            out[0]
+        );
+        assert_eq!(out[0].seq, 9, "it sorts where the gap is");
+        assert_eq!(out[1].data, "next");
+        assert_eq!(
+            seen, 6,
+            "the notice costs a line of the cap, like any other"
+        );
     }
 
     #[test]
@@ -1408,6 +1516,7 @@ mod tests {
                 StepLog {
                     run_id: run,
                     stored: 7,
+                    unstored: 0,
                 },
             );
             m.insert(
@@ -1415,6 +1524,7 @@ mod tests {
                 StepLog {
                     run_id: run,
                     stored: 0,
+                    unstored: 0,
                 },
             );
             m.insert(
@@ -1422,6 +1532,7 @@ mod tests {
                 StepLog {
                     run_id: run,
                     stored: 3,
+                    unstored: 0,
                 },
             );
         }
