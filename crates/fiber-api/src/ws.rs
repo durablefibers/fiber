@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Server-initiated liveness for agent sockets. An agent whose host vanished — NAT
@@ -544,6 +544,13 @@ async fn owned_step(
         return None;
     }
     Some(step)
+}
+
+/// What the step says when the server could not store one of its artifacts. The name
+/// matters more than the cause: it tells the pipeline author which `artifacts:` entry is
+/// missing, and the cause tells the operator whether it is theirs to fix.
+fn artifact_store_failure(rel: &str, err: &anyhow::Error) -> String {
+    format!("artifact {rel} could not be stored: {err}")
 }
 
 /// Like `owned_step`, but the lease must still be live. Used for artifacts (and,
@@ -1095,20 +1102,53 @@ async fn handle_agent(
                             &step_run_id.to_string(),
                             &rel.replace('/', "__"),
                         );
-                        match state.artifacts.put(&key, &bytes).await {
-                            Ok(stored_path) => {
-                                let _ = state
-                                    .store
-                                    .create_artifact(
-                                        step.run_id,
-                                        step_run_id,
-                                        &rel,
-                                        &stored_path,
-                                        bytes.len() as i64,
-                                    )
-                                    .await;
+                        // Storing it is part of the step, not a side effect of it: a
+                        // step whose artifacts were dropped is not a step that passed,
+                        // and its dependents would restore nothing and fail somewhere
+                        // else. This used to `warn!` and carry on, so a root-owned
+                        // artifact directory (or a full disk, or a dead bucket) lost
+                        // every artifact into the API's own log while every build stayed
+                        // green. The HTTP upload path already fails loudly.
+                        let stored = match state.artifacts.put(&key, &bytes).await {
+                            Ok(stored_path) => state
+                                .store
+                                .create_artifact(
+                                    step.run_id,
+                                    step_run_id,
+                                    &rel,
+                                    &stored_path,
+                                    bytes.len() as i64,
+                                )
+                                .await
+                                .map(|_| ()),
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = stored {
+                            let reason = artifact_store_failure(&rel, &e);
+                            error!(%step_run_id, %agent_id, "{reason}; failing the step");
+                            // The step is over for this socket either way.
+                            forget_step(&step_logs, step_run_id);
+                            match state
+                                .scheduler
+                                .on_step_complete(
+                                    agent_id,
+                                    step_run_id,
+                                    attempt,
+                                    StepStatus::Failed,
+                                    None,
+                                    Some(reason),
+                                )
+                                .await
+                            {
+                                // The agent keeps running the step; its own
+                                // StepComplete is then a late completion for an attempt
+                                // the row has moved past, which `on_step_complete`
+                                // already drops.
+                                Ok(_) => fill_agent(&state, agent_id, &tx).await,
+                                Err(e) => {
+                                    warn!(error = %e, %step_run_id, "failing the step for an unstored artifact failed")
+                                }
                             }
-                            Err(e) => warn!(error = %e, %step_run_id, "artifact store failed"),
                         }
                     }
                 }
@@ -1383,6 +1423,18 @@ async fn handle_run_events(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_unstored_artifact_names_itself_and_its_cause_on_the_step() {
+        // This string is the whole diagnosis a pipeline author gets: which artifact is
+        // missing, and whether the cause is theirs or the operator's.
+        let reason = artifact_store_failure(
+            "dist/app.tgz",
+            &anyhow::anyhow!("Permission denied (os error 13)"),
+        );
+        assert!(reason.contains("dist/app.tgz"), "{reason}");
+        assert!(reason.contains("Permission denied"), "{reason}");
+    }
 
     #[test]
     fn a_secret_that_cannot_be_decrypted_fails_the_step_rather_than_the_offer() {

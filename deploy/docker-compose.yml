@@ -28,8 +28,11 @@ x-logging: &logging
 
 configs:
   # The password reaches redis-server through a config file rather than `--requirepass`
-  # on the command line, which every process on the host can read out of `ps` and every
-  # user who can talk to the daemon can read out of `docker inspect`.
+  # on the command line, which every process in the host's pid namespace can read out of
+  # `ps`. It is not a secret store: `fiber-api`'s own environment still carries both
+  # passwords inside FIBER_DATABASE_URL and FIBER_REDIS_URL, so anyone who can talk to
+  # the Docker daemon can still read them out of `docker inspect`. Anyone who can talk
+  # to the daemon is root on the host anyway.
   fiber-redis-conf:
     content: |
       requirepass ${FIBER_REDIS_PASSWORD:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
@@ -67,13 +70,14 @@ services:
     ports:
       - "127.0.0.1:16379:6379"
     healthcheck:
-      # REDISCLI_AUTH keeps the password out of the probe's argv.
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      # Deliberately unauthenticated: `NOAUTH Authentication required` is an answer from
+      # a live server, which is all this probe has to establish. The alternative is
+      # REDISCLI_AUTH in the service's environment, which puts the password back into
+      # `docker inspect` for nothing.
+      test: ["CMD-SHELL", "redis-cli ping 2>&1 | grep -qE 'PONG|NOAUTH'"]
       interval: 5s
       timeout: 3s
       retries: 10
-    environment:
-      REDISCLI_AUTH: ${FIBER_REDIS_PASSWORD}
 
   # Optional: `docker compose --profile minio up -d`, together with
   # FIBER_S3_BUCKET=fiber-artifacts in deploy/.env. Without both, fiber-api stores
@@ -134,6 +138,16 @@ services:
     # The image runs as uid 10001 and writes nothing outside /data/artifacts, so the
     # rootfs is read-only and every capability is dropped: binding :8080 needs none, and
     # no-new-privileges means a setuid binary in the image cannot regain any.
+    #
+    # Two paths stay writable. /tmp is a tmpfs, mounted nosuid,nodev,noexec by Docker.
+    # /data/artifacts is not: it is a volume, so it is writable *and* executable, and
+    # what lands in it is attacker-influenced — any project writer can have an agent
+    # upload a file of their choosing. That is not a privilege on its own (nothing in
+    # the API executes an artifact, and uploads are path-sanitised and confined to the
+    # run's own prefix), but it is the one place a dropped payload can sit, so it is
+    # worth knowing about. It is left as a plain named volume rather than a `noexec`
+    # bind, because that would change the volume's shape and no existing deployment's
+    # data would follow it across the upgrade.
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777

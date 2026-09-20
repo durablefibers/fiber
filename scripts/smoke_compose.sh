@@ -18,10 +18,11 @@ export FIBER_REDIS_PASSWORD="${FIBER_REDIS_PASSWORD:-fiber}"
 export FIBER_S3_ACCESS_KEY="${FIBER_S3_ACCESS_KEY:-fiber}"
 export FIBER_S3_SECRET_KEY="${FIBER_S3_SECRET_KEY:-fiberfiber}"
 export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
-# Artifacts default to the local filesystem now that MinIO is optional; this smoke keeps
-# covering the S3 path, so it opts in and starts fiber-minio (naming a service enables
-# its profile).
-export FIBER_S3_BUCKET="${FIBER_S3_BUCKET:-fiber-artifacts}"
+# FIBER_S3_BUCKET is deliberately NOT set: this smoke runs the shipped default, which is
+# the local filesystem backend writing to a Docker volume as uid 10001 under a read-only
+# rootfs. That combination is what an operator gets by default, so it is the one that
+# needs end-to-end coverage; the S3 path is covered by `make smoke-s3`. MinIO is still
+# started below so the `minio` profile is exercised, but nothing depends on it.
 
 echo "== compose build + up =="
 # Stop legacy Compose project that may own 15432/16379

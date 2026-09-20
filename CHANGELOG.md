@@ -55,6 +55,22 @@ large install.
 
 ### Fixed
 
+- **An artifact the server cannot store fails its step instead of vanishing.** The
+  WebSocket upload path logged a `warn!` and carried on, and the row insert that follows
+  it was not checked at all, so a full disk, an unreachable bucket or an artifact
+  directory the API cannot write lost every artifact into the API's own log while every
+  build stayed green and dependent steps restored nothing. The step now fails through
+  the ordinary completion path with `artifact <name> could not be stored: <cause>` on the
+  step and its attempt, so `retries` apply and the failure is where the pipeline author
+  will look. The HTTP upload path already failed loudly.
+- **`fiber-api` refuses to start when its artifact directory is not writable.**
+  `create_dir_all` succeeds on a directory that already exists whatever it belongs to, so
+  an install upgrading to the non-root image booted green against its old root-owned
+  volume and only discovered the problem on the first upload. Boot now writes and removes
+  one probe file and, on failure, exits naming the directory and the `chown -R
+  10001:10001` that fixes it. Only the local backend is probed; the S3 backend already
+  fails closed on an unreachable bucket.
+
 - **The artifacts smoke wiped a workspace a step was using.** It removed
   `data/workspaces/<run_id>` — including `.repo`, the reference clone every step of the
   run fetches from and the working directory of whichever step is preparing — as soon as
@@ -295,11 +311,16 @@ large install.
   both. The OTLP endpoint is plumbed only as `OTEL_EXPORTER_OTLP_ENDPOINT`: the API reads
   `FIBER_OTEL_ENDPOINT` only when the standard name is *absent*, which a Compose
   passthrough never is.
-- **Container logs are capped and the Redis password is out of the command line.** Every
+- **Container logs are capped and the Redis password is off the command line.** Every
   service gets `max-size: 10m` / `max-file: 5`, where the json-file default keeps every
   line until the host disk fills and Postgres stops; `requirepass` reaches Redis through
-  a Compose `configs:` file instead of argv, which `ps` and `docker inspect` expose. Both
-  images gained a `HEALTHCHECK`, so a plain `docker run` gets the probe Compose had.
+  a Compose `configs:` file instead of argv, where any process in the host's pid
+  namespace could read it out of `ps`. Redis's healthcheck is unauthenticated (`NOAUTH`
+  is an answer from a live server) so that the password does not return to the service's
+  environment just to satisfy a probe. It is still not hidden from the Docker daemon:
+  `fiber-api`'s environment carries both passwords inside `FIBER_DATABASE_URL` and
+  `FIBER_REDIS_URL`. Both images gained a `HEALTHCHECK`, so a plain `docker run` gets
+  the probe Compose had.
 - **The `.dockerignore` files are allowlists.** The root one was a denylist, so `deploy/`
   — including a `deploy/.env` holding `FIBER_SECRETS_KEY` — entered the build context.
   Nothing copies it today, but `Dockerfile.ui` already ends in `COPY . .`, and one such

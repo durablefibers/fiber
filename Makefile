@@ -13,9 +13,12 @@ DEV_CREDS := FIBER_POSTGRES_PASSWORD=$${FIBER_POSTGRES_PASSWORD:-fiber} \
 	FIBER_S3_SECRET_KEY=$${FIBER_S3_SECRET_KEY:-fiberfiber} \
 	FIBER_ADMIN_PASSWORD=$${FIBER_ADMIN_PASSWORD:-fiber}
 # ...but a deploy/.env, if there is one, is the operator's own and wins outright:
-# injecting these would override it, and Redis would come back up on a different
-# password than the one their host API is configured with.
-COMPOSE := $(if $(wildcard deploy/.env),,$(DEV_CREDS)) docker compose -f deploy/docker-compose.yml
+# environment beats an env-file in Compose, so injecting these would silently override
+# it and Redis would come back up on a password their host API does not have. Anchored
+# on this makefile's directory, not the working directory: `make -C` (or a target run
+# from a subdirectory) would otherwise miss the file and do exactly that.
+HERE := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+COMPOSE := $(if $(wildcard $(HERE)/deploy/.env),,$(DEV_CREDS)) docker compose -f $(HERE)/deploy/docker-compose.yml
 ROOT := $(CURDIR)
 
 # THE gate, defined once. Both .github/workflows/ci.yml and .github/workflows/release.yml
