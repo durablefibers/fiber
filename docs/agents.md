@@ -4,9 +4,9 @@ Agents are outbound WebSocket workers that execute CI steps.
 
 An agent's identity is the token it connected with. The server binds `agent_id` from that token and ignores the `agent_id` carried in messages (a mismatch is logged). Log lines are accepted only for a step **last leased to that agent** (so the tail of a cancelled or reclaimed step is still recorded); artifacts and completions additionally require the lease to be **live** — anything after a reclaim or cancel is dropped, which is the at-least-once contract: the re-leased attempt reports its own result. Artifact restore downloads are limited to runs in which the agent holds a running step. A socket that never sends `Hello` is offered nothing, and pool scope always comes from the agent's database row, never from the connection.
 
-A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log line, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
+A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
-`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **1**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row.
+`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **2**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path).
 
 ## Pools
 
@@ -165,7 +165,7 @@ The server counts an agent's in-flight steps **from the database** (`step_runs` 
 | Heartbeat | Touches `last_seen_at`, renews leases, then receives offers until every free slot is filled — a concurrency-4 agent fills in one heartbeat, not four. Retried steps are not offered before their backoff (`not_before`) |
 | Step timeout | Every offer carries `timeout_minutes`; the agent kills the process group at the deadline and reports `failed` (`timed out after N min`). The server fails it itself after a grace period if the agent does not |
 | SIGTERM / SIGINT | In-flight step processes are stopped **without** reporting a result; once they are gone (≤ 10 s) the agent sends `Goodbye` and closes. `Goodbye` makes the server requeue those steps at once rather than when their leases expire, so a rolling agent restart hands the work to another agent within seconds. The bounced attempt counts against `retries` with one extra try, so a step bounced once never fails — even with `retries: 0` — but a step that loses more than `retries + 1` leases fails. A rolling restart of a whole pool can bounce the same step twice (it is re-leased immediately, with no backoff), which does fail a `retries: 0` step; give such steps `retries: 1` or restart agents one at a time |
-| Disconnect / WS close | The session ends; the steps do not. The agent is marked offline, but every step it was running stays `running` under its lease and keeps executing on the agent, its output buffered locally (up to 10 000 messages; past that the oldest log lines go, never a completion or an artifact, and a system line says how many were lost). Nothing is requeued |
+| Disconnect / WS close | The session ends; the steps do not. The agent is marked offline, but every step it was running stays `running` under its lease and keeps executing on the agent, its output buffered locally (up to 10 000 lines or 8 MB; past that the oldest log lines go, never a completion or an artifact, and a system line says how many were lost). Nothing is requeued |
 | Reconnect | Exponential backoff 1 s → 30 s with jitter; a `401` (revoked token) exits the process with status 2 instead of retrying forever. On reconnect the agent sends `Hello`, the first heartbeat renews every lease it still holds, and the buffered output is flushed in order; the server counts those steps against the agent's concurrency before offering it more. A step that finished while disconnected reports its result now, and it is accepted as long as the row is still `running` under this agent |
 | Lease lost | `Welcome` carries `lease_secs` (300, clamped to a day). If no frame has arrived from the server within that minus three heartbeats (**270 s**, counted from the last frame received before the outage — the server pings every 15 s, and a reconnect that fails does not move it), the agent stops its in-flight steps, drops their buffered log lines, and reports each one `failed` with `lease lost while the agent was disconnected` on its own attempt. The server takes that report only if it has not already reclaimed the step, so the row never sits `running` under an agent that has stopped working on it; either way the step retries under its existing budget. A new offer for the same step purges anything still queued from the earlier attempt. Server side, the reclaim loop requeues an expired lease with the same budget as before: it counts against `retries` with one extra try, and past `retries + 1` lost leases the step fails with `lease lost after N attempts`. A completion that arrives after the reclaim is ignored as stale |
 | Concurrency | `--concurrency` is enforced locally with a process-wide semaphore as well as by the server; a step parked on it still counts against its `timeout_minutes`, which start when the offer is received |
@@ -179,6 +179,60 @@ The server counts an agent's in-flight steps **from the database** (`step_runs` 
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
 | Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |
+
+## Log path
+
+A step's stdout and stderr are read as **bytes**, one line at a time, and decoded lossily:
+a Latin-1 filename in an `ls` listing, or any other byte that is not UTF-8, becomes the
+Unicode replacement character and the rest of the step's output still arrives. (Before
+0.6.2 the reader stopped at the first such byte, the child got SIGPIPE on its next write,
+and the step ended at exit 141 with an empty log.) A line longer than **64 KiB** is cut
+there and marked with a visible truncation marker; reading resumes at the next newline.
+The server applies the same cap again to whatever an agent sends it.
+
+Lines are coalesced into a `log_batch` message and flushed on whichever comes first:
+**50 ms**, **64 KB**, or **500 lines**. The server refuses a batch of more than 2 000
+lines, keeping the first 2 000 and saying how many it dropped.
+
+`seq` is assigned where the line is read, counts from zero per attempt across `stdout`,
+`stderr` and the agent's own `system` lines, and is never renumbered — a batch re-sent
+after a reconnect carries the numbers it had the first time.
+
+A step's log is read back in **storage order** (`log_lines.id`), which is also the cursor
+`fiber logs --follow` and the UI resume from, and `seq` agrees with it: while a step is
+running the agent's own notes travel down the same channel as its piped output, so a
+cancel's "killing step process" cannot overtake the output that preceded it. Notes from
+before the pipes exist (workspace prep) go straight out and are first by definition. Every
+notice inserted after the fact — dropped lines, lines that could not be stored — carries
+the `seq` of the gap it reports, so the two orders never disagree.
+
+The server stores a batch in one statement and publishes one event for it, where before
+it cost two queries and a Redis publish per line. An agent older than the batch keeps
+sending one `log_chunk` per line and the server handles it identically; an agent newer
+than the *server* unpacks its batches back into chunks, decided per session from
+`Welcome.protocol_version`.
+
+Between the pipes and the batcher is a bounded queue, and the agent waits for room in its
+outbox rather than dropping output while a session is up: a step that prints faster than
+the control plane can store blocks on its own `write`, which is what stops
+`yes | head -n 10000000` from buffering gigabytes. With the socket **down** there is
+nothing to wait for and the outbox bound applies instead — 10 000 lines or 8 MB, oldest
+first, with a system line saying how many were lost and where. The same notice appears if
+the socket is up but has not drained within 30 s. Once a step's process is gone the agent
+waits for the buffered output to reach the server — 60 s after an ordinary exit, 10 s
+after a cancel or timeout, which have to be reported promptly — and says so if it gives
+up with output still queued.
+
+Two caps sit past that. `FIBER_STEP_LOG_MAX_LINES` (default 50 000) bounds the lines
+stored per **attempt**, counted across sessions, with one `system` line at the cap saying
+so; a retry gets a fresh budget.
+
+`log_lines` is append-only with no unique key, so a message the agent re-sends after a
+session ended between the socket accepting it and the agent dropping it from its outbox
+is stored twice. Batching does not change how often that happens — at most one message
+per interrupted session, as before — but it changes how much of it you see: the duplicate
+is now up to 500 lines rather than one. The lines keep their original `seq`, so the
+repeat is identifiable.
 
 ## Presence in UI
 

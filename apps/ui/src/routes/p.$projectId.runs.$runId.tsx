@@ -301,6 +301,7 @@ function RunPage() {
             step_run_id?: string
             data?: string
             stream?: string
+            lines?: { stream?: string; data?: string }[]
           }
           if (msg.type === "run_updated" && msg.status) {
             setRun((r) => (r ? { ...r, status: msg.status! } : r))
@@ -335,7 +336,17 @@ function RunPage() {
               void refreshArtifacts()
             }
           }
-          if (msg.type === "log" && msg.data && msg.step_run_id) {
+          // `log` is one line, `log_batch` is many in one frame — the agent coalesces
+          // its output and the server stores and publishes it a batch at a time. A
+          // replica older than the batch still publishes single lines, so both arrive
+          // during a rolling deploy.
+          if (msg.type === "log" || msg.type === "log_batch") {
+            const incoming =
+              msg.type === "log"
+                ? msg.data
+                  ? [{ stream: msg.stream, data: msg.data }]
+                  : []
+                : (msg.lines ?? [])
             const cur = selectedRef.current
             const step = stepsRef.current.find(
               (s) => s.id === cur || s.step_id === cur
@@ -345,10 +356,13 @@ function RunPage() {
             if (
               step &&
               step.id === msg.step_run_id &&
-              viewingLatestAttemptRef.current
+              viewingLatestAttemptRef.current &&
+              incoming.length > 0
             ) {
-              const line = `[${msg.stream ?? "out"}] ${msg.data}`
-              setLogs((prev) => [...prev.slice(-800), line])
+              const rendered = incoming
+                .filter((l) => l.data !== undefined)
+                .map((l) => `[${l.stream ?? "out"}] ${l.data}`)
+              setLogs((prev) => [...prev, ...rendered].slice(-800))
             }
           }
         } catch {
