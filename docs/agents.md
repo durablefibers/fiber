@@ -57,13 +57,24 @@ Three ways to attach a machine, all needing a token from **Register** above.
 ### systemd (a build host)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/durablefibers/fiber/main/scripts/install-agent.sh \
-  | sudo FIBER_AGENT_TOKEN="$FIBER_AGENT_TOKEN" bash -s -- \
+export FIBER_AGENT_TOKEN=…
+tag=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/durablefibers/fiber/releases/latest)")
+
+curl -fsSL "https://raw.githubusercontent.com/durablefibers/fiber/$tag/scripts/install-agent.sh" \
+  | sudo --preserve-env=FIBER_AGENT_TOKEN,GH_TOKEN bash -s -- \
       --api-url wss://ci.example.com --labels os=linux
 ```
 
-Pass the token in the environment rather than as `--token`: argv is world-readable in
-`ps` for as long as the script runs.
+Two details that are not decoration:
+
+- **Fetch the script from `$tag`, not from `main`.** This script performs every check
+  below; taking the binary from a release and the verifier from a moving branch only
+  moves the problem one file along.
+- **`sudo --preserve-env=…`, not `sudo VAR=… bash`.** Both keep the token out of the
+  installer's argv, but `sudo VAR=… bash` puts it in *sudo's* argv, which is just as
+  world-readable in `ps`. Preserving `GH_TOKEN` as well is what lets the provenance
+  check run at all under `sudo` — see below.
 
 Downloads the release binary for the host architecture, creates the `fiber` system user,
 writes `/etc/fiber/agent.env` (mode `0640`, root-owned so the token is not world-readable),
@@ -77,27 +88,49 @@ This is still `curl | sudo bash`, so be clear about what each check is worth:
 
 | | Guarantee | Failure |
 |---|---|---|
-| **One tag** | `--version latest` is resolved to a concrete tag by following the `/releases/latest` redirect, and the tarball, the checksums and the systemd unit are all fetched from *that* tag. Earlier versions took the unit from `main`, so a host could run a released binary under an unreleased unit. | fatal |
-| **Checksum** | The tarball's SHA-256 must match the release's `SHA256SUMS` (or, on releases published before that file existed, the per-asset `.sha256`). Integrity only — both files come from the same release over the same channel, so it catches a truncated download, not a compromised release. | fatal, unless `--insecure-skip-checksum` |
-| **Provenance** | If the [`gh` CLI](https://cli.github.com) is installed and authenticated, `gh attestation verify` checks the tarball's build-provenance attestation against `durablefibers/fiber/.github/workflows/release.yml`. This is the only check a compromised release page cannot forge. | fatal, unless `--insecure-skip-attestation` |
+| **One tag** | `--version latest` is resolved to a concrete tag by following the `/releases/latest` redirect, and the tarball, the checksums and the systemd unit all come from *that* tag. If the unit cannot be obtained for that tag the install aborts, rather than pairing a new binary with the unit already on disk. | fatal |
+| **Checksum** | The tarball's SHA-256 must match the release's `SHA256SUMS` (or, on releases published before that file existed, the per-asset `.sha256`). Integrity only — both files come from the same release over the same channel, so it catches a truncated download, not a compromised release. The systemd unit is checked the same way, against the same `SHA256SUMS`. | fatal, unless `--insecure-skip-checksum` |
+| **Provenance** | When `gh` is usable, `gh attestation verify` checks the tarball's build-provenance attestation, pinned to this repository, to `.github/workflows/release.yml`, to `refs/tags/<the tag being installed>` and to a GitHub-hosted runner. Ref-pinning is what stops an attacker serving a genuine, still-validly-attested build of an *older, vulnerable* tag. | fatal **if the check runs and fails**, unless `--insecure-skip-attestation`; see the caveat below if it cannot run |
 
-`gh` is **not** required. Without it the script prints `provenance: NOT CHECKED` and names
-what is missing, so you always know which of the two guarantees you got. Releases up to and
-including **v0.6.2** carry no attestations at all; install those with
+Two exceptions to "one tag", both announced in the output: running the script from a
+checkout takes the unit from that checkout, and a release older than this feature has no
+`fiber-agent.service` asset, so the unit comes from `raw.githubusercontent.com` at the
+right tag but unverified.
+
+**The provenance check is the one that quietly does not happen.** It needs `gh` installed
+*and authenticated as the user running the script* — and under `sudo`, `env_reset` drops
+`GH_TOKEN` and points `HOME` at `/root`, so on a normal host the usual outcome is "gh is
+installed but not authenticated". That is a loud warning before anything is installed, not
+an error. To make it real, either preserve the token (`sudo --preserve-env=GH_TOKEN`, as in
+the command above) or verify as yourself first with `--check-only`. Pass
+`--require-attestation` to refuse to install unless provenance actually verified.
+
+Releases up to and including **v0.6.2** carry no attestations at all; install those with
 `--insecure-skip-attestation` (the checksum is still enforced).
 
-It finishes by printing the resolved tag, the tarball digest, and the digest of the
-`fiber-agent` binary it installed.
+It finishes by printing the resolved tag, the tarball digest, the digest of the
+`fiber-agent` binary it installed, and where the unit came from.
 
 #### Verifying a download by hand
 
 `--check-only` runs the whole resolve-download-verify path and exits without touching the
-host. It needs no root, and works on macOS as well as Linux:
+host. It needs no root — run it **as yourself**, where `gh` is authenticated, rather than
+under `sudo` — and it works on macOS as well as Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/durablefibers/fiber/main/scripts/install-agent.sh \
+tag=$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/durablefibers/fiber/releases/latest)")
+curl -fsSL "https://raw.githubusercontent.com/durablefibers/fiber/$tag/scripts/install-agent.sh" \
   | bash -s -- --check-only
 ```
+
+Its exit code is the answer, so it can gate a deployment script:
+
+| Exit | Meaning |
+|---|---|
+| `0` | Both the checksum and the provenance verified. |
+| `1` | A check ran and failed — mismatched checksum, or an attestation that does not match this repo/workflow/tag. Treat the download as hostile. |
+| `2` | A check could not be obtained: no usable `gh`, no published checksum, or an `--insecure-skip-*` flag. Nothing failed; less was proved than you asked for. |
 
 ```
 latest resolves to vX.Y.Z
@@ -118,14 +151,26 @@ Or do it yourself, without the script:
 
 ```bash
 tag=vX.Y.Z
+asset=fiber-agent-x86_64-unknown-linux-gnu.tar.gz
 base=https://github.com/durablefibers/fiber/releases/download/$tag
-curl -fsSLO "$base/fiber-agent-x86_64-unknown-linux-gnu.tar.gz"
+curl -fsSLO "$base/$asset"
 curl -fsSLO "$base/SHA256SUMS"
-sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify fiber-agent-x86_64-unknown-linux-gnu.tar.gz \
+
+# Check just this asset against the manifest. `sha256sum --ignore-missing` would also
+# work on GNU coreutils, but it does not exist on macOS — awk out the one line instead.
+awk -v f="$asset" '$2 == f' SHA256SUMS | sha256sum -c -     # macOS: shasum -a 256 -c -
+
+gh attestation verify "$asset" \
   --repo durablefibers/fiber \
-  --signer-workflow durablefibers/fiber/.github/workflows/release.yml
+  --signer-workflow durablefibers/fiber/.github/workflows/release.yml \
+  --source-ref "refs/tags/$tag" \
+  --deny-self-hosted-runners
 ```
+
+All four `gh` flags matter. `--repo` alone accepts an attestation minted by *any* workflow
+in the repository; `--signer-workflow` pins which one; `--source-ref` pins the tag, without
+which an older attested release passes; `--deny-self-hosted-runners` is what makes the
+"GitHub-hosted runner" claim true rather than assumed.
 
 See [operations](./operations.md#images-and-releases) for what a release attests to and
 how to verify the container images.
@@ -166,15 +211,25 @@ restart-looping, and `TimeoutStopSec=30` so SIGTERM can stop steps before the ki
 It is also hardened, and the hardening is visible to your builds. `ProtectSystem=full` and
 `NoNewPrivileges=true` make `/usr` and `/etc` read-only and stop `sudo` working, so a
 pipeline that installs packages system-wide fails here. `CapabilityBoundingSet=` drops every
-capability (no `ping`, no binding ports below 1024). `RestrictAddressFamilies=` allows
-`AF_UNIX AF_INET AF_INET6 AF_NETLINK` only, so raw/packet sockets fail. `UMask=0077` makes
-files a step creates readable by the `fiber` user only. `ProtectHome=true` hides `/home`,
-`/root` and `/run/user/*` — see [configuration](./configuration.md) under
+capability (no `ping`, no binding ports below 1024, and no `newuidmap`/`newgidmap`, so
+rootless podman cannot map a uid range). `RestrictAddressFamilies=` allows
+`AF_UNIX AF_INET AF_INET6 AF_NETLINK` only, so raw/packet sockets and `AF_ALG` fail.
+`UMask=0027` means files a step creates are not world-readable. `ProtectHome=true` hides
+`/home`, `/root` and `/run/user/*` — see [configuration](./configuration.md) under
 `FIBER_AGENT_ENV_PASSTHROUGH` for what that costs an SSH agent socket.
 
+Two more are worth knowing about before you blame the build:
+
+- **`SystemCallArchitectures=native`** refuses non-native personalities, so 32-bit
+  binaries do not run — `cargo test --target i686-*`, wine32, some vendor SDKs. Relax with
+  `SystemCallArchitectures=native x86`.
+- **`RestrictSUIDSGID=true`** blocks *creating* setuid/setgid files, which `dpkg-deb` and
+  `rpmbuild` need when the package being built contains one. Relax with
+  `RestrictSUIDSGID=false`.
+
 `MemoryDenyWriteExecute` and `RestrictNamespaces` are deliberately **not** set: the first
-breaks every JIT (JVM, Node, .NET), the second breaks rootless containers and `unshare`.
-The unit file lists the rest of what was considered and rejected, with reasons.
+breaks every JIT (JVM, Node, .NET), the second breaks `unshare` and rootless container
+tooling. The unit file lists the rest of what was considered and rejected, with reasons.
 
 Relax any of it in a drop-in (`/etc/systemd/system/fiber-agent.service.d/`) if your builds
 need it — a drop-in survives the next `install-agent.sh` run, edits to the unit do not.

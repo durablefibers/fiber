@@ -98,7 +98,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Root for per-step work dirs |
 | `FIBER_AGENT_ENV_PASSTHROUGH` | empty | Comma-separated names to pass from the agent's environment into steps, on top of the built-in allowlist (shell basics, proxy and CA settings). Everything else is cleared — use this for `SSH_AUTH_SOCK`, `CARGO_HOME`, `JAVA_HOME`, `NVM_DIR` and similar. **Under systemd, `SSH_AUTH_SOCK` needs a drop-in** — see below |
 | `FIBER_AGENT_WORKSPACE_TTL_HOURS` | `24` | Sweep run workspaces older than this at startup; `0` disables |
-| `FIBER_AGENT_DOCKER_USER` | image default | `--user` for step containers |
+| `FIBER_AGENT_DOCKER_USER` | image default | `--user` for step containers. Under the systemd unit see the `UMask` note below |
 | `FIBER_AGENT_DOCKER_NETWORK` | `bridge` | `--network`; `none` isolates steps from the network |
 | `FIBER_AGENT_DOCKER_MEMORY` | unlimited | `--memory` for step containers, e.g. `2g`. Off by default so an upgrade cannot start OOM-killing existing builds |
 | `FIBER_AGENT_DOCKER_CPUS` | unlimited | `--cpus` for step containers, e.g. `2` |
@@ -110,6 +110,20 @@ in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`
 `FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`). The installer also writes
 `FIBER_AGENT_INSTALLED_VERSION` and `FIBER_AGENT_INSTALLED_SHA256` there so a re-run can say
 what it is replacing; no crate reads them, and they are not deployment configuration.
+
+### `FIBER_AGENT_DOCKER_USER` and the unit's `UMask`
+
+The agent creates and clones the step workspace itself and then bind-mounts it into the
+container, so the umask the *agent* runs under decides whether the container user can read
+it. `deploy/fiber-agent.service` sets `UMask=0027` for that reason: at `0077` the workspace
+is mode `0700`, and any image with a non-root `USER`, or any `FIBER_AGENT_DOCKER_USER`
+that is not the `fiber` uid, fails at `cd /workspace` with `EACCES` and nothing in the step
+log explaining why.
+
+`0027` still denies every other user on the host, which is all `0077` was buying:
+everything under `/var/lib/fiber` is already `fiber`-owned inside a `0750` directory. If
+your images run as a user in no shared group and you need group access too, override with
+`UMask=0022` in a drop-in rather than lowering the state directory's mode.
 
 ### `SSH_AUTH_SOCK` under the systemd unit
 

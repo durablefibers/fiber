@@ -49,16 +49,24 @@ LockPersonality=true
 SystemCallArchitectures=native
 # The agent needs no capabilities at all: it opens an outbound socket, writes under
 # /var/lib/fiber, and forks shells. Combined with NoNewPrivileges this also means a
-# setuid binary in a build (sudo, ping, newgrp) gains nothing.
+# setuid binary in a build (sudo, ping, newgrp) gains nothing — including
+# newuidmap/newgidmap, so rootless podman/buildah will not map a uid range here even
+# though RestrictNamespaces is left off below for their sake. Unprivileged
+# single-uid `unshare` still works.
 CapabilityBoundingSet=
 # AF_NETLINK is not optional: glibc's NSS and every Go binary use it to enumerate
 # interfaces and resolve names, so dropping it breaks DNS in a way that looks like a
 # network outage. AF_UNIX carries the Docker socket. Builds that need AF_PACKET (raw
-# sockets, tcpdump) or AF_VSOCK must add them in a drop-in.
+# sockets, tcpdump), AF_VSOCK, or AF_ALG (kernel crypto — some crypto test suites and
+# cryptsetup use it) must add them in a drop-in.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# Build output and restored artifacts are readable by the fiber user only. Step
-# containers run under the Docker daemon, not this unit, so this does not reach them.
-UMask=0077
+# 0027, not 0077. The agent creates and clones the workspace under this umask and then
+# bind-mounts it into the step container: at 0077 the workspace is 0700, so any image
+# with a non-root USER, or FIBER_AGENT_DOCKER_USER set, fails at `cd /workspace` with
+# EACCES and nothing in the log explaining why. 0027 still denies other users, which is
+# all 0077 was buying — everything under /var/lib/fiber is already fiber-owned inside a
+# 0750 directory. See docs/configuration.md under FIBER_AGENT_DOCKER_USER.
+UMask=0027
 
 # Considered and deliberately NOT set, because each one breaks ordinary builds:
 #
@@ -74,6 +82,17 @@ UMask=0077
 #                                 and several package managers fail with EPERM.
 #   ProtectSystem=strict          Would make /opt and /srv read-only too; toolchains
 #                                 installed there (JDKs, SDKs) become unusable.
+#
+# Two directives above are kept even though they *can* break a plausible build, because
+# the builds they break are rare on a CI agent and a drop-in re-enables them per host:
+#
+#   SystemCallArchitectures=native  Refuses non-native personalities, so a 32-bit
+#                                 binary will not run: `--target i686-*` test
+#                                 execution, wine32, and some vendor SDK toolchains.
+#                                 Drop-in: SystemCallArchitectures=native x86
+#   RestrictSUIDSGID=true         Blocks *creating* setuid/setgid files, which
+#                                 `dpkg-deb`/`rpmbuild` need when the package being
+#                                 built contains one. Drop-in: RestrictSUIDSGID=false
 #
 # ProtectHome=true hides /home, /root and /run/user/*. The agent's own home is
 # /var/lib/fiber, so this costs nothing — except that a user's SSH agent socket lives
