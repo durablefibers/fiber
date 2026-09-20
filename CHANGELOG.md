@@ -55,6 +55,22 @@ large install.
 
 ### Fixed
 
+- **An artifact the server cannot store fails its step instead of vanishing.** The
+  WebSocket upload path logged a `warn!` and carried on, and the row insert that follows
+  it was not checked at all, so a full disk, an unreachable bucket or an artifact
+  directory the API cannot write lost every artifact into the API's own log while every
+  build stayed green and dependent steps restored nothing. The step now fails through
+  the ordinary completion path with `artifact <name> could not be stored: <cause>` on the
+  step and its attempt, so `retries` apply and the failure is where the pipeline author
+  will look. The HTTP upload path already failed loudly.
+- **`fiber-api` refuses to start when its artifact directory is not writable.**
+  `create_dir_all` succeeds on a directory that already exists whatever it belongs to, so
+  an install upgrading to the non-root image booted green against its old root-owned
+  volume and only discovered the problem on the first upload. Boot now writes and removes
+  one probe file and, on failure, exits naming the directory and the `chown -R
+  10001:10001` that fixes it. Only the local backend is probed; the S3 backend already
+  fails closed on an unreachable bucket.
+
 - **The artifacts smoke wiped a workspace a step was using.** It removed
   `data/workspaces/<run_id>` — including `.repo`, the reference clone every step of the
   run fetches from and the working directory of whichever step is preparing — as soon as
@@ -256,6 +272,60 @@ large install.
   negative assertions are polls: "the project-scoped agent does not take project B's
   step" is now checked continuously across a full offer cycle and fails the moment it is
   violated, rather than being sampled once after four seconds.
+- **Compose ships no working credentials.** `FIBER_POSTGRES_PASSWORD`,
+  `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY`/`FIBER_S3_SECRET_KEY` and
+  `FIBER_ADMIN_PASSWORD` defaulted to `fiber` / `fiberfiber`, so a stack brought up with
+  `FIBER_API_BIND=0.0.0.0` was a public instance with a published admin login. They are
+  now `${VAR:?}` — `docker compose config`, `up`, `pull` and `logs` all fail, naming the
+  first variable that is missing, until `deploy/.env` sets them.
+  **Migration: before upgrading, write the values you are already using into
+  `deploy/.env`** (`cp deploy/.env.example deploy/.env` and fill them in) — Postgres
+  keeps the password its volume was initialised with, so putting the old value back is
+  the no-downtime path. The S3 pair is required even when MinIO is off, because Compose
+  interpolates the whole file before it filters by profile; any non-empty placeholder
+  does. `make infra` and the smokes supply the old dev values themselves, so a
+  development checkout needs no `deploy/.env`.
+- **MinIO is optional; artifacts default to the local filesystem.** Compose set
+  `FIBER_S3_BUCKET` unconditionally, so the S3 backend was the only one a Compose
+  deployment could have, the `fiber_artifacts` volume was dead weight, and the API could
+  not become ready without MinIO. MinIO now sits behind the `minio` profile and
+  `FIBER_S3_BUCKET` is empty by default. **Migration: an install that wants to keep MinIO
+  must set `FIBER_S3_BUCKET=fiber-artifacts` in `deploy/.env` and bring the stack up with
+  `--profile minio`** — switching backends does not move existing blobs, and artifacts
+  written under the other backend stop downloading until you switch back.
+- **`fiber-api` runs as uid 10001 with a read-only rootfs.** The image ran as root while
+  the agent image already did not, so any RCE or SSRF in the API started from uid 0.
+  `fiber-ui` moves to `nginxinc/nginx-unprivileged` (uid 101, listening on 8080 in the
+  container; the published port is still 3100), and both get `read_only: true` with a
+  tmpfs for their scratch paths, `cap_drop: [ALL]` and `no-new-privileges`.
+  **Migration: an existing deployment whose artifact directory was created by the root
+  image needs a one-shot `chown -R 10001:10001`** — see
+  [operations](docs/operations.md#upgrades) for the exact command. It matters to Compose
+  now precisely because the same release makes the local filesystem the default backend.
+- **Compose plumbs the operator knobs it documented.** The env block is an allowlist and
+  silently dropped twelve variables `docs/configuration.md` told operators to set:
+  `FIBER_PUBLIC_URL` (so commit statuses linked nowhere), `FIBER_GITHUB_TOKEN`,
+  `FIBER_GITHUB_API_URL`, the four retention knobs, `FIBER_AGENT_STALE_SECS`, the two
+  step-timeout knobs and the OTLP endpoint. All are passed through, `deploy/.env.example`
+  lists every one of them, and the Compose table in `docs/configuration.md` now matches
+  both. The OTLP endpoint is plumbed only as `OTEL_EXPORTER_OTLP_ENDPOINT`: the API reads
+  `FIBER_OTEL_ENDPOINT` only when the standard name is *absent*, which a Compose
+  passthrough never is.
+- **Container logs are capped and the Redis password is off the command line.** Every
+  service gets `max-size: 10m` / `max-file: 5`, where the json-file default keeps every
+  line until the host disk fills and Postgres stops; `requirepass` reaches Redis through
+  a Compose `configs:` file instead of argv, where any process in the host's pid
+  namespace could read it out of `ps`. Redis's healthcheck is unauthenticated (`NOAUTH`
+  is an answer from a live server) so that the password does not return to the service's
+  environment just to satisfy a probe. It is still not hidden from the Docker daemon:
+  `fiber-api`'s environment carries both passwords inside `FIBER_DATABASE_URL` and
+  `FIBER_REDIS_URL`. Both images gained a `HEALTHCHECK`, so a plain `docker run` gets
+  the probe Compose had.
+- **The `.dockerignore` files are allowlists.** The root one was a denylist, so `deploy/`
+  — including a `deploy/.env` holding `FIBER_SECRETS_KEY` — entered the build context.
+  Nothing copies it today, but `Dockerfile.ui` already ends in `COPY . .`, and one such
+  line in `deploy/Dockerfile` would bake every credential into a published layer. Both
+  files now start from `*` and add back only what the builds read.
 
 ### Fixed
 

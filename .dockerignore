@@ -1,6 +1,15 @@
-target
-.git
-*.log
-.DS_Store
-data
-apps
+# Allowlist, not a denylist. Everything is excluded first and only the paths
+# deploy/Dockerfile actually copies are added back, so a future `COPY . .` cannot bake
+# deploy/.env — which holds FIBER_SECRETS_KEY, the database password and the admin
+# password — into an image layer that anyone who can pull the image can read.
+# Adding a COPY to deploy/Dockerfile means adding its source here too.
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates
+
+# Re-excluded from inside an allowed path: a per-crate build dir, editor droppings.
+crates/**/target
+**/*.log
+**/.DS_Store

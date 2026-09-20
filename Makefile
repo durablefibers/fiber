@@ -2,7 +2,23 @@
 	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-s3 smoke-compose \
 	login validate ready
 
-COMPOSE := docker compose -f deploy/docker-compose.yml
+# deploy/docker-compose.yml has no working default for the four credentials — a
+# deployment must put them in deploy/.env, and `docker compose config` fails until it
+# does. A dev box is not a deployment: these services publish on 127.0.0.1 only, and
+# scripts/dev-env.sh already assumes these throwaway values, so the make targets supply
+# them here rather than making every contributor write a deploy/.env.
+DEV_CREDS := FIBER_POSTGRES_PASSWORD=$${FIBER_POSTGRES_PASSWORD:-fiber} \
+	FIBER_REDIS_PASSWORD=$${FIBER_REDIS_PASSWORD:-fiber} \
+	FIBER_S3_ACCESS_KEY=$${FIBER_S3_ACCESS_KEY:-fiber} \
+	FIBER_S3_SECRET_KEY=$${FIBER_S3_SECRET_KEY:-fiberfiber} \
+	FIBER_ADMIN_PASSWORD=$${FIBER_ADMIN_PASSWORD:-fiber}
+# ...but a deploy/.env, if there is one, is the operator's own and wins outright:
+# environment beats an env-file in Compose, so injecting these would silently override
+# it and Redis would come back up on a password their host API does not have. Anchored
+# on this makefile's directory, not the working directory: `make -C` (or a target run
+# from a subdirectory) would otherwise miss the file and do exactly that.
+HERE := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+COMPOSE := $(if $(wildcard $(HERE)/deploy/.env),,$(DEV_CREDS)) docker compose -f $(HERE)/deploy/docker-compose.yml
 ROOT := $(CURDIR)
 
 # THE gate, defined once. Both .github/workflows/ci.yml and .github/workflows/release.yml
@@ -50,8 +66,10 @@ help:
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis
 
+# MinIO sits behind the `minio` Compose profile: artifacts default to the local
+# filesystem, and only `make api-s3` / `make smoke-s3` need the object store.
 infra-minio: infra
-	$(COMPOSE) up -d fiber-minio
+	$(COMPOSE) --profile minio up -d fiber-minio
 
 down:
 	$(COMPOSE) down

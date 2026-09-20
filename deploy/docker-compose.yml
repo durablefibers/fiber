@@ -2,6 +2,12 @@ name: fiber
 # Backing services bind to loopback only; put fiber-api / fiber-ui behind TLS
 # (docs/operations.md#deployment). Settings come from deploy/.env — see deploy/.env.example.
 #
+# Four credentials are required, not defaulted: FIBER_POSTGRES_PASSWORD,
+# FIBER_REDIS_PASSWORD, FIBER_S3_ACCESS_KEY/FIBER_S3_SECRET_KEY and
+# FIBER_ADMIN_PASSWORD. `docker compose config` fails until deploy/.env sets them. A
+# default that works is a default nobody changes, and FIBER_API_BIND=0.0.0.0 plus a
+# published admin password is a public instance with a known login.
+#
 # Networks: everything shares `backend`, except the agent, which sits alone with the API
 # on `agentnet`. Pipeline steps are repo-supplied shell, so an agent that could reach
 # fiber-postgres / fiber-redis / fiber-minio directly would hand every pipeline author the
@@ -10,15 +16,37 @@ networks:
   backend:
   agentnet:
 
+# Docker's default json-file driver keeps every line for ever: a chatty API or one
+# crash-looping container fills the host disk, and a full disk stops Postgres. 10 MB × 5
+# per container is the cap; ship them somewhere durable with a log driver if you need
+# more than ~50 MB of history.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+configs:
+  # The password reaches redis-server through a config file rather than `--requirepass`
+  # on the command line, which every process in the host's pid namespace can read out of
+  # `ps`. It is not a secret store: `fiber-api`'s own environment still carries both
+  # passwords inside FIBER_DATABASE_URL and FIBER_REDIS_URL, so anyone who can talk to
+  # the Docker daemon can still read them out of `docker inspect`. Anyone who can talk
+  # to the daemon is root on the host anyway.
+  fiber-redis-conf:
+    content: |
+      requirepass ${FIBER_REDIS_PASSWORD:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+
 services:
   fiber-postgres:
     networks: [backend]
     image: postgres:17-alpine
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_USER: fiber
       # Applied when the volume is first initialised; changing it later needs ALTER ROLE.
-      POSTGRES_PASSWORD: ${FIBER_POSTGRES_PASSWORD:-fiber}
+      POSTGRES_PASSWORD: ${FIBER_POSTGRES_PASSWORD:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
       POSTGRES_DB: fiber
     ports:
       - "127.0.0.1:15432:5432"
@@ -34,19 +62,31 @@ services:
     networks: [backend]
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--requirepass", "${FIBER_REDIS_PASSWORD:-fiber}"]
+    logging: *logging
+    command: ["redis-server", "/etc/redis/redis.conf"]
+    configs:
+      - source: fiber-redis-conf
+        target: /etc/redis/redis.conf
     ports:
       - "127.0.0.1:16379:6379"
     healthcheck:
-      # REDISCLI_AUTH keeps the password out of the probe's argv.
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      # Deliberately unauthenticated: `NOAUTH Authentication required` is an answer from
+      # a live server, which is all this probe has to establish. The alternative is
+      # REDISCLI_AUTH in the service's environment, which puts the password back into
+      # `docker inspect` for nothing.
+      test: ["CMD-SHELL", "redis-cli ping 2>&1 | grep -qE 'PONG|NOAUTH'"]
       interval: 5s
       timeout: 3s
       retries: 10
-    environment:
-      REDISCLI_AUTH: ${FIBER_REDIS_PASSWORD:-fiber}
 
+  # Optional: `docker compose --profile minio up -d`, together with
+  # FIBER_S3_BUCKET=fiber-artifacts in deploy/.env. Without both, fiber-api stores
+  # artifact blobs on the fiber_artifacts volume (docs/artifacts.md) and this service
+  # never starts. MinIO is what a multi-host deployment wants — presigned URLs let
+  # agents upload without going through the API — but it is not a dependency of running
+  # a pipeline.
   fiber-minio:
+    profiles: ["minio"]
     networks: [backend]
     # quay.io, not Docker Hub: `minio/minio` there now refuses anonymous pulls with
     # "pull access denied ... repository does not exist", so a machine without the image
@@ -57,10 +97,14 @@ services:
     # resolved to when it was pinned; Dependabot's docker ecosystem watches /deploy.
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
+    logging: *logging
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: ${FIBER_S3_ACCESS_KEY:-fiber}
-      MINIO_ROOT_PASSWORD: ${FIBER_S3_SECRET_KEY:-fiberfiber}
+      # Required even when the minio profile is off: Compose interpolates the whole file
+      # before it filters by profile. Left unset, MinIO would fall back to its own
+      # minioadmin/minioadmin.
+      MINIO_ROOT_USER: ${FIBER_S3_ACCESS_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+      MINIO_ROOT_PASSWORD: ${FIBER_S3_SECRET_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
     ports:
       - "127.0.0.1:19000:9000"
       - "127.0.0.1:19001:9001"
@@ -90,31 +134,79 @@ services:
         cache-from:
           - type=gha,scope=fiber-api
     restart: unless-stopped
+    logging: *logging
+    # The image runs as uid 10001 and writes nothing outside /data/artifacts, so the
+    # rootfs is read-only and every capability is dropped: binding :8080 needs none, and
+    # no-new-privileges means a setuid binary in the image cannot regain any.
+    #
+    # Two paths stay writable. /tmp is a tmpfs, mounted nosuid,nodev,noexec by Docker.
+    # /data/artifacts is not: it is a volume, so it is writable *and* executable, and
+    # what lands in it is attacker-influenced — any project writer can have an agent
+    # upload a file of their choosing. That is not a privilege on its own (nothing in
+    # the API executes an artifact, and uploads are path-sanitised and confined to the
+    # run's own prefix), but it is the one place a dropped payload can sit, so it is
+    # worth knowing about. It is left as a plain named volume rather than a `noexec`
+    # bind, because that would change the volume's shape and no existing deployment's
+    # data would follow it across the upgrade.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     environment:
-      FIBER_DATABASE_URL: postgres://fiber:${FIBER_POSTGRES_PASSWORD:-fiber}@fiber-postgres:5432/fiber
-      FIBER_REDIS_URL: redis://:${FIBER_REDIS_PASSWORD:-fiber}@fiber-redis:6379
+      FIBER_DATABASE_URL: postgres://fiber:${FIBER_POSTGRES_PASSWORD}@fiber-postgres:5432/fiber
+      FIBER_REDIS_URL: redis://:${FIBER_REDIS_PASSWORD}@fiber-redis:6379
       FIBER_LISTEN: 0.0.0.0:8080
       FIBER_ARTIFACTS_DIR: /data/artifacts
-      FIBER_S3_BUCKET: fiber-artifacts
-      FIBER_S3_ENDPOINT: http://fiber-minio:9000
+      # Empty = the local filesystem backend on the fiber_artifacts volume. Set this to
+      # a bucket name and start the `minio` profile (or point the endpoint at real S3)
+      # to switch. Changing it later does not move existing blobs.
+      FIBER_S3_BUCKET: ${FIBER_S3_BUCKET:-}
+      FIBER_S3_ENDPOINT: ${FIBER_S3_ENDPOINT:-http://fiber-minio:9000}
+      # Where agents and browsers reach the object store; it appears in every presigned
+      # URL. The loopback default only works for an agent on this host.
       FIBER_S3_PUBLIC_ENDPOINT: ${FIBER_S3_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
-      FIBER_S3_ACCESS_KEY: ${FIBER_S3_ACCESS_KEY:-fiber}
-      FIBER_S3_SECRET_KEY: ${FIBER_S3_SECRET_KEY:-fiberfiber}
-      FIBER_S3_REGION: us-east-1
+      FIBER_S3_ACCESS_KEY: ${FIBER_S3_ACCESS_KEY}
+      FIBER_S3_SECRET_KEY: ${FIBER_S3_SECRET_KEY}
+      FIBER_S3_REGION: ${FIBER_S3_REGION:-us-east-1}
       FIBER_ADMIN_USER: ${FIBER_ADMIN_USER:-admin}
-      FIBER_ADMIN_PASSWORD: ${FIBER_ADMIN_PASSWORD:-fiber}
+      # Applied only on the first boot of an empty database; change it later through the
+      # UI or the API.
+      FIBER_ADMIN_PASSWORD: ${FIBER_ADMIN_PASSWORD:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
       # Required for encrypted project/webhook secrets: openssl rand -hex 32 → deploy/.env.
       # Empty = plaintext at rest (fiber-api warns at boot).
       FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}
       FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
+      # Public base URL of this instance; commit statuses link back to it.
+      FIBER_PUBLIC_URL: ${FIBER_PUBLIC_URL:-}
+      # Instance-wide fallback for the PR file API and commit statuses. A project secret
+      # of the same name wins over it.
+      FIBER_GITHUB_TOKEN: ${FIBER_GITHUB_TOKEN:-}
+      FIBER_GITHUB_API_URL: ${FIBER_GITHUB_API_URL:-}
+      # Retention. Empty falls back to the documented default (30 / 20 / 100 / 3600).
+      FIBER_RETENTION_DAYS: ${FIBER_RETENTION_DAYS:-}
+      FIBER_RETENTION_KEEP_RUNS: ${FIBER_RETENTION_KEEP_RUNS:-}
+      FIBER_RETENTION_BATCH: ${FIBER_RETENTION_BATCH:-}
+      FIBER_RETENTION_INTERVAL_SECS: ${FIBER_RETENTION_INTERVAL_SECS:-}
       # Delete terminal durable fibers older than this many days. 0 disables.
       FIBER_RETENTION_FIBER_DAYS: ${FIBER_RETENTION_FIBER_DAYS:-7}
+      # Seconds without a heartbeat before an agent is marked offline.
+      FIBER_AGENT_STALE_SECS: ${FIBER_AGENT_STALE_SECS:-}
+      # Per-attempt limit for steps without `timeout_minutes`, and the extra minutes the
+      # server waits past a step's own limit before failing it itself.
+      FIBER_STEP_TIMEOUT_DEFAULT_MINUTES: ${FIBER_STEP_TIMEOUT_DEFAULT_MINUTES:-}
+      FIBER_STEP_TIMEOUT_GRACE_MINUTES: ${FIBER_STEP_TIMEOUT_GRACE_MINUTES:-}
       # Lines stored per step attempt before the rest are dropped. 0 disables it.
       FIBER_STEP_LOG_MAX_LINES: ${FIBER_STEP_LOG_MAX_LINES:-50000}
       # Let the http_request fiber task reach private addresses. Off by default.
       FIBER_HTTP_TASK_ALLOW_PRIVATE: ${FIBER_HTTP_TASK_ALLOW_PRIVATE:-0}
       # Bearer token for /metrics. Empty = the endpoint is off.
       FIBER_METRICS_TOKEN: ${FIBER_METRICS_TOKEN:-}
+      # OTLP collector base URL; /v1/traces and /v1/metrics are appended. One variable,
+      # not two: the API reads FIBER_OTEL_ENDPOINT only when OTEL_EXPORTER_OTLP_ENDPOINT
+      # is absent, and Compose would always define it — so the alias is resolved here.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-${FIBER_OTEL_ENDPOINT:-}}
       RUST_LOG: ${RUST_LOG:-info,fiber_api=info}
     ports:
       - "${FIBER_API_BIND:-127.0.0.1}:18080:8080"
@@ -138,8 +230,11 @@ services:
         condition: service_healthy
       fiber-redis:
         condition: service_healthy
+      # `required: false` so this is ordering, not a dependency: with the minio profile
+      # off the service does not exist and the API starts anyway on the local backend.
       fiber-minio:
         condition: service_healthy
+        required: false
 
   # Optional worker: `docker compose --profile agent up -d fiber-agent`.
   # Needs FIBER_AGENT_TOKEN in deploy/.env — create one with
@@ -158,6 +253,10 @@ services:
         cache-from:
           - type=gha,scope=fiber-agent
     restart: unless-stopped
+    logging: *logging
+    # No read_only / cap_drop here on purpose: this container runs repo-supplied shell,
+    # which writes to its workspace and legitimately needs a normal filesystem.
+    # Isolation for steps comes from the agent's own controls (docs/agents.md).
     environment:
       FIBER_API_URL: ws://fiber-api:8080
       FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
@@ -192,8 +291,20 @@ services:
         cache-from:
           - type=gha,scope=fiber-ui
     restart: unless-stopped
+    logging: *logging
+    # Static files and one nginx worker: nothing in the image is written at runtime
+    # except nginx's own pid file and scratch dirs, which are tmpfs below. The image is
+    # nginxinc/nginx-unprivileged, so it listens on 8080 as uid 101 and needs no
+    # capability at all.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m,uid=101,gid=101
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "${FIBER_UI_BIND:-127.0.0.1}:3100:80"
+      - "${FIBER_UI_BIND:-127.0.0.1}:3100:8080"
     depends_on:
       fiber-api:
         condition: service_healthy

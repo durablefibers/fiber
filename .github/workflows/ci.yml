@@ -174,7 +174,11 @@ jobs:
         # file and print logs rather than failing on an unset variable.
         env:
           FIBER_SECRETS_KEY: "00000000000000000000000000000000000000000000000000000000000000ff"
+          FIBER_POSTGRES_PASSWORD: fiber
           FIBER_REDIS_PASSWORD: fiber
+          FIBER_S3_ACCESS_KEY: fiber
+          FIBER_S3_SECRET_KEY: fiberfiber
+          FIBER_ADMIN_PASSWORD: fiber
         run: docker compose -f deploy/docker-compose.yml logs --tail=200
 
   # The other half of end-to-end, and the half nothing ran automatically before: authz,

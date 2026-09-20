@@ -7,7 +7,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | Variable | Default | Purpose |
 |---|---|---|
 | `FIBER_DATABASE_URL` | `postgres://fiber:fiber@localhost:15432/fiber` | Postgres |
-| `FIBER_REDIS_URL` | `redis://localhost:16379` | Redis (events + coordination). The Compose Redis requires a password: `redis://:fiber@127.0.0.1:16379` (`scripts/dev-env.sh` sets this) |
+| `FIBER_REDIS_URL` | `redis://localhost:16379` | Redis (events + coordination). The Compose Redis requires a password (`FIBER_REDIS_PASSWORD`, no default — `make infra` passes `fiber` on a dev box): `redis://:fiber@127.0.0.1:16379`, which is what `scripts/dev-env.sh` builds |
 | `FIBER_LISTEN` | `0.0.0.0:18080` | Bind address |
 | `FIBER_ARTIFACTS_DIR` | `./data/artifacts` | Local artifact root |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
@@ -42,18 +42,48 @@ Login is throttled per username: 10 failures within 10 minutes lock that usernam
 
 ## Compose (`deploy/.env`)
 
+`deploy/.env.example` is the copy-and-fill version of this table; every variable below is
+in it, and nothing reaches a container that is not in `deploy/docker-compose.yml`'s env
+block. An empty value means "the API's own default" from the table above — the Compose
+file passes the variable through as an empty string and each reader falls back.
+
+**Required — no default.** `docker compose config`, and therefore `up`, `pull` and
+`logs`, fails until `deploy/.env` gives each of these a value.
+
+| Variable | Purpose |
+|---|---|
+| `FIBER_POSTGRES_PASSWORD` | Postgres password (loopback-bound port `15432`); applied when the volume is first initialised, so changing it later also needs `ALTER ROLE` |
+| `FIBER_REDIS_PASSWORD` | Redis `requirepass` (loopback-bound port `16379`), delivered through a Compose `configs:` file, not argv |
+| `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY` | MinIO root credentials and what `fiber-api` signs S3 requests with. Required even with the `minio` profile off: Compose interpolates the whole file before it filters by profile. Any placeholder does when `FIBER_S3_BUCKET` is empty |
+| `FIBER_ADMIN_PASSWORD` | Bootstrap admin password — applied only on the first boot of an empty database; rotate an existing admin through the API/UI |
+
+**Optional.**
+
 | Variable | Default | Purpose |
 |---|---|---|
+| `FIBER_VERSION` | `latest` | Tag for the `ghcr.io/durablefibers/fiber-api` and `fiber-agent` images |
 | `FIBER_SECRETS_KEY` | empty (plaintext, warned) | Passed through to `fiber-api` |
-| `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` | `admin` / `fiber` | Bootstrap admin — applied only on the first boot of an empty database; rotate an existing admin through the API/UI |
-| `FIBER_POSTGRES_PASSWORD` | `fiber` | Postgres password (loopback-bound port `15432`); applied when the volume is first initialised |
-| `FIBER_REDIS_PASSWORD` | `fiber` | Redis `requirepass` (loopback-bound port `16379`) |
-| `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY` | `fiber` / `fiberfiber` | MinIO root + API credentials |
-| `FIBER_S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:19000` | Presign host for agents/browsers |
+| `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
+| `FIBER_S3_BUCKET` | empty | Empty = local filesystem on the `fiber_artifacts` volume. Set it (and run `--profile minio`, or point the endpoint at real S3) to use object storage |
+| `FIBER_S3_ENDPOINT` | `http://fiber-minio:9000` | S3 API endpoint as the API reaches it |
+| `FIBER_S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:19000` | Presign host for agents/browsers; the loopback default only works for an agent on this host |
+| `FIBER_S3_REGION` | `us-east-1` | Region |
 | `FIBER_CORS_ORIGINS` | `http://localhost:3100,http://127.0.0.1:3100` | See above |
 | `FIBER_API_BIND` / `FIBER_UI_BIND` | `127.0.0.1` | Host interface for `18080` / `3100`; set `0.0.0.0` only without a reverse proxy |
 | `VITE_FIBER_API_URL` | `http://localhost:18080` | Baked into the UI bundle |
+| `FIBER_PUBLIC_URL` | empty | Public base URL; commit statuses link back to it |
+| `FIBER_GITHUB_TOKEN` | empty | Instance-wide fallback for the PR file API and commit statuses |
+| `FIBER_GITHUB_API_URL` | empty (`https://api.github.com`) | GitHub Enterprise API base |
+| `FIBER_RETENTION_DAYS` / `_KEEP_RUNS` / `_BATCH` / `_INTERVAL_SECS` | empty (`30` / `20` / `100` / `3600`) | Run GC; see the API table |
+| `FIBER_RETENTION_FIBER_DAYS` | `7` | Durable-fiber GC |
+| `FIBER_AGENT_STALE_SECS` | empty (`45`) | Offline threshold for heartbeats |
+| `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` / `_GRACE_MINUTES` | empty (`60` / `5`) | Step timeout and the server-side backstop |
+| `FIBER_STEP_LOG_MAX_LINES` | `50000` | Lines stored per step attempt |
+| `FIBER_HTTP_TASK_ALLOW_PRIVATE` | `0` | `http_request` fiber task reach |
+| `FIBER_METRICS_TOKEN` | empty | Bearer token for `/metrics`; empty = off |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | OTLP collector base URL. Use this name in Compose, not `FIBER_OTEL_ENDPOINT`: the API reads the alias only when this one is *absent*, and Compose always defines what it passes |
 | `RUST_LOG` | `info,fiber_api=info` | API log filter |
+| `FIBER_AGENT_TOKEN` / `_NAME` / `_LABELS` / `_CONCURRENCY` | — / `compose` / `os=linux` / `2` | The optional `agent` profile |
 
 ## fiber-agent
 

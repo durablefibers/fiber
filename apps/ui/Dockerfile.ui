@@ -22,7 +22,16 @@ RUN pnpm build && \
     echo "unknown build output:" && find . -maxdepth 3 -type d | head -40 && exit 1; \
   fi
 
-FROM nginx:alpine
+# nginx-unprivileged, not nginx: the stock image starts as root to bind :80 and only
+# then drops to the `nginx` user, so a container escape starts from uid 0. This one runs
+# as uid 101 from PID 1 and listens on 8080 (see nginx.conf), which is also what lets
+# deploy/docker-compose.yml give it `read_only: true` and drop every capability —
+# without CAP_NET_BIND_SERVICE nothing can bind a privileged port anyway.
+FROM nginxinc/nginx-unprivileged:1.29-alpine
 COPY --from=builder /app/dist/client /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-EXPOSE 80
+EXPOSE 8080
+# busybox wget, not curl: the image ships no curl and adding one would mean a package
+# manager run as a non-root user.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1

@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Server-initiated liveness for agent sockets. An agent whose host vanished — NAT
@@ -544,6 +544,17 @@ async fn owned_step(
         return None;
     }
     Some(step)
+}
+
+/// What the step says when the server could not store one of its artifacts.
+///
+/// The name is the part the pipeline author needs — it says which `artifacts:` entry is
+/// missing. The cause is deliberately not here: this string is persisted as the step's
+/// `error` and any project `reader` can fetch it, and the cause is a backend or sqlx
+/// chain that can name a bucket, an endpoint or a database. That goes to the server log,
+/// the same split `ApiError::Internal` makes for HTTP responses.
+fn artifact_store_failure(rel: &str) -> String {
+    format!("artifact {rel} could not be stored; see the server log")
 }
 
 /// Like `owned_step`, but the lease must still be live. Used for artifacts (and,
@@ -1095,20 +1106,66 @@ async fn handle_agent(
                             &step_run_id.to_string(),
                             &rel.replace('/', "__"),
                         );
-                        match state.artifacts.put(&key, &bytes).await {
-                            Ok(stored_path) => {
-                                let _ = state
-                                    .store
-                                    .create_artifact(
-                                        step.run_id,
-                                        step_run_id,
-                                        &rel,
-                                        &stored_path,
-                                        bytes.len() as i64,
-                                    )
-                                    .await;
+                        // Storing it is part of the step, not a side effect of it: a
+                        // step whose artifacts were dropped is not a step that passed,
+                        // and its dependents would restore nothing and fail somewhere
+                        // else. This used to `warn!` and carry on, so a root-owned
+                        // artifact directory (or a full disk, or a dead bucket) lost
+                        // every artifact into the API's own log while every build stayed
+                        // green. The HTTP upload path already fails loudly.
+                        let stored = match state.artifacts.put(&key, &bytes).await {
+                            Ok(stored_path) => state
+                                .store
+                                .create_artifact(
+                                    step.run_id,
+                                    step_run_id,
+                                    &rel,
+                                    &stored_path,
+                                    bytes.len() as i64,
+                                )
+                                .await
+                                .map(|_| ()),
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = stored {
+                            let reason = artifact_store_failure(&rel);
+                            // `{e:#}` for the whole chain: the outer context alone is
+                            // "s3 put_object", which says nothing an operator can act on.
+                            error!(
+                                %step_run_id, %agent_id, artifact = %rel, error = format!("{e:#}"),
+                                "could not store an artifact; failing the step"
+                            );
+                            // The step is over for this socket either way.
+                            forget_step(&step_logs, step_run_id);
+                            match state
+                                .scheduler
+                                .on_step_complete(
+                                    agent_id,
+                                    step_run_id,
+                                    attempt,
+                                    StepStatus::Failed,
+                                    None,
+                                    Some(reason),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    // Tell the agent to stop, as the timeout backstop
+                                    // does. Without it the step keeps running while the
+                                    // server offers its next attempt — onto the same
+                                    // per-step workspace path, whose cleanup when the
+                                    // first process finally exits deletes the second
+                                    // attempt's checkout underneath it.
+                                    state
+                                        .scheduler
+                                        .cancel_step_on_agent(agent_id, step_run_id)
+                                        .await;
+                                    fill_agent(&state, agent_id, &tx).await;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, %step_run_id, "failing the step for an unstored artifact failed")
+                                }
                             }
-                            Err(e) => warn!(error = %e, %step_run_id, "artifact store failed"),
                         }
                     }
                 }
@@ -1383,6 +1440,22 @@ async fn handle_run_events(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_unstored_artifact_names_itself_without_leaking_its_cause() {
+        // The pipeline author needs to know which artifact is missing; the cause is the
+        // operator's and goes to the server log.
+        let reason = artifact_store_failure("dist/app.tgz");
+        assert!(reason.contains("dist/app.tgz"), "{reason}");
+        // The cause belongs in the server log: a reader of this project must not be
+        // handed a bucket name, an endpoint or a database error.
+        for leaked in ["Permission denied", "os error", "s3", "bucket", "database"] {
+            assert!(
+                !reason.to_ascii_lowercase().contains(leaked),
+                "{reason} leaks {leaked}"
+            );
+        }
+    }
 
     #[test]
     fn a_secret_that_cannot_be_decrypted_fails_the_step_rather_than_the_offer() {

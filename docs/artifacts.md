@@ -61,7 +61,17 @@ Presign uses a **separate SigV4 client** bound to the public endpoint (host rewr
 
 ### Compose
 
-`deploy/docker-compose.yml` enables MinIO for `fiber-api` by default (`FIBER_S3_*` + `depends_on: fiber-minio`). Host-run API: `make api-s3` after `make infra-minio`.
+`deploy/docker-compose.yml` uses the **local filesystem by default** — the `fiber_artifacts` volume — and keeps MinIO
+behind a Compose profile. To store artifacts in MinIO instead, set `FIBER_S3_BUCKET=fiber-artifacts` in
+`deploy/.env` and bring the stack up with the profile:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile minio up -d
+```
+
+Switching backends does not move existing blobs: each artifact row keeps the path it was written with, so
+artifacts stored under the other backend stop downloading until you switch back. Host-run API: `make api-s3`
+after `make infra-minio`.
 
 ### Local MinIO smoke
 

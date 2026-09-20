@@ -30,11 +30,10 @@ impl ArtifactBackend {
             .ok()
             .filter(|s| !s.is_empty());
         let Some(bucket) = bucket else {
-            tokio::fs::create_dir_all(artifacts_dir).await.ok();
+            let root = PathBuf::from(artifacts_dir);
+            ensure_writable(&root).await?;
             info!(%artifacts_dir, "artifact backend: local filesystem");
-            return Ok(Self::Local {
-                root: PathBuf::from(artifacts_dir),
-            });
+            return Ok(Self::Local { root });
         };
 
         let endpoint =
@@ -83,7 +82,46 @@ impl ArtifactBackend {
             bucket,
         })
     }
+}
 
+/// Prove the local artifact root is writable before the API reports itself ready.
+///
+/// `create_dir_all` succeeds on a directory that already exists whatever it is owned by,
+/// so an install whose artifact volume was created by the old root image boots green
+/// under uid 10001 and only finds out on the first upload — and the WebSocket upload
+/// path used to swallow that. One create-and-unlink at boot turns a silent, permanent
+/// loss of every artifact into a refusal to start, with the command that fixes it.
+async fn ensure_writable(root: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(root)
+        .await
+        .map_err(|e| unwritable(root, "create", &e))?;
+    let probe = root.join(format!(".fiber-write-probe-{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&probe, b"")
+        .await
+        .map_err(|e| unwritable(root, "write to", &e))?;
+    // Best effort: a probe file left by a crash between these two calls is harmless, and
+    // the next boot writes its own.
+    let _ = tokio::fs::remove_file(&probe).await;
+    Ok(())
+}
+
+/// The one line an operator gets when the artifact directory is not theirs to write.
+/// It has to carry the fix, because the reason is invisible from inside the container:
+/// the directory is there and looks fine, it just belongs to uid 0.
+fn unwritable(root: &Path, verb: &str, err: &std::io::Error) -> anyhow::Error {
+    anyhow!(
+        "cannot {verb} the artifact directory {} ({err}). fiber-api runs as uid 10001, \
+         and a directory created by an older root image has to be handed over once: \
+         `chown -R 10001:10001 <dir>` on the host, or for Compose `docker run --rm -v \
+         fiber_fiber_artifacts:/data/artifacts alpine chown -R 10001:10001 \
+         /data/artifacts`. See docs/operations.md#upgrades. Alternatively point \
+         FIBER_ARTIFACTS_DIR somewhere writable, or set FIBER_S3_BUCKET to store \
+         artifacts in object storage instead.",
+        root.display()
+    )
+}
+
+impl ArtifactBackend {
     pub fn object_key(run_id: &str, step_run_id: &str, name: &str) -> String {
         format!("artifacts/{run_id}/{step_run_id}/{name}")
     }
@@ -270,6 +308,46 @@ fn s3_key_from_stored(stored: &str, bucket: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fiber-artifacts-test-{name}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_writable_root_is_created_and_left_clean() {
+        let dir = scratch("writable");
+        ensure_writable(&dir).await.expect("fresh dir is writable");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "probe file left behind: {left:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_root_refuses_with_the_command_that_fixes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Mode bits do not stop uid 0, which is how this suite runs in some containers.
+        let enforced = std::fs::write(dir.join("root-check"), b"").is_err();
+        let err = ensure_writable(&dir).await.err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        if !enforced {
+            return;
+        }
+        let msg = err
+            .expect("a root-owned directory must fail the probe")
+            .to_string();
+        assert!(msg.contains("chown -R 10001:10001"), "{msg}");
+        assert!(msg.contains(&dir.display().to_string()), "{msg}");
+    }
 
     fn s3_backend(bucket: &str) -> ArtifactBackend {
         // Building a client performs no I/O, so the key helpers are testable offline.
