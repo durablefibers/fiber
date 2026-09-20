@@ -6,6 +6,22 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-09-20
+
+A big release: the September hardening audit's remaining phases, and the first one whose
+own artifacts can be verified.
+
+**Upgrade the API before the agents.** This release adds no migration, but it changes the
+agent wire protocol (`PROTOCOL_VERSION` 2) and the reference deployment's defaults — the
+Compose file now refuses to start without credentials of your own, and artifacts default
+to the local filesystem rather than MinIO. Read
+[operations](docs/operations.md#upgrades) before upgrading an existing install; a
+root-owned artifact volume needs one `chown`, and the API now refuses to boot rather than
+run green while losing every artifact it is handed.
+
+Security: `scripts/install-agent.sh` could be made to install an attacker's systemd unit
+as root. Nothing published shipped it. Details in the Security section below.
+
 ### Security
 
 - **The installer could be made to install an attacker's systemd unit as root.** Under the
@@ -68,6 +84,15 @@ minor versions may carry breaking changes.
   go through the "could not check" branch — `--insecure-skip-attestation` after a real
   failure, and `--tarball`.
 
+
+- **A `resync` frame on `/ws/runs/{id}`.** When a viewer falls behind the run's event
+  channel, the server now says so and keeps the socket instead of closing it. The run
+  page answers by refetching the selected step's log from the last line id it holds
+  (`after_id`) **and** re-reading the run, its steps and its artifacts — the same channel
+  carries the status transitions, so a gap could otherwise leave a finished run showing
+  as running until someone reloaded. It does the same after a reconnect. A client that
+  does not know the frame ignores it. See [api](docs/api.md#websockets).
+
 ### Changed
 
 - **`scripts/install-agent.sh` verifies instead of trusting.** `--version latest` is now
@@ -123,17 +148,6 @@ minor versions may carry breaking changes.
   socket under `/run/user/<uid>` as shipped. [configuration](docs/configuration.md) now
   documents the caveat and a `BindPaths=` drop-in next to the variable.
 
-### Added
-
-- **A `resync` frame on `/ws/runs/{id}`.** When a viewer falls behind the run's event
-  channel, the server now says so and keeps the socket instead of closing it. The run
-  page answers by refetching the selected step's log from the last line id it holds
-  (`after_id`) **and** re-reading the run, its steps and its artifacts — the same channel
-  carries the status transitions, so a gap could otherwise leave a finished run showing
-  as running until someone reloaded. It does the same after a reconnect. A client that
-  does not know the frame ignores it. See [api](docs/api.md#websockets).
-
-### Changed
 
 - **The run-event fan-out is per run.** Every `/ws/runs/{id}` subscriber used to sit on
   one process-wide 1024-slot broadcast, JSON-parse every event of every run to compare
