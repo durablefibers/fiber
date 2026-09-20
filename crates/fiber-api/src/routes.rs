@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fiber_core::{
     AddMemberRequest, CreateAgentRequest, CreatePipelineRequest, CreateProjectRequest,
-    CreateUserRequest, LoginRequest, ProjectRole, StartRunRequest, UpdateAgentRequest,
+    CreateUserRequest, LoginRequest, ProjectRole, StartRunRequest, StepRun, UpdateAgentRequest,
     UpdateMemberRequest, UpdatePipelineRequest, UpsertSecretRequest,
 };
 use hmac::{Hmac, KeyInit, Mac};
@@ -1126,7 +1126,7 @@ async fn agent_upload_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) || step.status != "running" {
+    if !agent_holds_attempt(&step, agent.id, attempt_header(&headers)) {
         return Err(ApiError::Unauthorized);
     }
     if body.len() as u64 > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -1163,10 +1163,35 @@ async fn agent_upload_artifact(
     })))
 }
 
+/// Whether an agent's artifact call is for a step it still holds, on the attempt it
+/// says. The WebSocket path checks all three; these routes checked only the first two,
+/// and a `step_run_id` is the same for every attempt — so an upload left over from an
+/// attempt the agent was disconnected through would land on the attempt that replaced
+/// it, where `create_artifact` upserts on `(step_run_id, name)` and the object key is
+/// deterministic: attempt 1's bytes silently replacing attempt 2's, for a dependent
+/// step to restore. `attempt` absent means an agent older than the field, checked as
+/// before.
+fn agent_holds_attempt(step: &StepRun, agent_id: Uuid, attempt: Option<i32>) -> bool {
+    step.agent_id == Some(agent_id)
+        && step.status == "running"
+        && fiber_scheduler::attempt_is_current(attempt, step.attempt)
+}
+
+/// The attempt an agent names on an artifact upload. Absent from older agents.
+fn attempt_header(headers: &HeaderMap) -> Option<i32> {
+    headers
+        .get("x-fiber-attempt")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+}
+
 #[derive(Deserialize)]
 struct PresignArtifactBody {
     path: String,
     size: u64,
+    /// The attempt the offer named; see [`agent_holds_attempt`].
+    #[serde(default)]
+    attempt: Option<i32>,
 }
 
 /// Ask for a direct S3 PUT URL when configured; otherwise `{ "mode": "proxy" }`.
@@ -1182,7 +1207,7 @@ async fn agent_presign_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) || step.status != "running" {
+    if !agent_holds_attempt(&step, agent.id, body.attempt) {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -1222,6 +1247,9 @@ struct CompleteArtifactBody {
     path: String,
     size: u64,
     stored_path: String,
+    /// The attempt the offer named; see [`agent_holds_attempt`].
+    #[serde(default)]
+    attempt: Option<i32>,
 }
 
 /// Register metadata after a successful direct (presigned) upload.
@@ -1237,7 +1265,7 @@ async fn agent_complete_artifact(
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    if step.agent_id != Some(agent.id) || step.status != "running" {
+    if !agent_holds_attempt(&step, agent.id, body.attempt) {
         return Err(ApiError::Unauthorized);
     }
     if body.size > crate::artifact_util::MAX_ARTIFACT_BYTES {
@@ -2153,7 +2181,6 @@ mod concurrency_funnel {
 
 #[cfg(test)]
 mod tests {
-
     //! Static audit of the router's own source. Convention 8 says every project-scoped
     //! handler goes through `access.rs`; a handler that resolves an id and proceeds
     //! without a role check is a security bug, not a style issue. Because the gate lives
@@ -2420,6 +2447,79 @@ mod tests {
         }
     }
     use super::*;
+
+    // --- artifact routes: the attempt is part of the authorisation -------------------
+
+    fn step_row(agent: Option<Uuid>, status: &str, attempt: i32) -> StepRun {
+        StepRun {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            step_id: "build".into(),
+            step_name: "build".into(),
+            status: status.into(),
+            image: None,
+            run_cmd: "true".into(),
+            labels: serde_json::json!([]),
+            needs: serde_json::json!([]),
+            retries: 0,
+            attempt,
+            agent_id: agent,
+            lease_expires_at: None,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn an_upload_for_an_earlier_attempt_is_refused() {
+        // The agent was disconnected through attempt 1, its upload kept retrying, and
+        // the step has since been re-leased as attempt 2. `create_artifact` upserts on
+        // (step_run_id, name) and the object key is the same, so accepting this would
+        // put attempt 1's bytes under attempt 2 for a dependent step to restore.
+        let agent = Uuid::new_v4();
+        let row = step_row(Some(agent), "running", 2);
+        assert!(!agent_holds_attempt(&row, agent, Some(1)));
+        assert!(agent_holds_attempt(&row, agent, Some(2)));
+    }
+
+    #[test]
+    fn an_upload_without_an_attempt_is_an_older_agent() {
+        let agent = Uuid::new_v4();
+        let row = step_row(Some(agent), "running", 2);
+        assert!(agent_holds_attempt(&row, agent, None));
+    }
+
+    #[test]
+    fn the_attempt_does_not_excuse_the_lease() {
+        let agent = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // Right attempt, wrong agent.
+        assert!(!agent_holds_attempt(
+            &step_row(Some(other), "running", 1),
+            agent,
+            Some(1)
+        ));
+        // Right agent and attempt, but the step is no longer running here.
+        for status in ["queued", "succeeded", "failed", "cancelled"] {
+            assert!(
+                !agent_holds_attempt(&step_row(Some(agent), status, 1), agent, Some(1)),
+                "{status} must not accept an upload"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attempt_header_is_parsed_and_optional() {
+        let mut h = HeaderMap::new();
+        assert_eq!(attempt_header(&h), None);
+        h.insert("x-fiber-attempt", HeaderValue::from_static("3"));
+        assert_eq!(attempt_header(&h), Some(3));
+        // Junk is not a claim about any attempt; treated as absent.
+        h.insert("x-fiber-attempt", HeaderValue::from_static("many"));
+        assert_eq!(attempt_header(&h), None);
+    }
 
     fn sign(secret: &str, body: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();

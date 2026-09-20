@@ -90,7 +90,8 @@ large install.
   `Goodbye`, and `Offer`, `LogChunk`, `Artifact` and `StepComplete` gain `attempt` — the
   server drops a message whose attempt is not the row's, so output an agent held through
   a reclaim cannot land on, or close, the attempt that replaced it — all backward
-  compatible. An agent with no `protocol_version` cancels its
+  compatible. The same attempt travels on the HTTP artifact routes as `X-Fiber-Attempt`
+  (upload) and an `attempt` body field (presign, complete). An agent with no `protocol_version` cancels its
   steps on any close, so the server requeues its steps on disconnect exactly as before;
   a new agent against a server that sends no `lease_secs` stops its steps on close as
   before. Only new-on-new keeps a step running through a reconnect — upgrade the API
@@ -98,6 +99,19 @@ large install.
 
 ### Fixed
 
+- **A step given up after a long outage no longer hangs its run.** The agent killed such
+  a step and said nothing, so the row stayed `running` under it and the first heartbeat
+  after reconnecting renewed the lease again — and every one after that. Nothing reported
+  it, no lease ever expired, and the run hung until the 60-minute step-timeout backstop
+  while the agent kept the concurrency slot. It now reports the attempt `failed` with
+  `lease lost while the agent was disconnected`; the server takes the report only if it
+  has not already reclaimed the step, and the step retries under its existing budget.
+- **An artifact upload can no longer overwrite a later attempt's.** The three HTTP agent
+  artifact routes checked the lease but not the attempt, and an upload retrying through
+  an outage could land after the step was re-leased — `artifacts` is unique on
+  `(step_run_id, name)` and the object key is deterministic, so the abandoned attempt's
+  bytes replaced the live one's for a dependent step to restore. They now carry the
+  attempt (`X-Fiber-Attempt`, or an `attempt` field) and refuse a stale one with `401`.
 - **A rotated token now requeues on the socket's own replica.** The heartbeat that finds
   the token invalid ends the session with an immediate requeue, so a rotation or delete
   no longer depends on the Redis fan-out reaching the replica that holds the socket.

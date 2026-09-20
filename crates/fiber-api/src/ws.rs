@@ -917,7 +917,13 @@ async fn handle_agent(
         }
     }
 
-    let _ = state.store.set_agent_online(agent_id, false).await;
+    // Presence belongs to the session that registered it. A socket that closed before
+    // Hello registered nothing — it is a reconnect racing its own predecessor, or a
+    // second process on the same token — and marking the agent offline from here would
+    // report the *live* session's agent as gone.
+    if agent_protocol.is_some() {
+        let _ = state.store.set_agent_online(agent_id, false).await;
+    }
     // A close is no longer the end of the agent's attempts: from protocol revision 1 it
     // keeps its steps running and renews their leases when it is back, so the rows are
     // left as they are and the reclaim loop requeues whatever expires. An older agent,
