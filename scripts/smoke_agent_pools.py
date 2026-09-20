@@ -14,6 +14,11 @@ import urllib.request
 # 18080 — which, when you are running a second API on another port to check a change,
 # is the old build, and the smoke passes without having tested anything you wrote.
 API = os.environ.get("FIBER_API_URL", "http://127.0.0.1:18080").rstrip("/")
+# The agent dials the same host over WebSocket. Derived, not hardcoded: a hardcoded
+# ws://127.0.0.1:18080 pointed the agents at whatever was on 18080 while the assertions
+# talked to $FIBER_API_URL, so in CI — or against a second API on another port — the
+# smoke tested two different servers and still passed.
+WS = API.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
 FAILS = 0
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -46,6 +51,41 @@ def check(name: str, cond: bool, detail: object = None) -> None:
         print(f"FAIL {name}: {detail}")
 
 
+def wait_online(token: str, agent_id: str, timeout: float = 30.0) -> bool:
+    """Poll until the API reports the agent online.
+
+    A fixed sleep here was a bet on how long registration takes: too short and the run
+    starts before any agent can take it (a flake that looks like a scheduling bug), too
+    long and every smoke pays for the worst case.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, agents = req("GET", "/api/agents", token=token)
+        if code == 200 and isinstance(agents, list):
+            if any(a.get("id") == agent_id and a.get("online") for a in agents):
+                return True
+        time.sleep(0.25)
+    return False
+
+
+def holds(predicate, seconds: float, interval: float = 0.5) -> tuple[bool, object]:
+    """Assert a *negative* — that something does not happen — by re-checking it.
+
+    `time.sleep(4); check(...)` samples once and calls the other 3.5 seconds proof. This
+    evaluates the invariant throughout the window and returns the first violation, so a
+    scoped agent that leases the wrong project's step for half a second is caught rather
+    than slept through.
+    """
+    deadline = time.time() + seconds
+    detail: object = None
+    while time.time() < deadline:
+        ok, detail = predicate()
+        if not ok:
+            return False, detail
+        time.sleep(interval)
+    return True, detail
+
+
 def wait_run(token: str, run_id: str, want: str, timeout: float = 45.0) -> dict:
     deadline = time.time() + timeout
     last = {}
@@ -67,7 +107,7 @@ def start_agent(token: str, name: str, log_path: str) -> subprocess.Popen:
     env.update(
         {
             "FIBER_AGENT_TOKEN": token,
-            "FIBER_API_URL": "ws://127.0.0.1:18080",
+            "FIBER_API_URL": WS,
             "FIBER_AGENT_USE_DOCKER": "false",
             "FIBER_AGENT_LABELS": "os=linux,pool=smoke",
             "FIBER_AGENT_NAME": name,
@@ -198,7 +238,7 @@ def main() -> int:
     time.sleep(0.5)
 
     proc = start_agent(scoped_tok, "scoped-a", "/tmp/fiber-agent-pool-scoped.log")
-    time.sleep(1.5)
+    check("scoped agent online", wait_online(admin, scoped_id), "never came online")
 
     code, run_a = req("POST", f"/api/pipelines/{pipe_a['id']}/runs", token=admin, body={})
     check("start run A", code in (200, 201) and "run" in run_a, run_a)
@@ -209,24 +249,30 @@ def main() -> int:
     code, run_b = req("POST", f"/api/pipelines/{pipe_b['id']}/runs", token=admin, body={})
     check("start run B", code in (200, 201) and "run" in run_b, run_b)
     rid_b = run_b.get("run", {}).get("id")
-    # Should stay pending/queued — scoped agent must not pick it up
-    time.sleep(4)
-    code, mid_b = req("GET", f"/api/runs/{rid_b}", token=admin)
-    mid_status = mid_b.get("status") or mid_b.get("run", {}).get("status")
-    check(
-        "scoped agent ignores project B",
-        code == 200 and mid_status in ("pending", "running"),
-        mid_b,
-    )
-    code, steps_b = req("GET", f"/api/runs/{rid_b}/steps", token=admin)
-    if isinstance(steps_b, dict) and "steps" in steps_b:
-        steps_b = steps_b["steps"]
-    step_statuses = [s.get("status") for s in steps_b] if isinstance(steps_b, list) else []
-    check(
-        "B steps still queued (not leased by scoped)",
-        all(s in ("queued", "pending") for s in step_statuses) and len(step_statuses) > 0,
-        step_statuses,
-    )
+
+    # Negative assertion: the only online agent is scoped to project A, so B's step must
+    # stay queued. The window covers more than one agent heartbeat (10 s is the offer
+    # interval; every offer point in between is also exercised), and a violation fails
+    # the instant it happens instead of after the window.
+    def b_untouched() -> tuple[bool, object]:
+        code, run = req("GET", f"/api/runs/{rid_b}", token=admin)
+        if code != 200:
+            return False, run
+        status = run.get("status") or run.get("run", {}).get("status")
+        if status not in ("pending", "running"):
+            return False, run
+        code, steps = req("GET", f"/api/runs/{rid_b}/steps", token=admin)
+        if isinstance(steps, dict) and "steps" in steps:
+            steps = steps["steps"]
+        statuses = [s.get("status") for s in steps] if isinstance(steps, list) else []
+        if not statuses:
+            return False, "run B has no steps"
+        if not all(s in ("queued", "pending") for s in statuses):
+            return False, statuses
+        return True, statuses
+
+    ok, detail = holds(b_untouched, seconds=12.0)
+    check("scoped agent ignores project B for a full offer cycle", ok, detail)
 
     # Global agent finishes B
     code, glob = req(
@@ -245,7 +291,11 @@ def main() -> int:
         glob,
     )
     glob_proc = start_agent(glob["token"], "global-pool", "/tmp/fiber-agent-pool-global.log")
-    time.sleep(1.5)
+    check(
+        "global agent online",
+        wait_online(admin, glob["agent"]["id"]),
+        "never came online",
+    )
     finished_b = wait_run(admin, rid_b, "succeeded", timeout=30)
     b_status = finished_b.get("status") or finished_b.get("run", {}).get("status")
     check("global agent runs project B", b_status == "succeeded", finished_b)

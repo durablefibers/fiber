@@ -26,12 +26,22 @@ updates:
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
+  # Every `uses:` in both workflows is pinned to a commit SHA with the tag in a trailing
+  # comment. This is what moves the SHA and the comment together — without it the pins
+  # freeze and we stop getting security fixes for the actions themselves.
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: monthly
+      interval: weekly
 
   - package-ecosystem: docker
     directory: /deploy
+    schedule:
+      interval: monthly
+
+  # apps/ui/Dockerfile.ui was outside every ecosystem, so `node:22-alpine` and
+  # `nginx:alpine` in the image serving the UI were the only base images nothing watched.
+  - package-ecosystem: docker
+    directory: /apps/ui
     schedule:
       interval: monthly

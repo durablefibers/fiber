@@ -2,6 +2,7 @@
   "name": "ui",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.34.5",
   "scripts": {
     "dev": "vite dev --host 127.0.0.1 --port 3100",
     "build": "vite build",
