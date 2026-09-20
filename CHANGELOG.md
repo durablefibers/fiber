@@ -39,6 +39,43 @@ large install.
 
 ### Changed
 
+- **Log ingest is batched end to end.** A line cost two Postgres round trips and an
+  awaited Redis publish, serially, inside the agent socket's read loop: a 100 000-line
+  build was 200 000 statements, and a single socket topped out at a few hundred lines a
+  second. The agent now coalesces output into a new `log_batch` message — flushed at
+  50 ms, 64 KB or 500 lines, whichever comes first — and the server stores a batch with
+  one `INSERT ... SELECT FROM UNNEST(...)` and publishes one `fiber:events` message for
+  it. The `owned_step` lookup and the per-attempt line counter are cached per
+  `(socket, step_run_id, attempt)` and dropped when the step completes or is cancelled;
+  the counter map used to grow for the life of the socket. Measured on a throwaway
+  database with a 50 000-line step: **122–609 lines/s before, 6 000–10 200 after**, and
+  **2.0 Postgres transactions per line before, 0.005–0.011 after**. `log_chunk` is still
+  accepted and takes the same path, so an agent that has not been upgraded is unaffected;
+  `PROTOCOL_VERSION` is now `2`.
+- **A byte that is not UTF-8 no longer ends a step's log.** The agent read output with a
+  line reader that returned `InvalidData` on the first such byte, and the loop around it
+  treated that as end-of-stream: one Latin-1 filename in an `ls` listing dropped the
+  pipe, the child got SIGPIPE on its next write, and the step ended at exit 141 with an
+  empty log. Output is now read as bytes and decoded lossily, and a line longer than
+  64 KiB is cut with a visible `…[truncated]` marker instead of becoming a WebSocket
+  frame past tungstenite's 64 MiB limit — which closed the socket and took every other
+  step on that agent with it. The server caps each line at 64 KiB as well, before the
+  insert and before the publish, since it cannot assume the agent did.
+- **A step that outruns the control plane is made to wait, not truncated.** Output now
+  crosses a bounded channel between the pipes and the batcher, and the batcher waits for
+  room in the outbox while a session is up, so back-pressure reaches the step's own
+  `write`. Before, a 50 000-line step reached the database as 10 008 lines with no
+  indication the other 40 000 had existed; it now arrives whole. With the socket down
+  nothing has changed in kind — the outbox still drops its oldest lines, now bounded by
+  bytes (8 MB) as well as lines (10 000), and still says how many went.
+  `log_lines` still has no unique key: a message re-sent after a session ended mid-flush
+  is stored twice, as before — at most one message per interrupted session, but now up to
+  500 lines of it rather than one. The lines keep their original `seq`.
+- **The run event stream carries `log_batch`.** One event per batch rather than per line,
+  which is also one slot of the 1024-slot broadcast rather than five hundred. `log` is
+  still forwarded, so a replica running the older code during a rolling deploy keeps
+  feeding open run pages, and `RunEvent::Log` now carries the `attempt` it belongs to.
+
 - **An agent fills every free slot in one heartbeat.** Offers were made one per
   heartbeat, so a concurrency-4 agent took forty seconds to fill and a new step waited up
   to ten with idle capacity beside it. Every offer point (`Hello`, heartbeat, step

@@ -6,8 +6,10 @@ use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use fiber_core::models::StepRun;
+use fiber_proto::limits::truncate_log_line;
 use fiber_proto::{
-    AgentMessage, ArtifactRestore, RunEvent, ServerMessage, StepStatus, WorkspaceOffer,
+    AgentMessage, ArtifactRestore, LogEventLine, LogLineWire, RunEvent, ServerMessage, StepStatus,
+    WorkspaceOffer,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -564,6 +566,164 @@ async fn leased_step(
     Some(step)
 }
 
+/// What one agent socket remembers about one attempt of one step, for the log path.
+///
+/// Both halves used to cost a query per line: `owned_step` was a `SELECT` on every
+/// `LogChunk`, and the line cap was seeded from `count_log_lines`. Neither answer can
+/// change under a live socket — an attempt is reclaimed only when its lease expires,
+/// which needs `LEASE_SECS` without a heartbeat, and this socket is closed after 45 s
+/// without a frame — so the socket resolves each `(step_run_id, attempt)` once.
+///
+/// Dropped on `StepComplete` and when a `Cancel` goes out to this agent, and with the
+/// socket. The map used to be the line counter alone and was never pruned, so a
+/// long-lived agent accumulated an entry per step it had ever run.
+#[derive(Debug)]
+struct StepLog {
+    run_id: Uuid,
+    /// Lines already stored for this attempt, including by an earlier session: the cap
+    /// is per attempt, not per socket.
+    stored: u64,
+}
+
+/// Shared with the socket's writer, which is where an outgoing `Cancel` is seen.
+type StepLogs = std::sync::Arc<std::sync::Mutex<HashMap<(Uuid, i32), StepLog>>>;
+
+fn forget_step(logs: &StepLogs, step_run_id: Uuid) {
+    if let Ok(mut m) = logs.lock() {
+        m.retain(|(s, _), _| *s != step_run_id);
+    }
+}
+
+/// Which lines of a batch to store, and what the attempt's count becomes.
+///
+/// A runaway step could otherwise write until the disk filled. Past the cap the lines are
+/// dropped, with one line saying so — silence would look like the step stopped producing
+/// output. Every line is also cut to `MAX_LOG_LINE_BYTES`: the agent caps its own, but a
+/// hostile or old one does not, and a 60 MB line is a 60 MB row and a 60 MB broadcast.
+fn plan_log_batch(lines: Vec<LogLineWire>, stored: u64, cap: u64) -> (Vec<LogLineWire>, u64) {
+    let mut seen = stored;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        seen += 1;
+        if seen > cap {
+            continue;
+        }
+        if seen == cap {
+            out.push(LogLineWire {
+                stream: "system".into(),
+                data: format!(
+                    "log truncated at {cap} lines for this attempt \
+                     (FIBER_STEP_LOG_MAX_LINES); the step is still running"
+                ),
+                seq: line.seq,
+            });
+            continue;
+        }
+        out.push(LogLineWire {
+            stream: line.stream,
+            data: truncate_log_line(&line.data).into_owned(),
+            seq: line.seq,
+        });
+    }
+    (out, seen)
+}
+
+/// Store one batch of a step's output and publish it once.
+///
+/// `LogChunk` from an older agent comes through here as a batch of one, so there is a
+/// single ingest path whatever the agent speaks.
+async fn ingest_log_batch(
+    state: &AppState,
+    logs: &StepLogs,
+    agent_id: Uuid,
+    step_run_id: Uuid,
+    attempt: Option<i32>,
+    lines: Vec<LogLineWire>,
+    cap: u64,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    // A cached entry is only ever reached with the attempt named, so a message from an
+    // agent older than the `attempt` field takes the `owned_step` path every time — the
+    // row is the only thing that can say which attempt it meant.
+    let cached = attempt.and_then(|a| {
+        logs.lock()
+            .ok()
+            .and_then(|m| m.get(&(step_run_id, a)).map(|e| (a, e.run_id, e.stored)))
+    });
+    let (row_attempt, run_id, stored) = match cached {
+        Some(hit) => hit,
+        None => {
+            let Some(step) = owned_step(state, agent_id, step_run_id, attempt).await else {
+                return;
+            };
+            let key = (step_run_id, step.attempt);
+            let known = logs.lock().ok().and_then(|m| m.get(&key).map(|e| e.stored));
+            let stored = match known {
+                Some(n) => n,
+                None => state
+                    .store
+                    .count_log_lines(step_run_id, step.attempt)
+                    .await
+                    .map(|n| u64::try_from(n).unwrap_or(0))
+                    .unwrap_or(0),
+            };
+            if let Ok(mut m) = logs.lock() {
+                m.entry(key).or_insert(StepLog {
+                    run_id: step.run_id,
+                    stored,
+                });
+            }
+            (step.attempt, step.run_id, stored)
+        }
+    };
+
+    let (to_store, seen) = plan_log_batch(lines, stored, cap);
+    // Spent whether or not the insert lands: a failing insert retried by the agent must
+    // not get a fresh budget.
+    if let Ok(mut m) = logs.lock()
+        && let Some(e) = m.get_mut(&(step_run_id, row_attempt))
+    {
+        e.stored = seen;
+    }
+    if to_store.is_empty() {
+        return;
+    }
+    let rows = match state
+        .store
+        .append_logs(run_id, step_run_id, row_attempt, &to_store)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, %step_run_id, "storing step output failed");
+            return;
+        }
+    };
+    // One event for the batch, not one per line: the run-event bus is a 1024-slot
+    // broadcast shared by every viewer of every run, and a chatty step used to spend a
+    // slot — and a Redis round trip — per line.
+    let ev = RunEvent::LogBatch {
+        run_id,
+        step_run_id,
+        attempt: Some(row_attempt),
+        lines: rows
+            .into_iter()
+            .map(|r| LogEventLine {
+                id: r.id,
+                stream: r.stream,
+                data: r.data,
+                seq: r.seq.max(0) as u64,
+                at: r.created_at,
+            })
+            .collect(),
+    };
+    if let Ok(payload) = serde_json::to_string(&ev) {
+        state.scheduler.publish_event(&payload).await;
+    }
+}
+
 /// `agent_id` is bound once from the authenticated token and never rebound from a
 /// client-supplied field: an agent may only ever act as itself.
 async fn handle_agent(
@@ -599,10 +759,17 @@ async fn handle_agent(
         .register_connection(agent_id, tx.clone())
         .await;
 
+    // Lines already stored per (step, attempt), and the step's run, so the cap and the
+    // ownership check cost a counter rather than two queries on every line. Shared with
+    // the writer because a `Cancel` reaches the agent through it, and a cancelled step
+    // may be requeued and leased back to this same agent as a new attempt.
+    let step_logs: StepLogs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     // The writer owns the sink: scheduler messages, the liveness pings, and — last —
     // the Close frame this side sends when it ends the session, so the agent learns
     // why instead of seeing a reset.
     let (close_tx, mut close_rx) = oneshot::channel::<CloseFrame>();
+    let writer_logs = std::sync::Arc::clone(&step_logs);
     let mut writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(AGENT_PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -611,6 +778,9 @@ async fn handle_agent(
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
+                    if let ServerMessage::Cancel { step_run_id } = &msg {
+                        forget_step(&writer_logs, *step_run_id);
+                    }
                     let Ok(text) = serde_json::to_string(&msg) else {
                         continue;
                     };
@@ -635,12 +805,6 @@ async fn handle_agent(
 
     // Log a spoofed agent_id once per session, not once per log line.
     let mut spoof_logged = false;
-    // Lines already stored per (step, attempt), so the cap costs a counter rather than a
-    // `SELECT COUNT(*)` on every line. Seeded from the table on the first line a session
-    // sees for an attempt: an agent that reconnects mid-attempt continues the count it
-    // left, rather than getting a fresh budget per socket. A retry is a new attempt with
-    // its own budget.
-    let mut logged: HashMap<(Uuid, i32), u64> = HashMap::new();
     // Set when this side ends the session because the token no longer authorises the
     // agent: its steps are requeued at once, whatever it declared in Hello.
     let mut revoked = false;
@@ -767,6 +931,8 @@ async fn handle_agent(
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
             }
+            // An agent older than `LogBatch` sends one of these per line. Same path,
+            // batch of one: the ingest rules must not depend on the agent's revision.
             AgentMessage::LogChunk {
                 agent_id: claimed,
                 step_run_id,
@@ -776,62 +942,38 @@ async fn handle_agent(
                 attempt,
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
-                if let Some(step) = owned_step(&state, agent_id, step_run_id, attempt).await {
-                    // A runaway step could otherwise write until the disk filled. Past the
-                    // cap the lines are dropped, with one line saying so — silence would
-                    // look like the step stopped producing output.
-                    // One attempt now spans sessions, so the count for a key this
-                    // session has not seen starts from what the attempt already wrote.
-                    let key = (step_run_id, step.attempt);
-                    if let std::collections::hash_map::Entry::Vacant(slot) = logged.entry(key) {
-                        let stored = state
-                            .store
-                            .count_log_lines(step_run_id, step.attempt)
-                            .await
-                            .map(|n| u64::try_from(n).unwrap_or(0))
-                            .unwrap_or(0);
-                        slot.insert(stored);
-                    }
-                    let seen = logged.entry(key).or_insert(0);
-                    *seen += 1;
-                    let (data, stream_name) = if *seen > log_cap {
-                        continue;
-                    } else if *seen == log_cap {
-                        (
-                            format!(
-                                "log truncated at {log_cap} lines for this attempt \
-                                 (FIBER_STEP_LOG_MAX_LINES); the step is still running"
-                            ),
-                            "system".to_string(),
-                        )
-                    } else {
-                        (data, stream_name)
-                    };
-                    if let Ok(line) = state
-                        .store
-                        .append_log(
-                            step.run_id,
-                            step_run_id,
-                            &stream_name,
-                            &data,
-                            seq,
-                            step.attempt,
-                        )
-                        .await
-                    {
-                        let ev = RunEvent::Log {
-                            run_id: step.run_id,
-                            step_run_id,
-                            stream: stream_name,
-                            data,
-                            seq,
-                            at: line.created_at,
-                        };
-                        if let Ok(payload) = serde_json::to_string(&ev) {
-                            state.scheduler.publish_event(&payload).await;
-                        }
-                    }
-                }
+                ingest_log_batch(
+                    &state,
+                    &step_logs,
+                    agent_id,
+                    step_run_id,
+                    attempt,
+                    vec![LogLineWire {
+                        stream: stream_name,
+                        data,
+                        seq,
+                    }],
+                    log_cap,
+                )
+                .await;
+            }
+            AgentMessage::LogBatch {
+                agent_id: claimed,
+                step_run_id,
+                attempt,
+                lines,
+            } => {
+                warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                ingest_log_batch(
+                    &state,
+                    &step_logs,
+                    agent_id,
+                    step_run_id,
+                    attempt,
+                    lines,
+                    log_cap,
+                )
+                .await;
             }
             AgentMessage::Artifact {
                 agent_id: claimed,
@@ -894,6 +1036,10 @@ async fn handle_agent(
                 attempt,
             } => {
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
+                // The step is over for this agent: nothing more of its output can be
+                // admitted under the cached attempt, and an agent that runs thousands of
+                // steps would otherwise keep an entry for every one of them.
+                forget_step(&step_logs, step_run_id);
                 // on_step_complete additionally rejects completions for steps not leased
                 // to agent_id, or reporting on an attempt the row has moved past.
                 match state
@@ -1133,6 +1279,7 @@ async fn handle_run_events(
                                 RunEvent::RunUpdated { run_id: rid, .. } => *rid == run_id,
                                 RunEvent::StepUpdated { run_id: rid, .. } => *rid == run_id,
                                 RunEvent::Log { run_id: rid, .. } => *rid == run_id,
+                                RunEvent::LogBatch { run_id: rid, .. } => *rid == run_id,
                             };
                             if matches && !send_bounded(&mut sink, payload).await {
                                 break;
@@ -1182,6 +1329,109 @@ mod tests {
         ));
         let db = anyhow::anyhow!("connection reset by peer");
         assert!(matches!(OfferError::from(db), OfferError::Transient(_)));
+    }
+
+    fn wire(seq: u64, data: &str) -> LogLineWire {
+        LogLineWire {
+            stream: "stdout".into(),
+            data: data.into(),
+            seq,
+        }
+    }
+
+    #[test]
+    fn a_batch_keeps_its_lines_in_order_with_their_own_seq() {
+        let lines = (0..4).map(|i| wire(10 + i, "x")).collect();
+        let (out, seen) = plan_log_batch(lines, 0, 1_000);
+        assert_eq!(
+            out.iter().map(|l| l.seq).collect::<Vec<_>>(),
+            vec![10, 11, 12, 13],
+            "the agent numbers the lines; the server stores what it was given"
+        );
+        assert_eq!(seen, 4);
+        assert!(out.iter().all(|l| l.stream == "stdout"));
+    }
+
+    #[test]
+    fn a_line_past_the_wire_cap_is_cut_before_it_is_stored() {
+        // A hostile or old agent does not cap its own lines, and a 60 MB line is a 60 MB
+        // row and a 60 MB broadcast payload.
+        let huge = "a".repeat(fiber_proto::limits::MAX_LOG_LINE_BYTES * 2);
+        let (out, _) = plan_log_batch(vec![wire(0, &huge)], 0, 1_000);
+        assert_eq!(out[0].data.len(), fiber_proto::limits::MAX_LOG_LINE_BYTES);
+        assert!(
+            out[0]
+                .data
+                .ends_with(fiber_proto::limits::TRUNCATION_MARKER)
+        );
+    }
+
+    #[test]
+    fn the_line_cap_is_counted_across_the_batch_and_says_so_once() {
+        // The cap is per attempt, and a batch may cross it in the middle. The line *at*
+        // the cap becomes the notice; everything after it is dropped silently.
+        let lines = (0..10).map(|i| wire(i, "out")).collect();
+        let (out, seen) = plan_log_batch(lines, 0, 5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[4].stream, "system");
+        assert!(
+            out[4].data.contains("FIBER_STEP_LOG_MAX_LINES"),
+            "{:?}",
+            out[4]
+        );
+        assert!(out[..4].iter().all(|l| l.data == "out"));
+        // The counter keeps climbing past the cap so a later batch is not readmitted.
+        assert_eq!(seen, 10);
+        let (later, _) = plan_log_batch(vec![wire(99, "more")], seen, 5);
+        assert!(later.is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_starts_at_the_cap_stores_nothing() {
+        let (out, seen) = plan_log_batch(vec![wire(0, "x"), wire(1, "y")], 50_000, 50_000);
+        assert!(out.is_empty());
+        assert_eq!(seen, 50_002);
+    }
+
+    #[test]
+    fn the_step_log_cache_is_keyed_by_attempt_and_pruned_by_step() {
+        // The count and the ownership answer are per attempt: a retry is a new attempt
+        // with its own budget, and must never read the previous attempt's counter.
+        let logs: StepLogs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let step = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        {
+            let mut m = logs.lock().unwrap();
+            m.insert(
+                (step, 1),
+                StepLog {
+                    run_id: run,
+                    stored: 7,
+                },
+            );
+            m.insert(
+                (step, 2),
+                StepLog {
+                    run_id: run,
+                    stored: 0,
+                },
+            );
+            m.insert(
+                (other, 1),
+                StepLog {
+                    run_id: run,
+                    stored: 3,
+                },
+            );
+        }
+        assert_eq!(logs.lock().unwrap()[&(step, 2)].stored, 0);
+        // StepComplete (and an outgoing Cancel) drop every attempt of that step, and
+        // nothing else: the map used to grow for the life of the socket.
+        forget_step(&logs, step);
+        let m = logs.lock().unwrap();
+        assert!(m.keys().all(|(s, _)| *s == other));
+        assert_eq!(m.len(), 1);
     }
 
     #[test]

@@ -100,7 +100,7 @@ than the field) and checked as before.
 | Path | Auth | Notes |
 |---|---|---|
 | `/ws/agent` | `Authorization: Bearer <agent token>` | Hello, Offer, logs, complete. Identity is bound from the token; `agent_id` fields in messages are ignored, and log / artifact / complete messages are accepted only for steps leased to that agent |
-| `/ws/runs/{id}` | `Sec-WebSocket-Protocol: fiber.token.<session token>` | Live run/step/log events. The server echoes the protocol to complete the handshake |
+| `/ws/runs/{id}` | `Sec-WebSocket-Protocol: fiber.token.<session token>` | Live run/step/log events (`run_updated`, `step_updated`, `log_batch`, and `log` from a replica older than the batch). The server echoes the protocol to complete the handshake |
 
 `/ws/agent` still accepts `?token=`, so an agent older than the server keeps working, but
 the query string is deprecated: a URL ends up in proxy and server access logs and a token

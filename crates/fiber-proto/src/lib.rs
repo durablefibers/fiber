@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod limits;
 pub mod validate;
 
 /// The agent protocol revision this crate speaks. An agent sends it in `Hello`; a server
@@ -13,7 +14,12 @@ pub mod validate;
 /// - `1` — the agent keeps its step tasks and its outbound queue across sessions, resumes
 ///   heartbeats (lease renewal) after a reconnect, sends `Goodbye` before a deliberate
 ///   exit, and reads `lease_secs` from `Welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// - `2` — the agent coalesces step output into [`AgentMessage::LogBatch`] instead of one
+///   `LogChunk` per line, and caps each line at [`limits::MAX_LOG_LINE_BYTES`]. It still
+///   accepts everything revision 1 did; a server that does not know `LogBatch` would
+///   answer `Error { "invalid message" }` and lose the output, which is why the revision
+///   is on the wire even though nothing gates on it yet.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,6 +232,19 @@ pub struct ArtifactRestore {
     pub size: u64,
 }
 
+/// One line of step output inside a [`AgentMessage::LogBatch`].
+///
+/// `stream` is `stdout`, `stderr` or `system`; `seq` is assigned by the agent and counts
+/// from zero per attempt across all three, so a viewer can interleave them in emission
+/// order. Batching does not renumber anything: a line carries the `seq` it was given when
+/// it was read, whichever batch it ends up in and however many times that batch is sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLineWire {
+    pub stream: String,
+    pub data: String,
+    pub seq: u64,
+}
+
 /// Messages from an agent to `fiber-api` over `/ws/agent`.
 ///
 /// The `agent_id` fields are informational only: the server binds the agent's identity
@@ -262,6 +281,26 @@ pub enum AgentMessage {
         /// line whose attempt is not the row's; absent (older agents) it is not checked.
         #[serde(default)]
         attempt: Option<i32>,
+    },
+    /// Several lines of one step's output in one message.
+    ///
+    /// The agent coalesces output rather than sending a frame per line: the server turns a
+    /// batch into one multi-row insert and one event, where per-line ingest cost two
+    /// database round trips and a publish each. `LogChunk` stays accepted — an agent older
+    /// than this variant never sends a batch, and a batch is exactly what a sequence of
+    /// chunks was, so nothing about ordering or `seq` changes.
+    ///
+    /// Empty batches are legal and do nothing. A batch is one unit for the outbox: it is
+    /// re-sent whole after a reconnect, so the server's duplicate handling sees the same
+    /// `(step_run_id, attempt, seq)` lines it would have seen as chunks.
+    LogBatch {
+        agent_id: Uuid,
+        step_run_id: Uuid,
+        /// As on `LogChunk`: the attempt these lines belong to, echoed from the `Offer`.
+        #[serde(default)]
+        attempt: Option<i32>,
+        #[serde(default)]
+        lines: Vec<LogLineWire>,
     },
     /// Legacy WS base64 upload. Prefer HTTP: presign PUT to S3 when available,
     /// else `PUT /api/agent/steps/.../artifacts`.
@@ -372,6 +411,8 @@ pub enum RunEvent {
         step_id: String,
         status: StepStatus,
     },
+    /// One stored line. Still published by a replica older than `LogBatch`, so the run
+    /// stream keeps forwarding it through a rolling deploy.
     Log {
         run_id: Uuid,
         step_run_id: Uuid,
@@ -379,7 +420,34 @@ pub enum RunEvent {
         data: String,
         seq: u64,
         at: DateTime<Utc>,
+        /// Which attempt produced the line. Absent from an older replica; a viewer that
+        /// cannot tell is showing the newest attempt, which is what it used to assume.
+        #[serde(default)]
+        attempt: Option<i32>,
     },
+    /// The lines one `LogBatch` stored, in the order they were stored.
+    ///
+    /// One event per batch rather than per line: the run-event bus is a 1024-slot
+    /// broadcast shared by every viewer of every run, and a chatty step used to spend a
+    /// slot per line. A consumer that does not know this variant ignores the frame.
+    LogBatch {
+        run_id: Uuid,
+        step_run_id: Uuid,
+        #[serde(default)]
+        attempt: Option<i32>,
+        lines: Vec<LogEventLine>,
+    },
+}
+
+/// One line inside [`RunEvent::LogBatch`], as stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEventLine {
+    /// `log_lines.id`, so a viewer can resume with `after_id` from what it has seen.
+    pub id: i64,
+    pub stream: String,
+    pub data: String,
+    pub seq: u64,
+    pub at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -608,6 +676,97 @@ mod tests {
         assert_eq!(shell, None);
         assert!(artifacts.is_empty());
         assert!(restore.is_empty());
+    }
+
+    #[test]
+    fn a_log_batch_round_trips_with_its_lines_in_order() {
+        let batch = AgentMessage::LogBatch {
+            agent_id: Uuid::nil(),
+            step_run_id: Uuid::nil(),
+            attempt: Some(2),
+            lines: (0..3)
+                .map(|i| LogLineWire {
+                    stream: "stdout".into(),
+                    data: format!("line {i}"),
+                    seq: 100 + i,
+                })
+                .collect(),
+        };
+        let text = serde_json::to_string(&batch).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["type"],
+            json!("log_batch")
+        );
+        let back: AgentMessage = serde_json::from_str(&text).unwrap();
+        let AgentMessage::LogBatch { attempt, lines, .. } = back else {
+            panic!("expected a batch");
+        };
+        assert_eq!(attempt, Some(2));
+        // Batching must not renumber: the seqs come back as they went in, in order.
+        assert_eq!(
+            lines.iter().map(|l| l.seq).collect::<Vec<_>>(),
+            vec![100, 101, 102]
+        );
+        assert_eq!(lines[1].data, "line 1");
+    }
+
+    #[test]
+    fn an_old_agent_still_speaks_log_chunk_to_a_new_server() {
+        // Revision 0/1 agents send one chunk per line and no `attempt`. The server has to
+        // keep parsing that exactly as before, or a deployed agent goes silent.
+        let v: AgentMessage = serde_json::from_value(json!({
+            "type": "log_chunk",
+            "agent_id": Uuid::nil(),
+            "step_run_id": Uuid::nil(),
+            "stream": "stdout",
+            "data": "hello",
+            "seq": 7,
+        }))
+        .unwrap();
+        let AgentMessage::LogChunk {
+            data, seq, attempt, ..
+        } = v
+        else {
+            panic!("expected a chunk");
+        };
+        assert_eq!((data.as_str(), seq, attempt), ("hello", 7, None));
+    }
+
+    #[test]
+    fn a_batch_without_lines_or_attempt_parses_as_empty() {
+        // `serde(default)` on both, so a peer that omits them is not a parse error.
+        let v: AgentMessage = serde_json::from_value(json!({
+            "type": "log_batch", "agent_id": Uuid::nil(), "step_run_id": Uuid::nil(),
+        }))
+        .unwrap();
+        assert!(matches!(
+            v,
+            AgentMessage::LogBatch {
+                attempt: None,
+                ref lines,
+                ..
+            } if lines.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_log_event_from_an_older_replica_has_no_attempt() {
+        let v: RunEvent = serde_json::from_value(json!({
+            "type": "log", "run_id": Uuid::nil(), "step_run_id": Uuid::nil(),
+            "stream": "stdout", "data": "x", "seq": 0, "at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert!(matches!(v, RunEvent::Log { attempt: None, .. }));
+        assert_eq!(
+            serde_json::to_value(RunEvent::LogBatch {
+                run_id: Uuid::nil(),
+                step_run_id: Uuid::nil(),
+                attempt: Some(1),
+                lines: vec![],
+            })
+            .unwrap()["type"],
+            json!("log_batch")
+        );
     }
 
     #[test]
