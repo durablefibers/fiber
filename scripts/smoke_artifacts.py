@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import os
-import shutil
 import time
 import urllib.error
 import urllib.request
@@ -64,7 +63,22 @@ def main() -> None:
     rid = run["run"]["id"]
     print("run", rid)
 
-    wiped = False
+    # This loop used to `rm -rf data/workspaces/<run_id>` as soon as the producing step
+    # reported success, to prove a later step restores its inputs rather than finding
+    # them lying around. It did not prove that, and it broke runs.
+    #
+    # It did not prove it because the agent already removes each step's workspace as
+    # that step finishes (`cleanup_workspace`), so the producer's output is gone from
+    # the disk without anyone's help; the external wipe only ever raced that GC. And it
+    # broke runs because the run directory also holds `.repo`, the reference clone every
+    # step fetches from and the working directory of whichever step is preparing right
+    # then — a dependent step is routinely already `running` by the time this poll sees
+    # the producer succeed, and it died with `fatal: unable to get current working
+    # directory`. It passed only by winning that race, so any change that shortens the
+    # gap between one step finishing and the next starting broke it.
+    #
+    # The property is asserted below instead, from facts that are true by the end of the
+    # run: no workspace survives it, and a consumer's log says it restored what it needed.
     status = "pending"
     for i in range(90):
         time.sleep(1.5)
@@ -73,19 +87,6 @@ def main() -> None:
         steps = run.get("steps") or req("GET", f"/api/runs/{rid}/steps", token=token)
         summary = " ".join(f"{s['step_id']}={s['status']}" for s in steps)
         print(f"t={i} run={status} {summary}")
-        build_ok = any(s["step_id"] == "build" and s["status"] == "succeeded" for s in steps)
-        if build_ok and not wiped:
-            w = os.path.join(WS_DIR, rid)
-            if os.path.isdir(w):
-                # The agent's own workspace GC releases this tree as the last step of
-                # the run leaves it, so a directory can vanish under the walk. That is
-                # the outcome this wants, not an error — but if anything is still there
-                # afterwards, remove it again and let a real failure raise.
-                shutil.rmtree(w, ignore_errors=True)
-                if os.path.isdir(w):
-                    shutil.rmtree(w)
-                print("WIPED workspace", w)
-            wiped = True
         if status in ("succeeded", "failed", "cancelled"):
             break
 
@@ -213,7 +214,12 @@ def main() -> None:
                 upload_hits += 1
     print(f"log_hits restore={restore_hits} upload={upload_hits}")
     assert upload_hits >= 2, "expected HTTP uploads from build/sign"
-    assert restore_hits >= 1, "expected at least one restore after workspace wipe"
+    # Nothing was left lying around for a consumer to pick up by accident: the agent
+    # releases the run's whole tree once its last step leaves.
+    run_ws = os.path.join(WS_DIR, rid)
+    assert not os.path.isdir(run_ws), f"run workspace survived the run: {run_ws}"
+    # And a consumer said it restored its inputs rather than finding them.
+    assert restore_hits >= 1, "expected at least one artifact restore"
 
     # Only on a pass: a failed smoke keeps its project, because the pipelines, runs and
     # logs inside it are the only record of what went wrong. Every assert above raises,

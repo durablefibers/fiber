@@ -1625,36 +1625,70 @@ impl Store {
         Ok((run, notify))
     }
 
-    pub async fn append_log(
+    /// Append many lines for one attempt of a step in a single statement.
+    ///
+    /// The per-line version cost a round trip each, and log ingest is by a wide margin
+    /// the busiest write in the system: a 100 000-line build was 100 000 inserts on the
+    /// agent socket's read loop, each one blocking the next message from that agent.
+    /// `UNNEST` turns a batch into one.
+    ///
+    /// Append-only, like every other write to this table. `log_lines` has no unique key,
+    /// so a batch the agent re-sends after a reconnect is stored twice — exactly as a
+    /// re-sent `LogChunk` was, and for the same reason: the alternative is a unique index
+    /// on `(step_run_id, attempt, seq)` that would cost more on every insert than
+    /// duplicate lines cost anyone reading them.
+    ///
+    /// Returns the stored rows in insertion order.
+    pub async fn append_logs(
         &self,
         run_id: Uuid,
         step_run_id: Uuid,
-        stream: &str,
-        data: &str,
-        seq: u64,
         attempt: i32,
-    ) -> Result<LogLine> {
-        Ok(sqlx::query_as::<_, LogLine>(
+        lines: &[fiber_proto::LogLineWire],
+    ) -> Result<Vec<LogLine>> {
+        if lines.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Borrowed, not cloned: a 500-line batch is up to 64 KB of `data`, and copying
+        // it into fresh `Vec<String>`s to hand to the driver doubled that for nothing.
+        let streams: Vec<&str> = lines.iter().map(|l| l.stream.as_str()).collect();
+        let data: Vec<&str> = lines.iter().map(|l| l.data.as_str()).collect();
+        let seqs: Vec<i64> = lines.iter().map(|l| l.seq as i64).collect();
+        let mut rows = sqlx::query_as::<_, LogLine>(
             "INSERT INTO log_lines (run_id, step_run_id, stream, data, seq, attempt)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             SELECT $1, $2, t.stream, t.data, t.seq, $3
+               FROM UNNEST($4::text[], $5::text[], $6::int8[])
+                 WITH ORDINALITY AS t(stream, data, seq, ord)
+              ORDER BY t.ord
              RETURNING id, run_id, step_run_id, stream, data, seq, created_at, attempt",
         )
         .bind(run_id)
         .bind(step_run_id)
-        .bind(stream)
-        .bind(data)
-        .bind(seq as i64)
         .bind(attempt)
-        .fetch_one(&self.pool)
-        .await?)
+        .bind(&streams)
+        .bind(&data)
+        .bind(&seqs)
+        .fetch_all(&self.pool)
+        .await?;
+        // `RETURNING` order is not promised by anything; `id` is, since the sequence is
+        // drawn in insertion order within the statement. Readers page by `id`.
+        rows.sort_unstable_by_key(|r| r.id);
+        Ok(rows)
     }
 
-    /// Log lines for a step, oldest first.
+    /// Log lines for a step, oldest first **by `id`**.
     ///
     /// With `after_id` this returns the lines following that id (for polling a live
     /// step); without it, the **last** `limit` lines, which is what a viewer opening a
     /// finished step wants. `attempt` narrows to one attempt — `seq` restarts per
     /// attempt, so a retried step's output would otherwise interleave.
+    ///
+    /// **The last element of a page is the highest `id` in it, and that is the cursor
+    /// every follower resumes from** (`fiber logs --follow`, the UI's poll). Sorting a
+    /// page by anything else breaks that contract silently: the cursor rewinds to the
+    /// last element's lower id and the next poll reprints everything after it. The
+    /// stored order is emission order because the agent assigns `seq` where a line is
+    /// read and sends system lines down the same channel as piped output.
     pub async fn list_logs(
         &self,
         step_run_id: Uuid,

@@ -39,7 +39,7 @@
 1. **Start run** — API snapshots the pipeline definition, creates `runs` + `step_runs` (compiled DAG, including matrix expansion).
 2. **Enqueue** — Scheduler marks root-ready steps `queued` and matches agent labels.
 3. **Offer / lease** — Connected agent receives `Offer` over WS (workspace, env, artifact restore list).
-4. **Execute** — Agent prepares git workspace, restores prior artifacts, runs shell or Docker, streams `LogChunk`.
+4. **Execute** — Agent prepares git workspace, restores prior artifacts, runs shell or Docker, streams output as `LogBatch` (coalesced at 50 ms / 64 KB / 500 lines; one multi-row insert and one `fiber:events` publish per batch). Older agents still send one `LogChunk` per line.
 5. **Complete** — Agent reports status; scheduler unlocks dependents or skips on failure (fail-fast).
 6. **Events** — Run/step/log updates publish on Redis `fiber:events` and to `/ws/runs/{id}` subscribers; agent-directed messages (cancel, disconnect) fan out on `fiber:agent_cmds` to whichever instance holds the agent's socket.
 
