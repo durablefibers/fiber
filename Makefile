@@ -1,9 +1,21 @@
-.PHONY: help infra infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy test test-rust test-ui \
+.PHONY: help infra infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny test test-rust test-ui \
 	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-s3 smoke-compose \
 	login validate ready
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
 ROOT := $(CURDIR)
+
+# THE gate, defined once. Both .github/workflows/ci.yml and .github/workflows/release.yml
+# run `make check`; nothing in either spells cargo out, so there is no second version of
+# the gate to drift from this one.
+#
+#  --workspace     all seven crates, including fiber-proto, which the old CI list and the
+#                  old Makefile list each managed to omit at different times
+#  --all-targets   lints tests, benches and examples, not just the libraries: a warning
+#                  in a #[cfg(test)] module used to pass locally and fail in CI
+#  --locked        refuses to silently rewrite Cargo.lock, so a Cargo.toml edit without
+#                  the matching lockfile fails at the gate instead of in `docker`
+CARGO_GATE_FLAGS := --workspace --all-targets --locked
 
 help:
 	@echo "Fiber DX targets:"
@@ -11,8 +23,11 @@ help:
 	@echo "  infra-minio   Also MinIO (19000 API / 19001 console)"
 	@echo "  down          Stop Compose services"
 	@echo "  build         cargo build workspace + fiber-cli"
-	@echo "  check         fmt --check + clippy -D warnings"
-	@echo "  test          cargo test --workspace + ui vitest"
+	@echo "  check         THE gate: fmt --check + clippy --workspace --all-targets --locked -D warnings"
+	@echo "  deny          cargo deny check (advisories, licences, sources) — needs cargo-deny"
+	@echo "  test          cargo test --workspace --locked + ui vitest"
+	@echo "  test-rust     cargo test --workspace --locked"
+	@echo "  test-ui       apps/ui vitest"
 	@echo "  images        Build fiber-api + fiber-agent container images"
 	@echo "  fmt           cargo fmt"
 	@echo "  clippy        cargo clippy"
@@ -25,10 +40,12 @@ help:
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
 	@echo "  smoke         authz + artifacts + concurrency + pools (needs an agent; pools kills them last)"
+	@echo "  smoke-authz / smoke-artifacts / smoke-concurrency / smoke-pools   one scenario each"
+	@echo "  smoke-s3      MinIO presign path (needs infra-minio + api-s3)"
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
-	@echo "CI:   .github/workflows/ci.yml (fmt + clippy + test + build; ui biome + tsc + vitest + build; docker build)"
+	@echo "CI:   .github/workflows/ci.yml — check (this make check), deny, ui, docker, smoke, smoke-host"
 
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis
@@ -40,7 +57,7 @@ down:
 	$(COMPOSE) down
 
 build:
-	cargo build -p fiber-api -p fiber-agent -p fiber-cli
+	cargo build --locked -p fiber-api -p fiber-agent -p fiber-cli
 
 images:
 	docker build -f deploy/Dockerfile --target fiber-api -t fiber-api:dev .
@@ -50,14 +67,20 @@ fmt:
 	cargo fmt
 
 clippy:
-	cargo clippy -p fiber-api -p fiber-agent -p fiber-cli -p fiber-core -p fiber-scheduler -p fiber-durable -- -D warnings
+	cargo clippy $(CARGO_GATE_FLAGS) -- -D warnings
 
 check: fmt-check clippy
+
+# Supply chain. Not folded into `check`: it downloads the RustSec advisory database, and
+# `make check` has to work offline. CI runs the same thing in the `deny` job.
+deny:
+	@command -v cargo-deny >/dev/null || { echo "cargo install cargo-deny --locked"; exit 1; }
+	cargo deny check
 
 test: test-rust test-ui
 
 test-rust:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 test-ui:
 	cd apps/ui && pnpm test
