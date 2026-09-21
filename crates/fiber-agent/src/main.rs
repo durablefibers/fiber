@@ -1,3 +1,4 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use fiber_proto::limits::{MAX_LOG_LINE_BYTES, MAX_RAW_LINE_BYTES, TRUNCATION_MARKER};
@@ -149,9 +150,10 @@ fn is_valid_env_key(k: &str) -> bool {
 #[derive(Clone)]
 struct ExecConfig {
     use_docker: bool,
-    /// `--label` on every step container, so the startup sweep can find this agent's
-    /// orphans without touching another agent's running containers.
-    container_label: String,
+    /// `--label`s on every step container: this agent, and this process of it. The
+    /// startup sweep uses them to find its own orphans without touching another agent's
+    /// running containers.
+    container_labels: ContainerLabels,
     env_passthrough: Vec<String>,
     docker_user: String,
     docker_network: String,
@@ -161,10 +163,10 @@ struct ExecConfig {
 }
 
 impl ExecConfig {
-    fn from_args(args: &Args) -> Self {
+    fn from_args(args: &Args, container_labels: ContainerLabels) -> Self {
         Self {
             use_docker: args.use_docker,
-            container_label: agent_container_label(&args.name),
+            container_labels,
             env_passthrough: args
                 .env_passthrough
                 .split(',')
@@ -281,9 +283,18 @@ fn json_escaped(value: &str) -> String {
 }
 
 /// Replaces every occurrence of a secret value in log output with `***`.
+///
+/// One Aho-Corasick automaton over every registered form, not a loop of `contains` per
+/// pattern: this runs on every log line of every step, and the pattern count is set by
+/// the project's secrets, not by us. Three 30-line PEM keys are 558 patterns — a
+/// per-pattern scan of a 64 KiB line is tens of milliseconds, which backpressures the log
+/// channel into the step's own pipes and slows the build. The automaton is O(line length)
+/// whatever the pattern count, and `LeftmostLongest` gives the "a secret containing
+/// another is masked whole" rule directly, where the old code got it by sorting patterns
+/// longest-first and hoping.
 #[derive(Clone, Default)]
 struct Redactor {
-    values: Vec<String>,
+    matcher: Option<Arc<AhoCorasick>>,
 }
 
 impl Redactor {
@@ -312,22 +323,50 @@ impl Redactor {
                 }
             }
         }
-        // Longest first, so a secret containing another is masked whole.
-        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        Self { values }
+        Self::from_patterns(values)
+    }
+
+    fn from_patterns(values: Vec<String>) -> Self {
+        if values.is_empty() {
+            return Self { matcher: None };
+        }
+        // `LeftmostLongest`: where two registered forms overlap at the same position, the
+        // longer one wins, so a secret that contains another is masked whole.
+        let matcher = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(&values);
+        match matcher {
+            Ok(m) => Self {
+                matcher: Some(Arc::new(m)),
+            },
+            // Refusing to redact would be worse than the cost of the fallback, and there
+            // is no fallback left — so say so loudly and mask nothing rather than
+            // pretending. In practice this cannot fail for literal patterns.
+            Err(e) => {
+                error!(error = %e, "could not build the log redactor; secrets will NOT be masked");
+                Self { matcher: None }
+            }
+        }
     }
 
     fn apply(&self, line: &str) -> String {
-        if self.values.is_empty() {
+        let Some(m) = &self.matcher else {
             return line.to_string();
-        }
-        let mut out = line.to_string();
-        for v in &self.values {
-            if out.contains(v.as_str()) {
-                out = out.replace(v.as_str(), "***");
-            }
-        }
+        };
+        // One replacement for every pattern, written by a closure rather than a vector of
+        // as many `"***"`s as there are patterns.
+        let mut out = String::with_capacity(line.len());
+        m.replace_all_with(line, &mut out, |_, _, dst| {
+            dst.push_str("***");
+            true
+        });
         out
+    }
+
+    /// Patterns registered, for tests.
+    #[cfg(test)]
+    fn pattern_count(&self) -> usize {
+        self.matcher.as_ref().map_or(0, |m| m.patterns_len())
     }
 }
 
@@ -1143,6 +1182,10 @@ struct AgentState {
     /// From the last `Welcome`. `None` until a server has said, or when the server is
     /// older than the field.
     lease_secs: Option<u64>,
+    /// Labels every step container of this process carries. Made once, in `main`, so
+    /// the boot id in them is the one the startup sweep excluded — a second set would
+    /// make a later sweep treat this process's own containers as a previous boot's.
+    container_labels: ContainerLabels,
     /// This agent's id, as the last `Welcome` gave it. Only informational on the wire
     /// (the server binds identity from the token), but a report the agent synthesises
     /// still carries it so it does not read as spoofed.
@@ -1160,8 +1203,9 @@ struct AgentState {
 }
 
 impl AgentState {
-    fn new(concurrency: u32) -> Self {
+    fn new(concurrency: u32, container_labels: ContainerLabels) -> Self {
         Self {
+            container_labels,
             slots: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1) as usize)),
             outbound: Outbound::new(),
             prepared: Arc::new(Mutex::new(HashSet::new())),
@@ -1376,8 +1420,11 @@ async fn main() -> Result<()> {
     info!(workspace_dir = %args.workspace_dir.display(), "workspace root");
     // Anything left from a previous process (crash, kill -9) is nobody's to finish.
     sweep_stale_workspaces(&args.workspace_dir, args.workspace_ttl_hours).await;
+    // One set for the life of the process: the sweep below excludes this boot id, and
+    // every container started from here carries it.
+    let container_labels = ContainerLabels::new(&args.name);
     if args.use_docker {
-        sweep_orphaned_containers(&agent_container_label(&args.name)).await;
+        sweep_orphaned_containers(&container_labels, &args.name).await;
     }
     let labels: Vec<String> = args
         .labels
@@ -1394,7 +1441,7 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let mut st = AgentState::new(args.concurrency);
+    let mut st = AgentState::new(args.concurrency, container_labels);
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
@@ -1798,7 +1845,7 @@ async fn run_session(
                                 // The attempt's clock starts now, not when a local permit frees up.
                                 let offered_at = tokio::time::Instant::now();
                                 let redactor = Redactor::new(&env, &secret_keys);
-                                let exec = ExecConfig::from_args(args);
+                                let exec = ExecConfig::from_args(args, st.container_labels.clone());
                                 in_flight.fetch_add(1, Ordering::SeqCst);
                                 let workspaces = Arc::clone(&st.workspaces);
                                 tokio::spawn(async move {
@@ -2079,7 +2126,6 @@ async fn execute_step_inner(
     let log_lines_tx: Arc<Mutex<Option<mpsc::Sender<RawLine>>>> = Arc::new(Mutex::new(None));
     let closure_tx = Arc::clone(&log_lines_tx);
     let mut log = |stream: &str, data: String| {
-        let data = log_redactor.apply(&data);
         let seq = log_seq.fetch_add(1, Ordering::Relaxed);
         // `try_send`, because this is a sync closure called from a dozen places and
         // some of them hold no runtime slot to yield. Full means ten thousand lines are
@@ -2100,6 +2146,11 @@ async fn execute_step_inner(
         }
         // Before the pipes exist (workspace prep) and after they are drained: nothing
         // is buffered behind this, so straight to the outbox is in order by definition.
+        //
+        // Masked here and only here: everything that reaches the channel above is masked
+        // by the batcher, and doing it in both places ran the matcher twice over every
+        // system line the agent writes.
+        let data = log_redactor.apply(&data);
         let _ = out_tx.send(AgentMessage::LogBatch {
             agent_id,
             step_run_id,
@@ -2260,7 +2311,9 @@ async fn execute_step_inner(
             "--name",
             &container_name,
             "--label",
-            &exec.container_label,
+            &exec.container_labels.agent,
+            "--label",
+            &exec.container_labels.boot,
             "-v",
             &mount,
         ]);
@@ -2969,6 +3022,43 @@ async fn upload_artifacts(
         }
         match tokio::fs::symlink_metadata(&path).await {
             Ok(meta) if meta.is_file() => {
+                // Opened `O_NOFOLLOW`, and judged on the handle rather than on a second
+                // stat of the path. The check above and the read are two syscalls apart,
+                // and a step can leave a process running behind it (the group is only
+                // killed on cancel or timeout), so the regular file that was checked can
+                // be a symlink to someone's key by the time it is opened. `O_NOFOLLOW`
+                // refuses that outright, and the size below is the size of the thing
+                // actually being read.
+                let opened = tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .await;
+                let mut file = match opened {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let msg = format!("failed to open artifact {rel}: {e}");
+                        log("system", msg.clone());
+                        failures.push(msg);
+                        continue;
+                    }
+                };
+                let meta = match file.metadata().await {
+                    Ok(m) if m.is_file() => m,
+                    Ok(_) => {
+                        let msg =
+                            format!("artifact {rel} is not a regular file; refusing to upload it");
+                        log("system", msg.clone());
+                        failures.push(msg);
+                        continue;
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to stat artifact {rel}: {e}");
+                        log("system", msg.clone());
+                        failures.push(msg);
+                        continue;
+                    }
+                };
                 if meta.len() > MAX_ARTIFACT_BYTES {
                     let msg = format!(
                         "artifact {} too large ({} bytes, limit {MAX_ARTIFACT_BYTES})",
@@ -2979,7 +3069,8 @@ async fn upload_artifacts(
                     failures.push(msg);
                     continue;
                 }
-                match tokio::fs::read(&path).await {
+                let mut buf = Vec::with_capacity(meta.len() as usize);
+                match file.read_to_end(&mut buf).await.map(|_| buf) {
                     Ok(bytes) => {
                         log(
                             "system",
@@ -3302,13 +3393,35 @@ async fn clone_step_workspace(
 }
 
 /// Delete run workspaces — and orphaned step env files — left behind by a crash.
-/// The `--label` every step container of this agent carries, so the startup sweep can
-/// tell its own leftovers from the containers of another agent sharing the host.
+/// The default `FIBER_AGENT_NAME`. Two agents left on it share a label, which is the one
+/// configuration where the sweep below must not run.
+const DEFAULT_AGENT_NAME: &str = "local";
+
+/// The labels every step container of this agent carries: which agent started it, and
+/// which *process* of that agent.
 ///
-/// The name is the agent's, sanitized: a label value is an argv token and the name comes
-/// from configuration, not from a pipeline, but this is still the one place it reaches
-/// `docker`.
-fn agent_container_label(agent_name: &str) -> String {
+/// Two labels because the sweep has to tell "a container my previous process left behind"
+/// from "a container another live agent is running". The boot id answers the second
+/// question for one agent restarting; the name keeps two differently-named agents on one
+/// host out of each other's way entirely.
+#[derive(Clone)]
+struct ContainerLabels {
+    agent: String,
+    boot: String,
+}
+
+impl ContainerLabels {
+    fn new(agent_name: &str) -> Self {
+        Self {
+            agent: format!("fiber.agent={}", label_safe(agent_name)),
+            boot: format!("fiber.boot={}", Uuid::new_v4()),
+        }
+    }
+}
+
+/// An agent name as a docker label value. The name comes from configuration rather than
+/// from a pipeline, but this is still the one place it becomes an argv token.
+fn label_safe(agent_name: &str) -> String {
     let safe: String = agent_name
         .chars()
         .map(|c| {
@@ -3320,37 +3433,81 @@ fn agent_container_label(agent_name: &str) -> String {
         })
         .take(64)
         .collect();
-    let safe = if safe.is_empty() {
+    if safe.is_empty() {
         "agent".to_string()
     } else {
         safe
-    };
-    format!("fiber.agent={safe}")
+    }
 }
 
-/// Container ids in `docker ps -q` output.
+/// Whether the startup sweep may run for this agent name.
 ///
-/// Separated from the process call so the parsing is testable: a blank line handed to
-/// `docker rm -f` is an argument error that would abort the whole sweep.
-fn container_ids(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric()))
-        .map(str::to_string)
+/// Not on the unmodified default. `make agent` and the documented quickstart both leave
+/// `FIBER_AGENT_NAME` at `local`, so two agents on one host share a label — and a sweep
+/// keyed on that label would `docker rm -f` the other's *running* step containers,
+/// killing live builds. Naming an agent is the cheap half of the fix and the thing an
+/// operator running two of them has to do anyway.
+fn sweep_allowed(agent_name: &str) -> bool {
+    agent_name.trim() != DEFAULT_AGENT_NAME && !agent_name.trim().is_empty()
+}
+
+/// Container ids to remove, from `docker ps` rows of `(id, boot label)`.
+///
+/// Only containers from another boot: whatever this process started is by definition
+/// still running, and a row with no boot label predates the label and is treated as
+/// another boot's, which is what it is.
+fn containers_to_sweep(rows: &[(String, String)], my_boot: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, boot)| boot != my_boot)
+        .map(|(id, _)| id.clone())
         .collect()
 }
 
-/// Remove step containers this agent left running.
+/// Parse `docker ps --format '{{.ID}} {{.Label "fiber.boot"}}'` output into rows.
+///
+/// Separated from the process call so the parsing is testable: a blank line handed to
+/// `docker rm -f` is an argument error that would abort the whole sweep.
+fn container_rows(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let id = parts.next()?;
+            // A container id is hex and at least a short id long. Anything else on this
+            // stream is prose ("Cannot connect to the Docker daemon"), and this list is
+            // about to be handed to `docker rm -f`.
+            if id.len() < 12 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some((id.to_string(), parts.next().unwrap_or_default().to_string()))
+        })
+        .collect()
+}
+
+/// Remove step containers an earlier process of *this* agent left running.
 ///
 /// A `kill -9` (or an OOM-killed agent) leaves `docker run --rm` children alive: the
 /// container keeps the step's workspace bind-mounted and its `--env-file` secrets in the
 /// process environment, and nothing ever reaps it — the step is reclaimed and re-run
-/// somewhere else while the orphan holds CPU, memory and the credentials. Only containers
-/// carrying this agent's label are touched, so a second agent on the same host is safe.
-async fn sweep_orphaned_containers(label: &str) {
+/// somewhere else while the orphan holds CPU, memory and the credentials.
+async fn sweep_orphaned_containers(labels: &ContainerLabels, agent_name: &str) {
+    if !sweep_allowed(agent_name) {
+        info!(
+            "not sweeping orphaned step containers: FIBER_AGENT_NAME is the default \
+             `{DEFAULT_AGENT_NAME}`, and two agents on one host would then share a label. \
+             Give this agent a name to enable the sweep."
+        );
+        return;
+    }
     let out = Command::new("docker")
-        .args(["ps", "-aq", "--filter", &format!("label={label}")])
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={}", labels.agent),
+            "--format",
+            "{{.ID}} {{.Label \"fiber.boot\"}}",
+        ])
         .output()
         .await;
     let Ok(out) = out else {
@@ -3361,7 +3518,9 @@ async fn sweep_orphaned_containers(label: &str) {
     if !out.status.success() {
         return;
     }
-    let ids = container_ids(&String::from_utf8_lossy(out.stdout.as_slice()));
+    let rows = container_rows(&String::from_utf8_lossy(out.stdout.as_slice()));
+    let boot_value = labels.boot.trim_start_matches("fiber.boot=");
+    let ids = containers_to_sweep(&rows, boot_value);
     if ids.is_empty() {
         return;
     }
@@ -4367,12 +4526,58 @@ mod tests {
     }
 
     #[test]
+    fn redaction_cost_does_not_grow_with_the_number_of_secrets() {
+        // Twenty 30-line PEM keys is ~3 700 registered patterns. Scanning a 64 KiB line
+        // once per pattern is a quarter of a second, and the log channel backpressures
+        // into the step's own pipes — the build itself slows down because someone stored
+        // a few keys. One automaton is O(line length) whatever the pattern count.
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for k in 0..20 {
+            let body: String = (0..30)
+                .map(|i| format!("secretline{k:02}{i:02}abcdefghijklmnop"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let name = format!("KEY_{k}");
+            env_pairs.push((name.clone(), body));
+            keys.push(name);
+        }
+        let r = Redactor::new(&env_pairs, &keys);
+        assert!(
+            r.pattern_count() > 1_500,
+            "expected a large pattern set, got {}",
+            r.pattern_count()
+        );
+
+        let line = "x".repeat(64 * 1024);
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let out = r.apply(&line);
+            assert_eq!(out.len(), line.len());
+        }
+        let elapsed = started.elapsed();
+        // Deliberately loose (a debug build, on whatever CI runs): the per-pattern loop
+        // this replaced needs about five seconds for the same work.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "redaction took {elapsed:?} for 20 lines against {} patterns",
+            r.pattern_count()
+        );
+
+        // Still correct at that size.
+        assert_eq!(
+            r.apply("head secretline0500abcdefghijklmnop tail"),
+            "head *** tail"
+        );
+    }
+
+    #[test]
     fn redactor_does_not_widen_a_short_secret_through_its_encodings() {
         // "abc" is below MIN_LEN; its base64 ("YWJj") must not be registered either, and
         // neither may any longer encoding of it — masking those blanks out unrelated
         // output for a value too short to be worth protecting.
         let r = Redactor::new(&env(&[("SHORT", "abc")]), &["SHORT".into()]);
-        assert!(r.values.is_empty(), "registered {:?}", r.values);
+        assert_eq!(r.pattern_count(), 0, "a short secret registered a pattern");
     }
 
     #[test]
@@ -4386,6 +4591,35 @@ mod tests {
         assert!(artifact_components("out/../../etc/passwd").is_none());
         assert!(artifact_components("").is_none());
         assert!(artifact_components(".").is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_an_artifact_refuses_a_symlink_swapped_in_after_the_check() {
+        // The leaf race: the path was a regular file when it was checked, and is a
+        // symlink by the time it is opened. A step can leave a process behind to do
+        // exactly that, so the open itself has to refuse rather than the stat before it.
+        let root = std::env::temp_dir().join(format!("fiber-nofollow-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = root.join("id_rsa");
+        std::fs::write(&secret, b"PRIVATE").unwrap();
+        let target = root.join("out.txt");
+        std::os::unix::fs::symlink(&secret, &target).unwrap();
+        let opened = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&target)
+            .await;
+        assert!(opened.is_err(), "O_NOFOLLOW opened a symlink");
+        // The same open on the real file still works.
+        assert!(
+            tokio::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&secret)
+                .await
+                .is_ok()
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -4415,26 +4649,67 @@ mod tests {
     }
 
     #[test]
-    fn container_ids_are_taken_only_from_well_formed_lines() {
+    fn container_rows_are_taken_only_from_well_formed_lines() {
         // A blank line handed to `docker rm -f` is an argument error that aborts the
         // whole sweep, and anything else in that output is not an id.
         assert_eq!(
-            container_ids("abc123\n\n  def456  \n"),
-            vec!["abc123".to_string(), "def456".to_string()]
+            container_rows("a1b2c3d4e5f6 boot-a\n\n  0f1e2d3c4b5a6   boot-b \n"),
+            vec![
+                ("a1b2c3d4e5f6".to_string(), "boot-a".to_string()),
+                ("0f1e2d3c4b5a6".to_string(), "boot-b".to_string())
+            ]
         );
-        assert!(container_ids("").is_empty());
-        assert!(container_ids("Cannot connect to the Docker daemon\n").is_empty());
+        // A container from before the boot label has none; it is still a previous boot's.
+        assert_eq!(
+            container_rows("a1b2c3d4e5f6\n"),
+            vec![("a1b2c3d4e5f6".to_string(), String::new())]
+        );
+        assert!(container_rows("").is_empty());
+        assert!(container_rows("Cannot connect to the Docker daemon\n").is_empty());
+        // A short id is not one; neither is a word that happens to be hex.
+        assert!(container_rows("abc123\n").is_empty());
+        assert!(container_rows("deadbeef\n").is_empty());
     }
 
     #[test]
-    fn the_container_label_is_this_agents_own() {
-        assert_eq!(agent_container_label("build-01"), "fiber.agent=build-01");
+    fn the_container_labels_name_this_agent_and_this_process() {
+        let l = ContainerLabels::new("build-01");
+        assert_eq!(l.agent, "fiber.agent=build-01");
+        assert!(l.boot.starts_with("fiber.boot="));
+        // Two processes of the same agent differ.
+        assert_ne!(l.boot, ContainerLabels::new("build-01").boot);
         // The name reaches `docker` as an argv token.
         assert_eq!(
-            agent_container_label("a b;rm -rf /"),
+            ContainerLabels::new("a b;rm -rf /").agent,
             "fiber.agent=a_b_rm_-rf__"
         );
-        assert_eq!(agent_container_label(""), "fiber.agent=agent");
+        assert_eq!(ContainerLabels::new("").agent, "fiber.agent=agent");
+    }
+
+    #[test]
+    fn the_sweep_never_touches_this_processes_own_containers() {
+        // The whole hazard: `docker rm -f` on a container another live agent is running
+        // kills a build in progress. Only another boot's containers may go.
+        let rows = vec![
+            ("mine".to_string(), "boot-me".to_string()),
+            ("previous".to_string(), "boot-old".to_string()),
+            ("unlabelled".to_string(), String::new()),
+        ];
+        assert_eq!(
+            containers_to_sweep(&rows, "boot-me"),
+            vec!["previous".to_string(), "unlabelled".to_string()]
+        );
+        assert!(containers_to_sweep(&[], "boot-me").is_empty());
+    }
+
+    #[test]
+    fn the_sweep_stands_down_on_the_default_agent_name() {
+        // `make agent` and the quickstart both leave the name at `local`, so two agents
+        // on one host share a label and the sweep would kill the other's running steps.
+        assert!(!sweep_allowed("local"));
+        assert!(!sweep_allowed("  local  "));
+        assert!(!sweep_allowed(""));
+        assert!(sweep_allowed("build-01"));
     }
 
     #[test]

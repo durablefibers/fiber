@@ -396,12 +396,18 @@ repeat is identifiable.
 
 Process groups: cancel kills the step's process group so grandchildren die too.
 
-Every step container carries a `fiber.agent=<agent name>` label, and the agent removes any
-container with its own label at startup. A `kill -9`, an OOM kill or a lost power cable
-otherwise leaves `docker run --rm` children alive, still holding the step's workspace mount
-and its `--env-file` secrets, with nothing left to reap them. Only this agent's label is
-swept, so a second agent on the same host is untouched — give co-located agents distinct
-`FIBER_AGENT_NAME`s.
+Every step container carries two labels: `fiber.agent=<agent name>` and
+`fiber.boot=<uuid>`, one per agent process. At startup the agent removes containers that
+carry its own agent label and a *different* boot id — leftovers from an earlier process of
+itself. A `kill -9`, an OOM kill or a lost power cable otherwise leaves `docker run --rm`
+children alive, still holding the step's workspace mount and its `--env-file` secrets,
+with nothing left to reap them.
+
+The sweep **does not run while `FIBER_AGENT_NAME` is the default `local`**, and says so in
+one line at startup. Two agents left on the default would share an agent label, and a
+sweep keyed on it would `docker rm -f` the other's *running* step containers, killing live
+builds. Name your agents (`FIBER_AGENT_NAME=build-01`) to enable it; co-located agents
+need distinct names anyway.
 
 `FIBER_AGENT_WORKSPACE_DIR` is resolved to an absolute path at startup (and logged). Docker
 refuses a relative bind source, so the documented default `./data/workspaces` could not be
@@ -435,19 +441,32 @@ them is replaced with `***` in the step's log lines and in its error:
 | Form | Where it shows up |
 |---|---|
 | The value itself | `echo "$TOKEN"` |
-| Base64 (standard and URL-safe, and the standard encoding of the value with a trailing newline) | `base64 <<< "$TOKEN"`, a basic-auth header a client logs |
+| Base64, standard and URL-safe | a value encoded on its own |
+| Base64 of the value plus a trailing newline | `base64 <<< "$TOKEN"` and `echo "$TOKEN" \| base64`, **for values up to 57 bytes** — past that GNU `base64` wraps at 76 columns and the encoding is split across lines |
 | Percent-encoded (RFC 3986) | a token in a query string, `curl --trace` |
 | JSON-escaped | a value serialized into a request body a client echoes |
 
 A multi-line secret (a PEM key, a service-account JSON) is registered line by line as well
 as whole, because logs arrive one line at a time — and each of those lines gets the same
-set of encodings.
+set of encodings. Matching is one automaton over every registered form, so the cost is
+proportional to the line, not to how many secrets the project has.
 
-What it still does not catch: a value shorter than 8 characters (masking those would blank
-out unrelated output), an encoding of something *containing* the secret rather than the
-secret alone (`base64` of a whole file, `gzip`, a hash), a value the step splits or
-reverses, and anything written somewhere other than the step's output. Treat masking as a
-guard against accidental `echo`, not as permission to print secrets.
+What it still does not catch:
+
+- A value shorter than 8 characters — masking those would blank out unrelated output.
+- An encoding of something *containing* the secret rather than the secret alone. This is
+  the common case and it is worth being concrete: **basic auth is not covered**, because
+  the header is `base64("user:" + token)` and base64 encodes independent three-byte
+  groups, so the encoding of the token alone appears inside it only when the prefix
+  length happens to be a multiple of three. The same goes for `base64` of a whole file or
+  of a JSON document that contains the value.
+- Other encodings: **hex** and **base32** are not registered, nor is a hash of the value.
+- A value the step splits, reverses, or prints one character at a time.
+- A token that crosses the 64 KiB line cap: redaction runs after truncation, so the
+  surviving prefix of a value cut in half is not matched and is written in clear.
+- Anything written somewhere other than the step's own output.
+
+Treat masking as a guard against accidental `echo`, not as permission to print secrets.
 
 This is a boundary, not a sandbox: anyone who can write a `fiber.yml` still runs code as
 the agent user. Keep agents on hosts you would grant those people.

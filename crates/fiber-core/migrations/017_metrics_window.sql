@@ -2,8 +2,7 @@
 -- every attempt inside the retention window on each scrape. This index is what makes the
 -- bound cheap: without it the window is still a sequential scan, just with a filter.
 --
--- 017 is taken by the parallel hardening change; this file is 018 so the two can land in
--- either order. No CONCURRENTLY: sqlx runs a migration in one transaction, and
--- `step_attempts` is bounded by retention (see docs/operations.md "Upgrades").
+-- No CONCURRENTLY: sqlx runs a migration in one transaction, and `step_attempts` is
+-- bounded by retention (see docs/operations.md "Upgrades").
 CREATE INDEX IF NOT EXISTS idx_step_attempts_started
     ON step_attempts (started_at);

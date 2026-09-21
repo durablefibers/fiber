@@ -1,7 +1,7 @@
 //! Background retention / GC for finished runs, artifact blobs, durable fibers and
 //! sessions.
 
-use crate::artifacts::ArtifactBackend;
+use crate::artifacts::{ArtifactBackend, StoredObject};
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use fiber_core::Store;
@@ -196,18 +196,34 @@ async fn sweep_orphan_objects(store: &Store, artifacts: &ArtifactBackend, hours:
             return;
         }
     };
-    // Same rule as the blob half of `run_once`: a failure to answer "is this referenced"
-    // must not read as "nothing references these".
-    let referenced = match store.artifact_paths_still_referenced(&candidates).await {
+    // Asked two ways, and an object has to be unreferenced by *both* before it goes. The
+    // path comparison assumes this process spells the artifact root exactly as the process
+    // that wrote the row did; the key comparison does not depend on the root at all. A
+    // single disagreement here destroys live artifacts, so the cheaper question is not
+    // enough on its own.
+    //
+    // Failures follow the blob half of `run_once`: not being able to answer "is this
+    // referenced" must never read as "nothing references these".
+    let paths: Vec<String> = candidates.iter().map(|c| c.stored_path.clone()).collect();
+    let keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
+    let referenced_paths = match store.artifact_paths_still_referenced(&paths).await {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "could not check artifact references; keeping every object");
             return;
         }
     };
-    let candidates: BTreeSet<String> = candidates.into_iter().collect();
+    let referenced_keys = match store.artifact_keys_still_referenced(&keys).await {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "could not check artifact keys; keeping every object");
+            return;
+        }
+    };
+    let orphans = orphan_objects(&candidates, &referenced_paths, &referenced_keys);
     let mut removed = 0usize;
-    for path in unreferenced_blobs(&candidates, &referenced) {
+    for object in &orphans {
+        let path = &object.stored_path;
         match artifacts.delete(path).await {
             Ok(()) => removed += 1,
             Err(e) => warn!(%path, error = %e, "orphan object delete failed (continuing)"),
@@ -221,6 +237,21 @@ async fn sweep_orphan_objects(store: &Store, artifacts: &ArtifactBackend, hours:
             "retention removed artifact objects with no row"
         );
     }
+}
+
+/// The objects no row points at, by path **or** by key.
+///
+/// Split out and tested because it is the predicate a delete path acts on: everything it
+/// returns is destroyed. A candidate either question matches is kept.
+fn orphan_objects<'a>(
+    candidates: &'a [StoredObject],
+    referenced_paths: &[String],
+    referenced_keys: &[String],
+) -> Vec<&'a StoredObject> {
+    candidates
+        .iter()
+        .filter(|c| !referenced_paths.contains(&c.stored_path) && !referenced_keys.contains(&c.key))
+        .collect()
 }
 
 /// Passes of `run_once` one tick may make. Retention deleted at most `batch` runs an
@@ -313,7 +344,12 @@ pub async fn retention_loop(
                  raise FIBER_RETENTION_BATCH or lower FIBER_RETENTION_INTERVAL_SECS"
             );
         }
-        sweep_orphan_objects(&store, &artifacts, cfg.orphan_hours).await;
+        // Behind the same switch as run deletion: `FIBER_RETENTION_DAYS=0` is what an
+        // operator sets to mean "this instance deletes nothing", and an object sweep that
+        // ran anyway would be a surprise in the one direction that cannot be undone.
+        if cfg.enabled() {
+            sweep_orphan_objects(&store, &artifacts, cfg.orphan_hours).await;
+        }
         tokio::time::sleep(cfg.interval).await;
     }
 }
@@ -475,6 +511,53 @@ mod tests {
         // `batch` is floored at 1 by the config, but the predicate must not treat
         // "deleted nothing out of a batch of nothing" as progress.
         assert!(!keep_catching_up(0, 0, 1));
+    }
+
+    // --- orphan object selection -------------------------------------------------------
+
+    fn object(path: &str, key: &str) -> StoredObject {
+        StoredObject {
+            stored_path: path.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_object_no_row_points_at_by_either_name_is_deleted() {
+        let c = vec![object("/data/artifacts/r/s/x", "artifacts/r/s/x")];
+        let got = orphan_objects(&c, &[], &[]);
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn a_row_matching_by_path_keeps_the_object() {
+        let c = vec![object("/data/artifacts/r/s/x", "artifacts/r/s/x")];
+        assert!(orphan_objects(&c, &["/data/artifacts/r/s/x".into()], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_row_matching_only_by_key_still_keeps_the_object() {
+        // The hazard this exists for: the row was written when the artifact root was
+        // spelled differently (relative vs absolute, a trailing slash, a symlinked
+        // mount), so the path comparison finds nothing and every live object looks
+        // unreferenced. The key does not depend on the root.
+        let c = vec![object("/data/artifacts/r/s/x", "artifacts/r/s/x")];
+        let kept = orphan_objects(&c, &[], &["artifacts/r/s/x".into()]);
+        assert!(
+            kept.is_empty(),
+            "a live artifact was selected for deletion: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_unreferenced_member_of_a_batch_is_selected() {
+        let c = vec![
+            object("s3://b/artifacts/r/s/live", "artifacts/r/s/live"),
+            object("s3://b/artifacts/r/s/orphan", "artifacts/r/s/orphan"),
+        ];
+        let got = orphan_objects(&c, &[], &["artifacts/r/s/live".into()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "artifacts/r/s/orphan");
     }
 
     // --- orphan object keys --------------------------------------------------------------

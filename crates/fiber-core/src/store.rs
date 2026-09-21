@@ -1088,6 +1088,37 @@ impl Store {
 
     /// Of `paths`, those still referenced by an artifact row. Retention must not delete a
     /// blob a retry (or any other run) still points at.
+    /// Which of these object **keys** (`artifacts/{run}/{step}/{name}`) a row still
+    /// points at, whatever root the row's path was written with.
+    ///
+    /// The path comparison in [`Self::artifact_paths_still_referenced`] only works when
+    /// the process asking spells the artifact root exactly as the process that wrote the
+    /// row did. That is now guaranteed by canonicalising the root, but the orphan sweep
+    /// deletes what this says is unreferenced, and a single disagreement there destroys
+    /// live artifacts — so it also asks by key, which no root can change. Each row's key
+    /// is extracted with the layout's own shape (two UUIDs), so a root that happens to
+    /// contain `artifacts/` cannot truncate it in the wrong place.
+    pub async fn artifact_keys_still_referenced(&self, keys: &[String]) -> Result<Vec<String>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(sqlx::query_scalar::<_, String>(
+            r#"
+            WITH referenced AS (
+                SELECT DISTINCT substring(
+                    path from 'artifacts/[0-9a-fA-F-]{36}/[0-9a-fA-F-]{36}/.*$'
+                ) AS key
+                FROM artifacts
+            )
+            SELECT t.k FROM unnest($1::text[]) AS t(k)
+            JOIN referenced r ON r.key = t.k
+            "#,
+        )
+        .bind(keys)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn artifact_paths_still_referenced(&self, paths: &[String]) -> Result<Vec<String>> {
         if paths.is_empty() {
             return Ok(vec![]);

@@ -159,7 +159,7 @@ ticks, so turning one off does not stop the others.
 |---|---|---|
 | `FIBER_RETENTION_DAYS` | `30` | Terminal runs, keeping the newest `FIBER_RETENTION_KEEP_RUNS` per pipeline |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Terminal durable fibers, and their memoized steps by cascade |
-| `FIBER_RETENTION_ORPHAN_HOURS` | `24` | Artifact objects older than this that no row points at (see [artifacts](./artifacts.md#objects-with-no-row)) |
+| `FIBER_RETENTION_ORPHAN_HOURS` | `24` | Artifact objects older than this that no row points at (see [artifacts](./artifacts.md#objects-with-no-row)). Only when `FIBER_RETENTION_DAYS` is above `0` |
 
 ### Keeping up
 
@@ -498,7 +498,7 @@ Background loop in `fiber-api`:
 1. Purge expired sessions  
 2. Delete terminal runs (`succeeded` / `failed` / `cancelled`) older than `FIBER_RETENTION_DAYS`, while keeping the newest `FIBER_RETENTION_KEEP_RUNS` per pipeline  
 3. Delete this batch's `log_lines` in chunks, then the runs (cascade removes steps, attempts, and whatever lines are left), then the artifact blobs nothing points at any more
-4. Once per tick, delete artifact objects with no row older than `FIBER_RETENTION_ORPHAN_HOURS`
+4. Once per tick, delete artifact objects with no row older than `FIBER_RETENTION_ORPHAN_HOURS` — asked by path *and* by key, so a changed artifact root cannot make live objects look orphaned, and skipped entirely when `FIBER_RETENTION_DAYS=0`
 
 Defaults: 30 days, keep 20, batch 100, interval 1h, up to 20 batches per tick. Set `FIBER_RETENTION_DAYS=0` to disable age deletion (sessions still purged).
 

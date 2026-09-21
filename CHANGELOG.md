@@ -9,7 +9,7 @@ minor versions may carry breaking changes.
 Hygiene from the September audit: secrets stop leaking into places a project *reader* can
 see, and two background jobs stop scanning whole tables on a timer.
 
-Migration `018_metrics_window.sql` adds one index on `step_attempts(started_at)`. It is
+Migration `017_metrics_window.sql` adds one index on `step_attempts(started_at)`. It is
 additive and applies at boot.
 
 ### Security
@@ -33,7 +33,11 @@ additive and applies at boot.
   cap) left the object in the store with no row, where retention, which follows rows,
   could never see it. `Content-Length` is now signed with the declared size, refused
   uploads are deleted, and retention sweeps objects with no row older than
-  `FIBER_RETENTION_ORPHAN_HOURS` (24; `0` disables).
+  `FIBER_RETENTION_ORPHAN_HOURS` (24; `0` disables, as does `FIBER_RETENTION_DAYS=0`).
+  The sweep asks "is this referenced" by object key as well as by stored path, so a
+  changed artifact root cannot make live objects look orphaned. **One instance owns
+  everything under `artifacts/`** — two deployments must not share a bucket without
+  distinct prefixes.
 - **The durable `http_request` task sends to the address it checked.** It resolved the
   host, validated every address, then let the HTTP client resolve the name again — a
   record with a zero TTL could answer public for the check and `169.254.169.254` for the
@@ -46,7 +50,9 @@ additive and applies at boot.
 - **The agent refuses symlinked and non-relative artifact paths.** A repository controls
   its own working tree, so `out/build.log -> ~/.ssh/id_rsa`, `out -> /`, or an absolute
   `artifacts:` entry uploaded a file the step never produced. Every component of the path
-  is now checked, and the declaration fails the step instead.
+  is now checked, the file is opened `O_NOFOLLOW` and judged on the handle rather than on
+  a second stat (a step can leave a process behind to swap the file between the two), and
+  the declaration fails the step instead.
 
 ### Changed
 
@@ -64,10 +70,23 @@ additive and applies at boot.
 - **`GET /api/projects/{id}/fibers` returns fibers without their memoized step results.**
   The Fibers page polls it every two seconds and never showed them; hydrating each row was
   one query per fiber, 101 per poll. `GET /api/fibers/{id}` still includes them.
-- **The agent sweeps its own orphaned step containers at startup** (`fiber.agent=<name>`
-  label) and resolves `FIBER_AGENT_WORKSPACE_DIR` to an absolute path. A `kill -9` left
-  `docker run --rm` containers alive holding the step's env-file secrets, and docker
-  refused the documented relative default as a bind source.
+- **The agent sweeps its own orphaned step containers at startup** — those carrying its
+  `fiber.agent=<name>` label and a *different* `fiber.boot` id, so a container this
+  process started is never a candidate. The sweep stands down while `FIBER_AGENT_NAME` is
+  the default `local`, because two agents on the default share a label and it would kill
+  the other's running steps. `FIBER_AGENT_WORKSPACE_DIR` is also resolved to an absolute
+  path: a `kill -9` left `docker run --rm` containers alive holding the step's env-file
+  secrets, and docker refused the documented relative default as a bind source.
+- **The local artifact root is resolved to one absolute path at startup.** A stored path
+  is the root joined to the key, and that string is what retention compares against; two
+  spellings of the same directory (the relative clap default on one boot, the absolute
+  path `scripts/dev-env.sh` exports on the next) used to break reads, and would now have
+  let the object sweep delete live artifacts.
+- **Log redaction is one Aho-Corasick automaton** rather than a scan per registered
+  pattern, so its cost is proportional to the line rather than to how many secrets the
+  project has: three 30-line PEM keys are ~560 patterns and were tens of milliseconds per
+  64 KiB line, which backpressures the log channel into the step's own pipes. System
+  lines are also no longer masked twice.
 
 ### Fixed
 

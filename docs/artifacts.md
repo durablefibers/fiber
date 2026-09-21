@@ -47,6 +47,12 @@ and again when a direct upload is completed. Re-uploading the *same* name does n
 twice: a step is at-least-once, and its row is replaced rather than added. Over a cap, the
 upload is a 400 and the step fails with the server's reason in its log.
 
+The check reads the step's current usage and then acts, so two uploads racing each other
+can overshoot the byte cap by one artifact. The stock agent uploads a step's artifacts one
+at a time; overshooting needs a modified agent, which already holds that project's
+secrets. Treat the caps as a bound on accident and runaway loops, not as a quota against
+a hostile agent.
+
 ### When an upload fails
 
 A declared artifact that exists but could not be stored **fails the step** — an unreadable
@@ -92,9 +98,25 @@ An upload that got as far as the object store but never reached `complete` — t
 died mid-step, the step was reclaimed — leaves an object nothing references. Once an hour
 retention lists up to 1 000 objects under `artifacts/` older than
 `FIBER_RETENTION_ORPHAN_HOURS` (default 24, `0` disables), asks the database which of them
-are still referenced, and deletes the rest. Only the `artifacts/{run}/{step}/{name}`
-layout this process writes is considered, so other data in the same bucket is left alone,
-and a failure to answer "is this referenced" keeps every object.
+are still referenced, and deletes the rest. It runs only when run retention is on
+(`FIBER_RETENTION_DAYS` above `0`): setting that to zero means this instance deletes
+nothing.
+
+Because it deletes, it is deliberately narrow and fails closed:
+
+- Only the `artifacts/{run uuid}/{step uuid}/{name}` layout this process writes is
+  considered; symlinks and anything else under the root are ignored.
+- "Still referenced" is asked twice — by stored path *and* by object key — and an object
+  has to be unreferenced both ways before it goes. The key does not depend on how the
+  artifact root is spelled, so a root that changed between boots cannot make live
+  artifacts look orphaned. (The local root is also resolved to one absolute path at
+  startup, so it cannot change by spelling alone.)
+- A failure to answer either question keeps every object for that tick.
+
+**One instance owns everything under `artifacts/` in its bucket or directory.** Two
+deployments sharing a bucket will delete each other's objects, because each sees the
+other's as having no row. Give them separate buckets, or separate prefixes, before
+sharing one.
 
 ### Public endpoint
 
