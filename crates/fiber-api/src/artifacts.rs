@@ -32,7 +32,18 @@ impl ArtifactBackend {
         let Some(bucket) = bucket else {
             let root = PathBuf::from(artifacts_dir);
             ensure_writable(&root).await?;
-            info!(%artifacts_dir, "artifact backend: local filesystem");
+            // Absolute and resolved, once, before anything is stored or compared.
+            //
+            // A stored path is the root joined to the key, and that string is what goes
+            // in `artifacts.path` and what retention compares against when deciding which
+            // objects nothing references. Two spellings of the same directory — the
+            // relative default `./data/artifacts` on one boot and the absolute path
+            // `scripts/dev-env.sh` exports on the next, a trailing slash, a symlinked
+            // mount — used to mean rows that could not be read. Since the orphan sweep,
+            // the same mismatch means *live objects are deleted while their rows survive*,
+            // so the root has to be one canonical string.
+            let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
+            info!(root = %root.display(), "artifact backend: local filesystem");
             return Ok(Self::Local { root });
         };
 
@@ -241,7 +252,16 @@ impl ArtifactBackend {
     }
 
     /// Presigned PUT for direct agent upload; `None` for local (use API proxy).
-    pub async fn presign_put(&self, key: &str, secs: u64) -> Result<Option<String>> {
+    ///
+    /// `content_length` is signed, so the URL is only usable for an object of exactly
+    /// that size: without it the URL was a licence to write any number of bytes into the
+    /// bucket, and the size check on `complete` came far too late to stop them arriving.
+    pub async fn presign_put(
+        &self,
+        key: &str,
+        secs: u64,
+        content_length: i64,
+    ) -> Result<Option<String>> {
         match self {
             Self::Local { .. } => Ok(None),
             Self::S3 {
@@ -255,6 +275,7 @@ impl ArtifactBackend {
                     .put_object()
                     .bucket(bucket)
                     .key(key)
+                    .content_length(content_length)
                     .presigned(conf)
                     .await
                     .context("presign put")?;
@@ -262,6 +283,140 @@ impl ArtifactBackend {
             }
         }
     }
+
+    /// Stored paths under the artifact prefix last modified before `cutoff`, up to `limit`.
+    ///
+    /// Retention follows rows; an object whose row was never written — a presigned upload
+    /// the agent never completed, or one `complete` refused — is invisible to it and stays
+    /// in the bucket for ever. This is the other half: the objects, so the caller can ask
+    /// which of them nothing points at. Only the `artifacts/{run}/{step}/{name}` layout
+    /// this process writes is listed.
+    pub async fn list_stale_objects(
+        &self,
+        cutoff: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<StoredObject>> {
+        match self {
+            Self::Local { root } => {
+                let mut out = Vec::new();
+                let base = root.join("artifacts");
+                let mut dirs = vec![base.clone()];
+                while let Some(dir) = dirs.pop() {
+                    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                        continue;
+                    };
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                        // `symlink_metadata`, like the agent's artifact walk: a symlink
+                        // to a directory must not make the sweep follow it out of the
+                        // root, and a symlink to a file must not be listed for deletion.
+                        let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await else {
+                            continue;
+                        };
+                        if meta.is_dir() {
+                            dirs.push(entry.path());
+                            continue;
+                        }
+                        if !meta.modified().is_ok_and(|m| m < cutoff) {
+                            continue;
+                        }
+                        // A symlink under the artifact root is not an object this process
+                        // wrote, and it is about to be handed to a delete path.
+                        if meta.is_symlink() {
+                            continue;
+                        }
+                        let path = entry.path();
+                        let Ok(rel) = path.strip_prefix(root) else {
+                            continue;
+                        };
+                        let key = rel.to_string_lossy().to_string();
+                        if !is_artifact_object_key(&key) {
+                            continue;
+                        }
+                        out.push(StoredObject {
+                            stored_path: path.to_string_lossy().to_string(),
+                            key,
+                        });
+                    }
+                }
+                Ok(out)
+            }
+            Self::S3 { client, bucket, .. } => {
+                let mut out = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let mut req = client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix("artifacts/")
+                        .max_keys(1000);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    let page = req.send().await.context("s3 list_objects_v2")?;
+                    for obj in page.contents() {
+                        let Some(key) = obj.key() else { continue };
+                        if !is_artifact_object_key(key) {
+                            continue;
+                        }
+                        let old = obj
+                            .last_modified()
+                            .and_then(|t| std::time::SystemTime::try_from(*t).ok())
+                            .is_some_and(|t| t < cutoff);
+                        if !old {
+                            continue;
+                        }
+                        out.push(StoredObject {
+                            stored_path: format!("s3://{bucket}/{key}"),
+                            key: key.to_string(),
+                        });
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                    token = page.next_continuation_token().map(str::to_string);
+                    if token.is_none() {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// One object the sweep is considering: the path as a row would spell it, and the key it
+/// was stored under.
+///
+/// Both, because the safety of the sweep rests on matching against the rows, and the path
+/// is only comparable when this process and the row that wrote it agree on the artifact
+/// root. The key does not depend on the root at all, so it catches a mismatch that the
+/// path alone would read as "nothing references this object".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub stored_path: String,
+    pub key: String,
+}
+
+/// Whether a key is one this process wrote: `artifacts/{run uuid}/{step uuid}/{name}`.
+///
+/// The sweep deletes what it lists, so it only ever considers the exact layout
+/// [`ArtifactBackend::object_key`] produces. Anything else in the bucket — another tool's
+/// data, an operator's own upload — is none of its business.
+pub(crate) fn is_artifact_object_key(key: &str) -> bool {
+    let mut parts = key.split('/');
+    if parts.next() != Some("artifacts") {
+        return false;
+    }
+    let (Some(run), Some(step), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    parts.next().is_none()
+        && !name.is_empty()
+        && uuid::Uuid::parse_str(run).is_ok()
+        && uuid::Uuid::parse_str(step).is_ok()
 }
 
 fn s3_client(endpoint: &str, region: &str, access: &str, secret: &str) -> Client {
@@ -357,6 +512,110 @@ mod tests {
             client,
             bucket: bucket.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_presigned_put_is_bound_to_the_size_it_was_issued_for() {
+        // Without a signed content-length the URL is a licence to write any number of
+        // bytes into the bucket for ten minutes, and the size check on `complete`
+        // happens after they have all arrived.
+        let url = s3_backend("fiber")
+            .presign_put("artifacts/r/s/a.txt", 600, 1234)
+            .await
+            .unwrap()
+            .expect("s3 backend presigns");
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length"),
+            "content-length is not a signed header: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_local_root_is_resolved_once_so_paths_compare() {
+        // Two spellings of the same directory used to produce two spellings of every
+        // stored path. Reads broke; since the orphan sweep, the mismatch deletes live
+        // objects whose rows survive.
+        let dir = scratch("canon");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let a = ArtifactBackend::from_env(dir.join("sub").to_str().unwrap())
+            .await
+            .unwrap();
+        let b = ArtifactBackend::from_env(dir.join("sub/../sub/").to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let key = ArtifactBackend::object_key("r", "s", "a.txt");
+        assert_eq!(a.stored_path_for_key(&key), b.stored_path_for_key(&key));
+        assert!(
+            a.stored_path_for_key(&key).starts_with('/'),
+            "{}",
+            a.stored_path_for_key(&key)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_object_is_not_listed_for_deletion() {
+        let root = scratch("sweep-symlink");
+        let backend = ArtifactBackend::Local { root: root.clone() };
+        let run = uuid::Uuid::new_v4().to_string();
+        let step = uuid::Uuid::new_v4().to_string();
+        let dir = root.join(format!("artifacts/{run}/{step}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.join("secret");
+        std::fs::write(&outside, b"not ours").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link.txt")).unwrap();
+        let listed = backend
+            .list_stale_objects(std::time::SystemTime::now() + Duration::from_secs(600), 100)
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "a symlink was listed for deletion: {listed:?}"
+        );
+        assert!(outside.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_local_sweep_lists_only_old_objects_of_our_own_layout() {
+        let root = scratch("sweep");
+        let key = ArtifactBackend::object_key(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            "dist.tgz",
+        );
+        let backend = ArtifactBackend::Local { root: root.clone() };
+        let stored = backend.put(&key, b"bytes").await.unwrap();
+        // Something else living in the same directory must be left alone.
+        std::fs::create_dir_all(root.join("artifacts/not-a-uuid")).unwrap();
+        std::fs::write(root.join("artifacts/not-a-uuid/keepme"), b"x").unwrap();
+
+        let fresh = backend
+            .list_stale_objects(
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fresh.is_empty(),
+            "an object written seconds ago is still in flight: {fresh:?}"
+        );
+
+        let stale = backend
+            .list_stale_objects(std::time::SystemTime::now() + Duration::from_secs(600), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            vec![StoredObject {
+                stored_path: stored,
+                key
+            }],
+            "only this process's own layout is swept, and the key comes back with it"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

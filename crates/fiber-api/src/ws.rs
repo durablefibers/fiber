@@ -413,6 +413,27 @@ fn needs_closure_for(snapshot: &serde_json::Value, step_id: &str) -> HashSet<Str
     closure
 }
 
+/// Whether an agent holding `holder_step_ids` in a run may read an artifact produced by
+/// `producer`.
+///
+/// The same rule the offer used when it chose what to restore: a step sees the output of
+/// the steps it transitively depends on, and its own. Scoping to the run instead let an
+/// agent holding any step of a run fetch every artifact of that run — including one from
+/// an unrelated parallel branch it was deliberately not offered.
+pub(crate) fn artifact_readable_by_holder(
+    snapshot: &serde_json::Value,
+    holder_step_ids: &[String],
+    producer: Option<&str>,
+) -> bool {
+    let Some(producer) = producer else {
+        // No producing step row left: nothing to judge against, so no.
+        return false;
+    };
+    holder_step_ids
+        .iter()
+        .any(|holder| holder == producer || needs_closure_for(snapshot, holder).contains(producer))
+}
+
 /// The compiled step entry for `step_id` inside a `CompiledDag` snapshot.
 fn snapshot_step<'a>(
     snapshot: &'a serde_json::Value,
@@ -1113,19 +1134,35 @@ async fn handle_agent(
                         // artifact directory (or a full disk, or a dead bucket) lost
                         // every artifact into the API's own log while every build stayed
                         // green. The HTTP upload path already fails loudly.
-                        let stored = match state.artifacts.put(&key, &bytes).await {
-                            Ok(stored_path) => state
-                                .store
-                                .create_artifact(
-                                    step.run_id,
-                                    step_run_id,
-                                    &rel,
-                                    &stored_path,
-                                    bytes.len() as i64,
-                                )
-                                .await
-                                .map(|_| ()),
-                            Err(e) => Err(e),
+                        // The per-step caps apply here too: this path is older and
+                        // smaller (8 MiB) but no more bounded in *how many* artifacts one
+                        // step may store. A failure to ask is not a refusal — a database
+                        // blip must not fail a build over an abuse guard.
+                        let refusal = crate::routes::artifact_cap_refusal(
+                            &state,
+                            step_run_id,
+                            &rel,
+                            bytes.len() as i64,
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        let stored = match refusal {
+                            Some(why) => Err(anyhow::anyhow!("{why}")),
+                            None => match state.artifacts.put(&key, &bytes).await {
+                                Ok(stored_path) => state
+                                    .store
+                                    .create_artifact(
+                                        step.run_id,
+                                        step_run_id,
+                                        &rel,
+                                        &stored_path,
+                                        bytes.len() as i64,
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                                Err(e) => Err(e),
+                            },
                         };
                         if let Err(e) = stored {
                             let reason = artifact_store_failure(&rel);
@@ -1737,6 +1774,65 @@ mod tests {
         assert!(!c.contains("package"));
         assert!(needs_closure_for(&snap, "checkout").is_empty());
         assert!(needs_closure_for(&snap, "nope").is_empty());
+    }
+
+    #[test]
+    fn an_agent_may_download_only_what_its_step_depends_on() {
+        // The same graph the restore list is built from: the download route must agree
+        // with the offer, or an agent holding `test-b` can fetch `test-a`'s artifacts by
+        // id even though it was deliberately not offered them.
+        let snap = json!({"steps": [
+            {"id": "checkout", "needs": []},
+            {"id": "build", "needs": ["checkout"]},
+            {"id": "test-a", "needs": ["build"]},
+            {"id": "test-b", "needs": ["build"]},
+            {"id": "package", "needs": ["test-a"]}
+        ]});
+        let holds = |s: &str| vec![s.to_string()];
+
+        // Transitive dependencies, and the step's own output.
+        assert!(artifact_readable_by_holder(
+            &snap,
+            &holds("package"),
+            Some("build")
+        ));
+        assert!(artifact_readable_by_holder(
+            &snap,
+            &holds("package"),
+            Some("checkout")
+        ));
+        assert!(artifact_readable_by_holder(
+            &snap,
+            &holds("package"),
+            Some("package")
+        ));
+        // A parallel branch is not a dependency.
+        assert!(!artifact_readable_by_holder(
+            &snap,
+            &holds("test-b"),
+            Some("test-a")
+        ));
+        // Neither is a step that depends on the holder.
+        assert!(!artifact_readable_by_holder(
+            &snap,
+            &holds("build"),
+            Some("package")
+        ));
+        // An agent holding several steps of the run gets the union of their closures.
+        assert!(artifact_readable_by_holder(
+            &snap,
+            &["test-b".to_string(), "package".to_string()],
+            Some("test-a")
+        ));
+        // No producing step row, or a producer not in the snapshot: no.
+        assert!(!artifact_readable_by_holder(&snap, &holds("package"), None));
+        assert!(!artifact_readable_by_holder(
+            &snap,
+            &holds("package"),
+            Some("gone")
+        ));
+        // Holding nothing reads nothing.
+        assert!(!artifact_readable_by_holder(&snap, &[], Some("build")));
     }
 
     #[test]

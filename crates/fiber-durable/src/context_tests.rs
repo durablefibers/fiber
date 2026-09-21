@@ -93,6 +93,15 @@ impl FiberPersistence for RecordingStore {
             .push((name.to_string(), input.clone(), wake_at));
         Ok(record_with(FiberState::default()))
     }
+
+    async fn count_live_siblings(
+        &self,
+        _project_id: Uuid,
+        _name: &str,
+        _exclude: Uuid,
+    ) -> Result<i64> {
+        Ok(0)
+    }
 }
 
 fn record_with(state: FiberState) -> FiberRecord {

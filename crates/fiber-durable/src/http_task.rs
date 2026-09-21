@@ -12,7 +12,7 @@ use crate::registry::FiberHandler;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Response body kept in the fiber result. Enough to see what came back, bounded so a
@@ -152,55 +152,81 @@ fn parse_input(input: &Value) -> Result<Request> {
     })
 }
 
-/// Resolve the host and refuse any address the guard blocks.
+/// The addresses a host resolved to, once every one of them has passed the guard.
 ///
 /// Every resolved address is checked, not just the first: a name that returns one public
-/// and one private address must not be usable to reach the private one.
-async fn check_destination(url: &reqwest::Url) -> Result<()> {
-    if allow_private() {
-        return Ok(());
+/// and one private address must not be usable to reach the private one. Separated from
+/// the lookup so the decision is testable without DNS.
+fn allowed_addrs(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
+    if addrs.is_empty() {
+        bail!("{host} did not resolve");
     }
-    let host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
-    let port = url.port_or_known_default().unwrap_or(443);
-
-    // A literal address needs no lookup, and must be checked as given.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if let Some(why) = blocked_reason(ip) {
-            bail!("refusing to call {host}: {why} address");
-        }
-        return Ok(());
-    }
-
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| anyhow!("resolve {host}: {e}"))?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
+    for addr in &addrs {
         if let Some(why) = blocked_reason(addr.ip()) {
             bail!("refusing to call {host}: resolves to a {why} address");
         }
     }
-    if !any {
-        bail!("{host} did not resolve");
+    Ok(addrs)
+}
+
+/// What came back from [`check_destination`]: the addresses the request must use, or
+/// `Unpinned` when there is nothing to pin (a literal address, or the guard switched off).
+#[derive(Debug, PartialEq, Eq)]
+enum Destination {
+    Unpinned,
+    Pinned(Vec<SocketAddr>),
+}
+
+/// Resolve the host and refuse any address the guard blocks, returning what was checked.
+///
+/// The caller must send to *these* addresses. Handing the name back to reqwest to resolve
+/// again is a TOCTOU: a record with a zero TTL can answer with a public address for this
+/// lookup and `169.254.169.254` for the one reqwest does a millisecond later, and the
+/// guard above would have inspected an address the request never used.
+async fn check_destination(url: &reqwest::Url) -> Result<Destination> {
+    if allow_private() {
+        return Ok(Destination::Unpinned);
     }
-    Ok(())
+    let host = url.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+
+    // A literal address needs no lookup, and must be checked as given. There is nothing
+    // to pin: reqwest connects to the address in the URL.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(why) = blocked_reason(ip) {
+            bail!("refusing to call {host}: {why} address");
+        }
+        return Ok(Destination::Unpinned);
+    }
+
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| anyhow!("resolve {host}: {e}"))?
+        .collect();
+    Ok(Destination::Pinned(allowed_addrs(host, addrs)?))
 }
 
 /// One attempt. Never returns `Err` for an HTTP-level outcome — the caller decides what is
 /// worth retrying, and a step that returned `Err` would fail the whole fiber instead.
 async fn attempt(req: &Request, idempotency_key: &str) -> Value {
-    if let Err(e) = check_destination(&req.url).await {
+    let destination = match check_destination(&req.url).await {
+        Ok(d) => d,
         // Not retryable: resolution will not become allowed on the next go.
-        return json!({ "ok": false, "retryable": false, "error": format!("{e:#}") });
-    }
-    let client = match reqwest::Client::builder()
+        Err(e) => return json!({ "ok": false, "retryable": false, "error": format!("{e:#}") }),
+    };
+    let mut builder = reqwest::Client::builder()
         .timeout(req.timeout)
         // A redirect is a second destination the guard never saw. Whoever wants to call
         // the target of a redirect can name it directly.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .redirect(reqwest::redirect::Policy::none());
+    // The addresses the guard actually inspected, so reqwest cannot resolve the name a
+    // second time and reach somewhere else.
+    if let Destination::Pinned(addrs) = &destination
+        && let Some(host) = req.url.host_str()
     {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             return json!({ "ok": false, "retryable": false, "error": format!("client: {e}") });
@@ -358,5 +384,44 @@ mod tests {
         let url: reqwest::Url = "http://169.254.169.254/latest/meta-data/".parse().unwrap();
         let err = check_destination(&url).await.unwrap_err().to_string();
         assert!(err.contains("link-local"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_literal_public_address_needs_no_pin() {
+        // Nothing resolves, so there is nothing a second lookup could change.
+        let url: reqwest::Url = "https://1.1.1.1/".parse().unwrap();
+        assert_eq!(
+            check_destination(&url).await.unwrap(),
+            Destination::Unpinned
+        );
+    }
+
+    #[test]
+    fn the_addresses_that_pass_the_guard_are_the_ones_handed_back() {
+        // What is checked must be what is connected to: returning the list is how the
+        // caller pins it, so a second resolution of the same name cannot answer with
+        // somewhere else.
+        let addrs: Vec<SocketAddr> = vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap(),
+        ];
+        assert_eq!(allowed_addrs("example.com", addrs.clone()).unwrap(), addrs);
+    }
+
+    #[test]
+    fn one_private_answer_among_public_ones_refuses_the_whole_name() {
+        let addrs: Vec<SocketAddr> = vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "169.254.169.254:443".parse().unwrap(),
+        ];
+        let err = allowed_addrs("rebind.example", addrs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("link-local"), "{err}");
+    }
+
+    #[test]
+    fn a_name_with_no_answers_is_not_silently_allowed() {
+        assert!(allowed_addrs("nowhere.example", vec![]).is_err());
     }
 }

@@ -264,7 +264,11 @@ def main() -> int:
             ],
             text=True,
         ).strip()
-        check("db path is s3://", row.startswith("s3://fiber-artifacts/"), row)
+        # Derived, like API and DSN above: this script has to be runnable against a
+        # throwaway bucket, and a hardcoded name failed there while everything it was
+        # meant to assert had passed.
+        bucket = os.environ.get("FIBER_S3_BUCKET", "fiber-artifacts")
+        check("db path is s3://", row.startswith(f"s3://{bucket}/"), row)
     except Exception as e:
         check("db path is s3://", False, e)
 

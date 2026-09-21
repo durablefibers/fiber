@@ -159,6 +159,26 @@ ticks, so turning one off does not stop the others.
 |---|---|---|
 | `FIBER_RETENTION_DAYS` | `30` | Terminal runs, keeping the newest `FIBER_RETENTION_KEEP_RUNS` per pipeline |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Terminal durable fibers, and their memoized steps by cascade |
+| `FIBER_RETENTION_ORPHAN_HOURS` | `24` | Artifact objects older than this that no row points at (see [artifacts](./artifacts.md#objects-with-no-row)). Only when `FIBER_RETENTION_DAYS` is above `0` |
+
+### Keeping up
+
+A tick deletes `FIBER_RETENTION_BATCH` runs (100) and, while the last batch came back
+full, takes another — up to 20 passes, so 2 000 runs an hour rather than the 100 it used
+to be. A project producing more than that per hour would never have caught up: the backlog
+and `log_lines` with it grew for ever while the loop looked healthy. If you see
+
+```
+retention hit its per-tick pass limit; the backlog is still shrinking
+```
+
+the deletions are working but not fast enough: raise `FIBER_RETENTION_BATCH` or lower
+`FIBER_RETENTION_INTERVAL_SECS`.
+
+Each batch's `log_lines` are deleted in 50 000-row statements before the runs go. The
+cascade from `DELETE FROM runs` would otherwise be one statement over millions of rows on
+the busiest table in the schema, holding a transaction (and its `xmin`, so autovacuum
+cannot follow) for minutes.
 
 Fibers have a shorter default than runs because they are usually a notification that either
 worked or did not, where a run is a build someone may want to look back at. **A suspended
@@ -207,7 +227,12 @@ scrape_configs:
 | `fiber_step_duration_seconds` | Histogram: how long each attempt spent running |
 
 Every value is read from the database on scrape, not counted in the process, so a restart
-does not reset anything and two API replicas report the same figures. The one to alert on
+does not reset anything and two API replicas report the same figures. A snapshot is cached
+for **10 seconds**: a scrape every 15 s still sees fresh numbers, while a second scraper,
+a dashboard refresh or a retry collapses onto the same round of queries instead of putting
+six more on the pool. The two histograms cover the **last 24 hours** of attempts —
+Prometheus keeps the longer history from these samples, and an unbounded window meant a
+sequential scan of every attempt inside the retention period, twice per scrape. The one to alert on
 is `fiber_oldest_queued_step_age_seconds`: it climbs when no agent matches a step's labels,
 which is otherwise invisible until someone notices a run sitting still. Steps held back by
 retry backoff are excluded, since they are waiting deliberately.
@@ -472,9 +497,10 @@ Background loop in `fiber-api`:
 
 1. Purge expired sessions  
 2. Delete terminal runs (`succeeded` / `failed` / `cancelled`) older than `FIBER_RETENTION_DAYS`, while keeping the newest `FIBER_RETENTION_KEEP_RUNS` per pipeline  
-3. Delete artifact blobs (local file or S3) before removing DB rows (cascade removes steps, logs, attempts)
+3. Delete this batch's `log_lines` in chunks, then the runs (cascade removes steps, attempts, and whatever lines are left), then the artifact blobs nothing points at any more
+4. Once per tick, delete artifact objects with no row older than `FIBER_RETENTION_ORPHAN_HOURS` — asked by path *and* by key, so a changed artifact root cannot make live objects look orphaned, and skipped entirely when `FIBER_RETENTION_DAYS=0`
 
-Defaults: 30 days, keep 20, batch 100, interval 1h. Set `FIBER_RETENTION_DAYS=0` to disable age deletion (sessions still purged).
+Defaults: 30 days, keep 20, batch 100, interval 1h, up to 20 batches per tick. Set `FIBER_RETENTION_DAYS=0` to disable age deletion (sessions still purged).
 
 Migration `003_retention.sql` adds indexes used by the query.
 
