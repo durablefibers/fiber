@@ -6,6 +6,70 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **`showcase` is a reserved project slug, and the demo project is seeded once.** A
+  caller-supplied `slug` on `POST /api/projects` skipped `slugify` entirely and landed
+  verbatim, so anyone who could create a project could claim `showcase` — and the boot
+  seeder adopts whatever project holds that slug and adds the bootstrap admin to it as
+  **owner**. Supplied slugs are now `slugify`d like derived ones, and `showcase` is
+  refused with a `400`. Separately, the seed ran on every boot, so a demo project you
+  deleted came back on the next restart; it now runs only when the users table was empty
+  at boot — the same condition the admin bootstrap uses — or when `FIBER_SEED_SHOWCASE=1`
+  asks for it explicitly.
+
+### Added
+
+- `FIBER_SEED_SHOWCASE` (`auto` / `1` / `0`) — whether to seed the Showcase demo project
+  this boot. `auto` means "only on a fresh instance". An unreadable value fails the boot
+  rather than guessing. See [configuration](docs/configuration.md).
+
+### Changed
+
+- **A pipeline that is wrong now says so instead of quietly doing nothing.** Five silent
+  misconfigurations became errors where the author can still see them:
+  - An `if:` this server cannot evaluate fails the compile, naming the expression and what
+    was wrong with it. `!=`, `&&`, `||`, `failure()`, `cancelled()`, a `${{ … }}` wrapper
+    and contexts other than `matrix.` / `env.` all used to evaluate to `false` **forever**,
+    so the step was skipped on every run with no diagnosis. They are rejected, not
+    implemented — richer conditions remain a roadmap item.
+  - A `paths` / `paths_ignore` glob that does not compile is a `400`. It used to be
+    dropped, leaving an empty filter set, which matches no file — so the trigger never
+    fired.
+  - A cron that parses but can never occur (`0 0 0 31 2 *`) is a `400`; it used to leave
+    `next_due_at` `NULL` forever.
+  - An empty step id is rejected. `needs`, the snapshot and the UI all refer to a step
+    by id.
+  - **Unknown YAML fields are rejected**, naming the field and the nearest valid one.
+    `continue-on-error`, `working-directory`, `need:`, `artifact:` and every other typo
+    parsed clean and produced a step that ran without the field. A pipeline **already
+    stored** is still read leniently, so existing rows and run snapshots keep executing —
+    the strictness is on the authoring path (`fiber validate`, `POST
+    /api/pipelines/parse-yaml`, the Import panel). All 10 `examples/*.yml` and the repo's
+    own `fiber.yml` compile unchanged.
+- **A definition is capped at 500 expanded steps** (`DagError::TooManySteps`). Only the
+  per-step matrix (64 cells) was capped before, so 80 steps of 64 cells was a legal
+  5 120-step pipeline that opened a transaction and did one `INSERT` per step.
+
+### Fixed
+
+- **Store errors are classified by type, not by substring.** `access.rs` and six handlers
+  matched on `contains("forbidden")` and `ends_with("not found")`: rewording a store
+  message silently turned a `404` into a `500`, and any error from any layer whose text
+  happened to contain "forbidden" became a `403`. A typed `fiber_core::StoreError`
+  (`Forbidden` / `NotFound` / `Validation` / `Other`) now carries the classification, with
+  one `From` impl mapping it to a status. Every HTTP status is unchanged; `Internal` still
+  masks its body and logs the full cause chain. `ValidationError` is replaced by
+  `StoreError::Validation`.
+- **Starting a run is one insert, and propagation no longer scans the snapshot per step.**
+  `start_run` and `retry_run` issued one `INSERT` per step inside the run's transaction
+  (500 round-trips for a 500-step DAG) and now use a single `UNNEST` insert;
+  `propagate_after_step` indexes the definition snapshot by id once instead of scanning
+  the whole JSON array for every pending step on every planning pass, under the run lock.
+  Measured on a synthetic 500-step run, one planning pass went from **12.9 ms to 1.1 ms**
+  (debug build). A `failed_only` retry likewise copies carried-over artifacts in one
+  statement.
+
 ## [0.6.3] — 2026-09-20
 
 A big release: the September hardening audit's remaining phases, and the first one whose

@@ -12,6 +12,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_ARTIFACTS_DIR` | `./data/artifacts` | Local artifact root |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
 | `FIBER_ADMIN_PASSWORD` | `fiber` | Bootstrap admin password (API warns at boot while it is the default) |
+| `FIBER_SEED_SHOWCASE` | `auto` | Seed the **Showcase** demo project and its pipelines. `auto` = only when the users table was empty at boot (a fresh instance), so a demo project you delete stays deleted; `1` = seed on this boot (restores it, and picks up pipelines a newer version added); `0` = never. Any other value fails the boot |
 | `FIBER_CORS_ORIGINS` | `http://127.0.0.1:3100,http://localhost:3100` | Comma-separated browser origins allowed to call the API; `*` = any origin |
 | `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project **and webhook** secrets at rest |
 | `FIBER_S3_BUCKET` | unset | If set, use S3/MinIO backend |
@@ -64,6 +65,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_VERSION` | `latest` | Tag for the `ghcr.io/durablefibers/fiber-api` and `fiber-agent` images |
 | `FIBER_SECRETS_KEY` | empty (plaintext, warned) | Passed through to `fiber-api` |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
+| `FIBER_SEED_SHOWCASE` | `auto` | See above; `auto` seeds the demo project only on the first boot of an empty database |
 | `FIBER_S3_BUCKET` | empty | Empty = local filesystem on the `fiber_artifacts` volume. Set it (and run `--profile minio`, or point the endpoint at real S3) to use object storage |
 | `FIBER_S3_ENDPOINT` | `http://fiber-minio:9000` | S3 API endpoint as the API reaches it |
 | `FIBER_S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:19000` | Presign host for agents/browsers; the loopback default only works for an agent on this host |

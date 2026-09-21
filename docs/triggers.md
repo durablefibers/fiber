@@ -16,6 +16,8 @@ Webhook: `POST /api/projects/{id}/webhooks/github` with header `X-GitHub-Event: 
 
 Changed files come from the payload (`commits` / `head_commit` added·modified·removed). Empty `changed` + non-empty filters → do not fire.
 
+`paths` / `paths_ignore` are [globset](https://docs.rs/globset) patterns and are **compiled when the pipeline is saved**: a pattern that does not compile (`"src/[**"`, an unclosed class) is a `400` naming the field and the pattern. It used to be dropped silently, which left an *empty* filter set — and an empty set matches no file, so the pipeline never fired and nothing said why. An empty-string pattern is refused for the same reason.
+
 
 ## Pull request
 
@@ -46,6 +48,7 @@ on:
 ```
 
 - Cron wins if both are set.
+- A cron has to **parse and have a next occurrence**. `0 0 0 31 2 *` — the 31st of February — parses fine and can never fire; saving it is now a `400` rather than a pipeline whose `next_due_at` stays `NULL` forever.
 - Due times stored on `pipelines.next_due_at`; the scheduler polls Postgres every 30 s, so a schedule saved through the API or UI fires on the next tick without a restart. With several API replicas the slot is claimed with a compare-and-set, so each occurrence starts exactly one run; while a previous run of the pipeline is still active the occurrence is skipped and retried next tick.
 - Trigger label looks like `schedule:60m` or cron-derived.
 

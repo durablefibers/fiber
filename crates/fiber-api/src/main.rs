@@ -70,6 +70,11 @@ struct Args {
 
     #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = "fiber")]
     admin_password: String,
+
+    /// Seed the Showcase demo project: `auto` (only when the instance has no users yet),
+    /// `1` to seed on this boot, `0` never.
+    #[arg(long, env = "FIBER_SEED_SHOWCASE", default_value = "auto")]
+    seed_showcase: String,
 }
 
 #[tokio::main]
@@ -87,10 +92,17 @@ async fn main() -> Result<()> {
     if n > 0 {
         tracing::info!(count = n, "backfilled pipeline next_due_at");
     }
+    // Read before `ensure_admin_user`, which creates one: this is what "fresh instance"
+    // means for the seeder too, so a deleted demo project stays deleted across restarts.
+    let users_existed = store.count_users().await? > 0;
     let admin = store
         .ensure_admin_user(&args.admin_user, &args.admin_password)
         .await?;
-    fiber_core::ensure_showcase(&store, admin.id).await?;
+    if fiber_core::seed::should_seed_showcase(Some(&args.seed_showcase), users_existed)
+        .map_err(anyhow::Error::msg)?
+    {
+        fiber_core::ensure_showcase(&store, admin.id).await?;
+    }
 
     // Lazy: the first command connects, and the manager reconnects on its own after
     // that. Connecting eagerly here made an unreachable Redis a crash loop, although

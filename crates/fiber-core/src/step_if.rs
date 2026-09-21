@@ -9,6 +9,10 @@ pub struct IfContext {
     pub env: Vec<(String, String)>,
 }
 
+/// Everything the `if:` grammar accepts, for error messages and for the docs to quote.
+pub const SUPPORTED_IF: &str =
+    "`success()`, `always()`, `never()`, or `<matrix|env>.<key> == '<value>'`";
+
 /// Evaluate a step condition. Empty / missing → `success()`.
 ///
 /// Supported:
@@ -16,6 +20,10 @@ pub struct IfContext {
 /// - `never()` — always skip
 /// - `success()` — run when needs succeeded (default)
 /// - `matrix.<key> == 'value'` / `env.<KEY> == 'value'` — equality against matrix/env
+///
+/// Anything else is rejected by [`validate`] when the pipeline compiles, so an expression
+/// that reaches here has already been understood. The `false` fallbacks below are what a
+/// definition stored before that validation existed still evaluates to.
 pub fn eval_if(expr: Option<&str>, ctx: &IfContext) -> bool {
     let expr = expr
         .map(str::trim)
@@ -27,6 +35,109 @@ pub fn eval_if(expr: Option<&str>, ctx: &IfContext) -> bool {
         "success()" => ctx.needs_succeeded,
         _ => eval_equality(expr, ctx).unwrap_or(false),
     }
+}
+
+/// Reject an `if:` this crate cannot evaluate, naming what went wrong.
+///
+/// Without this, a typo or a GitHub Actions expression (`!=`, `&&`, `github.event_name`)
+/// falls through [`eval_if`]'s equality arm, yields `None`, and becomes `false` — so the
+/// step is skipped on every run of every pipeline for as long as nobody re-reads the YAML.
+/// A condition that cannot be evaluated is a mistake in the definition, and the compiler
+/// is the only place that can say so while the author is still looking.
+///
+/// This validates the *shape*, not the outcome: `matrix.os == 'plan9'` is well-formed and
+/// simply never true. `!=`, `&&` and `||` are refused rather than implemented — a boolean
+/// grammar is a feature with its own precedence and truthiness questions (roadmap R-1),
+/// and silently accepting half of one is how this finding happened.
+pub fn validate(expr: Option<&str>) -> Result<(), String> {
+    let Some(expr) = expr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if expr.contains("${{") {
+        return Err(format!(
+            "if: `{expr}` — drop the `${{{{ }}}}` wrapper; a Fiber condition is a bare \
+             expression ({SUPPORTED_IF})"
+        ));
+    }
+    for op in ["!=", "&&", "||", ">=", "<=", "=~"] {
+        if expr.contains(op) {
+            return Err(format!(
+                "if: `{expr}` — the `{op}` operator is not supported; use {SUPPORTED_IF}"
+            ));
+        }
+    }
+    if matches!(expr, "always()" | "never()" | "success()") {
+        return Ok(());
+    }
+    // A call this crate does not implement. Catching it here (rather than letting the
+    // equality arm fail) is what turns `failure()` into a sentence instead of a skip.
+    if expr.ends_with(')')
+        && let Some(open) = expr.find('(')
+    {
+        let name = &expr[..open];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "if: `{expr}` — unknown function `{name}()`; supported: {SUPPORTED_IF}"
+            ));
+        }
+    }
+    let Some((left, right)) = split_eq(expr) else {
+        return Err(format!(
+            "if: `{expr}` — not a condition this server understands; use {SUPPORTED_IF}"
+        ));
+    };
+    if right.contains("==") {
+        return Err(format!(
+            "if: `{expr}` — more than one `==`; a condition compares exactly two values"
+        ));
+    }
+    let left = left.trim();
+    if left.is_empty() {
+        return Err(format!("if: `{expr}` — nothing on the left of `==`"));
+    }
+    if let Some((context, key)) = left.split_once('.') {
+        if !matches!(context, "matrix" | "env") {
+            return Err(format!(
+                "if: `{expr}` — unknown context `{context}`; only `matrix.` and `env.` are \
+                 available to a step condition"
+            ));
+        }
+        if !is_key(key) {
+            return Err(format!(
+                "if: `{expr}` — `{context}.{key}` is not a usable {context} name"
+            ));
+        }
+    } else if !is_key(left) {
+        return Err(format!(
+            "if: `{expr}` — `{left}` is not a matrix or env name; write \
+             `matrix.{left} == '...'` if that is what you meant"
+        ));
+    }
+    let right = right.trim();
+    if right.is_empty() {
+        return Err(format!("if: `{expr}` — nothing on the right of `==`"));
+    }
+    let quoted = |q: char| right.starts_with(q) && right.ends_with(q) && right.len() >= 2;
+    if !quoted('\'') && !quoted('"') {
+        if right.contains('\'') || right.contains('"') {
+            return Err(format!(
+                "if: `{expr}` — the value `{right}` has an unbalanced quote"
+            ));
+        }
+        if right.contains(char::is_whitespace) {
+            return Err(format!(
+                "if: `{expr}` — quote the value: `{left} == '{right}'`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A matrix axis or env name: what the YAML can actually bind.
+fn is_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn eval_equality(expr: &str, ctx: &IfContext) -> Option<bool> {
@@ -109,6 +220,52 @@ mod tests {
                 env: vec![]
             }
         ));
+    }
+
+    #[test]
+    fn validate_accepts_what_eval_understands() {
+        for ok in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("always()"),
+            Some("never()"),
+            Some("success()"),
+            Some("matrix.os == 'linux'"),
+            Some("env.CHANNEL == \"nightly\""),
+            Some("os == 'linux'"),
+            Some("matrix.rust-version == '1.98'"),
+        ] {
+            assert!(validate(ok).is_ok(), "{ok:?} should validate");
+        }
+    }
+
+    /// Every one of these used to compile and then skip the step on every run.
+    #[test]
+    fn validate_rejects_what_eval_would_silently_call_false() {
+        let cases = [
+            ("matrix.os != 'windows'", "!="),
+            ("success() && matrix.os == 'linux'", "&&"),
+            ("matrix.os == 'linux' || matrix.os == 'mac'", "||"),
+            ("failure()", "failure()"),
+            ("cancelled()", "cancelled()"),
+            ("${{ success() }}", "${{"),
+            ("github.event_name == 'push'", "github"),
+            ("succes()", "succes()"),
+            ("matrix.os", "understands"),
+            ("== 'linux'", "left"),
+            ("matrix.os ==", "right"),
+            ("matrix.os == 'a' == 'b'", "more than one"),
+            ("matrix.os == 'lin ux", "unbalanced"),
+            ("matrix.os == lin ux", "quote the value"),
+        ];
+        for (expr, needle) in cases {
+            let err = validate(Some(expr)).expect_err(&format!("{expr} must be rejected"));
+            assert!(
+                err.contains(needle),
+                "error for `{expr}` should mention `{needle}`, got: {err}"
+            );
+        }
     }
 
     #[test]

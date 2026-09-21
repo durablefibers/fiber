@@ -15,7 +15,7 @@ mod toolchain_audit;
 
 pub use dag::{CompiledDag, DagError, compile_definition};
 pub use due_index::DueIndex;
-pub use error::{SecretDecryptError, ValidationError};
+pub use error::{SecretDecryptError, StoreError};
 pub use models::*;
 pub use path_filter::paths_allow;
 pub use roles::ProjectRole;

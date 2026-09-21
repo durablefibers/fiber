@@ -778,14 +778,7 @@ async fn remove_member(
         .store
         .remove_project_member(id, user_id, actor == ProjectRole::Owner)
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("cannot remove") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -829,13 +822,7 @@ async fn update_user(
         .store
         .set_instance_admin(id, req.is_admin)
         .await
-        .map_err(|e| {
-            if e.to_string().ends_with("not found") {
-                ApiError::NotFound
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     Ok(Json(updated))
 }
 
@@ -1595,13 +1582,11 @@ async fn update_agent(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     require_agent_manage(&state, &user, &existing).await?;
-    let mut agent = state.store.update_agent(id, req).await.map_err(|e| {
-        if e.to_string().contains("not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    let mut agent = state
+        .store
+        .update_agent(id, req)
+        .await
+        .map_err(ApiError::from)?;
     let labels = agent
         .labels
         .as_array()
@@ -1660,13 +1645,11 @@ async fn rotate_agent_token(
         .scheduler
         .force_disconnect_agent(id, "token rotated — reconnect with the new token")
         .await;
-    let mut resp = state.store.rotate_agent_token(id).await.map_err(|e| {
-        if e.to_string().contains("not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    let mut resp = state
+        .store
+        .rotate_agent_token(id)
+        .await
+        .map_err(ApiError::from)?;
     resp.agent.token_hash = "***".into();
     Ok(Json(resp))
 }
@@ -2074,21 +2057,41 @@ pub enum ApiError {
     Internal(String),
 }
 
+impl From<fiber_core::StoreError> for ApiError {
+    fn from(e: fiber_core::StoreError) -> Self {
+        use fiber_core::StoreError as S;
+        match e {
+            S::Forbidden(_) => ApiError::Forbidden,
+            S::NotFound(_) => ApiError::NotFound,
+            S::Validation(m) => ApiError::BadRequest(m),
+            // Named for the log, masked for the client — as any untyped error is.
+            S::Other(m) => ApiError::Internal(m),
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        // Typed validation failures are the caller's fault.
-        if e.downcast_ref::<fiber_core::ValidationError>().is_some()
-            || e.downcast_ref::<fiber_core::DagError>().is_some()
-        {
+        use fiber_core::StoreError as S;
+        // What the store meant, not what its message happens to read like. Matching on
+        // `contains("forbidden")` made every layer's wording load-bearing: an upstream
+        // error that merely quoted the word became a 403, and rewording "agent not found"
+        // turned a 404 into a 500. `Forbidden` and `NotFound` answer with a fixed body, so
+        // only the two that carry text back to the caller keep the full `anyhow` chain.
+        if let Some(store) = e.downcast_ref::<S>() {
+            return match store {
+                S::Forbidden(_) => ApiError::Forbidden,
+                S::NotFound(_) => ApiError::NotFound,
+                S::Validation(_) => ApiError::BadRequest(format!("{e:#}")),
+                S::Other(_) => ApiError::Internal(format!("{e:#}")),
+            };
+        }
+        // A definition the caller wrote wrongly is the caller's fault.
+        if e.downcast_ref::<fiber_core::DagError>().is_some() {
             return ApiError::BadRequest(format!("{e:#}"));
         }
-        let msg = e.to_string();
-        if msg.contains("forbidden") {
-            ApiError::Forbidden
-        } else {
-            // Full cause chain: the log line is the only place this text now appears.
-            ApiError::Internal(format!("{e:#}"))
-        }
+        // Full cause chain: the log line is the only place this text now appears.
+        ApiError::Internal(format!("{e:#}"))
     }
 }
 
@@ -2679,20 +2682,67 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
+    /// The status comes from the variant, not from the wording.
     #[test]
-    fn api_error_maps_forbidden_from_anyhow() {
+    fn api_error_maps_the_store_error_type_not_its_message() {
+        use fiber_core::StoreError as S;
+        type Expect = fn(&ApiError) -> bool;
+        let cases: Vec<(S, Expect)> = vec![
+            (S::forbidden(), |e| matches!(e, ApiError::Forbidden)),
+            (
+                S::Forbidden("forbidden: only an owner can remove an owner".into()),
+                |e| matches!(e, ApiError::Forbidden),
+            ),
+            (S::not_found("agent"), |e| matches!(e, ApiError::NotFound)),
+            // Reworded — and still a 404, which is the whole point.
+            (S::NotFound("no such agent on this instance".into()), |e| {
+                matches!(e, ApiError::NotFound)
+            }),
+            (
+                S::Validation("cannot remove the last owner".into()),
+                |e| matches!(e, ApiError::BadRequest(m) if m == "cannot remove the last owner"),
+            ),
+            (S::Other("pool exhausted".into()), |e| {
+                matches!(e, ApiError::Internal(_))
+            }),
+        ];
+        for (store, want) in cases {
+            let text = store.to_string();
+            let direct: ApiError = ApiError::from(store);
+            assert!(want(&direct), "direct mapping of `{text}`");
+            let boxed: ApiError = anyhow::Error::msg(text.clone()).context("x").into();
+            // Untyped, even with the same words: internal.
+            assert!(matches!(boxed, ApiError::Internal(_)), "untyped `{text}`");
+        }
+        // An error that merely says "forbidden" is no longer a 403.
         let e: ApiError = anyhow::anyhow!("forbidden: reader cannot write").into();
-        assert!(matches!(e, ApiError::Forbidden));
+        assert!(matches!(e, ApiError::Internal(_)));
         let e: ApiError = anyhow::anyhow!("db down").into();
         assert!(matches!(e, ApiError::Internal(_)));
     }
 
+    /// The store's typed errors survive an `anyhow` context layer, which is how they
+    /// reach the handler from `scheduler::start_run` and the `*_on` helpers.
+    #[test]
+    fn a_store_error_is_recognised_through_a_context_layer() {
+        use fiber_core::StoreError as S;
+        let e: ApiError = anyhow::Error::new(S::not_found("run"))
+            .context("starting a run")
+            .into();
+        assert!(matches!(e, ApiError::NotFound));
+        let e: ApiError = anyhow::Error::new(S::forbidden())
+            .context("checking membership")
+            .into();
+        assert!(matches!(e, ApiError::Forbidden));
+    }
+
     #[test]
     fn api_error_maps_typed_validation_to_400() {
-        let e: ApiError = anyhow::Error::new(fiber_core::ValidationError("nope".into())).into();
+        let e: ApiError =
+            anyhow::Error::new(fiber_core::StoreError::Validation("nope".into())).into();
         assert!(matches!(e, ApiError::BadRequest(m) if m == "nope"));
         let wrapped =
-            anyhow::Error::new(fiber_core::ValidationError("inner".into())).context("outer");
+            anyhow::Error::new(fiber_core::StoreError::Validation("inner".into())).context("outer");
         let e: ApiError = wrapped.into();
         assert!(matches!(e, ApiError::BadRequest(m) if m == "outer: inner"));
     }

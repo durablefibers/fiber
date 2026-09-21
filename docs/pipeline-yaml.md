@@ -34,7 +34,15 @@ steps:
 | `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
 | `concurrency` | no | Keep one run per group in flight; see below |
 
-In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted.
+In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted. Give a map-form step its own `id:` and it is rejected — the key *is* the id, and two answers to the question is one of them going unread.
+
+**Unknown fields are errors.** A field no table on this page lists fails `fiber validate`,
+`POST /api/pipelines/parse-yaml`, and the Import panel, naming the field and the nearest
+one that exists. GitHub Actions spellings (`continue-on-error`, `working-directory`),
+near-misses (`need:`, `artifact:`, `imgae:`) and anything else serde used to drop on the
+floor previously parsed clean and produced a step that quietly ran without the field. A
+pipeline **already stored** is still read leniently, so an old row keeps executing; the
+strictness is on the authoring path, where there is someone to tell.
 
 ### `concurrency`
 
@@ -176,8 +184,21 @@ Compile produces cells like `test__os_linux`. `needs` that point at a matrixed s
 | `always()` | Run once upstreams are terminal, even if they failed. Steps *after* an `always()` step still see the failure: `success()` is transitive over the whole ancestry, so `build → cleanup (always) → deploy` skips `deploy` when `build` failed |
 | `never()` | Skip |
 | `matrix.os == 'linux'` | Compare matrix (or env) axis |
+| `env.CHANNEL == "nightly"` | Same, against step / pipeline `env` |
 
 Evaluated when a step becomes ready to queue (dependencies terminal), not at run create — except root steps, which are evaluated immediately.
+
+**That table is the whole grammar, and anything else is rejected when the pipeline
+compiles.** `!=`, `&&`, `||`, `failure()`, `cancelled()`, a `${{ … }}` wrapper and any
+context other than `matrix.` / `env.` (`github.event_name`, say) are refused with a
+message naming what was wrong. They are *not* implemented: booleans bring precedence and
+truthiness questions that deserve a design rather than half an implementation, and richer
+conditions are a roadmap item. Until this change, all of them evaluated to `false`
+forever — the step was skipped on every run of every build with nothing anywhere saying
+why, which is the one outcome worse than an error.
+
+A well-formed condition that is simply never true (`matrix.os == 'plan9'`) still compiles.
+The check is on the shape, not the outcome.
 
 
 ## Examples in-repo
@@ -194,9 +215,17 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 | `examples/scoped-secrets.yml` | Per-step `secrets:` allowlist |
 | `examples/concurrency.yml` | One run per branch, cancelling the previous |
 
+## Limits
+
+| Limit | Value | Why |
+|---|---|---|
+| Expanded steps per pipeline | 500 | A definition is expanded (matrix cells included) before it is counted, so 16 steps of 64 cells is 1 024 and is refused. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's |
+| Matrix cells per step | 64 | Unchanged |
+
 ## Semantics
 
 - Cycles are rejected at compile / save.
+- A step id cannot be empty. `needs`, the run snapshot, and the UI all refer to a step by id.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
 - Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.

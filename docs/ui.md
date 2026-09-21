@@ -26,8 +26,9 @@ project's secrets and members are never in the global Settings page.
 Deleting a project is owner-only and irreversible: it takes every pipeline, run, log
 line, artifact, secret, member, durable fiber, and project-scoped agent with it, and
 cancels anything still running first. The button unlocks only once you type the
-project's name. The seeded **showcase** project comes back on the next `fiber-api`
-boot, so deleting it is a reset rather than a removal.
+project's name. The seeded **showcase** project stays deleted: since v0.6.4 the seed
+runs only when the users table was empty at boot, so restoring the demo takes
+`FIBER_SEED_SHOWCASE=1` on one restart.
 
 ## The canvas
 

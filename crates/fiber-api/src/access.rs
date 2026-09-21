@@ -12,18 +12,14 @@ pub async fn require_project(
     project_id: Uuid,
     min: ProjectRole,
 ) -> Result<ProjectRole, ApiError> {
+    // `require_role` returns `StoreError::Forbidden`, which `ApiError::from` maps to 403.
+    // This used to read the message: any error whose text contained "forbidden" — from
+    // any layer — became a 403, and a reworded one became a 500.
     state
         .store
         .require_role(project_id, user.id, min)
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("forbidden") {
-                ApiError::Forbidden
-            } else {
-                ApiError::from(e)
-            }
-        })
+        .map_err(ApiError::from)
 }
 
 /// Instance-admin gate. Instance admins manage the global agent pool, every agent,
