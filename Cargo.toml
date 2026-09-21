@@ -55,6 +55,9 @@ hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
+# Multi-pattern search for the agent's log redaction. Already in the tree (regex,
+# globset); made direct so the matcher is one automaton rather than a loop over patterns.
+aho-corasick = "1"
 rand = "0.10"
 getrandom = "0.4"
 globset = "0.4"

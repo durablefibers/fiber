@@ -38,6 +38,10 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_HTTP_TASK_ALLOW_PRIVATE` | `0` | Let the `http_request` fiber task reach private, loopback and link-local addresses. See [durable fibers](./durable-fibers.md) |
 | `FIBER_STEP_LOG_MAX_LINES` | `50000` | Lines stored per step attempt; the rest are dropped with one line saying so. `0` disables the cap |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Delete terminal durable fibers older than this. `0` disables. Suspended fibers are never touched |
+| `FIBER_RETENTION_ORPHAN_HOURS` | `24` | Delete artifact objects this old that no row points at (uploads that never completed). `0` disables, and so does `FIBER_RETENTION_DAYS=0`. See [artifacts](./artifacts.md#objects-with-no-row) |
+| `FIBER_MAX_ARTIFACTS_PER_STEP` | `50` | Artifacts one step may store. Re-uploading the same name does not count twice |
+| `FIBER_MAX_ARTIFACT_BYTES_PER_STEP` | `536870912` | Total artifact bytes one step may store (512 MiB) |
+| `FIBER_INTERVAL_MAX_PER_PROJECT` | `10` | Live `interval_task` chains a project may have; a chain at the cap stops instead of creating its successor. See [durable fibers](./durable-fibers.md#interval_task-and-the-chain-cap) |
 | `RUST_LOG` | — | Tracing filter |
 
 Login is throttled per username: 10 failures within 10 minutes lock that username for 60 s (`429` with `Retry-After`); after a lockout the count restarts, so the sustained ceiling is about 10 guesses per minute per username per API instance. Because the key is the username, anyone can keep a known username (including `admin`) locked — an accepted trade-off over IP keying, which is spoofable behind a proxy. Error responses never include database or Redis error text; details go to the API log.
@@ -80,6 +84,9 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_GITHUB_API_URL` | empty (`https://api.github.com`) | GitHub Enterprise API base |
 | `FIBER_RETENTION_DAYS` / `_KEEP_RUNS` / `_BATCH` / `_INTERVAL_SECS` | empty (`30` / `20` / `100` / `3600`) | Run GC; see the API table |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Durable-fiber GC |
+| `FIBER_RETENTION_ORPHAN_HOURS` | empty (`24`) | Artifact objects with no row |
+| `FIBER_MAX_ARTIFACTS_PER_STEP` / `FIBER_MAX_ARTIFACT_BYTES_PER_STEP` | empty (`50` / `536870912`) | Per-step artifact caps |
+| `FIBER_INTERVAL_MAX_PER_PROJECT` | empty (`10`) | Live `interval_task` chains per project |
 | `FIBER_AGENT_STALE_SECS` | empty (`45`) | Offline threshold for heartbeats |
 | `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` / `_GRACE_MINUTES` | empty (`60` / `5`) | Step timeout and the server-side backstop |
 | `FIBER_STEP_LOG_MAX_LINES` | `50000` | Lines stored per step attempt |

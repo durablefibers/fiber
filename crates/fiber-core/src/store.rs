@@ -26,6 +26,13 @@ pub struct Store {
 
 /// Bucket boundaries in seconds, for both step duration and queue wait. Chosen for CI:
 /// sub-second is noise, and anything past an hour is a stuck build rather than a slow one.
+/// How far back the `/metrics` latency histograms look.
+///
+/// A day is what an operator watches when something is wrong now; Prometheus keeps the
+/// longer history itself from these samples. Unbounded, each histogram was a sequential
+/// scan of every `step_attempts` row inside the retention window, twice per scrape.
+const METRICS_WINDOW_HOURS: i32 = 24;
+
 const HISTOGRAM_BUCKETS: &[f64] = &[
     1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
 ];
@@ -326,13 +333,16 @@ impl Store {
     /// Bucket one expression into a Prometheus histogram.
     ///
     /// `width_bucket` does the counting in Postgres, so this is one row per bucket rather
-    /// than one per observation. The caller's `from_sql` must produce a single `v` column.
-    async fn histogram(&self, from_sql: &str) -> Result<Histogram> {
+    /// than one per observation. The caller's `from_sql` must produce a single `v` column
+    /// and bound itself to the last `$2` hours: unbounded, each of these was a sequential
+    /// scan of every attempt inside the retention window on every scrape.
+    async fn histogram(&self, from_sql: &str, window_hours: i32) -> Result<Histogram> {
         let rows: Vec<(i32, i64, f64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT width_bucket(v, $1::float8[])::int4, COUNT(*)::int8, COALESCE(SUM(v), 0)::float8 \
              FROM ({from_sql}) t WHERE v IS NOT NULL AND v >= 0 GROUP BY 1"
         )))
         .bind(HISTOGRAM_BUCKETS)
+        .bind(window_hours)
         .fetch_all(&self.pool)
         .await?;
 
@@ -396,14 +406,25 @@ impl Store {
         .await?;
         // Both are per attempt, not per step: a step that was retried waited twice and ran
         // twice, and averaging that away would hide exactly the runs worth looking at.
+        //
+        // Both are bounded to a recent window. A histogram over 30 days of attempts
+        // answers a question nobody asks (Prometheus keeps its own history of these) and
+        // costs a full scan of the table on every scrape.
         let step_duration = self
             .histogram(
                 "SELECT EXTRACT(EPOCH FROM (finished_at - started_at))::float8 AS v \
-                 FROM step_attempts WHERE finished_at IS NOT NULL",
+                 FROM step_attempts \
+                 WHERE finished_at IS NOT NULL \
+                   AND started_at >= NOW() - make_interval(hours => $2::int4)",
+                METRICS_WINDOW_HOURS,
             )
             .await?;
         let queue_wait = self
-            .histogram("SELECT queue_wait_seconds AS v FROM step_attempts")
+            .histogram(
+                "SELECT queue_wait_seconds AS v FROM step_attempts \
+                 WHERE started_at >= NOW() - make_interval(hours => $2::int4)",
+                METRICS_WINDOW_HOURS,
+            )
             .await?;
         Ok(MetricsSnapshot {
             step_runs,
@@ -1101,6 +1122,37 @@ impl Store {
 
     /// Of `paths`, those still referenced by an artifact row. Retention must not delete a
     /// blob a retry (or any other run) still points at.
+    /// Which of these object **keys** (`artifacts/{run}/{step}/{name}`) a row still
+    /// points at, whatever root the row's path was written with.
+    ///
+    /// The path comparison in [`Self::artifact_paths_still_referenced`] only works when
+    /// the process asking spells the artifact root exactly as the process that wrote the
+    /// row did. That is now guaranteed by canonicalising the root, but the orphan sweep
+    /// deletes what this says is unreferenced, and a single disagreement there destroys
+    /// live artifacts — so it also asks by key, which no root can change. Each row's key
+    /// is extracted with the layout's own shape (two UUIDs), so a root that happens to
+    /// contain `artifacts/` cannot truncate it in the wrong place.
+    pub async fn artifact_keys_still_referenced(&self, keys: &[String]) -> Result<Vec<String>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(sqlx::query_scalar::<_, String>(
+            r#"
+            WITH referenced AS (
+                SELECT DISTINCT substring(
+                    path from 'artifacts/[0-9a-fA-F-]{36}/[0-9a-fA-F-]{36}/.*$'
+                ) AS key
+                FROM artifacts
+            )
+            SELECT t.k FROM unnest($1::text[]) AS t(k)
+            JOIN referenced r ON r.key = t.k
+            "#,
+        )
+        .bind(keys)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn artifact_paths_still_referenced(&self, paths: &[String]) -> Result<Vec<String>> {
         if paths.is_empty() {
             return Ok(vec![]);
@@ -1821,6 +1873,27 @@ impl Store {
         .await?)
     }
 
+    /// `(count, total bytes)` of the artifacts this step has stored under names other
+    /// than `name`.
+    ///
+    /// `name` is excluded because a re-upload replaces its row (`ON CONFLICT` on
+    /// `(step_run_id, name)`): a step that is retried must not spend its cap again on the
+    /// artifact it is replacing.
+    pub async fn artifact_usage_for_step(
+        &self,
+        step_run_id: Uuid,
+        name: &str,
+    ) -> Result<(i64, i64)> {
+        Ok(sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*)::int8, COALESCE(SUM(GREATEST(size, 0)), 0)::int8
+             FROM artifacts WHERE step_run_id = $1 AND name <> $2",
+        )
+        .bind(step_run_id)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn list_artifacts(&self, run_id: Uuid) -> Result<Vec<Artifact>> {
         Ok(sqlx::query_as::<_, Artifact>(
             "SELECT id, run_id, step_run_id, name, path, size, created_at
@@ -1831,19 +1904,52 @@ impl Store {
         .await?)
     }
 
-    /// True when `agent_id` currently holds a running step in the artifact's run.
-    /// Backs the agent restore-download route; global vs project pools need no special case.
-    pub async fn agent_may_read_artifact(&self, agent_id: Uuid, artifact_id: Uuid) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                 SELECT 1 FROM artifacts a
-                 JOIN step_runs s ON s.run_id = a.run_id
-                 WHERE a.id = $1 AND s.agent_id = $2 AND s.status = 'running')",
+    /// What an agent's artifact download is judged on: the run's definition snapshot, the
+    /// step ids this agent currently holds running in that run, and the step that produced
+    /// the artifact.
+    ///
+    /// The decision itself is the caller's (`fiber-api` owns the `needs` closure), because
+    /// it has to match the one the offer made when it chose what to restore. `None` means
+    /// the artifact does not exist, or this agent holds nothing running in its run — the
+    /// route answers 404 either way, so existence is not disclosed.
+    pub async fn agent_artifact_access(
+        &self,
+        agent_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<ArtifactAccess>> {
+        // The run snapshot and the producing step, in one row. The producer join is a
+        // LEFT JOIN: an artifact whose step row is gone is unreadable, not a 500.
+        let Some((snapshot, producer_step_id)) =
+            sqlx::query_as::<_, (serde_json::Value, Option<String>)>(
+                "SELECT r.definition_snapshot, p.step_id
+                 FROM artifacts a
+                 JOIN runs r ON r.id = a.run_id
+                 LEFT JOIN step_runs p ON p.id = a.step_run_id
+                 WHERE a.id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let holder_step_ids = sqlx::query_scalar::<_, String>(
+            "SELECT s.step_id FROM step_runs s
+             JOIN artifacts a ON a.run_id = s.run_id
+             WHERE a.id = $1 AND s.agent_id = $2 AND s.status = 'running'",
         )
         .bind(artifact_id)
         .bind(agent_id)
-        .fetch_one(&self.pool)
-        .await?)
+        .fetch_all(&self.pool)
+        .await?;
+        if holder_step_ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ArtifactAccess {
+            snapshot,
+            holder_step_ids,
+            producer_step_id,
+        }))
     }
 
     pub async fn get_artifact(&self, id: Uuid) -> Result<Option<Artifact>> {
@@ -1916,6 +2022,43 @@ impl Store {
             .await?
         };
         Ok(rows)
+    }
+
+    /// Delete these runs' log lines in `chunk`-sized statements, returning how many rows
+    /// went.
+    ///
+    /// `DELETE FROM runs` cascades to `log_lines`, and a batch of a hundred runs can carry
+    /// millions of rows: one statement then holds a transaction (and its `xmin`, so
+    /// autovacuum cannot clean up behind it) for minutes, against the hottest table in the
+    /// schema. Chunking it keeps each statement short and each lock brief; the runs are
+    /// terminal and past the retention cutoff, so nothing is reading these rows.
+    ///
+    /// This is the one path allowed to remove append-only rows (see the retention
+    /// exception in the conventions).
+    pub async fn delete_log_lines_for_runs(&self, run_ids: &[Uuid], chunk: i64) -> Result<u64> {
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+        let chunk = chunk.clamp(1_000, 200_000);
+        let mut total = 0u64;
+        // A ceiling on the statements, not on the rows: a pathological batch must not
+        // hold the retention tick for ever. What is left is deleted by the cascade.
+        for _ in 0..500 {
+            let res = sqlx::query(
+                "DELETE FROM log_lines WHERE ctid IN (
+                     SELECT ctid FROM log_lines WHERE run_id = ANY($1) LIMIT $2)",
+            )
+            .bind(run_ids)
+            .bind(chunk)
+            .execute(&self.pool)
+            .await?;
+            let n = res.rows_affected();
+            total += n;
+            if n < chunk as u64 {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     pub async fn delete_runs(&self, run_ids: &[Uuid]) -> Result<u64> {

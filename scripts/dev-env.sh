@@ -49,6 +49,12 @@ export FIBER_AGENT_LABELS="${FIBER_AGENT_LABELS:-os=linux}"
 export FIBER_AGENT_CONCURRENCY="${FIBER_AGENT_CONCURRENCY:-1}"
 export VITE_FIBER_API_URL="${VITE_FIBER_API_URL:-http://127.0.0.1:18080}"
 export FIBER_RETENTION_FIBER_DAYS="${FIBER_RETENTION_FIBER_DAYS:-7}"
+# Artifact objects with no row (an upload that never completed) are swept after this long.
+export FIBER_RETENTION_ORPHAN_HOURS="${FIBER_RETENTION_ORPHAN_HOURS:-24}"
+# Per-step artifact caps, and live interval_task chains per project.
+export FIBER_MAX_ARTIFACTS_PER_STEP="${FIBER_MAX_ARTIFACTS_PER_STEP:-50}"
+export FIBER_MAX_ARTIFACT_BYTES_PER_STEP="${FIBER_MAX_ARTIFACT_BYTES_PER_STEP:-536870912}"
+export FIBER_INTERVAL_MAX_PER_PROJECT="${FIBER_INTERVAL_MAX_PER_PROJECT:-10}"
 export FIBER_STEP_LOG_MAX_LINES="${FIBER_STEP_LOG_MAX_LINES:-50000}"
 # The http_request fiber task stays restricted in dev too, so what you test matches
 # what an operator gets.

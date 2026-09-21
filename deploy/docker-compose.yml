@@ -196,6 +196,12 @@ services:
       FIBER_RETENTION_INTERVAL_SECS: ${FIBER_RETENTION_INTERVAL_SECS:-}
       # Delete terminal durable fibers older than this many days. 0 disables.
       FIBER_RETENTION_FIBER_DAYS: ${FIBER_RETENTION_FIBER_DAYS:-7}
+      # Artifact objects with no row (an upload that never completed), in hours. 0 = off.
+      FIBER_RETENTION_ORPHAN_HOURS: ${FIBER_RETENTION_ORPHAN_HOURS:-}
+      # Per-step artifact caps (count, total bytes) and live interval_task chains.
+      FIBER_MAX_ARTIFACTS_PER_STEP: ${FIBER_MAX_ARTIFACTS_PER_STEP:-}
+      FIBER_MAX_ARTIFACT_BYTES_PER_STEP: ${FIBER_MAX_ARTIFACT_BYTES_PER_STEP:-}
+      FIBER_INTERVAL_MAX_PER_PROJECT: ${FIBER_INTERVAL_MAX_PER_PROJECT:-}
       # Seconds without a heartbeat before an agent is marked offline.
       FIBER_AGENT_STALE_SECS: ${FIBER_AGENT_STALE_SECS:-}
       # Per-attempt limit for steps without `timeout_minutes`, and the extra minutes the

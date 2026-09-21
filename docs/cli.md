@@ -44,6 +44,13 @@ echo $?                                   # 0 succeeded · 1 failed/cancelled ·
 stdout, so `fiber run … --follow > build.log` keeps the two apart. Waiting polls the API
 rather than holding a WebSocket, so it works behind proxies that do not pass upgrades.
 
+**A failed poll is not a failed build.** Each poll has a 30-second request timeout and is
+retried up to five times with backoff (1 s, 2 s, 4 s, 8 s, 10 s), printing each failure to
+stderr; only after that does the command give up and exit non-zero. A restarting API, a
+proxy 502 or a dropped connection used to exit `1`, which a gating script reads as a red
+build. `--timeout-secs` bounds the whole wait, including the retries, and a connection that
+stalls mid-request is abandoned rather than waited on for ever.
+
 ```bash
 fiber runs list $PROJECT_ID --limit 20                 # newest first
 fiber runs list $PROJECT_ID --before $LAST_RUN_ID      # next page

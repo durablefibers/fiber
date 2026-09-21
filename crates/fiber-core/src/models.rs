@@ -308,6 +308,18 @@ pub struct CreateUserRequest {
     pub password: String,
 }
 
+/// The facts an agent artifact download is decided on. See
+/// [`crate::Store::agent_artifact_access`].
+#[derive(Debug, Clone)]
+pub struct ArtifactAccess {
+    /// The run's immutable definition snapshot, which carries the `needs` graph.
+    pub snapshot: serde_json::Value,
+    /// Step ids this agent holds running in that run.
+    pub holder_step_ids: Vec<String>,
+    /// The step that produced the artifact, if its row still exists.
+    pub producer_step_id: Option<String>,
+}
+
 /// Counts behind the `/metrics` endpoint, read from the database in one pass.
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
