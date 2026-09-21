@@ -14,6 +14,9 @@ pub struct AppState {
     pub loop_health: Arc<crate::supervisor::LoopHealth>,
     pub artifacts: ArtifactBackend,
     pub login_guard: Arc<LoginGuard>,
+    /// `/metrics` is six queries, two of them over `step_attempts`. Held here for a few
+    /// seconds so a scrape (or several) does not put that on the pool every time.
+    pub metrics_cache: Arc<crate::metrics_cache::MetricsCache>,
     /// Flips to `true` once a shutdown signal arrives. Long-lived handlers (the WebSocket
     /// sessions) watch it so they can close cleanly instead of being cut off when the
     /// process exits.

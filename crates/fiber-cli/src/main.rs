@@ -335,7 +335,11 @@ async fn main() -> Result<()> {
             } else {
                 password.unwrap_or_else(|| "fiber".to_string())
             };
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .context("http client")?;
             let resp: LoginResp = client
                 .post(format!("{base}/api/auth/login"))
                 .json(&json!({ "username": username, "password": password }))
@@ -966,7 +970,11 @@ async fn wait_for_run(
     let mut cursors: HashMap<String, i64> = HashMap::new();
     let mut announced: HashMap<String, String> = HashMap::new();
     loop {
-        let detail = api_json(client.get(format!("{base}/api/runs/{run_id}"))).await?;
+        // A single failed poll is not a failed build. Without this one proxy 502, one
+        // API restart or one dropped connection exited non-zero, and a script gating on
+        // `fiber run --wait` read that as a red build.
+        let detail =
+            poll_with_retry(client, &format!("{base}/api/runs/{run_id}"), deadline).await?;
         let status = detail["run"]["status"]
             .as_str()
             .unwrap_or("running")
@@ -991,7 +999,7 @@ async fn wait_for_run(
             if let Some(a) = after {
                 url.push_str(&format!("&after_id={a}"));
             }
-            let Ok(lines) = api_json(client.get(url)).await else {
+            let Ok(lines) = api_json(client.get(url).timeout(POLL_REQUEST_TIMEOUT)).await else {
                 continue;
             };
             for l in lines.as_array().cloned().unwrap_or_default() {
@@ -1020,6 +1028,44 @@ async fn wait_for_run(
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+}
+
+/// Per-request ceiling while polling. Short: the endpoint answers in milliseconds, and a
+/// connection that has stopped moving has to be abandoned for the retry to happen at all.
+const POLL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How many consecutive failures of the same poll are tolerated before the wait gives up.
+const POLL_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry number `attempt` (1-based): 1 s, 2 s, 4 s, 8 s, capped at 10 s.
+fn poll_backoff(attempt: u32) -> std::time::Duration {
+    let secs = 1u64 << attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(secs.min(10))
+}
+
+/// GET `url` as JSON, retrying a failure a few times with backoff.
+///
+/// Returns the last error once the attempts or the caller's deadline run out, so a truly
+/// unreachable API still ends the wait rather than looping for ever.
+async fn poll_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=POLL_ATTEMPTS {
+        match api_json(client.get(url).timeout(POLL_REQUEST_TIMEOUT)).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                eprintln!("poll failed (attempt {attempt}/{POLL_ATTEMPTS}): {e}");
+                last = Some(e);
+            }
+        }
+        if attempt == POLL_ATTEMPTS || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(poll_backoff(attempt)).await;
+    }
+    Err(last.unwrap_or_else(|| anyhow!("poll {url} failed")))
 }
 
 /// Succeeded exits 0; anything else exits 1, so `fiber run --wait` can gate a script.
@@ -1063,6 +1109,12 @@ struct LoginResp {
 
 fn api_client(token: &str) -> reqwest::Client {
     reqwest::Client::builder()
+        // A connect that never completes (a dropped SYN to a proxy, a blackholed route)
+        // hangs the whole command: `fiber run --wait --timeout-secs 600` only looks at
+        // its deadline between polls, so without this the timeout was unreachable.
+        // No overall request timeout here: `fiber artifacts download` legitimately runs
+        // for minutes. The polling loop sets its own per-request one.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .default_headers({
             let mut h = reqwest::header::HeaderMap::new();
             h.insert(
@@ -1168,6 +1220,37 @@ fn load_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- wait/poll resilience ----------------------------------------------------------
+
+    #[test]
+    fn poll_backoff_grows_and_is_capped() {
+        // A retry storm against an API that is restarting helps nobody, and a backoff
+        // that keeps doubling would blow past the caller's --timeout-secs in one sleep.
+        assert_eq!(poll_backoff(1), std::time::Duration::from_secs(1));
+        assert_eq!(poll_backoff(2), std::time::Duration::from_secs(2));
+        assert_eq!(poll_backoff(3), std::time::Duration::from_secs(4));
+        assert_eq!(poll_backoff(4), std::time::Duration::from_secs(8));
+        assert_eq!(poll_backoff(5), std::time::Duration::from_secs(10));
+        assert_eq!(poll_backoff(50), std::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_poll_past_the_deadline_stops_retrying() {
+        // --timeout-secs has to bound the retries too, or an unreachable API turns a
+        // bounded wait into a five-attempt one on top of it.
+        let client = api_client("t");
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        // Port 1 is not listening: the connection is refused immediately.
+        let err = poll_with_retry(&client, "http://127.0.0.1:1/api/runs/x", past)
+            .await
+            .expect_err("an unreachable API must surface as an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "retried past the deadline: {err}"
+        );
+    }
 
     // --- artifact download filename ----------------------------------------------------
 

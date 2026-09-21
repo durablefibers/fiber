@@ -111,6 +111,34 @@ impl FiberStore {
         }
     }
 
+    /// Unfinished fibers of one task in one project, not counting `exclude`.
+    ///
+    /// The caller is usually a fiber asking about itself, and counting itself would make
+    /// a cap of one stop the only chain there is.
+    pub async fn count_live_siblings(
+        &self,
+        project_id: Uuid,
+        name: &str,
+        exclude: Uuid,
+    ) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM fibers
+             WHERE project_id = $1 AND name = $2 AND id <> $3
+               AND status IN ('pending', 'running', 'suspended')",
+        )
+        .bind(project_id)
+        .bind(name)
+        .bind(exclude)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// The project's fibers for the list view, **without** their memoized step results.
+    ///
+    /// The Fibers page polls this every two seconds and shows status, timing and the
+    /// result — never `state.steps`. Hydrating each row cost one `fiber_steps` query per
+    /// fiber (101 per poll at the limit), so the steps are left empty here and filled in
+    /// by [`Self::get`], which is what the detail view calls.
     pub async fn list_by_project(&self, project_id: Uuid) -> Result<Vec<FiberRecord>> {
         let rows = sqlx::query_as::<_, FiberRow>(
             "SELECT id, project_id, name, status, input, state, result, error, attempts,
@@ -120,40 +148,76 @@ impl FiberStore {
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            out.push(self.hydrate(r).await?);
-        }
-        Ok(out)
+        Ok(rows.into_iter().map(record_from_row).collect())
     }
 
     async fn hydrate(&self, row: FiberRow) -> Result<FiberRecord> {
-        let mut state: FiberState = serde_json::from_value(row.state).unwrap_or_default();
         let steps =
             sqlx::query_as::<_, StepRow>("SELECT key, value FROM fiber_steps WHERE fiber_id = $1")
                 .bind(row.id)
                 .fetch_all(&self.pool)
                 .await?;
+        let mut record = record_from_row(row);
         for s in steps {
-            state.steps.insert(s.key, s.value);
+            record.state.steps.insert(s.key, s.value);
         }
-        Ok(FiberRecord {
-            id: row.id,
-            project_id: row.project_id,
-            name: row.name,
-            status: FiberStatus::parse(&row.status),
-            input: row.input,
-            state,
-            result: row.result,
-            error: row.error,
-            attempts: row.attempts,
-            wake_at: row.wake_at,
-            heartbeat_at: row.heartbeat_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        })
+        Ok(record)
     }
 
+    /// Hydrate many rows with one `fiber_steps` query instead of one per fiber.
+    async fn hydrate_all(&self, rows: Vec<FiberRow>) -> Result<Vec<FiberRecord>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let steps = sqlx::query_as::<_, (Uuid, String, serde_json::Value)>(
+            "SELECT fiber_id, key, value FROM fiber_steps WHERE fiber_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<FiberRecord> = rows.into_iter().map(record_from_row).collect();
+        attach_steps(&mut out, steps);
+        Ok(out)
+    }
+}
+
+/// File each `(fiber_id, key, value)` under its own fiber.
+///
+/// The batched read returns every claimed fiber's steps in one result set, so the rows
+/// have to be matched back by id — putting one fiber's memoized results on another would
+/// make the engine skip a step that never ran.
+fn attach_steps(records: &mut [FiberRecord], steps: Vec<(Uuid, String, serde_json::Value)>) {
+    let index: std::collections::HashMap<Uuid, usize> =
+        records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+    for (fiber_id, key, value) in steps {
+        if let Some(i) = index.get(&fiber_id) {
+            records[*i].state.steps.insert(key, value);
+        }
+    }
+}
+
+/// A row as a record, with no memoized steps attached. Callers that need them add them.
+fn record_from_row(row: FiberRow) -> FiberRecord {
+    let state: FiberState = serde_json::from_value(row.state).unwrap_or_default();
+    FiberRecord {
+        id: row.id,
+        project_id: row.project_id,
+        name: row.name,
+        status: FiberStatus::parse(&row.status),
+        input: row.input,
+        state,
+        result: row.result,
+        error: row.error,
+        attempts: row.attempts,
+        wake_at: row.wake_at,
+        heartbeat_at: row.heartbeat_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+impl FiberStore {
     /// Persist a fiber, unless a person has cancelled it in the meantime.
     ///
     /// Returns whether the write applied. The engine holds a record from before the handler
@@ -294,11 +358,9 @@ impl FiberStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            out.push(self.hydrate(r).await?);
-        }
-        Ok(out)
+        // One query for every claimed fiber's memoized steps, not one each: this runs on
+        // the poller's tick, and the engine needs the steps to skip what is already done.
+        self.hydrate_all(rows).await
     }
 
     pub async fn cancel(&self, id: Uuid) -> Result<Option<FiberRecord>> {
@@ -421,4 +483,59 @@ struct FiberRow {
 struct StepRow {
     key: String,
     value: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rec(id: Uuid) -> FiberRecord {
+        let now = Utc::now();
+        FiberRecord {
+            id,
+            project_id: Uuid::new_v4(),
+            name: "t".into(),
+            status: FiberStatus::Running,
+            input: json!({}),
+            state: FiberState::default(),
+            result: None,
+            error: None,
+            attempts: 0,
+            wake_at: None,
+            heartbeat_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn batched_steps_land_on_their_own_fiber() {
+        // One query returns every claimed fiber's steps together. Filing one fiber's
+        // memoized result under another would make the engine skip a step that never ran.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut records = vec![rec(a), rec(b)];
+        attach_steps(
+            &mut records,
+            vec![
+                (a, "one".into(), json!(1)),
+                (b, "two".into(), json!(2)),
+                (a, "three".into(), json!(3)),
+                // A fiber that is not in this batch must not panic or land anywhere.
+                (Uuid::new_v4(), "stray".into(), json!(9)),
+            ],
+        );
+        assert_eq!(records[0].state.steps.len(), 2);
+        assert_eq!(records[0].state.steps["one"], json!(1));
+        assert_eq!(records[0].state.steps["three"], json!(3));
+        assert_eq!(records[1].state.steps.len(), 1);
+        assert_eq!(records[1].state.steps["two"], json!(2));
+    }
+
+    #[test]
+    fn a_batch_with_no_steps_leaves_every_record_alone() {
+        let mut records = vec![rec(Uuid::new_v4())];
+        attach_steps(&mut records, vec![]);
+        assert!(records[0].state.steps.is_empty());
+    }
 }

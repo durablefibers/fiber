@@ -149,6 +149,9 @@ fn is_valid_env_key(k: &str) -> bool {
 #[derive(Clone)]
 struct ExecConfig {
     use_docker: bool,
+    /// `--label` on every step container, so the startup sweep can find this agent's
+    /// orphans without touching another agent's running containers.
+    container_label: String,
     env_passthrough: Vec<String>,
     docker_user: String,
     docker_network: String,
@@ -161,6 +164,7 @@ impl ExecConfig {
     fn from_args(args: &Args) -> Self {
         Self {
             use_docker: args.use_docker,
+            container_label: agent_container_label(&args.name),
             env_passthrough: args
                 .env_passthrough
                 .split(',')
@@ -220,6 +224,62 @@ impl Workspaces {
     }
 }
 
+/// Every spelling of one secret that a step is likely to print.
+///
+/// Matching the raw bytes only is what makes redaction look like it works and then not:
+/// `base64 <<< "$TOKEN"`, a token in a `curl --trace` URL, and a value inside a JSON body
+/// are all the secret, and none of them contains its literal bytes. Each form here is one
+/// a step produces without trying to — the point is the accident, not the adversary, who
+/// can always encrypt.
+fn redaction_forms(value: &str) -> Vec<String> {
+    use base64::Engine as _;
+    // The floor is on the secret, not on its encodings: base64 of a three-character
+    // value is eight characters, and registering that would mask unrelated output for a
+    // value too short to be worth protecting.
+    if value.len() < Redactor::MIN_LEN {
+        return Vec::new();
+    }
+    let std_b64 = base64::engine::general_purpose::STANDARD;
+    let url_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut out = vec![
+        value.to_string(),
+        std_b64.encode(value.as_bytes()),
+        url_b64.encode(value.as_bytes()),
+        // `base64 <<< "$TOKEN"` and `echo "$TOKEN" | base64` encode a trailing newline,
+        // which is the form the finding was written against.
+        std_b64.encode(format!("{value}\n").as_bytes()),
+        percent_encoded(value),
+        json_escaped(value),
+    ];
+    out.retain(|v| v.len() >= Redactor::MIN_LEN);
+    out
+}
+
+/// RFC 3986 percent-encoding of everything outside the unreserved set — what a query
+/// string, a form body, or a client tracing a request writes.
+fn percent_encoded(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The value as it appears inside a JSON string: quotes, backslashes, control characters
+/// and newlines escaped, without the surrounding quotes.
+fn json_escaped(value: &str) -> String {
+    let quoted = serde_json::Value::String(value.to_string()).to_string();
+    quoted
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(&quoted)
+        .to_string()
+}
+
 /// Replaces every occurrence of a secret value in log output with `***`.
 #[derive(Clone, Default)]
 struct Redactor {
@@ -228,30 +288,32 @@ struct Redactor {
 
 impl Redactor {
     /// Values shorter than this are skipped: masking a two-character secret would blank
-    /// out unrelated output without protecting much.
+    /// out unrelated output without protecting much. Applied to each encoded form too, so
+    /// a short secret does not come back through a longer encoding of itself.
     const MIN_LEN: usize = 8;
 
     fn new(env: &[(String, String)], secret_keys: &[String]) -> Self {
-        let mut values: Vec<String> = Vec::new();
+        let mut bases: Vec<String> = Vec::new();
         for (k, v) in env.iter().filter(|(k, _)| secret_keys.contains(k)) {
             let _ = k;
-            if v.len() >= Self::MIN_LEN {
-                values.push(v.clone());
-            }
+            bases.push(v.clone());
             // Logs arrive a line at a time, so a multi-line secret (a PEM key, a service
             // account JSON) would never match as a whole. Mask its lines individually.
             if v.contains('\n') {
-                values.extend(
-                    v.lines()
-                        .map(str::trim_end)
-                        .filter(|l| l.len() >= Self::MIN_LEN)
-                        .map(str::to_string),
-                );
+                bases.extend(v.lines().map(str::trim_end).map(str::to_string));
+            }
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut values: Vec<String> = Vec::new();
+        for base in bases {
+            for form in redaction_forms(&base) {
+                if seen.insert(form.clone()) {
+                    values.push(form);
+                }
             }
         }
         // Longest first, so a secret containing another is masked whole.
         values.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        values.dedup();
         Self { values }
     }
 
@@ -1287,7 +1349,7 @@ fn give_up_steps(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     // Held to the end of main: dropping it flushes whatever has not been exported.
     let _otel = otel::init(&args.name)?;
 
@@ -1296,8 +1358,27 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
     std::fs::create_dir_all(&args.workspace_dir)?;
+    // Absolute from here on. The documented default is `./data/workspaces`, and a
+    // relative path becomes the source of a `docker run -v` bind, which the daemon
+    // refuses outright ("must be an absolute path"): docker mode did not work with the
+    // documented default. Resolved once at startup rather than per step, so every
+    // workspace path the agent logs, sweeps and mounts is the same one.
+    match std::fs::canonicalize(&args.workspace_dir) {
+        Ok(abs) => args.workspace_dir = abs,
+        Err(e) => {
+            error!(
+                path = %args.workspace_dir.display(), error = %e,
+                "cannot resolve the workspace directory"
+            );
+            std::process::exit(2);
+        }
+    }
+    info!(workspace_dir = %args.workspace_dir.display(), "workspace root");
     // Anything left from a previous process (crash, kill -9) is nobody's to finish.
     sweep_stale_workspaces(&args.workspace_dir, args.workspace_ttl_hours).await;
+    if args.use_docker {
+        sweep_orphaned_containers(&agent_container_label(&args.name)).await;
+    }
     let labels: Vec<String> = args
         .labels
         .split(',')
@@ -2173,7 +2254,16 @@ async fn execute_step_inner(
         );
         docker_container = Some(container_name.clone());
         let mut cmd = Command::new("docker");
-        cmd.args(["run", "--rm", "--name", &container_name, "-v", &mount]);
+        cmd.args([
+            "run",
+            "--rm",
+            "--name",
+            &container_name,
+            "--label",
+            &exec.container_label,
+            "-v",
+            &mount,
+        ]);
         let container_cwd = match subdir {
             Some(d) => format!("/workspace/{d}"),
             None => "/workspace".to_string(),
@@ -2767,6 +2857,69 @@ where
     }
 }
 
+/// The server's explanation for a refused request, as a short suffix for a step's log.
+///
+/// Bounded and single-line: this ends up in `log_lines` and in the step's `error`, and an
+/// error page or a stack trace pasted there helps nobody.
+async fn error_detail(resp: reqwest::Response) -> String {
+    let body = resp.text().await.unwrap_or_default();
+    let trimmed: String = body
+        .trim()
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(300)
+        .collect();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(" ({trimmed})")
+    }
+}
+
+/// The plain components of a declared artifact path, or `None` when it is not a simple
+/// relative path.
+///
+/// `..`, an absolute path and a Windows prefix are all refused here rather than by a
+/// substring check: `work_dir.join("/etc/passwd")` discards the workspace entirely, so
+/// an absolute declaration read a file outside the checkout and uploaded it.
+fn artifact_components(rel: &str) -> Option<Vec<std::ffi::OsString>> {
+    let mut out = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n.to_os_string()),
+            _ => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The first path element of `rel` under `work_dir` that is a symlink, if any.
+///
+/// Every component is checked, not just the leaf: `out -> /` with `artifacts: [out/etc/shadow]`
+/// is the same escape one level up. A component that does not exist ends the walk — the
+/// caller's own metadata call reports it as missing.
+async fn symlink_in(work_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let mut cur = work_dir.to_path_buf();
+    for part in artifact_components(rel)? {
+        cur.push(part);
+        match tokio::fs::symlink_metadata(&cur).await {
+            Ok(m) if m.is_symlink() => return Some(cur),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Leaf name for the `tar czf …` suggestion on a directory artifact.
+fn artifact_archive_hint(rel: &str) -> String {
+    Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("artifact")
+        .to_string()
+}
+
 /// Upload each declared artifact, returning the ones that could not be stored.
 ///
 /// A path that does not exist is a warning, not a failure: a pipeline may legitimately
@@ -2795,14 +2948,26 @@ async fn upload_artifacts(
     let complete_url = format!("{http_api}/api/agent/steps/{step_run_id}/artifacts/complete");
     for rel in artifacts {
         let rel = rel.trim();
-        if rel.is_empty() || rel.contains("..") {
+        if artifact_components(rel).is_none() {
             let msg = format!("unsafe artifact path: {rel}");
             log("system", msg.clone());
             failures.push(msg);
             continue;
         }
         let path = work_dir.join(rel);
-        match tokio::fs::metadata(&path).await {
+        // Checked before the open, on every component. A repository controls its own
+        // working tree, so `out/build.log -> ~/.ssh/id_rsa` (or `out -> /`) is a file the
+        // step never produced being uploaded to a store every project reader can read.
+        if let Some(link) = symlink_in(work_dir, rel).await {
+            let msg = format!(
+                "artifact {rel} is or is under a symlink ({}); refusing to upload it",
+                link.display()
+            );
+            log("system", msg.clone());
+            failures.push(msg);
+            continue;
+        }
+        match tokio::fs::symlink_metadata(&path).await {
             Ok(meta) if meta.is_file() => {
                 if meta.len() > MAX_ARTIFACT_BYTES {
                     let msg = format!(
@@ -2852,7 +3017,25 @@ async fn upload_artifacts(
                     }
                 }
             }
-            Ok(_) => log("system", format!("artifact {rel} is not a file; skipping")),
+            // A directory used to be skipped with a note, leaving the step green and the
+            // artifact absent — the dependent step then failed at restore time, or worse,
+            // ran without it. `artifacts: [dist/]` is a mistake worth reporting where it
+            // was made. Archive the tree into one file in the step instead:
+            // `tar czf dist.tgz dist` and declare `dist.tgz`.
+            Ok(meta) if meta.is_dir() => {
+                let msg = format!(
+                    "artifact {rel} is a directory; declare the files individually or \
+                     archive it first (tar czf {}.tgz {rel})",
+                    artifact_archive_hint(rel)
+                );
+                log("system", msg.clone());
+                failures.push(msg);
+            }
+            Ok(_) => {
+                let msg = format!("artifact {rel} is not a regular file; refusing to upload it");
+                log("system", msg.clone());
+                failures.push(msg);
+            }
             Err(e) => log("system", format!("artifact {rel} missing: {e}")),
         }
     }
@@ -2890,9 +3073,14 @@ async fn upload_one_artifact(
             .await
             .map_err(|e| ApiFailure::Fatal(format!("presign parse {rel}: {e}")))?,
         Ok(resp) => {
+            // The body carries the server's reason — an artifact cap, an unusable path,
+            // an attempt that has moved on. Without it the step's only clue is
+            // "HTTP 400", and the operator has to read the API's log to learn why.
+            let status = resp.status();
+            let why = error_detail(resp).await;
             return Err(ApiFailure::from_status(
-                resp.status(),
-                format!("presign {rel} failed: HTTP {}", resp.status()),
+                status,
+                format!("presign {rel} failed: HTTP {status}{why}"),
             ));
         }
         Err(e) => return Err(ApiFailure::Transient(format!("presign {rel} failed: {e}"))),
@@ -3114,6 +3302,79 @@ async fn clone_step_workspace(
 }
 
 /// Delete run workspaces — and orphaned step env files — left behind by a crash.
+/// The `--label` every step container of this agent carries, so the startup sweep can
+/// tell its own leftovers from the containers of another agent sharing the host.
+///
+/// The name is the agent's, sanitized: a label value is an argv token and the name comes
+/// from configuration, not from a pipeline, but this is still the one place it reaches
+/// `docker`.
+fn agent_container_label(agent_name: &str) -> String {
+    let safe: String = agent_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let safe = if safe.is_empty() {
+        "agent".to_string()
+    } else {
+        safe
+    };
+    format!("fiber.agent={safe}")
+}
+
+/// Container ids in `docker ps -q` output.
+///
+/// Separated from the process call so the parsing is testable: a blank line handed to
+/// `docker rm -f` is an argument error that would abort the whole sweep.
+fn container_ids(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove step containers this agent left running.
+///
+/// A `kill -9` (or an OOM-killed agent) leaves `docker run --rm` children alive: the
+/// container keeps the step's workspace bind-mounted and its `--env-file` secrets in the
+/// process environment, and nothing ever reaps it — the step is reclaimed and re-run
+/// somewhere else while the orphan holds CPU, memory and the credentials. Only containers
+/// carrying this agent's label are touched, so a second agent on the same host is safe.
+async fn sweep_orphaned_containers(label: &str) {
+    let out = Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("label={label}")])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        // No docker client, or no daemon: `use_docker` steps will fail with their own
+        // message; a missing sweep is not worth a startup failure.
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let ids = container_ids(&String::from_utf8_lossy(out.stdout.as_slice()));
+    if ids.is_empty() {
+        return;
+    }
+    warn!(
+        containers = ids.len(),
+        "removing step containers left by a previous agent process"
+    );
+    let mut cmd = Command::new("docker");
+    cmd.args(["rm", "-f"]);
+    cmd.args(&ids);
+    let _ = cmd.output().await;
+}
+
 async fn sweep_stale_workspaces(root: &Path, ttl_hours: u64) {
     if ttl_hours == 0 {
         return;
@@ -4053,6 +4314,127 @@ mod tests {
             r.apply("prefix qrstuvwxyz123456 suffix"),
             "prefix *** suffix"
         );
+    }
+
+    #[test]
+    fn redactor_masks_a_base64_encoding_of_a_secret() {
+        use base64::Engine as _;
+        let value = "supersecretvalue";
+        let r = Redactor::new(&env(&[("NPM_TOKEN", value)]), &["NPM_TOKEN".into()]);
+        let std_b64 = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
+        let url_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes());
+        // `base64 <<< "$TOKEN"` encodes the trailing newline the here-string adds.
+        let with_nl =
+            base64::engine::general_purpose::STANDARD.encode(format!("{value}\n").as_bytes());
+        assert_eq!(r.apply(&format!("body={std_b64}")), "body=***");
+        assert_eq!(r.apply(&url_b64), "***");
+        assert_eq!(r.apply(&with_nl), "***");
+    }
+
+    #[test]
+    fn redactor_masks_a_percent_encoded_secret() {
+        // What a query string or a `curl --trace` line carries.
+        let r = Redactor::new(&env(&[("TOKEN", "p@ss w0rd/1234")]), &["TOKEN".into()]);
+        assert_eq!(
+            r.apply("GET /x?t=p%40ss%20w0rd%2F1234 HTTP/1.1"),
+            "GET /x?t=*** HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn redactor_masks_a_json_escaped_secret() {
+        let r = Redactor::new(&env(&[("TOKEN", "a\"b\\c\tlongenough")]), &["TOKEN".into()]);
+        // Serialized into a request body, the value carries its escapes, not its bytes.
+        assert_eq!(
+            r.apply(r#"{"token":"a\"b\\c\tlongenough"}"#),
+            r#"{"token":"***"}"#
+        );
+    }
+
+    #[test]
+    fn redactor_masks_encoded_forms_of_each_line_of_a_multi_line_secret() {
+        use base64::Engine as _;
+        let key = "-----BEGIN KEY-----\nabcdefghijklmnop\nqrstuvwxyz123456\n-----END KEY-----";
+        let r = Redactor::new(&env(&[("DEPLOY_KEY", key)]), &["DEPLOY_KEY".into()]);
+        let line_b64 = base64::engine::general_purpose::STANDARD.encode(b"abcdefghijklmnop");
+        assert_eq!(r.apply(&line_b64), "***");
+        // And the whole key as it appears inside a JSON payload.
+        let escaped = key.replace('\n', "\\n");
+        assert_eq!(
+            r.apply(&format!("{{\"key\":\"{escaped}\"}}")),
+            "{\"key\":\"***\"}"
+        );
+    }
+
+    #[test]
+    fn redactor_does_not_widen_a_short_secret_through_its_encodings() {
+        // "abc" is below MIN_LEN; its base64 ("YWJj") must not be registered either, and
+        // neither may any longer encoding of it — masking those blanks out unrelated
+        // output for a value too short to be worth protecting.
+        let r = Redactor::new(&env(&[("SHORT", "abc")]), &["SHORT".into()]);
+        assert!(r.values.is_empty(), "registered {:?}", r.values);
+    }
+
+    #[test]
+    fn an_artifact_path_must_be_plain_and_relative() {
+        assert!(artifact_components("out/VERSION").is_some());
+        assert!(artifact_components("dist").is_some());
+        // `work_dir.join("/etc/passwd")` is `/etc/passwd`: an absolute declaration would
+        // read outside the workspace entirely.
+        assert!(artifact_components("/etc/passwd").is_none());
+        assert!(artifact_components("../../etc/passwd").is_none());
+        assert!(artifact_components("out/../../etc/passwd").is_none());
+        assert!(artifact_components("").is_none());
+        assert!(artifact_components(".").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_artifact_is_found_at_any_depth() {
+        let root = std::env::temp_dir().join(format!("fiber-art-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("out/nested")).unwrap();
+        std::fs::write(root.join("out/nested/real.txt"), b"ok").unwrap();
+        let secret = root.join("id_rsa");
+        std::fs::write(&secret, b"PRIVATE").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("out/leaf.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("out"), root.join("alias")).unwrap();
+
+        assert_eq!(symlink_in(&root, "out/nested/real.txt").await, None);
+        assert_eq!(
+            symlink_in(&root, "out/leaf.txt").await,
+            Some(root.join("out/leaf.txt")),
+            "the leaf itself is a symlink"
+        );
+        assert_eq!(
+            symlink_in(&root, "alias/nested/real.txt").await,
+            Some(root.join("alias")),
+            "a symlinked parent is the same escape one level up"
+        );
+        // Nothing there yet is not a symlink; the caller reports it as missing.
+        assert_eq!(symlink_in(&root, "out/absent").await, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn container_ids_are_taken_only_from_well_formed_lines() {
+        // A blank line handed to `docker rm -f` is an argument error that aborts the
+        // whole sweep, and anything else in that output is not an id.
+        assert_eq!(
+            container_ids("abc123\n\n  def456  \n"),
+            vec!["abc123".to_string(), "def456".to_string()]
+        );
+        assert!(container_ids("").is_empty());
+        assert!(container_ids("Cannot connect to the Docker daemon\n").is_empty());
+    }
+
+    #[test]
+    fn the_container_label_is_this_agents_own() {
+        assert_eq!(agent_container_label("build-01"), "fiber.agent=build-01");
+        // The name reaches `docker` as an argv token.
+        assert_eq!(
+            agent_container_label("a b;rm -rf /"),
+            "fiber.agent=a_b_rm_-rf__"
+        );
+        assert_eq!(agent_container_label(""), "fiber.agent=agent");
     }
 
     #[test]

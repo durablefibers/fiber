@@ -241,7 +241,16 @@ impl ArtifactBackend {
     }
 
     /// Presigned PUT for direct agent upload; `None` for local (use API proxy).
-    pub async fn presign_put(&self, key: &str, secs: u64) -> Result<Option<String>> {
+    ///
+    /// `content_length` is signed, so the URL is only usable for an object of exactly
+    /// that size: without it the URL was a licence to write any number of bytes into the
+    /// bucket, and the size check on `complete` came far too late to stop them arriving.
+    pub async fn presign_put(
+        &self,
+        key: &str,
+        secs: u64,
+        content_length: i64,
+    ) -> Result<Option<String>> {
         match self {
             Self::Local { .. } => Ok(None),
             Self::S3 {
@@ -255,6 +264,7 @@ impl ArtifactBackend {
                     .put_object()
                     .bucket(bucket)
                     .key(key)
+                    .content_length(content_length)
                     .presigned(conf)
                     .await
                     .context("presign put")?;
@@ -262,6 +272,112 @@ impl ArtifactBackend {
             }
         }
     }
+
+    /// Stored paths under the artifact prefix last modified before `cutoff`, up to `limit`.
+    ///
+    /// Retention follows rows; an object whose row was never written — a presigned upload
+    /// the agent never completed, or one `complete` refused — is invisible to it and stays
+    /// in the bucket for ever. This is the other half: the objects, so the caller can ask
+    /// which of them nothing points at. Only the `artifacts/{run}/{step}/{name}` layout
+    /// this process writes is listed.
+    pub async fn list_stale_objects(
+        &self,
+        cutoff: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        match self {
+            Self::Local { root } => {
+                let mut out = Vec::new();
+                let base = root.join("artifacts");
+                let mut dirs = vec![base.clone()];
+                while let Some(dir) = dirs.pop() {
+                    let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                        continue;
+                    };
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                        let Ok(meta) = entry.metadata().await else {
+                            continue;
+                        };
+                        if meta.is_dir() {
+                            dirs.push(entry.path());
+                            continue;
+                        }
+                        if !meta.modified().is_ok_and(|m| m < cutoff) {
+                            continue;
+                        }
+                        let path = entry.path();
+                        let Ok(rel) = path.strip_prefix(root) else {
+                            continue;
+                        };
+                        if !is_artifact_object_key(&rel.to_string_lossy()) {
+                            continue;
+                        }
+                        out.push(path.to_string_lossy().to_string());
+                    }
+                }
+                Ok(out)
+            }
+            Self::S3 { client, bucket, .. } => {
+                let mut out = Vec::new();
+                let mut token: Option<String> = None;
+                loop {
+                    let mut req = client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix("artifacts/")
+                        .max_keys(1000);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    let page = req.send().await.context("s3 list_objects_v2")?;
+                    for obj in page.contents() {
+                        let Some(key) = obj.key() else { continue };
+                        if !is_artifact_object_key(key) {
+                            continue;
+                        }
+                        let old = obj
+                            .last_modified()
+                            .and_then(|t| std::time::SystemTime::try_from(*t).ok())
+                            .is_some_and(|t| t < cutoff);
+                        if !old {
+                            continue;
+                        }
+                        out.push(format!("s3://{bucket}/{key}"));
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                    token = page.next_continuation_token().map(str::to_string);
+                    if token.is_none() {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Whether a key is one this process wrote: `artifacts/{run uuid}/{step uuid}/{name}`.
+///
+/// The sweep deletes what it lists, so it only ever considers the exact layout
+/// [`ArtifactBackend::object_key`] produces. Anything else in the bucket — another tool's
+/// data, an operator's own upload — is none of its business.
+pub(crate) fn is_artifact_object_key(key: &str) -> bool {
+    let mut parts = key.split('/');
+    if parts.next() != Some("artifacts") {
+        return false;
+    }
+    let (Some(run), Some(step), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    parts.next().is_none()
+        && !name.is_empty()
+        && uuid::Uuid::parse_str(run).is_ok()
+        && uuid::Uuid::parse_str(step).is_ok()
 }
 
 fn s3_client(endpoint: &str, region: &str, access: &str, secret: &str) -> Client {
@@ -357,6 +473,61 @@ mod tests {
             client,
             bucket: bucket.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_presigned_put_is_bound_to_the_size_it_was_issued_for() {
+        // Without a signed content-length the URL is a licence to write any number of
+        // bytes into the bucket for ten minutes, and the size check on `complete`
+        // happens after they have all arrived.
+        let url = s3_backend("fiber")
+            .presign_put("artifacts/r/s/a.txt", 600, 1234)
+            .await
+            .unwrap()
+            .expect("s3 backend presigns");
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length"),
+            "content-length is not a signed header: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_local_sweep_lists_only_old_objects_of_our_own_layout() {
+        let root = scratch("sweep");
+        let key = ArtifactBackend::object_key(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            "dist.tgz",
+        );
+        let backend = ArtifactBackend::Local { root: root.clone() };
+        let stored = backend.put(&key, b"bytes").await.unwrap();
+        // Something else living in the same directory must be left alone.
+        std::fs::create_dir_all(root.join("artifacts/not-a-uuid")).unwrap();
+        std::fs::write(root.join("artifacts/not-a-uuid/keepme"), b"x").unwrap();
+
+        let fresh = backend
+            .list_stale_objects(
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            fresh.is_empty(),
+            "an object written seconds ago is still in flight: {fresh:?}"
+        );
+
+        let stale = backend
+            .list_stale_objects(std::time::SystemTime::now() + Duration::from_secs(600), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            vec![stored],
+            "only this process's own layout is swept"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -19,12 +19,40 @@ through `GET /api/agent/artifacts/{id}/download?via=api`. Both log a `system` li
 the presigned route was unreachable, so the slower path is visible rather than silent.
 Direct transfer is still tried first and still used wherever it works.
 
+### What may be declared
+
+An `artifacts:` entry names one **regular file**, by a plain relative path inside the
+workspace:
+
+- **A symlink is refused**, at any component of the path. The repository controls its own
+  working tree, so `out/build.log -> ~/.ssh/id_rsa` (or `out -> /`) would otherwise upload
+  a file the step never produced into a store every project reader can download.
+- **A directory is refused.** It used to be skipped with a note, which left the step green
+  and the artifact absent — the dependent step then failed at restore time, or worse, ran
+  without it. Archive it in the step instead: `tar czf dist.tgz dist` and declare
+  `dist.tgz`.
+- **An absolute path, `..`, or anything else that is not a plain relative path is
+  refused.** These read outside the workspace entirely.
+
+### Caps
+
+| Limit | Default | Override |
+|---|---|---|
+| One artifact | 64 MiB | not configurable |
+| Artifacts per step | 50 | `FIBER_MAX_ARTIFACTS_PER_STEP` |
+| Total bytes per step | 512 MiB | `FIBER_MAX_ARTIFACT_BYTES_PER_STEP` |
+
+The per-step caps are checked before the bytes move (on presign and on the proxy `PUT`)
+and again when a direct upload is completed. Re-uploading the *same* name does not count
+twice: a step is at-least-once, and its row is replaced rather than added. Over a cap, the
+upload is a 400 and the step fails with the server's reason in its log.
+
 ### When an upload fails
 
 A declared artifact that exists but could not be stored **fails the step** — an unreadable
-file, one over the 64 MiB cap, an unsafe path, or a failed transfer. Otherwise the step
-would report success while a later step that `needs` it fails with a missing file, and the
-log would blame the wrong step.
+file, one over a cap, a symlink, a directory, an unsafe path, or a failed transfer.
+Otherwise the step would report success while a later step that `needs` it fails with a
+missing file, and the log would blame the wrong step.
 
 A declared path that simply does not exist is a warning, not a failure, so a step may
 declare an artifact it only sometimes produces. Nothing downstream can restore it either
@@ -46,7 +74,27 @@ Agent upload path when S3 is enabled:
 2. HTTP `PUT` body to `upload_url` (no extra Content-Type header)
 3. `POST /api/agent/steps/{id}/artifacts/complete` `{ "path", "size", "stored_path" }` — API HEADs the object and registers metadata
 
+The presigned URL signs `Content-Length` with the declared size, so it is only usable for
+an object of exactly that many bytes — an agent (or anything that gets hold of the URL
+inside its ten minutes) cannot write more than the step asked to write. Send the body as
+one request with its length set, which every ordinary HTTP client does; a chunked upload
+of the same bytes will not match the signature.
+
+If the object store refuses a rejected upload's bytes, or `complete` refuses them (wrong
+size, over a cap), the API deletes the object it found: a rejected upload writes no row,
+and retention follows rows.
+
 If presign returns `{ mode: "proxy" }`, the agent falls back to the local PUT proxy.
+
+### Objects with no row
+
+An upload that got as far as the object store but never reached `complete` — the agent
+died mid-step, the step was reclaimed — leaves an object nothing references. Once an hour
+retention lists up to 1 000 objects under `artifacts/` older than
+`FIBER_RETENTION_ORPHAN_HOURS` (default 24, `0` disables), asks the database which of them
+are still referenced, and deletes the rest. Only the `artifacts/{run}/{step}/{name}`
+layout this process writes is considered, so other data in the same bucket is left alone,
+and a failure to answer "is this referenced" keeps every object.
 
 ### Public endpoint
 
@@ -91,3 +139,4 @@ Run page lists artifacts (filtered to the selected step when present) with downl
 ## Legacy
 
 WS base64 `Artifact` messages still exist in the proto; prefer HTTP (presign or proxy).
+That path is limited to 8 MiB per artifact and is subject to the same per-step caps.

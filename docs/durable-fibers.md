@@ -14,7 +14,7 @@ Registered at API boot (see `fiber-durable` tasks module):
 
 - `ping` — trivial success  
 - `sleep_demo` — demonstrates `sleep` / resume (`input.seconds`)  
-- `interval_task` — recurring-style demo  
+- `interval_task` — recurring-style demo; each run creates the next fiber  
 
 `GET /api/fibers/tasks` returns what this build actually registered, and the Fibers page
 asks for that rather than carrying its own copy of the list. Tasks are compiled in: adding
@@ -57,6 +57,30 @@ not followed — a redirect is a second destination the check never saw. Set
 `FIBER_HTTP_TASK_ALLOW_PRIVATE=1` to permit them, which is a decision for whoever runs the
 instance rather than whoever writes a pipeline.
 
+The request then goes to **the addresses that were checked**, not to whatever the name
+resolves to a moment later: a record with a zero TTL could otherwise answer with a public
+address for the check and `169.254.169.254` for the request the HTTP client made on its
+own. A literal address in the URL needs no pinning, and with
+`FIBER_HTTP_TASK_ALLOW_PRIVATE=1` nothing is pinned because nothing is refused.
+
+### `interval_task` and the chain cap
+
+`interval_task` extends itself: each run creates the next fiber, due `interval_seconds`
+later (floor 5 s). Nothing ends a chain on its own, so a project writer creating fibers —
+a `writer` operation — could otherwise leave unbounded perpetual work running in the API
+process.
+
+A chain stops rather than extending itself when its project already has
+`FIBER_INTERVAL_MAX_PER_PROJECT` (default 10) other unfinished `interval_task` fibers. The
+tick itself still succeeds, `next_fiber_id` is `null`, and the API logs
+
+```
+interval_task chain stopped: the project is at its live-chain cap (FIBER_INTERVAL_MAX_PER_PROJECT)
+```
+
+A chain does not count itself, so a cap of 1 still allows one chain. Cancel the fibers you
+no longer want (`fiber fibers cancel`) — the cap frees as soon as they are terminal.
+
 ## API / CLI
 
 ```bash
@@ -68,6 +92,10 @@ cargo run -p fiber-cli -- fibers cancel $FIBER_ID
 ```
 
 HTTP: `GET/POST /api/projects/{id}/fibers`, `GET /api/fibers/{id}`, `POST /api/fibers/{id}/cancel` (writer to mutate), `GET /api/fibers/tasks` (any authenticated user).
+
+The **list** returns each fiber without its memoized step results (`state.steps` is empty);
+`GET /api/fibers/{id}` fills them in. The Fibers page polls the list every two seconds, and
+hydrating each row cost one query per fiber — 101 per poll at the limit of 100.
 
 Optional `wake_at` (RFC3339) on create starts the fiber suspended until due.
 

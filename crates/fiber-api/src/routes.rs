@@ -170,12 +170,21 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl Into
     if !constant_time_eq(presented.as_bytes(), expected.trim().as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
     }
-    let snapshot = match state.store.metrics_snapshot().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "metrics snapshot");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n").into_response();
-        }
+    // Served from the cache when it is fresh: a scrape every 15 s (times however many
+    // scrapers and replicas) must not mean a scan of `step_attempts` every 15 s.
+    let snapshot = match state.metrics_cache.get() {
+        Some(s) => s,
+        None => match state.store.metrics_snapshot().await {
+            Ok(s) => {
+                state.metrics_cache.put(s.clone());
+                s
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "metrics snapshot");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n")
+                    .into_response();
+            }
+        },
     };
     let mut out = String::new();
     render_metrics(&mut out, &snapshot);
@@ -602,6 +611,11 @@ async fn delete_project(
             break;
         }
         runs_deleted += batch.len();
+        // Same reason as retention: the cascade from `runs` reaches `log_lines`, and a
+        // project with a long history is millions of rows in one statement.
+        if let Err(e) = state.store.delete_log_lines_for_runs(&batch, 50_000).await {
+            tracing::warn!(project_id = %id, error = %e, "chunked log-line delete failed");
+        }
         let paths = state
             .store
             .delete_runs_returning_artifact_paths(&batch)
@@ -1141,6 +1155,7 @@ async fn agent_upload_artifact(
         .unwrap_or("");
     let rel = crate::artifact_util::sanitize_artifact_rel_path(header_path)
         .ok_or_else(|| ApiError::BadRequest("missing or invalid X-Fiber-Artifact-Path".into()))?;
+    enforce_artifact_caps(&state, step_run_id, &rel, body.len() as i64).await?;
     let key = crate::artifacts::ArtifactBackend::object_key(
         &step.run_id.to_string(),
         &step_run_id.to_string(),
@@ -1161,6 +1176,42 @@ async fn agent_upload_artifact(
         "name": art.name,
         "size": art.size,
     })))
+}
+
+/// Refuse an upload that would take the step past its artifact caps.
+///
+/// Asked before the bytes move (on presign and on the proxy PUT) and again on `complete`,
+/// because the size given at presign time is a claim. The artifact being replaced does not
+/// count against the step: `create_artifact` upserts on `(step_run_id, name)`, and a step
+/// is at-least-once.
+async fn enforce_artifact_caps(
+    state: &AppState,
+    step_run_id: Uuid,
+    name: &str,
+    size: i64,
+) -> Result<(), ApiError> {
+    match artifact_cap_refusal(state, step_run_id, name, size)
+        .await
+        .map_err(ApiError::from)?
+    {
+        Some(why) => Err(ApiError::BadRequest(why)),
+        None => Ok(()),
+    }
+}
+
+/// The reason this artifact is over a cap, or `None` when it fits. Shared with the legacy
+/// WebSocket upload path in `ws.rs`, which has no `ApiError` to return.
+pub(crate) async fn artifact_cap_refusal(
+    state: &AppState,
+    step_run_id: Uuid,
+    name: &str,
+    size: i64,
+) -> anyhow::Result<Option<String>> {
+    let (count, bytes) = state
+        .store
+        .artifact_usage_for_step(step_run_id, name)
+        .await?;
+    Ok(crate::artifact_util::ArtifactCaps::from_env().refusal(count, bytes, size))
 }
 
 /// Whether an agent's artifact call is for a step it still holds, on the attempt it
@@ -1218,15 +1269,19 @@ async fn agent_presign_artifact(
     }
     let rel = crate::artifact_util::sanitize_artifact_rel_path(&body.path)
         .ok_or_else(|| ApiError::BadRequest("missing or invalid path".into()))?;
+    enforce_artifact_caps(&state, step_run_id, &rel, body.size as i64).await?;
     let key = crate::artifacts::ArtifactBackend::object_key(
         &step.run_id.to_string(),
         &step_run_id.to_string(),
         &rel.replace('/', "__"),
     );
     const EXPIRES: u64 = 600;
+    // Signed with the size the agent declared: the URL is then only usable for an object
+    // of exactly that many bytes, so the size checks here are enforced by the object
+    // store rather than discovered afterwards.
     let Some(upload_url) = state
         .artifacts
-        .presign_put(&key, EXPIRES)
+        .presign_put(&key, EXPIRES, body.size as i64)
         .await
         .map_err(ApiError::from)?
     else {
@@ -1283,6 +1338,9 @@ async fn agent_complete_artifact(
     );
     let expected = state.artifacts.stored_path_for_key(&key);
     if body.stored_path != expected {
+        // Not ours to delete: the path names an object this step was never given a URL
+        // for, and removing it on request would be the deletion primitive this route
+        // deliberately does not have.
         return Err(ApiError::BadRequest("stored_path mismatch".into()));
     }
     match state
@@ -1292,15 +1350,24 @@ async fn agent_complete_artifact(
         .map_err(ApiError::from)?
     {
         Some(n) if n != body.size => {
-            return Err(ApiError::BadRequest(format!(
-                "uploaded size {n} != claimed {}",
-                body.size
-            )));
+            return Err(reject_uploaded_object(
+                &state,
+                &body.stored_path,
+                format!("uploaded size {n} != claimed {}", body.size),
+            )
+            .await);
         }
         None => {
             return Err(ApiError::BadRequest("object not found after upload".into()));
         }
         Some(_) => {}
+    }
+    if let Err(e) = enforce_artifact_caps(&state, step_run_id, &rel, body.size as i64).await {
+        let why = match &e {
+            ApiError::BadRequest(m) => m.clone(),
+            _ => "artifact refused".to_string(),
+        };
+        return Err(reject_uploaded_object(&state, &body.stored_path, why).await);
     }
     let art = state
         .store
@@ -1320,9 +1387,25 @@ async fn agent_complete_artifact(
     })))
 }
 
-/// Restore download. An agent may only read artifacts of runs in which it currently
-/// holds a running step (that is exactly the restore list it was offered); anything
-/// else is 404 so existence is not disclosed.
+/// Refuse a completed upload and remove the object it left behind.
+///
+/// A rejected `complete` writes no row, and retention only follows rows — so the object
+/// stayed in the bucket for ever, invisible to every sweep. Deleting it here is the
+/// cheap half of that leak; the prefix sweep in `retention.rs` catches whatever this
+/// misses (a crash between the PUT and the `complete`, say).
+async fn reject_uploaded_object(state: &AppState, stored_path: &str, why: String) -> ApiError {
+    if let Err(e) = state.artifacts.delete(stored_path).await {
+        tracing::warn!(
+            stored_path, error = %e,
+            "could not delete the object behind a rejected artifact upload"
+        );
+    }
+    ApiError::BadRequest(why)
+}
+
+/// Restore download. An agent may only read artifacts produced by the steps its own
+/// running step depends on — exactly the restore list it was offered. Anything else is
+/// 404 so existence is not disclosed.
 #[derive(serde::Deserialize)]
 pub struct AgentDownloadQuery {
     /// `via=api` streams the bytes through this process instead of redirecting to object
@@ -1339,12 +1422,17 @@ async fn agent_download_artifact(
     Query(q): Query<AgentDownloadQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::Redirect;
-    if !state
+    let access = state
         .store
-        .agent_may_read_artifact(agent.id, id)
+        .agent_artifact_access(agent.id, id)
         .await
         .map_err(ApiError::from)?
-    {
+        .ok_or(ApiError::NotFound)?;
+    if !crate::ws::artifact_readable_by_holder(
+        &access.snapshot,
+        &access.holder_step_ids,
+        access.producer_step_id.as_deref(),
+    ) {
         return Err(ApiError::NotFound);
     }
     let artifact = state

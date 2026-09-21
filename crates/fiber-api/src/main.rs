@@ -5,6 +5,7 @@ mod auth;
 mod github;
 mod github_status;
 mod login_guard;
+mod metrics_cache;
 mod otel;
 mod retention;
 mod routes;
@@ -198,6 +199,7 @@ async fn main() -> Result<()> {
         fiber_scheduler,
         artifacts,
         login_guard: Arc::new(login_guard::LoginGuard::new()),
+        metrics_cache: Arc::new(metrics_cache::MetricsCache::default()),
         loop_health: health,
         shutdown: shutdown_rx.clone(),
         sessions: sessions.clone(),

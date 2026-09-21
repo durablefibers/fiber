@@ -39,6 +39,12 @@ pub trait FiberPersistence: Send + Sync + 'static {
         input: Value,
         wake_at: Option<DateTime<Utc>>,
     ) -> Result<FiberRecord>;
+
+    /// How many *other* unfinished fibers of this task exist in the project. A
+    /// self-rescheduling chain asks before extending itself, which is the only thing
+    /// standing between a project writer and an unbounded number of perpetual fibers.
+    async fn count_live_siblings(&self, project_id: Uuid, name: &str, exclude: Uuid)
+    -> Result<i64>;
 }
 
 #[async_trait]
@@ -71,5 +77,14 @@ impl FiberPersistence for FiberStore {
         wake_at: Option<DateTime<Utc>>,
     ) -> Result<FiberRecord> {
         FiberStore::create(self, project_id, name, input, wake_at).await
+    }
+
+    async fn count_live_siblings(
+        &self,
+        project_id: Uuid,
+        name: &str,
+        exclude: Uuid,
+    ) -> Result<i64> {
+        FiberStore::count_live_siblings(self, project_id, name, exclude).await
     }
 }

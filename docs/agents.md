@@ -396,6 +396,17 @@ repeat is identifiable.
 
 Process groups: cancel kills the step's process group so grandchildren die too.
 
+Every step container carries a `fiber.agent=<agent name>` label, and the agent removes any
+container with its own label at startup. A `kill -9`, an OOM kill or a lost power cable
+otherwise leaves `docker run --rm` children alive, still holding the step's workspace mount
+and its `--env-file` secrets, with nothing left to reap them. Only this agent's label is
+swept, so a second agent on the same host is untouched — give co-located agents distinct
+`FIBER_AGENT_NAME`s.
+
+`FIBER_AGENT_WORKSPACE_DIR` is resolved to an absolute path at startup (and logged). Docker
+refuses a relative bind source, so the documented default `./data/workspaces` could not be
+used in docker mode before.
+
 Steps and git run with no stdin and `GIT_TERMINAL_PROMPT=0`: anything that would wait on a terminal fails at once instead of at the timeout. Git is limited to the `file`, `git`, `http`, `https`, and `ssh` transports (`GIT_ALLOW_PROTOCOL`, unless the operator set it), and the agent refuses a `workspace.repo` that is not one of those or an scp-like `user@host:path`, so the `ext::` transport — which runs a command on the host — is unreachable however the definition was written. A credential in the remote URL is masked in the log.
 
 ## What a step can see
@@ -409,15 +420,33 @@ Steps run repo-supplied shell, so the agent narrows what is reachable:
 | **Docker env** | Passed with `--env-file` on a `0600` temporary file, never `-e KEY=VALUE`, which would put every secret in the host's process list. The docker client is itself started with a cleared environment, and variable names are validated, so a hostile name cannot make docker copy one of its own variables into the step |
 | **Container limits** | `--security-opt no-new-privileges` and `--pids-limit 512` by default, plus `--user`, `--network`, `--memory`, `--cpus` from `FIBER_AGENT_DOCKER_*`. Memory and CPU limits are off unless set; whatever applies is printed as a `system` log line so an exit 137 is diagnosable |
 | **Workspace** | One directory per step, deleted when the step finishes — including on cancel, timeout, or failure. The run's tree goes when its last step on this agent finishes; anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` (24) is swept at startup |
-| **Artifacts** | Only those produced by the steps this one transitively `needs` |
+| **Artifacts** | Only those produced by the steps this one transitively `needs` — enforced when the offer is built *and* again when the agent asks to download one |
 | **Untrusted runs** | A fork's pull request is offered only to agents bound to that project, never to the global pool, and receives no secrets — see [triggers](./triggers.md#pull-requests-from-forks) |
 
 A step with a git workspace is cloned from one reference clone per run, so a second step
 costs a local object copy rather than another fetch, and the checkout is self-contained
 (`git` works the same inside a container as on the host).
 
-Masking is a substring match on the secret's value, so it does not catch a value the step
-transforms first (base64, URL-encoding) or one shorter than 8 characters. Treat it as a
+### What masking covers
+
+Each secret of at least 8 characters is registered in several spellings, and every one of
+them is replaced with `***` in the step's log lines and in its error:
+
+| Form | Where it shows up |
+|---|---|
+| The value itself | `echo "$TOKEN"` |
+| Base64 (standard and URL-safe, and the standard encoding of the value with a trailing newline) | `base64 <<< "$TOKEN"`, a basic-auth header a client logs |
+| Percent-encoded (RFC 3986) | a token in a query string, `curl --trace` |
+| JSON-escaped | a value serialized into a request body a client echoes |
+
+A multi-line secret (a PEM key, a service-account JSON) is registered line by line as well
+as whole, because logs arrive one line at a time — and each of those lines gets the same
+set of encodings.
+
+What it still does not catch: a value shorter than 8 characters (masking those would blank
+out unrelated output), an encoding of something *containing* the secret rather than the
+secret alone (`base64` of a whole file, `gzip`, a hash), a value the step splits or
+reverses, and anything written somewhere other than the step's output. Treat masking as a
 guard against accidental `echo`, not as permission to print secrets.
 
 This is a boundary, not a sandbox: anyone who can write a `fiber.yml` still runs code as

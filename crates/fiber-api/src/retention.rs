@@ -24,6 +24,9 @@ pub struct RetentionConfig {
     /// `days`: a run is a build someone may want to look back at, while a fiber is usually
     /// a notification that either worked or did not.
     pub fiber_days: u64,
+    /// Delete artifact objects with no row that are older than this many hours. `0`
+    /// disables the sweep.
+    pub orphan_hours: u64,
 }
 
 impl RetentionConfig {
@@ -35,6 +38,7 @@ impl RetentionConfig {
             get("FIBER_RETENTION_BATCH").as_deref(),
             get("FIBER_RETENTION_INTERVAL_SECS").as_deref(),
             get("FIBER_RETENTION_FIBER_DAYS").as_deref(),
+            get("FIBER_RETENTION_ORPHAN_HOURS").as_deref(),
         )
     }
 
@@ -48,6 +52,7 @@ impl RetentionConfig {
         batch: Option<&str>,
         interval_secs: Option<&str>,
         fiber_days: Option<&str>,
+        orphan_hours: Option<&str>,
     ) -> Self {
         fn parsed<T: std::str::FromStr>(raw: Option<&str>, default: T) -> T {
             raw.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
@@ -60,6 +65,7 @@ impl RetentionConfig {
             // A floor on the interval keeps a typo from turning GC into a hot loop.
             interval: StdDuration::from_secs(parsed::<u64>(interval_secs, 3600).max(60)),
             fiber_days: parsed(fiber_days, 7),
+            orphan_hours: parsed(orphan_hours, 24),
         }
     }
 
@@ -112,6 +118,19 @@ pub async fn run_once(
     // Delete the rows first, then only those blobs nothing points at any more: a retry
     // carries its predecessor's artifact rows forward, so two runs can share one blob.
     let ids: Vec<Uuid> = run_ids.into_iter().collect();
+    // `DELETE FROM runs` cascades to `log_lines`, which is where all the rows are: a
+    // hundred runs of twenty steps at the 50 000-line cap is two million rows in one
+    // implicit transaction. Taken out in chunks first, so the cascade has almost nothing
+    // left to do and no single statement holds the table for minutes.
+    match store
+        .delete_log_lines_for_runs(&ids, LOG_DELETE_CHUNK)
+        .await
+    {
+        Ok(n) if n > 0 => info!(log_lines = n, "retention removed log lines"),
+        Ok(_) => {}
+        // The cascade will still take them; this is an optimisation, not a prerequisite.
+        Err(e) => warn!(error = %e, "chunked log-line delete failed (continuing)"),
+    }
     let deleted = store.delete_runs(&ids).await?;
 
     let candidates: Vec<String> = paths.iter().cloned().collect();
@@ -146,6 +165,76 @@ pub async fn run_once(
         "retention purged terminal runs"
     );
     Ok(deleted)
+}
+
+/// Log lines removed per statement before the runs go.
+const LOG_DELETE_CHUNK: i64 = 50_000;
+/// Objects examined by one orphan sweep. A ceiling on the tick, not on the backlog: the
+/// next tick takes the next batch.
+const ORPHAN_SWEEP_LIMIT: usize = 1_000;
+
+/// Delete artifact objects that no row points at.
+///
+/// The row is the record; the object is a side effect of an upload. A presigned PUT whose
+/// `complete` never arrived (the agent died, the step was reclaimed mid-upload) leaves an
+/// object nothing will ever reference, and retention — which walks rows — cannot see it.
+/// Only objects older than `hours` are considered, so an upload in flight, or one whose
+/// ten-minute URL is still valid, is never touched.
+async fn sweep_orphan_objects(store: &Store, artifacts: &ArtifactBackend, hours: u64) {
+    if hours == 0 {
+        return;
+    }
+    let cutoff = std::time::SystemTime::now() - StdDuration::from_secs(hours * 3600);
+    let candidates = match artifacts
+        .list_stale_objects(cutoff, ORPHAN_SWEEP_LIMIT)
+        .await
+    {
+        Ok(c) if c.is_empty() => return,
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "could not list artifact objects; skipping the orphan sweep");
+            return;
+        }
+    };
+    // Same rule as the blob half of `run_once`: a failure to answer "is this referenced"
+    // must not read as "nothing references these".
+    let referenced = match store.artifact_paths_still_referenced(&candidates).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "could not check artifact references; keeping every object");
+            return;
+        }
+    };
+    let candidates: BTreeSet<String> = candidates.into_iter().collect();
+    let mut removed = 0usize;
+    for path in unreferenced_blobs(&candidates, &referenced) {
+        match artifacts.delete(path).await {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(%path, error = %e, "orphan object delete failed (continuing)"),
+        }
+    }
+    if removed > 0 {
+        info!(
+            objects = removed,
+            examined = candidates.len(),
+            older_than_hours = hours,
+            "retention removed artifact objects with no row"
+        );
+    }
+}
+
+/// Passes of `run_once` one tick may make. Retention deleted at most `batch` runs an
+/// hour, a ceiling of 2 400 a day that a busy project never catches up with — the backlog
+/// (and `log_lines` with it) grew for ever while the metric said retention was running.
+/// Capped rather than unbounded so a tick still ends and the other loops get the pool.
+const MAX_CATCHUP_PASSES: u32 = 20;
+
+/// Whether retention should immediately take another batch.
+///
+/// A full batch means there was more to delete than one pass could take; anything less
+/// means the backlog is clear until the next tick.
+fn keep_catching_up(deleted: u64, batch: i64, passes: u32) -> bool {
+    deleted >= batch.max(1) as u64 && passes < MAX_CATCHUP_PASSES
 }
 
 /// Split the `(run_id, artifact_path)` rows into the runs to delete and the distinct
@@ -201,9 +290,30 @@ pub async fn retention_loop(
         "retention GC configured (0 days = that part is off)"
     );
     loop {
-        if let Err(e) = run_once(&store, &artifacts, &fibers, &cfg).await {
-            warn!(error = %e, "retention tick failed");
+        let mut passes = 0u32;
+        loop {
+            passes += 1;
+            match run_once(&store, &artifacts, &fibers, &cfg).await {
+                Ok(deleted) => {
+                    if !keep_catching_up(deleted, cfg.batch, passes) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "retention tick failed");
+                    break;
+                }
+            }
         }
+        if passes >= MAX_CATCHUP_PASSES {
+            warn!(
+                passes,
+                batch = cfg.batch,
+                "retention hit its per-tick pass limit; the backlog is still shrinking, \
+                 raise FIBER_RETENTION_BATCH or lower FIBER_RETENTION_INTERVAL_SECS"
+            );
+        }
+        sweep_orphan_objects(&store, &artifacts, cfg.orphan_hours).await;
         tokio::time::sleep(cfg.interval).await;
     }
 }
@@ -224,7 +334,7 @@ mod tests {
 
     #[test]
     fn an_unset_environment_gives_the_documented_defaults() {
-        let c = RetentionConfig::from_raw(None, None, None, None, None);
+        let c = RetentionConfig::from_raw(None, None, None, None, None, None);
         assert_eq!(c.days, 30);
         assert_eq!(c.keep_per_pipeline, 20);
         assert_eq!(c.batch, 100);
@@ -234,8 +344,14 @@ mod tests {
 
     #[test]
     fn values_are_taken_as_given_when_usable() {
-        let c =
-            RetentionConfig::from_raw(Some("90"), Some("5"), Some("250"), Some("600"), Some("14"));
+        let c = RetentionConfig::from_raw(
+            Some("90"),
+            Some("5"),
+            Some("250"),
+            Some("600"),
+            Some("14"),
+            Some("6"),
+        );
         assert_eq!(c.days, 90);
         assert_eq!(c.keep_per_pipeline, 5);
         assert_eq!(c.batch, 250);
@@ -253,6 +369,7 @@ mod tests {
             Some("lots"),
             Some("-"),
             Some("soon"),
+            Some("never"),
         );
         assert_eq!(c.days, 30);
         assert_eq!(c.keep_per_pipeline, 20);
@@ -264,26 +381,26 @@ mod tests {
     #[test]
     fn a_batch_floor_of_one_keeps_gc_making_progress() {
         assert_eq!(
-            RetentionConfig::from_raw(None, None, Some("0"), None, None).batch,
+            RetentionConfig::from_raw(None, None, Some("0"), None, None, None).batch,
             1
         );
         assert_eq!(
-            RetentionConfig::from_raw(None, None, Some("-5"), None, None).batch,
+            RetentionConfig::from_raw(None, None, Some("-5"), None, None, None).batch,
             1
         );
     }
 
     #[test]
     fn an_interval_floor_keeps_gc_from_becoming_a_hot_loop() {
-        let c = RetentionConfig::from_raw(None, None, None, Some("1"), None);
+        let c = RetentionConfig::from_raw(None, None, None, Some("1"), None, None);
         assert_eq!(c.interval, StdDuration::from_secs(60));
     }
 
     #[test]
     fn zero_days_disables_run_retention_but_is_still_a_valid_config() {
-        let c = RetentionConfig::from_raw(Some("0"), None, None, None, None);
+        let c = RetentionConfig::from_raw(Some("0"), None, None, None, None, None);
         assert!(!c.enabled());
-        assert!(RetentionConfig::from_raw(Some("1"), None, None, None, None).enabled());
+        assert!(RetentionConfig::from_raw(Some("1"), None, None, None, None, None).enabled());
     }
 
     // --- row partitioning --------------------------------------------------------------
@@ -328,6 +445,59 @@ mod tests {
     fn no_rows_means_nothing_to_do() {
         let (ids, blobs) = partition_retention_rows(vec![]);
         assert!(ids.is_empty() && blobs.is_empty());
+    }
+
+    // --- catch-up ----------------------------------------------------------------------
+
+    #[test]
+    fn a_full_batch_means_there_is_more_to_delete() {
+        // 100 runs an hour is 2 400 a day; a project above that never catches up, and
+        // log_lines grows without bound while the tick looks healthy.
+        assert!(keep_catching_up(100, 100, 1));
+        assert!(keep_catching_up(101, 100, 1));
+    }
+
+    #[test]
+    fn a_partial_batch_ends_the_tick() {
+        assert!(!keep_catching_up(99, 100, 1));
+        assert!(!keep_catching_up(0, 100, 1));
+    }
+
+    #[test]
+    fn catching_up_is_bounded() {
+        // Otherwise one tick can hold the pool for as long as the backlog lasts.
+        assert!(keep_catching_up(100, 100, MAX_CATCHUP_PASSES - 1));
+        assert!(!keep_catching_up(100, 100, MAX_CATCHUP_PASSES));
+    }
+
+    #[test]
+    fn a_zero_batch_cannot_make_the_loop_spin() {
+        // `batch` is floored at 1 by the config, but the predicate must not treat
+        // "deleted nothing out of a batch of nothing" as progress.
+        assert!(!keep_catching_up(0, 0, 1));
+    }
+
+    // --- orphan object keys --------------------------------------------------------------
+
+    #[test]
+    fn only_this_processes_own_object_layout_is_swept() {
+        use crate::artifacts::is_artifact_object_key;
+        let run = Uuid::new_v4();
+        let step = Uuid::new_v4();
+        assert!(is_artifact_object_key(&format!(
+            "artifacts/{run}/{step}/dist.tgz"
+        )));
+        // Anything else in the bucket belongs to someone else.
+        assert!(!is_artifact_object_key("artifacts/not-a-uuid/x/y"));
+        assert!(!is_artifact_object_key(&format!("artifacts/{run}/{step}")));
+        assert!(!is_artifact_object_key(&format!(
+            "artifacts/{run}/{step}/nested/file"
+        )));
+        assert!(!is_artifact_object_key(&format!(
+            "backups/{run}/{step}/file"
+        )));
+        assert!(!is_artifact_object_key(""));
+        assert!(!is_artifact_object_key(&format!("artifacts/{run}/{step}/")));
     }
 
     // --- blob selection ----------------------------------------------------------------
