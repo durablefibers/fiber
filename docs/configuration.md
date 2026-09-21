@@ -12,6 +12,8 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_ARTIFACTS_DIR` | `./data/artifacts` | Local artifact root |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
 | `FIBER_ADMIN_PASSWORD` | `fiber` | Bootstrap admin password (API warns at boot while it is the default) |
+| `FIBER_MAX_STEPS` | `500` | Most expanded steps (matrix cells included) one pipeline may compile to; past it the definition is rejected with `TooManySteps`. Raise it for a generated fan-out. It bounds the **number** of cells only — a cell is not a fixed size, so a separate, non-configurable 8 MiB budget bounds the bytes a definition expands to, and the three routes that accept a definition cap the request body at 256 KiB. `0` or a non-number fails the boot. **`fiber validate` reads it too**, from the developer's shell: a server raised to 2000 and a developer left unset means a pipeline that fails locally and is accepted on push |
+| `FIBER_SEED_SHOWCASE` | `auto` | Seed the **Showcase** demo project and its pipelines. `auto` = only when the users table was empty at boot (a fresh instance), so a demo project you delete stays deleted; `1` = seed on this boot (restores it, and picks up pipelines a newer version added); `0` = never. Any other value fails the boot |
 | `FIBER_CORS_ORIGINS` | `http://127.0.0.1:3100,http://localhost:3100` | Comma-separated browser origins allowed to call the API; `*` = any origin |
 | `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project **and webhook** secrets at rest |
 | `FIBER_S3_BUCKET` | unset | If set, use S3/MinIO backend |
@@ -68,6 +70,8 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_VERSION` | `latest` | Tag for the `ghcr.io/durablefibers/fiber-api` and `fiber-agent` images |
 | `FIBER_SECRETS_KEY` | empty (plaintext, warned) | Passed through to `fiber-api` |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
+| `FIBER_MAX_STEPS` | `500` | See above. Set it for the CLI as well as the server, or the two disagree |
+| `FIBER_SEED_SHOWCASE` | `auto` | See above; `auto` seeds the demo project only on the first boot of an empty database |
 | `FIBER_S3_BUCKET` | empty | Empty = local filesystem on the `fiber_artifacts` volume. Set it (and run `--profile minio`, or point the endpoint at real S3) to use object storage |
 | `FIBER_S3_ENDPOINT` | `http://fiber-minio:9000` | S3 API endpoint as the API reaches it |
 | `FIBER_S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:19000` | Presign host for agents/browsers; the loopback default only works for an agent on this host |

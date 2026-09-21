@@ -34,7 +34,32 @@ steps:
 | `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
 | `concurrency` | no | Keep one run per group in flight; see below |
 
-In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted.
+In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted. Give a map-form step its own `id:` and it is rejected — the key *is* the id, and two answers to the question is one of them going unread.
+
+**Unknown fields are errors.** A field no table on this page lists is rejected by
+`fiber validate`, `POST /api/pipelines/parse-yaml`, the Import panel, **and the save API**
+(`POST`/`PUT /api/projects/{id}/pipelines`, whether the definition arrives as YAML or as
+JSON), naming the field and the nearest one that exists. GitHub Actions spellings
+(`continue-on-error`, `working-directory`), near-misses (`need:`, `artifact:`, `imgae:`)
+and anything else serde used to drop on the floor previously parsed clean and produced a
+step that quietly ran without the field. A pipeline **already stored** is still read
+leniently, so an old row keeps executing; the strictness is on the authoring path, where
+there is someone to tell.
+
+Two exceptions, both at the top level only:
+
+```yaml
+_common_labels: &labels [os=linux]   # anchor holder — `_` or `x-` prefix, not audited
+name: p
+steps:
+  build:
+    run: cargo build
+    labels: *labels
+```
+
+YAML **merge keys (`<<`) are not supported** and are rejected with a message saying so:
+serde does not apply them, so the merged fields would simply be absent — the exact
+failure this audit exists to prevent. Write the fields out.
 
 ### `concurrency`
 
@@ -176,8 +201,27 @@ Compile produces cells like `test__os_linux`. `needs` that point at a matrixed s
 | `always()` | Run once upstreams are terminal, even if they failed. Steps *after* an `always()` step still see the failure: `success()` is transitive over the whole ancestry, so `build → cleanup (always) → deploy` skips `deploy` when `build` failed |
 | `never()` | Skip |
 | `matrix.os == 'linux'` | Compare matrix (or env) axis |
+| `env.CHANNEL == "nightly"` | Same, against step / pipeline `env` |
+
+The **name** has to exist on the step. `matrix.osx == 'linux'` where the axis is `os` is
+well-formed and false on every run forever, so it is rejected too, with the names the
+step does have. What a condition can read is fully known when the pipeline compiles: the
+pipeline `env`, the step `env`, and the cell's matrix bindings (plus their `MATRIX_*`
+and `FIBER_MATRIX_*` aliases).
 
 Evaluated when a step becomes ready to queue (dependencies terminal), not at run create — except root steps, which are evaluated immediately.
+
+**That table is the whole grammar, and anything else is rejected when the pipeline
+compiles.** `!=`, `&&`, `||`, `failure()`, `cancelled()`, a `${{ … }}` wrapper and any
+context other than `matrix.` / `env.` (`github.event_name`, say) are refused with a
+message naming what was wrong. They are *not* implemented: booleans bring precedence and
+truthiness questions that deserve a design rather than half an implementation, and richer
+conditions are a roadmap item. Until this change, all of them evaluated to `false`
+forever — the step was skipped on every run of every build with nothing anywhere saying
+why, which is the one outcome worse than an error.
+
+A well-formed condition that is simply never true (`matrix.os == 'plan9'`) still compiles.
+The check is on the shape, not the outcome.
 
 
 ## Examples in-repo
@@ -194,9 +238,20 @@ Evaluated when a step becomes ready to queue (dependencies terminal), not at run
 | `examples/scoped-secrets.yml` | Per-step `secrets:` allowlist |
 | `examples/concurrency.yml` | One run per branch, cancelling the previous |
 
+## Limits
+
+| Limit | Value | Why |
+|---|---|---|
+| Expanded steps per pipeline | 500, or `FIBER_MAX_STEPS` | Counted **as it expands**, matrix cells included, so 16 steps of 64 cells is 1 024 and is refused — and the expansion stops at the cap rather than building all 1 024 first. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's. Raise `FIBER_MAX_STEPS` for a generated fan-out, on the CLI as well as the server |
+| Expanded bytes per pipeline | 8 MiB | The step count alone is not a size: pipeline `env` is merged into **every** expanded cell, and each cell copies its step's `run`, `labels`, `artifacts` and `needs`. So a large value multiplies by the number of steps. Not configurable |
+| Request body for a definition | 256 KiB | On `POST /api/pipelines/parse-yaml` and pipeline create/update. Compiling amplifies, so the bytes of the body are what has to be bounded first |
+| Matrix cells per step | 64 | Unchanged |
+
 ## Semantics
 
 - Cycles are rejected at compile / save.
+- A step id cannot be empty. `needs`, the run snapshot, and the UI all refer to a step by id.
+- Depending on a step twice is the same as depending on it once: `needs` is deduplicated before matrix cells are substituted in.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
 - Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.

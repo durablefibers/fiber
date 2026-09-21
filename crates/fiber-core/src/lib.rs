@@ -15,7 +15,7 @@ mod toolchain_audit;
 
 pub use dag::{CompiledDag, DagError, compile_definition};
 pub use due_index::DueIndex;
-pub use error::{SecretDecryptError, ValidationError};
+pub use error::{SecretDecryptError, StoreError};
 pub use models::*;
 pub use path_filter::paths_allow;
 pub use roles::ProjectRole;
@@ -24,4 +24,4 @@ pub use schedule::{
 };
 pub use seed::ensure_showcase;
 pub use step_if::{IfContext, eval_if};
-pub use store::{Reclaimed, RunKey, StartedRun, Store, superseded};
+pub use store::{BootScan, PipelineDefect, Reclaimed, RunKey, StartedRun, Store, superseded};

@@ -59,6 +59,15 @@ impl FillCursor {
     }
 }
 
+/// Whether a repeated failure is worth another log line: the first one, or a new reason.
+///
+/// The schedule loop revisits every pipeline every tick. Without this a permanently
+/// broken one produces 2 880 identical warnings a day, each restating what the boot audit
+/// said once — which is how a log stops being read.
+fn is_news(previous: Option<&String>, reason: &str) -> bool {
+    previous.map(String::as_str) != Some(reason)
+}
+
 #[derive(Clone)]
 pub struct Scheduler {
     store: Store,
@@ -77,6 +86,12 @@ pub struct Scheduler {
     run_bus: RunBus,
     /// Earliest schedule due per pipeline (memoturn DueIndex pattern).
     schedule_due: Arc<DueIndex<Uuid>>,
+    /// pipeline -> why it last refused to compile, so the schedule loop says it once.
+    ///
+    /// A permanently broken pipeline is visited every tick, and a `warn!` on each one is
+    /// 2 880 identical lines a day restating what the boot audit already said. Kept until
+    /// the reason changes (or the process restarts), which is when there is news.
+    uncompilable: Arc<RwLock<HashMap<Uuid, String>>>,
     /// Distinguishes this process so Redis echo is not double-delivered locally.
     instance_id: Uuid,
 }
@@ -147,6 +162,7 @@ impl Scheduler {
             events,
             run_bus: RunBus::new(),
             schedule_due: Arc::new(DueIndex::new()),
+            uncompilable: Arc::new(RwLock::new(HashMap::new())),
             instance_id: Uuid::new_v4(),
         }
     }
@@ -1099,6 +1115,40 @@ impl Scheduler {
             let Some(observed_due) = p.next_due_at else {
                 continue;
             };
+            // Compiled *before* the slot is claimed. `claim_schedule_slot` advances the
+            // occurrence, and a start that then fails was only a `warn!` — so a nightly
+            // pipeline whose definition no longer compiles (a validator tightened, a
+            // field renamed) consumed its occurrence every night and never fired again,
+            // with no way to re-arm it but an edit. Leaving the occurrence alone means
+            // the due time stays put, each tick says why, and the schedule resumes by
+            // itself the moment the definition is fixed.
+            if let Err(e) = fiber_core::compile_definition(&def) {
+                let reason = e.to_string();
+                let news = {
+                    let mut seen = self.uncompilable.write().await;
+                    let news = is_news(seen.get(&p.id), &reason);
+                    if news {
+                        seen.insert(p.id, reason.clone());
+                    }
+                    news
+                };
+                if news {
+                    warn!(
+                        pipeline = %p.id, error = %reason,
+                        "scheduled pipeline does not compile; the occurrence is left in \
+                         place and will fire once the definition is fixed (said once \
+                         per reason)"
+                    );
+                } else {
+                    debug!(pipeline = %p.id, error = %reason, "still not compiling");
+                }
+                continue;
+            }
+            // It compiles: forget any earlier complaint, so a pipeline that breaks again
+            // later is reported again.
+            if !self.uncompilable.read().await.is_empty() {
+                self.uncompilable.write().await.remove(&p.id);
+            }
             let next = next_due_from_triggers(on, Utc::now());
             // Compare-and-set on next_due_at (plus "no active run"): across several API
             // instances exactly one claims the slot; the rest see it already advanced.
@@ -1115,7 +1165,14 @@ impl Scheduler {
             let trigger = schedule_trigger_label(on);
             info!(pipeline = %p.id, %trigger, "scheduled run");
             match self.start_run(p.id, &trigger).await {
-                Ok((run, _, _)) => self.enqueue_run_ready(run.id).await?,
+                // The run exists and its roots are queued; a failed wake only costs the
+                // latency until the next tick picks it up, so it must not abort the rest
+                // of this one. Same call, same reasoning as the webhook path.
+                Ok((run, _, _)) => {
+                    if let Err(e) = self.enqueue_run_ready(run.id).await {
+                        warn!(run = %run.id, error = %e, "run started but the queue wake failed");
+                    }
+                }
                 // The slot is already advanced; skipping one occurrence beats double-firing.
                 Err(e) => warn!(pipeline = %p.id, error = %e, "scheduled run failed to start"),
             }
@@ -1330,6 +1387,16 @@ fn labels_match(agent: &[String], required: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A permanently broken pipeline is revisited every 30 s forever.
+    #[test]
+    fn a_repeated_compile_failure_is_reported_once_per_reason() {
+        let first = "pipeline contains a cycle".to_string();
+        assert!(is_news(None, &first), "the first failure is news");
+        assert!(!is_news(Some(&first), &first), "the same reason is not");
+        let second = "every step needs a non-empty id".to_string();
+        assert!(is_news(Some(&first), &second), "a new reason is news again");
+    }
     use super::*;
 
     fn presence(concurrency: u32, reserved: u32) -> AgentPresence {

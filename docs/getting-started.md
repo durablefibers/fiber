@@ -26,7 +26,8 @@ make api-s3
 Equivalent manual env: `source scripts/dev-env.sh` then `cargo run -p fiber-api`.
 - API: http://127.0.0.1:18080
 - Login: **admin** / **fiber** (override with `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD`)
-- Migrations apply on boot; a **Showcase** project is seeded for the admin owner
+- Migrations apply on boot; a **Showcase** project is seeded for the admin owner on a
+  fresh database only (`FIBER_SEED_SHOWCASE`)
 
 ## 3. Web UI
 

@@ -42,6 +42,18 @@ const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
 /// gets this long to answer before it is reported down.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most bytes a pipeline definition may arrive as, on the three routes that take one.
+///
+/// Compiling amplifies: a matrix multiplies each step, the pipeline `env` is merged into
+/// every expanded cell, and each `needs` entry is rewritten to the dependency's cells. So
+/// the quantity an attacker controls is **bytes of the body**, not the step count the DAG
+/// compiler caps — and axum's 2 MB default was enough to turn one request into gigabytes.
+/// `parse-yaml` takes only `AuthUser`, so that request needs no project membership at all.
+///
+/// 256 KiB against a few KB for the largest pipeline in `examples/` leaves three orders of
+/// magnitude of headroom for a generated definition while keeping the worst case bounded.
+/// The DAG-level caps stay: this bounds the input, they bound the output.
+const DEFINITION_MAX_BYTES: usize = 256 * 1024;
 
 pub fn router(state: AppState) -> Router {
     // Two sub-routers, one layer. `Router::layer` wraps the routes present when it is
@@ -54,6 +66,16 @@ pub fn router(state: AppState) -> Router {
     let webhook: MethodRouter<AppState> = post(github_webhook)
         .layer::<_, Infallible>(DefaultBodyLimit::max(WEBHOOK_MAX_BYTES))
         .layer(ConcurrencyLimitLayer::new(WEBHOOK_MAX_IN_FLIGHT));
+    // Same shape as the webhook limit above: the layer wraps what is on the method
+    // router when it runs, so the GET beside each of these keeps the default.
+    let create_pipeline_route: MethodRouter<AppState> = get(list_pipelines).merge(
+        post(create_pipeline).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES)),
+    );
+    let update_pipeline_route: MethodRouter<AppState> = get(get_pipeline).merge(
+        put(update_pipeline).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES)),
+    );
+    let parse_yaml_route: MethodRouter<AppState> =
+        post(parse_yaml).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES));
     let api = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -75,20 +97,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{id}", put(update_user))
-        .route(
-            "/api/projects/{id}/pipelines",
-            get(list_pipelines).post(create_pipeline),
-        )
+        .route("/api/projects/{id}/pipelines", create_pipeline_route)
         .route(
             "/api/projects/{id}/secrets",
             get(list_secrets).post(upsert_secret),
         )
         .route("/api/projects/{id}/secrets/{key}", delete(delete_secret))
-        .route("/api/pipelines/parse-yaml", post(parse_yaml))
-        .route(
-            "/api/pipelines/{id}",
-            get(get_pipeline).put(update_pipeline),
-        )
+        .route("/api/pipelines/parse-yaml", parse_yaml_route)
+        .route("/api/pipelines/{id}", update_pipeline_route)
         .route("/api/pipelines/{id}/runs", post(start_run))
         .route("/api/projects/{id}/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
@@ -792,14 +808,7 @@ async fn remove_member(
         .store
         .remove_project_member(id, user_id, actor == ProjectRole::Owner)
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("cannot remove") {
-                ApiError::BadRequest(msg)
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -843,13 +852,7 @@ async fn update_user(
         .store
         .set_instance_admin(id, req.is_admin)
         .await
-        .map_err(|e| {
-            if e.to_string().ends_with("not found") {
-                ApiError::NotFound
-            } else {
-                ApiError::from(e)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     Ok(Json(updated))
 }
 
@@ -1659,13 +1662,15 @@ async fn create_agent(
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_agent_scope(&state, &user, req.project_id).await?;
-    let mut resp = state.store.create_agent(req).await.map_err(|e| {
-        if e.to_string().contains("project not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    // `create_agent` returns `StoreError::NotFound` for an unknown `project_id`, which
+    // `ApiError::from` maps to 404. This is not a race: `require_agent_scope`
+    // short-circuits for an instance admin, so an admin posting a stale project id
+    // reaches the store's check on every call.
+    let mut resp = state
+        .store
+        .create_agent(req)
+        .await
+        .map_err(ApiError::from)?;
     resp.agent.token_hash = "***".into();
     Ok((StatusCode::CREATED, Json(resp)))
 }
@@ -1683,13 +1688,11 @@ async fn update_agent(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     require_agent_manage(&state, &user, &existing).await?;
-    let mut agent = state.store.update_agent(id, req).await.map_err(|e| {
-        if e.to_string().contains("not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    let mut agent = state
+        .store
+        .update_agent(id, req)
+        .await
+        .map_err(ApiError::from)?;
     let labels = agent
         .labels
         .as_array()
@@ -1748,13 +1751,11 @@ async fn rotate_agent_token(
         .scheduler
         .force_disconnect_agent(id, "token rotated — reconnect with the new token")
         .await;
-    let mut resp = state.store.rotate_agent_token(id).await.map_err(|e| {
-        if e.to_string().contains("not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    let mut resp = state
+        .store
+        .rotate_agent_token(id)
+        .await
+        .map_err(ApiError::from)?;
     resp.agent.token_hash = "***".into();
     Ok(Json(resp))
 }
@@ -1922,30 +1923,23 @@ async fn github_webhook(
                 .find_pipelines_for_push(id, &branch, &changed)
                 .await
                 .map_err(ApiError::from)?;
-            let mut run_ids = Vec::new();
-            for p in pipelines {
-                let (run, _, _) = state
-                    .scheduler
-                    .start_run_for_commit(p.id, &format!("github:push:{branch}"), commit.clone())
-                    .await
-                    .map_err(ApiError::from)?;
-                // Off the request path: a slow GitHub must not stall the delivery past
-                // its timeout and cause a redelivery (and a duplicate run).
-                let store = state.store.clone();
-                let run_for_status = run.clone();
-                tokio::spawn(async move {
-                    crate::github::report_run_status(&store, &run_for_status).await;
-                });
-                state
-                    .scheduler
-                    .enqueue_run_ready(run.id)
-                    .await
-                    .map_err(ApiError::from)?;
-                run_ids.push(run.id);
-            }
-            Ok(Json(
-                json!({ "started": run_ids, "changed_files": changed.len() }),
-            ))
+            let (run_ids, failed) = start_matched_pipelines(
+                &state,
+                pipelines,
+                &format!("github:push:{branch}"),
+                commit,
+            )
+            .await;
+            let status = delivery_status(&run_ids, &failed);
+            Ok((
+                status,
+                Json(json!({
+                    "started": run_ids,
+                    "failed": failed,
+                    "changed_files": changed.len(),
+                })),
+            )
+                .into_response())
         }
         "pull_request" => {
             let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
@@ -2034,40 +2028,117 @@ async fn github_webhook(
                 .find_pipelines_for_pull_request(id, &base, action, &changed)
                 .await
                 .map_err(ApiError::from)?;
-            let mut run_ids = Vec::new();
-            for p in pipelines {
-                let (run, _, _) = state
-                    .scheduler
-                    .start_run_for_commit(
-                        p.id,
-                        &format!("github:pr:{number}:{action}"),
-                        commit.clone(),
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                // Off the request path: a slow GitHub must not stall the delivery past
-                // its timeout and cause a redelivery (and a duplicate run).
-                let store = state.store.clone();
-                let run_for_status = run.clone();
-                tokio::spawn(async move {
-                    crate::github::report_run_status(&store, &run_for_status).await;
-                });
-                state
-                    .scheduler
-                    .enqueue_run_ready(run.id)
-                    .await
-                    .map_err(ApiError::from)?;
-                run_ids.push(run.id);
-            }
-            Ok(Json(json!({
-                "started": run_ids,
-                "action": action,
-                "base": base,
-                "changed_files": changed.len(),
-                "files_source": files_source,
-            })))
+            let (run_ids, failed) = start_matched_pipelines(
+                &state,
+                pipelines,
+                &format!("github:pr:{number}:{action}"),
+                commit,
+            )
+            .await;
+            let status = delivery_status(&run_ids, &failed);
+            Ok((
+                status,
+                Json(json!({
+                    "started": run_ids,
+                    "failed": failed,
+                    "action": action,
+                    "base": base,
+                    "changed_files": changed.len(),
+                    "files_source": files_source,
+                })),
+            )
+                .into_response())
         }
-        _ => Ok(Json(json!({ "ignored": true, "event": event }))),
+        _ => Ok(Json(json!({ "ignored": true, "event": event })).into_response()),
+    }
+}
+
+/// What a client may be told about an error, by the same rule `ApiError` applies.
+///
+/// A definition the caller wrote wrongly is described; anything else is "internal
+/// error", because the alternative is echoing an sqlx or anyhow chain — the rule
+/// `ApiError::Internal` exists to enforce. Used where the error is reported inside a
+/// successful response rather than as the response's status.
+fn client_safe_message(e: &anyhow::Error) -> String {
+    use fiber_core::StoreError as S;
+    match e.downcast_ref::<S>() {
+        Some(S::Validation(_)) => format!("{e:#}"),
+        Some(S::NotFound(_)) => "not found".into(),
+        Some(S::Forbidden(_)) => "forbidden".into(),
+        Some(S::Other(_)) | None if e.downcast_ref::<fiber_core::DagError>().is_some() => {
+            format!("{e:#}")
+        }
+        _ => "internal error".into(),
+    }
+}
+
+/// Start every pipeline a delivery matched, and keep going past one that will not start.
+///
+/// The loop used to `?` on the first error. With pipelines A, B, C matching a branch and
+/// B carrying a definition that no longer compiles, A started, B failed the whole
+/// request, and C never ran — then GitHub redelivered and started a *second* run of A for
+/// the same commit.
+///
+/// A **partial** success stays 200: a redelivery cannot fix a pipeline that is broken on
+/// disk, and it would duplicate the runs that did start. When **nothing** started, that
+/// reasoning does not apply — there is nothing to duplicate, a redelivery is worth a try
+/// for a transient failure, and a red delivery is the one place a repository admin
+/// actually looks. See [`delivery_status`].
+async fn start_matched_pipelines(
+    state: &AppState,
+    pipelines: Vec<fiber_core::Pipeline>,
+    trigger: &str,
+    commit: fiber_core::RunCommit,
+) -> (Vec<Uuid>, Vec<Value>) {
+    let mut started = Vec::new();
+    let mut failed = Vec::new();
+    for p in pipelines {
+        let run = match state
+            .scheduler
+            .start_run_for_commit(p.id, trigger, commit.clone())
+            .await
+        {
+            Ok((run, _, _)) => run,
+            Err(e) => {
+                // The full chain goes to the log; the delivery body gets the classified
+                // message only. GitHub stores this response and renders it in the
+                // repository's Deliveries tab for every repo admin, so an sqlx pool
+                // timeout or a connection-string fragment would be published there.
+                tracing::error!(
+                    pipeline = %p.id, name = %p.name, error = ?e,
+                    "webhook could not start this pipeline; the others still run"
+                );
+                let message = client_safe_message(&e);
+                failed.push(json!({ "pipeline": p.id, "name": p.name, "error": message }));
+                continue;
+            }
+        };
+        // Off the request path: a slow GitHub must not stall the delivery past
+        // its timeout and cause a redelivery (and a duplicate run).
+        let store = state.store.clone();
+        let run_for_status = run.clone();
+        tokio::spawn(async move {
+            crate::github::report_run_status(&store, &run_for_status).await;
+        });
+        if let Err(e) = state.scheduler.enqueue_run_ready(run.id).await {
+            // The run exists and its root steps are queued; only the wake-up was lost, and
+            // the scheduler's own tick picks it up. Never worth failing the delivery.
+            tracing::warn!(run = %run.id, error = %e, "run started but the queue wake failed");
+        }
+        started.push(run.id);
+    }
+    (started, failed)
+}
+
+/// `500` only when every pipeline that matched failed to start.
+///
+/// A delivery that matched nothing is a success: most pushes match no pipeline, and
+/// turning those red would make the Deliveries tab useless for spotting the real thing.
+fn delivery_status(started: &[Uuid], failed: &[Value]) -> StatusCode {
+    if started.is_empty() && !failed.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
     }
 }
 
@@ -2162,21 +2233,41 @@ pub enum ApiError {
     Internal(String),
 }
 
+impl From<fiber_core::StoreError> for ApiError {
+    fn from(e: fiber_core::StoreError) -> Self {
+        use fiber_core::StoreError as S;
+        match e {
+            S::Forbidden(_) => ApiError::Forbidden,
+            S::NotFound(_) => ApiError::NotFound,
+            S::Validation(m) => ApiError::BadRequest(m),
+            // Named for the log, masked for the client — as any untyped error is.
+            S::Other(m) => ApiError::Internal(m),
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        // Typed validation failures are the caller's fault.
-        if e.downcast_ref::<fiber_core::ValidationError>().is_some()
-            || e.downcast_ref::<fiber_core::DagError>().is_some()
-        {
+        use fiber_core::StoreError as S;
+        // What the store meant, not what its message happens to read like. Matching on
+        // `contains("forbidden")` made every layer's wording load-bearing: an upstream
+        // error that merely quoted the word became a 403, and rewording "agent not found"
+        // turned a 404 into a 500. `Forbidden` and `NotFound` answer with a fixed body, so
+        // only the two that carry text back to the caller keep the full `anyhow` chain.
+        if let Some(store) = e.downcast_ref::<S>() {
+            return match store {
+                S::Forbidden(_) => ApiError::Forbidden,
+                S::NotFound(_) => ApiError::NotFound,
+                S::Validation(_) => ApiError::BadRequest(format!("{e:#}")),
+                S::Other(_) => ApiError::Internal(format!("{e:#}")),
+            };
+        }
+        // A definition the caller wrote wrongly is the caller's fault.
+        if e.downcast_ref::<fiber_core::DagError>().is_some() {
             return ApiError::BadRequest(format!("{e:#}"));
         }
-        let msg = e.to_string();
-        if msg.contains("forbidden") {
-            ApiError::Forbidden
-        } else {
-            // Full cause chain: the log line is the only place this text now appears.
-            ApiError::Internal(format!("{e:#}"))
-        }
+        // Full cause chain: the log line is the only place this text now appears.
+        ApiError::Internal(format!("{e:#}"))
     }
 }
 
@@ -2200,11 +2291,11 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod concurrency_funnel {
     //! Starting a run has to go through the scheduler, which is where a new run cancels
-    //! the older ones in its concurrency group. Four call sites reach this code — the
-    //! manual start, the retry, and both webhook paths (the schedule loop lives in the
-    //! scheduler itself) — and a fifth that called the store directly would silently opt
-    //! out of concurrency with nothing to show for it. Audit the source rather than
-    //! trust the next author to notice.
+    //! the older ones in its concurrency group. Three call sites reach this code — the
+    //! manual start, the retry, and `start_matched_pipelines` for both webhook paths
+    //! (the schedule loop lives in the scheduler itself) — and a fourth that called the
+    //! store directly would silently opt out of concurrency with nothing to show for it.
+    //! Audit the source rather than trust the next author to notice.
 
     /// Everything above the first `#[cfg(test)]`, so this module's own text — which
     /// necessarily contains the pattern it looks for — is not what gets audited.
@@ -2259,9 +2350,11 @@ mod concurrency_funnel {
             .lines()
             .filter(|l| l.trim().starts_with(".retry_run"))
             .count();
+        // Two sites: the manual start, and `start_matched_pipelines`, which both webhook
+        // branches call so that one uncompilable pipeline cannot abort the delivery.
         assert!(
-            starts >= 3,
-            "expected the manual and both webhook starts, found {starts}"
+            starts >= 2,
+            "expected the manual start and the webhook helper, found {starts}"
         );
         assert_eq!(retries, 1, "expected exactly the retry route's call");
     }
@@ -2767,20 +2860,111 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
+    /// The status comes from the variant, not from the wording.
+    /// GitHub stores the delivery body and shows it to every repository admin, so it is
+    /// a client response like any other.
     #[test]
-    fn api_error_maps_forbidden_from_anyhow() {
+    fn a_reported_delivery_failure_never_carries_a_store_chain() {
+        use fiber_core::StoreError as S;
+        // A broken definition is the author's, and saying so is the point.
+        let dag = anyhow::Error::new(fiber_core::DagError::EmptyStepId).context("compiling");
+        assert_eq!(
+            client_safe_message(&dag),
+            "compiling: every step needs a non-empty id"
+        );
+        let v = anyhow::Error::new(S::Validation("cron `x` can never fire".into()));
+        assert!(client_safe_message(&v).contains("can never fire"));
+
+        // Everything else is masked, with the chain left to the log.
+        let sqlx_ish =
+            anyhow::anyhow!("pool timed out; connection postgres://fiber:hunter2@db:5432/fiber")
+                .context("start_run_for_commit");
+        let msg = client_safe_message(&sqlx_ish);
+        assert_eq!(msg, "internal error");
+        assert!(!msg.contains("hunter2") && !msg.contains("pool"));
+        assert_eq!(
+            client_safe_message(&anyhow::Error::new(S::Other("shard down".into()))),
+            "internal error"
+        );
+    }
+
+    #[test]
+    fn a_delivery_is_red_only_when_nothing_started() {
+        let run = || Uuid::new_v4();
+        let fail = || json!({ "pipeline": Uuid::new_v4() });
+        // Nothing matched: a normal push, not a failure.
+        assert_eq!(delivery_status(&[], &[]), StatusCode::OK);
+        // Partial: redelivering would duplicate the runs that did start.
+        assert_eq!(delivery_status(&[run()], &[fail()]), StatusCode::OK);
+        assert_eq!(delivery_status(&[run()], &[]), StatusCode::OK);
+        // Nothing started and something failed: nothing to duplicate, so say so where
+        // the repository admin will see it.
+        assert_eq!(
+            delivery_status(&[], &[fail()]),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn api_error_maps_the_store_error_type_not_its_message() {
+        use fiber_core::StoreError as S;
+        type Expect = fn(&ApiError) -> bool;
+        let cases: Vec<(S, Expect)> = vec![
+            (S::forbidden(), |e| matches!(e, ApiError::Forbidden)),
+            (
+                S::Forbidden("forbidden: only an owner can remove an owner".into()),
+                |e| matches!(e, ApiError::Forbidden),
+            ),
+            (S::not_found("agent"), |e| matches!(e, ApiError::NotFound)),
+            // Reworded — and still a 404, which is the whole point.
+            (S::NotFound("no such agent on this instance".into()), |e| {
+                matches!(e, ApiError::NotFound)
+            }),
+            (
+                S::Validation("cannot remove the last owner".into()),
+                |e| matches!(e, ApiError::BadRequest(m) if m == "cannot remove the last owner"),
+            ),
+            (S::Other("pool exhausted".into()), |e| {
+                matches!(e, ApiError::Internal(_))
+            }),
+        ];
+        for (store, want) in cases {
+            let text = store.to_string();
+            let direct: ApiError = ApiError::from(store);
+            assert!(want(&direct), "direct mapping of `{text}`");
+            let boxed: ApiError = anyhow::Error::msg(text.clone()).context("x").into();
+            // Untyped, even with the same words: internal.
+            assert!(matches!(boxed, ApiError::Internal(_)), "untyped `{text}`");
+        }
+        // An error that merely says "forbidden" is no longer a 403.
         let e: ApiError = anyhow::anyhow!("forbidden: reader cannot write").into();
-        assert!(matches!(e, ApiError::Forbidden));
+        assert!(matches!(e, ApiError::Internal(_)));
         let e: ApiError = anyhow::anyhow!("db down").into();
         assert!(matches!(e, ApiError::Internal(_)));
     }
 
+    /// The store's typed errors survive an `anyhow` context layer, which is how they
+    /// reach the handler from `scheduler::start_run` and the `*_on` helpers.
+    #[test]
+    fn a_store_error_is_recognised_through_a_context_layer() {
+        use fiber_core::StoreError as S;
+        let e: ApiError = anyhow::Error::new(S::not_found("run"))
+            .context("starting a run")
+            .into();
+        assert!(matches!(e, ApiError::NotFound));
+        let e: ApiError = anyhow::Error::new(S::forbidden())
+            .context("checking membership")
+            .into();
+        assert!(matches!(e, ApiError::Forbidden));
+    }
+
     #[test]
     fn api_error_maps_typed_validation_to_400() {
-        let e: ApiError = anyhow::Error::new(fiber_core::ValidationError("nope".into())).into();
+        let e: ApiError =
+            anyhow::Error::new(fiber_core::StoreError::Validation("nope".into())).into();
         assert!(matches!(e, ApiError::BadRequest(m) if m == "nope"));
         let wrapped =
-            anyhow::Error::new(fiber_core::ValidationError("inner".into())).context("outer");
+            anyhow::Error::new(fiber_core::StoreError::Validation("inner".into())).context("outer");
         let e: ApiError = wrapped.into();
         assert!(matches!(e, ApiError::BadRequest(m) if m == "outer: inner"));
     }

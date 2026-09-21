@@ -71,6 +71,15 @@ struct Args {
 
     #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = "fiber")]
     admin_password: String,
+
+    /// Seed the Showcase demo project: `auto` (only when the instance has no users yet),
+    /// `1` to seed on this boot, `0` never.
+    #[arg(long, env = "FIBER_SEED_SHOWCASE", default_value = "auto")]
+    seed_showcase: String,
+
+    /// Most expanded steps one pipeline may compile to (matrix cells included).
+    #[arg(long, env = "FIBER_MAX_STEPS")]
+    max_steps: Option<String>,
 }
 
 #[tokio::main]
@@ -78,20 +87,67 @@ async fn main() -> Result<()> {
     let otel = otel::init()?;
 
     let args = Args::parse();
+    // Validated here so a typo is a boot failure rather than a limit nobody chose.
+    // `fiber_core::dag::max_steps` reads the same variable and warns on its own for the
+    // CLI, which has no boot to fail.
+    let max_steps =
+        fiber_core::dag::max_steps_from(args.max_steps.as_deref()).map_err(anyhow::Error::msg)?;
+    // Hand the parsed value to the compiler rather than letting it re-read the
+    // environment: clap also accepts `--max-steps`, and two readers disagreeing is a
+    // boot line that says one thing and a 400 that says another.
+    if let Err(in_force) = fiber_core::dag::set_max_steps(max_steps) {
+        tracing::warn!(
+            in_force,
+            requested = max_steps,
+            "step cap was already fixed before it could be set"
+        );
+    }
+    if max_steps != fiber_core::dag::DEFAULT_MAX_STEPS {
+        tracing::info!(max_steps, "step cap overridden");
+    }
     std::fs::create_dir_all(&args.artifacts_dir)?;
     fiber_core::secrets::init_from_env();
 
     let pool = db::connect(&args.database_url).await?;
     db::migrate(&pool).await?;
     let store = Store::new(pool);
-    let n = store.backfill_schedule_dues().await?;
-    if n > 0 {
-        tracing::info!(count = n, "backfilled pipeline next_due_at");
+    // One walk: back-fill schedule dues, and report definitions that no longer compile.
+    // An upgrade can tighten a validator, which turns a stored pipeline that was accepted
+    // into one that cannot start — say so here rather than on the next push.
+    match store.scan_pipelines_at_boot().await {
+        Ok(scan) => {
+            if scan.backfilled > 0 {
+                tracing::info!(count = scan.backfilled, "backfilled pipeline next_due_at");
+            }
+            for d in &scan.defects {
+                tracing::error!(
+                    project = %d.project_id, pipeline = %d.pipeline_id, name = %d.name,
+                    reason = %d.reason,
+                    "stored pipeline no longer compiles and cannot start until it is fixed"
+                );
+            }
+            if !scan.defects.is_empty() {
+                tracing::error!(
+                    count = scan.defects.len(),
+                    "pipelines that will not start; see the lines above"
+                );
+            }
+        }
+        // Never worth failing the boot: the back-fill is best-effort and the audit is a
+        // report, not a gate. The schedule loop re-derives a missing due time anyway.
+        Err(e) => tracing::warn!(error = %e, "could not scan stored pipelines at boot"),
     }
+    // Read before `ensure_admin_user`, which creates one: this is what "fresh instance"
+    // means for the seeder too, so a deleted demo project stays deleted across restarts.
+    let users_existed = store.count_users().await? > 0;
     let admin = store
         .ensure_admin_user(&args.admin_user, &args.admin_password)
         .await?;
-    fiber_core::ensure_showcase(&store, admin.id).await?;
+    if fiber_core::seed::should_seed_showcase(Some(&args.seed_showcase), users_existed)
+        .map_err(anyhow::Error::msg)?
+    {
+        fiber_core::ensure_showcase(&store, admin.id).await?;
+    }
 
     // Lazy: the first command connects, and the manager reconnects on its own after
     // that. Connecting eagerly here made an unreachable Redis a crash loop, although

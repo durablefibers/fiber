@@ -1,4 +1,4 @@
-use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml};
+use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml_lenient};
 use crate::models::*;
 // sqlx 0.9 refuses a runtime-built query string unless it is asserted safe. Every
 // interpolation in this file splices a column-list `const` — PIPELINE_COLS, AGENT_COLS,
@@ -83,13 +83,35 @@ impl Store {
         .await?)
     }
 
+    /// Create a project owned by `owner_id`.
+    ///
+    /// The slug is **always** `slugify`d, supplied or derived. It used to be taken
+    /// verbatim when supplied, which let any caller write a slug no `slugify` output can
+    /// produce — including the reserved `showcase`, which the boot seeder then adopts and
+    /// adds the bootstrap admin to as owner.
     pub async fn create_project(
         &self,
         owner_id: Uuid,
         req: CreateProjectRequest,
     ) -> Result<Project> {
+        let slug = slugify(req.slug.as_deref().unwrap_or(&req.name));
+        if crate::seed::is_reserved_slug(&slug) {
+            return Err(crate::StoreError::Validation(format!(
+                "slug `{slug}` is reserved by this instance; choose another"
+            ))
+            .into());
+        }
+        self.insert_project(owner_id, &req.name, &slug).await
+    }
+
+    /// Insert a project and its owner, no slug policy. Only `seed` bypasses that policy.
+    pub(crate) async fn insert_project(
+        &self,
+        owner_id: Uuid,
+        name: &str,
+        slug: &str,
+    ) -> Result<Project> {
         let id = Uuid::new_v4();
-        let slug = req.slug.unwrap_or_else(|| slugify(&req.name));
         // Project and owner land together: a project with no owner can never be deleted
         // or have an owner granted, since both need one.
         let mut tx = self.pool.begin().await?;
@@ -98,10 +120,17 @@ impl Store {
              RETURNING id, name, slug, created_at",
         )
         .bind(id)
-        .bind(&req.name)
-        .bind(&slug)
+        .bind(name)
+        .bind(slug)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        // Slugifying a supplied slug enlarges the collision class — `Web UI` and
+        // `web-ui` now land on one slug — so a clash is an ordinary thing for a caller
+        // to do, and answering it with a 500 tells them nothing.
+        .map_err(|e| match unique_violation(&e) {
+            true => crate::StoreError::Validation(format!("slug `{slug}` is already taken")).into(),
+            false => anyhow::Error::new(e),
+        })?;
         sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)")
             .bind(project.id)
             .bind(owner_id)
@@ -145,9 +174,12 @@ impl Store {
             // The decision was already made atomically above; this only names the reason.
             tx.rollback().await?;
             return Err(if actor_is_owner {
-                crate::ValidationError("cannot demote the last owner".into()).into()
+                crate::StoreError::Validation("cannot demote the last owner".into()).into()
             } else {
-                anyhow!("forbidden: only an owner can change an owner's role")
+                crate::StoreError::Forbidden(
+                    "forbidden: only an owner can change an owner's role".into(),
+                )
+                .into()
             });
         }
         tx.commit().await?;
@@ -176,10 +208,10 @@ impl Store {
         min: crate::roles::ProjectRole,
     ) -> Result<crate::roles::ProjectRole> {
         let Some(role) = self.member_role(project_id, user_id).await? else {
-            return Err(anyhow!("forbidden"));
+            return Err(crate::StoreError::forbidden().into());
         };
         if !role.at_least(min) {
-            return Err(anyhow!("forbidden"));
+            return Err(crate::StoreError::forbidden().into());
         }
         Ok(role)
     }
@@ -232,11 +264,12 @@ impl Store {
             tx.rollback().await?;
             return match role {
                 None => Ok(()),
-                Some(_) if !actor_is_owner => {
-                    Err(anyhow!("forbidden: only an owner can remove an owner"))
-                }
+                Some(_) if !actor_is_owner => Err(crate::StoreError::Forbidden(
+                    "forbidden: only an owner can remove an owner".into(),
+                )
+                .into()),
                 Some(_) => {
-                    Err(crate::ValidationError("cannot remove the last owner".into()).into())
+                    Err(crate::StoreError::Validation("cannot remove the last owner".into()).into())
                 }
             };
         }
@@ -288,9 +321,12 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         if exists {
-            Err(crate::ValidationError("cannot demote the last instance admin".into()).into())
+            Err(
+                crate::StoreError::Validation("cannot demote the last instance admin".into())
+                    .into(),
+            )
         } else {
-            anyhow::bail!("user not found")
+            Err(crate::StoreError::not_found("user").into())
         }
     }
 
@@ -590,6 +626,9 @@ impl Store {
         project_id: Uuid,
         req: CreatePipelineRequest,
     ) -> Result<Pipeline> {
+        // The submitted value is audited; what is already stored is not. See
+        // `dag::audit_definition`.
+        crate::dag::audit_definition(&req.definition).map_err(crate::StoreError::Validation)?;
         let def = value_to_definition(&req.definition)?;
         compile_definition(&def).context("invalid pipeline definition")?;
         if let Some(on) = &def.on {
@@ -618,6 +657,7 @@ impl Store {
         pipeline_id: Uuid,
         req: UpdatePipelineRequest,
     ) -> Result<Pipeline> {
+        crate::dag::audit_definition(&req.definition).map_err(crate::StoreError::Validation)?;
         let def = value_to_definition(&req.definition)?;
         compile_definition(&def).context("invalid pipeline definition")?;
         if let Some(on) = &def.on {
@@ -726,16 +766,43 @@ impl Store {
     }
 
     /// Backfill `next_due_at` for pipelines that have a schedule but no due time yet.
-    pub async fn backfill_schedule_dues(&self) -> Result<u64> {
-        let pipelines = self.list_all_pipelines().await?;
-        let mut n = 0u64;
-        for p in pipelines {
+    /// One walk over every pipeline at boot: back-fill missing schedule due times, and
+    /// report the definitions that no longer compile.
+    ///
+    /// Both used to list and deserialise every pipeline separately, before the listener
+    /// binds — the same work twice on an instance with thousands of them.
+    ///
+    /// The audit exists because a validator that tightens — an `if:` that used to
+    /// evaluate to `false`, a glob that used to be dropped — turns a pipeline that was
+    /// accepted into one that cannot start, and the operator would otherwise find out on
+    /// the next push. Nothing is changed or blocked by it; the boot continues.
+    pub async fn scan_pipelines_at_boot(&self) -> Result<BootScan> {
+        let mut scan = BootScan::default();
+        for p in self.list_all_pipelines().await? {
+            let def = match value_to_definition(&p.definition) {
+                Ok(def) => Some(def),
+                Err(e) => {
+                    scan.defects.push(PipelineDefect {
+                        project_id: p.project_id,
+                        pipeline_id: p.id,
+                        name: p.name.clone(),
+                        reason: format!("{e:#}"),
+                    });
+                    None
+                }
+            };
+            let Some(def) = def else { continue };
+            if let Err(e) = compile_definition(&def) {
+                scan.defects.push(PipelineDefect {
+                    project_id: p.project_id,
+                    pipeline_id: p.id,
+                    name: p.name.clone(),
+                    reason: e.to_string(),
+                });
+            }
             if p.next_due_at.is_some() {
                 continue;
             }
-            let Ok(def) = value_to_definition(&p.definition) else {
-                continue;
-            };
             let Some(on) = def.on.as_ref().filter(|o| has_schedule(o)) else {
                 continue;
             };
@@ -750,9 +817,9 @@ impl Store {
             .bind(next)
             .execute(&self.pool)
             .await?;
-            n += 1;
+            scan.backfilled += 1;
         }
-        Ok(n)
+        Ok(scan)
     }
 
     /// Re-queue a failed step for another attempt, not offerable before `backoff_secs`.
@@ -870,8 +937,8 @@ impl Store {
         .await?;
         let superseded = superseded_runs_on(&mut tx, &run).await?;
 
+        let mut rows = StepRows::with_capacity(compiled.steps.len());
         for step in &compiled.steps {
-            let sid = Uuid::new_v4();
             // Only evaluate `if:` for roots here. Dependent steps stay Pending until
             // unlock time — otherwise `success()` would skip them before needs run.
             let status = if step.needs.is_empty() {
@@ -887,32 +954,9 @@ impl Store {
             } else {
                 StepStatus::Pending
             };
-            let error = if status == StepStatus::Skipped {
-                Some("if: condition false".to_string())
-            } else {
-                None
-            };
-            sqlx::query(
-                "INSERT INTO step_runs
-                 (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
-                  error, queued_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                         CASE WHEN $5 = 'queued' THEN NOW() END)",
-            )
-            .bind(sid)
-            .bind(run_id)
-            .bind(&step.id)
-            .bind(&step.name)
-            .bind(step_status_str(status))
-            .bind(&step.image)
-            .bind(&step.run)
-            .bind(json!(step.labels))
-            .bind(json!(step.needs))
-            .bind(step.retries as i32)
-            .bind(error)
-            .execute(&mut *tx)
-            .await?;
+            rows.push(Uuid::new_v4(), step, status);
         }
+        rows.insert_on(&mut tx, run_id).await?;
         tx.commit().await?;
 
         // If all roots skipped, propagate so dependents can resolve — and return the run
@@ -952,14 +996,16 @@ impl Store {
             .await?
             .ok_or_else(|| anyhow!("run not found"))?;
         if !original.status_enum().is_terminal() {
-            return Err(crate::ValidationError(
+            return Err(crate::StoreError::Validation(
                 "run is still active; cancel it before retrying".into(),
             )
             .into());
         }
         let compiled: CompiledDag = serde_json::from_value(original.definition_snapshot.clone())
             .map_err(|e| {
-                crate::ValidationError(format!("run snapshot is not a compiled pipeline: {e}"))
+                crate::StoreError::Validation(format!(
+                    "run snapshot is not a compiled pipeline: {e}"
+                ))
             })?;
         let previous = self.list_step_runs(run_id).await?;
 
@@ -998,9 +1044,21 @@ impl Store {
         .await?;
         let superseded = superseded_runs_on(&mut tx, &run).await?;
 
+        // The previous run's rows by step id: `failed_only` carries a succeeded step over
+        // rather than running it again, and a linear scan per step made that quadratic in
+        // the definition.
+        let mut prior_by_step: std::collections::HashMap<&str, &StepRun> =
+            std::collections::HashMap::with_capacity(previous.len());
+        for p in &previous {
+            // First wins, as the linear `find` this replaces did.
+            prior_by_step.entry(p.step_id.as_str()).or_insert(p);
+        }
+        let mut rows = StepRows::with_capacity(compiled.steps.len());
+        // (new step_run id, previous step_run id) for the artifacts carried forward.
+        let mut carried: Vec<(Uuid, Uuid)> = Vec::new();
         for step in &compiled.steps {
             let sid = Uuid::new_v4();
-            let prior = previous.iter().find(|p| p.step_id == step.id);
+            let prior = prior_by_step.get(step.id.as_str()).copied();
             let carry_over =
                 failed_only && prior.is_some_and(|p| p.status_enum() == StepStatus::Succeeded);
             let status = if carry_over {
@@ -1018,61 +1076,37 @@ impl Store {
             } else {
                 StepStatus::Pending
             };
-            let error = match status {
-                StepStatus::Skipped => Some("if: condition false".to_string()),
-                _ => None,
-            };
+            let prior = carry_over.then_some(prior).flatten();
+            rows.push_carried(
+                sid,
+                step,
+                status,
+                prior.and_then(|p| p.exit_code),
+                prior.and_then(|p| p.started_at),
+                prior.and_then(|p| p.finished_at),
+            );
+            if let Some(p) = prior {
+                carried.push((sid, p.id));
+            }
+        }
+        rows.insert_on(&mut tx, new_run_id).await?;
+
+        // A carried-over step produces nothing this time, so its artifacts are copied
+        // forward; otherwise its dependents would have nothing to restore. The blob is
+        // shared — retention only deletes one once no run references it.
+        if !carried.is_empty() {
+            let (new_ids, prior_ids): (Vec<Uuid>, Vec<Uuid>) = carried.into_iter().unzip();
             sqlx::query(
-                "INSERT INTO step_runs
-                 (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
-                  error, exit_code, started_at, finished_at, queued_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                         CASE WHEN $5 = 'queued' THEN NOW() END)",
+                "INSERT INTO artifacts (id, run_id, step_run_id, name, path, size)
+                 SELECT gen_random_uuid(), $1, m.new_id, a.name, a.path, a.size
+                 FROM unnest($2::uuid[], $3::uuid[]) AS m(new_id, prior_id)
+                 JOIN artifacts a ON a.step_run_id = m.prior_id",
             )
-            .bind(sid)
             .bind(new_run_id)
-            .bind(&step.id)
-            .bind(&step.name)
-            .bind(step_status_str(status))
-            .bind(&step.image)
-            .bind(&step.run)
-            .bind(json!(step.labels))
-            .bind(json!(step.needs))
-            .bind(step.retries as i32)
-            .bind(error)
-            .bind(
-                carry_over
-                    .then(|| prior.and_then(|p| p.exit_code))
-                    .flatten(),
-            )
-            .bind(
-                carry_over
-                    .then(|| prior.and_then(|p| p.started_at))
-                    .flatten(),
-            )
-            .bind(
-                carry_over
-                    .then(|| prior.and_then(|p| p.finished_at))
-                    .flatten(),
-            )
+            .bind(&new_ids)
+            .bind(&prior_ids)
             .execute(&mut *tx)
             .await?;
-
-            // A carried-over step produces nothing this time, so its artifacts are copied
-            // forward; otherwise its dependents would have nothing to restore. The blob is
-            // shared — retention only deletes one once no run references it.
-            if carry_over && let Some(p) = prior {
-                sqlx::query(
-                    "INSERT INTO artifacts (id, run_id, step_run_id, name, path, size)
-                     SELECT gen_random_uuid(), $1, $2, name, path, size
-                     FROM artifacts WHERE step_run_id = $3",
-                )
-                .bind(new_run_id)
-                .bind(sid)
-                .bind(p.id)
-                .execute(&mut *tx)
-                .await?;
-            }
         }
         tx.commit().await?;
 
@@ -1549,10 +1583,11 @@ impl Store {
             .cloned()
             .unwrap_or(json!([]));
 
+        let snapshot = SnapshotIndex::new(&snapshot_steps);
         let mut steps = list_step_runs_on(&mut tx, run_id).await?;
         let mut changed = Vec::new();
         loop {
-            let plan = plan_transitions(&steps, &snapshot_steps);
+            let plan = plan_transitions_indexed(&steps, &snapshot);
             if plan.is_empty() {
                 break;
             }
@@ -1594,10 +1629,9 @@ impl Store {
         }
 
         if steps.iter().all(|s| s.status_enum().is_terminal()) {
-            let tolerated = snapshot_tolerated(&snapshot_steps);
             let any_failed = steps.iter().any(|s| match s.status_enum() {
                 StepStatus::Cancelled => true,
-                StepStatus::Failed => !tolerated.contains(&s.step_id),
+                StepStatus::Failed => !snapshot.tolerates(&s.step_id),
                 _ => false,
             });
             let status = if any_failed {
@@ -2052,7 +2086,7 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
             if exists.is_none() {
-                return Err(anyhow!("project not found"));
+                return Err(crate::StoreError::not_found("project").into());
             }
         }
         let id = Uuid::new_v4();
@@ -2106,7 +2140,7 @@ impl Store {
 
     pub async fn update_agent(&self, id: Uuid, req: UpdateAgentRequest) -> Result<Agent> {
         let Some(existing) = self.get_agent(id).await? else {
-            return Err(anyhow!("agent not found"));
+            return Err(crate::StoreError::not_found("agent").into());
         };
         let name = req.name.unwrap_or(existing.name);
         let labels = req.labels.unwrap_or_else(|| {
@@ -2148,7 +2182,7 @@ impl Store {
     /// Issue a new token; invalidates the previous one. Returns plaintext once.
     pub async fn rotate_agent_token(&self, id: Uuid) -> Result<CreateAgentResponse> {
         let Some(_) = self.get_agent(id).await? else {
-            return Err(anyhow!("agent not found"));
+            return Err(crate::StoreError::not_found("agent").into());
         };
         let token = generate_token();
         let token_hash = hash_token(&token);
@@ -2366,10 +2400,16 @@ impl Store {
             .transpose()
     }
 
-    pub async fn ensure_admin_user(&self, username: &str, password: &str) -> Result<PublicUser> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+    /// How many users exist. Read at boot, before `ensure_admin_user` can create one, to
+    /// tell a fresh instance from one an operator has been running.
+    pub async fn count_users(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&self.pool)
-            .await?;
+            .await?)
+    }
+
+    pub async fn ensure_admin_user(&self, username: &str, password: &str) -> Result<PublicUser> {
+        let count = self.count_users().await?;
         if count > 0 {
             // Recovery path only: promote FIBER_ADMIN_USER while the instance has *no*
             // admin. Never on every boot — anyone who can create users (project admins,
@@ -2619,40 +2659,205 @@ impl Store {
     }
 }
 
+/// Read a stored `pipelines.definition` (or a submitted one) into a definition.
+///
+/// Deliberately **lenient** about fields it does not know, on both shapes. A row written
+/// by an older version has to keep compiling, because the runs it governs are already in
+/// the database and a schema tightening must not fail them at execution time. The strict
+/// unknown-key audit lives on the authoring path — `fiber validate`,
+/// `POST /api/pipelines/parse-yaml`, and the CLI — where there is still an author to tell.
+/// One `step_runs` insert for a whole DAG, as parallel arrays.
+///
+/// `start_run` and `retry_run` used to issue one `INSERT` per step inside the run's
+/// transaction: a 500-step pipeline was 500 round-trips holding a write transaction and a
+/// pool connection, and the cost scaled with the definition rather than with the run. The
+/// arrays go over once and `unnest` turns them back into rows server-side.
+///
+/// Carry-over columns (`exit_code`, `started_at`, `finished_at`) are `None` for a fresh
+/// run and carry the previous attempt's values for a `failed_only` retry.
+struct StepRows {
+    ids: Vec<Uuid>,
+    step_ids: Vec<String>,
+    names: Vec<String>,
+    statuses: Vec<String>,
+    images: Vec<Option<String>>,
+    commands: Vec<String>,
+    labels: Vec<Value>,
+    needs: Vec<Value>,
+    retries: Vec<i32>,
+    errors: Vec<Option<String>>,
+    exit_codes: Vec<Option<i32>>,
+    started_at: Vec<Option<chrono::DateTime<chrono::Utc>>>,
+    finished_at: Vec<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl StepRows {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            ids: Vec::with_capacity(n),
+            step_ids: Vec::with_capacity(n),
+            names: Vec::with_capacity(n),
+            statuses: Vec::with_capacity(n),
+            images: Vec::with_capacity(n),
+            commands: Vec::with_capacity(n),
+            labels: Vec::with_capacity(n),
+            needs: Vec::with_capacity(n),
+            retries: Vec::with_capacity(n),
+            errors: Vec::with_capacity(n),
+            exit_codes: Vec::with_capacity(n),
+            started_at: Vec::with_capacity(n),
+            finished_at: Vec::with_capacity(n),
+        }
+    }
+
+    fn push(&mut self, id: Uuid, step: &crate::dag::CompiledStep, status: StepStatus) {
+        self.push_carried(id, step, status, None, None, None);
+    }
+
+    fn push_carried(
+        &mut self,
+        id: Uuid,
+        step: &crate::dag::CompiledStep,
+        status: StepStatus,
+        exit_code: Option<i32>,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.ids.push(id);
+        self.step_ids.push(step.id.clone());
+        self.names.push(step.name.clone());
+        self.statuses.push(step_status_str(status).to_string());
+        self.images.push(step.image.clone());
+        self.commands.push(step.run.clone());
+        self.labels.push(json!(step.labels));
+        self.needs.push(json!(step.needs));
+        self.retries.push(step.retries as i32);
+        self.errors.push(match status {
+            StepStatus::Skipped => Some("if: condition false".to_string()),
+            _ => None,
+        });
+        self.exit_codes.push(exit_code);
+        self.started_at.push(started_at);
+        self.finished_at.push(finished_at);
+    }
+
+    async fn insert_on(&self, tx: &mut sqlx::PgConnection, run_id: Uuid) -> Result<()> {
+        if self.ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO step_runs
+               (id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
+                error, exit_code, started_at, finished_at, queued_at)
+             SELECT t.id, $1, t.step_id, t.step_name, t.status, t.image, t.run_cmd, t.labels,
+                    t.needs, t.retries, t.error, t.exit_code, t.started_at, t.finished_at,
+                    CASE WHEN t.status = 'queued' THEN NOW() END
+             FROM unnest($2::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+                         $8::jsonb[], $9::jsonb[], $10::int4[], $11::text[], $12::int4[],
+                         $13::timestamptz[], $14::timestamptz[])
+               AS t(id, step_id, step_name, status, image, run_cmd, labels, needs, retries,
+                    error, exit_code, started_at, finished_at)",
+        )
+        .bind(run_id)
+        .bind(&self.ids)
+        .bind(&self.step_ids)
+        .bind(&self.names)
+        .bind(&self.statuses)
+        .bind(&self.images)
+        .bind(&self.commands)
+        .bind(&self.labels)
+        .bind(&self.needs)
+        .bind(&self.retries)
+        .bind(&self.errors)
+        .bind(&self.exit_codes)
+        .bind(&self.started_at)
+        .bind(&self.finished_at)
+        .execute(tx)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Whether an sqlx error is Postgres `23505 unique_violation`.
+///
+/// Read from the SQLSTATE, not the message: the message is localised and contains the
+/// constraint name, which is exactly the kind of text this crate stopped matching on.
+fn unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+/// What [`Store::scan_pipelines_at_boot`] found.
+#[derive(Debug, Default)]
+pub struct BootScan {
+    /// Pipelines given a `next_due_at` they were missing.
+    pub backfilled: u64,
+    /// Pipelines that will not start until someone edits them.
+    pub defects: Vec<PipelineDefect>,
+}
+
+/// A stored pipeline that would not compile today. See [`Store::scan_pipelines_at_boot`].
+#[derive(Debug, Clone)]
+pub struct PipelineDefect {
+    pub project_id: Uuid,
+    pub pipeline_id: Uuid,
+    pub name: String,
+    pub reason: String,
+}
+
 pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {
     if let Some(yaml) = value.get("yaml").and_then(|v| v.as_str()) {
-        return Ok(parse_pipeline_yaml(yaml)?);
+        return Ok(parse_pipeline_yaml_lenient(yaml)?);
     }
     Ok(serde_json::from_value(value.clone())?)
 }
 
-/// Step ids the snapshot marks `continue_on_error`.
+/// The run's definition snapshot, keyed by step id.
 ///
-/// Read from the snapshot rather than a column: the snapshot is what governs this
-/// execution, so editing the pipeline mid-run cannot change whether a failure is tolerated.
-fn snapshot_tolerated(steps: &Value) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    if let Some(arr) = steps.as_array() {
-        for s in arr {
-            if s.get("continue_on_error").and_then(Value::as_bool) == Some(true)
-                && let Some(id) = s.get("id").and_then(|v| v.as_str())
-            {
-                out.insert(id.to_string());
-            }
-        }
-    }
-    out
+/// The snapshot is a JSON array, and every lookup used to be a linear scan of it: one per
+/// pending or queued step, per planning pass, per completion, with the run row locked.
+/// A 500-step run therefore did 250 000 string comparisons over a multi-megabyte `Value`
+/// each time a step finished. Built once per `propagate_after_step` instead.
+///
+/// Borrowed from the snapshot, never copied: this is the hot path's whole point.
+pub(crate) struct SnapshotIndex<'a> {
+    by_id: std::collections::HashMap<&'a str, &'a Value>,
+    /// Ids the snapshot marks `continue_on_error`. Read from the snapshot rather than a
+    /// column: the snapshot governs this execution, so editing the pipeline mid-run
+    /// cannot change whether a failure is tolerated.
+    tolerated: std::collections::HashSet<&'a str>,
 }
 
-fn snapshot_step_if_env(steps: &Value, step_id: &str) -> (Option<String>, Vec<(String, String)>) {
-    let Some(arr) = steps.as_array() else {
-        return (None, vec![]);
-    };
-    for s in arr {
-        if s.get("id").and_then(|v| v.as_str()) != Some(step_id) {
-            continue;
+impl<'a> SnapshotIndex<'a> {
+    pub(crate) fn new(steps: &'a Value) -> Self {
+        let mut by_id = std::collections::HashMap::new();
+        let mut tolerated = std::collections::HashSet::new();
+        if let Some(arr) = steps.as_array() {
+            by_id.reserve(arr.len());
+            for s in arr {
+                let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                // First wins, as the scan it replaces did.
+                by_id.entry(id).or_insert(s);
+                if s.get("continue_on_error").and_then(Value::as_bool) == Some(true) {
+                    tolerated.insert(id);
+                }
+            }
         }
-        let if_expr = s.get("if").and_then(|v| v.as_str()).map(|s| s.to_string());
+        Self { by_id, tolerated }
+    }
+
+    fn tolerates(&self, step_id: &str) -> bool {
+        self.tolerated.contains(step_id)
+    }
+
+    /// The step's `if:` and the env bindings it is evaluated against (step env first,
+    /// then the matrix cell, which is what says which cell this is).
+    fn if_env(&self, step_id: &str) -> (Option<&'a str>, Vec<(String, String)>) {
+        let Some(s) = self.by_id.get(step_id) else {
+            return (None, vec![]);
+        };
+        let if_expr = s.get("if").and_then(|v| v.as_str());
         let mut env = Vec::new();
         if let Some(pairs) = s.get("env").and_then(|v| v.as_array()) {
             for p in pairs {
@@ -2671,9 +2876,8 @@ fn snapshot_step_if_env(steps: &Value, step_id: &str) -> (Option<String>, Vec<(S
                 }
             }
         }
-        return (if_expr, env);
+        (if_expr, env)
     }
-    (None, vec![])
 }
 
 fn status_str(s: RunStatus) -> &'static str {
@@ -3055,17 +3259,30 @@ enum Transition {
 /// must be skipped because a dependency failed or was skipped, and which pending
 /// steps have all dependencies terminal and may be queued (subject to `if:`).
 /// Callers apply the result and re-plan until nothing changes.
+/// The entry point the tests plan against; production builds the index once and calls
+/// [`plan_transitions_indexed`] directly.
+#[cfg(test)]
 fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Transition)> {
+    plan_transitions_indexed(steps, &SnapshotIndex::new(snapshot_steps))
+}
+
+/// [`plan_transitions`] against a snapshot index the caller built once.
+///
+/// `propagate_after_step` re-plans until nothing changes, so the index is hoisted out of
+/// that loop: rebuilding it per pass would put the scan back, one level up.
+fn plan_transitions_indexed(
+    steps: &[StepRun],
+    snapshot: &SnapshotIndex<'_>,
+) -> Vec<(usize, Transition)> {
     use std::collections::HashSet;
     // `continue_on_error` means the failure is recorded but not propagated: the step's own
     // row still says failed, and everything downstream proceeds as if it had not. A cancel
     // is never tolerated — that is an operator stopping the run, not the step's own outcome.
-    let tolerated = snapshot_tolerated(snapshot_steps);
     let failed: HashSet<&str> = steps
         .iter()
         .filter(|s| match s.status_enum() {
             StepStatus::Cancelled => true,
-            StepStatus::Failed => !tolerated.contains(&s.step_id),
+            StepStatus::Failed => !snapshot.tolerates(&s.step_id),
             _ => false,
         })
         .map(|s| s.step_id.as_str())
@@ -3074,7 +3291,7 @@ fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Tr
         .iter()
         .filter(|s| match s.status_enum() {
             StepStatus::Succeeded => true,
-            StepStatus::Failed => tolerated.contains(&s.step_id),
+            StepStatus::Failed => snapshot.tolerates(&s.step_id),
             _ => false,
         })
         .map(|s| s.step_id.as_str())
@@ -3108,15 +3325,15 @@ fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Tr
             StepStatus::Queued => {
                 // A queued step only sees a newly failed dependency after a cancel;
                 // `always()` steps stay queued, as they would have when first planned.
-                let (if_expr, _) = snapshot_step_if_env(snapshot_steps, &s.step_id);
-                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                let (if_expr, _) = snapshot.if_env(&s.step_id);
+                let always = if_expr.map(str::trim) == Some("always()");
                 if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
                     plan.push((idx, Transition::Skip("dependency failed")));
                 }
             }
             StepStatus::Pending => {
-                let (if_expr, env) = snapshot_step_if_env(snapshot_steps, &s.step_id);
-                let always = if_expr.as_deref().map(str::trim) == Some("always()");
+                let (if_expr, env) = snapshot.if_env(&s.step_id);
+                let always = if_expr.map(str::trim) == Some("always()");
                 // Fail-fast cascade — except for `always()` steps, which wait for their
                 // dependencies to finish and then run regardless of the outcome.
                 if !always && needs.iter().any(|n| tainted.contains(n.as_str())) {
@@ -3137,7 +3354,7 @@ fn plan_transitions(steps: &[StepRun], snapshot_steps: &Value) -> Vec<(usize, Tr
                     needs_succeeded,
                     env,
                 };
-                if !crate::step_if::eval_if(if_expr.as_deref(), &ctx) {
+                if !crate::step_if::eval_if(if_expr, &ctx) {
                     plan.push((idx, Transition::Skip("if: condition false")));
                 } else {
                     plan.push((idx, Transition::Queue));
@@ -3384,10 +3601,10 @@ mod snapshot_tests {
             {"id": "b", "continue_on_error": false},
             {"id": "c"},
         ]));
-        let tolerated = snapshot_tolerated(&snap);
-        assert!(tolerated.contains("a"));
-        assert!(!tolerated.contains("b"), "explicit false is not tolerated");
-        assert!(!tolerated.contains("c"), "absent means not tolerated");
+        let index = SnapshotIndex::new(&snap);
+        assert!(index.tolerates("a"));
+        assert!(!index.tolerates("b"), "explicit false is not tolerated");
+        assert!(!index.tolerates("c"), "absent means not tolerated");
     }
 
     #[test]
@@ -3398,15 +3615,16 @@ mod snapshot_tests {
             {"id": "b", "continue_on_error": 1},
             {"id": "c", "continue_on_error": null},
         ]));
-        assert!(snapshot_tolerated(&snap).is_empty());
+        let index = SnapshotIndex::new(&snap);
+        assert!(!index.tolerates("a") && !index.tolerates("b") && !index.tolerates("c"));
     }
 
     #[test]
     fn a_malformed_snapshot_tolerates_nothing() {
         // Failing open here would let a failure pass silently through a broken snapshot.
-        assert!(snapshot_tolerated(&json!({})).is_empty());
-        assert!(snapshot_tolerated(&json!(null)).is_empty());
-        assert!(snapshot_tolerated(&json!([{"no_id": true}])).is_empty());
+        assert!(!SnapshotIndex::new(&json!({})).tolerates("a"));
+        assert!(!SnapshotIndex::new(&json!(null)).tolerates("a"));
+        assert!(!SnapshotIndex::new(&json!([{"no_id": true}])).tolerates("a"));
     }
 
     #[test]
@@ -3415,8 +3633,8 @@ mod snapshot_tests {
             {"id": "a", "if": "always()", "env": [["K", "v"], ["K2", "v2"]]},
             {"id": "b", "if": "never()"},
         ]));
-        let (if_expr, env) = snapshot_step_if_env(&snap, "a");
-        assert_eq!(if_expr.as_deref(), Some("always()"));
+        let (if_expr, env) = SnapshotIndex::new(&snap).if_env("a");
+        assert_eq!(if_expr, Some("always()"));
         assert_eq!(
             env,
             vec![
@@ -3433,7 +3651,7 @@ mod snapshot_tests {
         let snap = steps(json!([
             {"id": "a", "env": [["os", "from-env"]], "matrix": {"os": "linux"}},
         ]));
-        let (_, env) = snapshot_step_if_env(&snap, "a");
+        let (_, env) = SnapshotIndex::new(&snap).if_env("a");
         assert_eq!(
             env,
             vec![
@@ -3448,8 +3666,8 @@ mod snapshot_tests {
     #[test]
     fn an_unknown_step_id_yields_no_condition_and_no_env() {
         let snap = steps(json!([{"id": "a", "if": "always()"}]));
-        assert_eq!(snapshot_step_if_env(&snap, "missing"), (None, vec![]));
-        assert_eq!(snapshot_step_if_env(&json!(null), "a"), (None, vec![]));
+        assert_eq!(SnapshotIndex::new(&snap).if_env("missing"), (None, vec![]));
+        assert_eq!(SnapshotIndex::new(&json!(null)).if_env("a"), (None, vec![]));
     }
 
     #[test]
@@ -3457,14 +3675,14 @@ mod snapshot_tests {
         let snap = steps(json!([
             {"id": "a", "env": [["K", "v"], ["only-one"], ["K2", 5], "not-a-pair"]},
         ]));
-        let (_, env) = snapshot_step_if_env(&snap, "a");
+        let (_, env) = SnapshotIndex::new(&snap).if_env("a");
         assert_eq!(env, vec![("K".to_string(), "v".to_string())]);
     }
 
     #[test]
     fn a_non_string_matrix_value_is_skipped() {
         let snap = steps(json!([{"id": "a", "matrix": {"n": 3, "os": "linux"}}]));
-        let (_, env) = snapshot_step_if_env(&snap, "a");
+        let (_, env) = SnapshotIndex::new(&snap).if_env("a");
         assert_eq!(env, vec![("os".to_string(), "linux".to_string())]);
     }
 
@@ -3519,6 +3737,31 @@ mod snapshot_tests {
         .unwrap();
         assert_eq!(from_yaml.name, "p");
         assert_eq!(from_yaml.steps.len(), 1);
+    }
+
+    /// A stored definition is replayed, not authored: the strict parser would fail a run
+    /// whose row predates the field it no longer recognises.
+    #[test]
+    fn a_stored_definition_with_an_unknown_key_still_loads() {
+        let legacy_yaml = json!({
+            "yaml": "name: p\nfuture_pipeline_field: 1\nsteps:\n  - id: a\n    name: A\n    \
+                     run: 'true'\n    continue-on-error: true\n",
+        });
+        // The authoring path refuses it...
+        assert!(crate::dag::parse_pipeline_yaml(legacy_yaml["yaml"].as_str().unwrap()).is_err());
+        // ...and the stored row still compiles and runs.
+        let def = value_to_definition(&legacy_yaml).expect("legacy row still loads");
+        assert_eq!(def.steps.len(), 1);
+        assert!(compile_definition(&def).is_ok());
+
+        // Same for the JSON shape, which is what every current row uses.
+        let def = value_to_definition(&json!({
+            "name": "p",
+            "future_pipeline_field": 1,
+            "steps": [{"id": "a", "name": "A", "run": "true", "continue-on-error": true}],
+        }))
+        .expect("stored JSON stays lenient");
+        assert!(compile_definition(&def).is_ok());
     }
 
     #[test]

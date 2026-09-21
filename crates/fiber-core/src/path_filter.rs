@@ -2,7 +2,31 @@
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+/// Reject a pattern `globset` cannot compile, naming the field it came from.
+///
+/// [`compile_globs`] drops what it cannot parse, because it runs on a stored definition
+/// where there is nobody to tell. That makes `paths: ["src/[**"]` an *empty* filter set,
+/// and an empty set matches nothing — so the trigger never fires and the pipeline looks
+/// like it is being ignored. The write path calls this instead, so the typo is a 400 with
+/// the pattern in it rather than a build that never happens.
+pub fn validate_globs(field: &str, patterns: &[String]) -> Result<(), String> {
+    for p in patterns {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "{field}: an empty pattern matches nothing; remove it"
+            ));
+        }
+        Glob::new(trimmed).map_err(|e| format!("{field}: invalid glob `{trimmed}`: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Compile patterns; invalid globs are skipped.
+///
+/// Lenient on purpose: a definition stored before [`validate_globs`] existed still has to
+/// evaluate rather than panic. New and edited pipelines cannot reach here with a pattern
+/// this would drop.
 pub fn compile_globs(patterns: &[String]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
@@ -75,6 +99,28 @@ mod tests {
             &[],
             &ignore
         ));
+    }
+
+    #[test]
+    fn an_invalid_glob_is_a_named_error_not_an_empty_filter() {
+        // Unclosed character class: the pattern the finding used.
+        let err = validate_globs("on.push.paths", &["src/[**".into()]).expect_err("rejected");
+        assert!(err.contains("src/[**"), "{err}");
+        assert!(err.contains("on.push.paths"), "{err}");
+        // And what it used to do instead: silently become a set that matches nothing.
+        assert!(compile_globs(&["src/[**".into()]).is_empty());
+        assert!(!paths_allow(
+            &["src/main.rs".into()],
+            &["src/[**".into()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn valid_globs_and_empty_patterns() {
+        assert!(validate_globs("on.push.paths", &["src/**".into(), "*.md".into()]).is_ok());
+        assert!(validate_globs("on.push.paths", &[]).is_ok());
+        assert!(validate_globs("on.push.paths", &["  ".into()]).is_err());
     }
 
     #[test]

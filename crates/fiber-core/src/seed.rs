@@ -1,6 +1,6 @@
 //! Demo project + complex DAG pipelines seeded on API boot.
 
-use crate::models::{CreatePipelineRequest, CreateProjectRequest};
+use crate::models::CreatePipelineRequest;
 use crate::roles::ProjectRole;
 use crate::store::Store;
 use anyhow::Result;
@@ -8,6 +8,37 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 const SHOWCASE_SLUG: &str = "showcase";
+
+/// Slugs no API caller may take.
+///
+/// `ensure_showcase` adopts whatever project holds the showcase slug and makes the
+/// bootstrap admin its **owner**. A caller-supplied slug used to skip `slugify` entirely,
+/// so anyone who could create a project could claim `showcase` and be handed a co-owner
+/// on the next restart — a cross-tenant write performed by the server itself.
+pub fn is_reserved_slug(slug: &str) -> bool {
+    slug == SHOWCASE_SLUG
+}
+
+/// Whether to seed the demo project this boot.
+///
+/// The seed used to run unconditionally, so an operator who deleted the demo project got
+/// it back on every restart, with the bootstrap admin re-added as owner. Default is
+/// therefore "only on a fresh instance", which is the same condition the admin bootstrap
+/// uses: a users table that was empty when the process started.
+///
+/// `FIBER_SEED_SHOWCASE` overrides it — `1` to seed on this boot (to restore the demo, or
+/// to pick up pipelines a newer version added), `0` never. An unreadable value is a boot
+/// error rather than a guess, because both guesses are wrong for somebody.
+pub fn should_seed_showcase(setting: Option<&str>, users_existed: bool) -> Result<bool, String> {
+    match setting.map(str::trim).unwrap_or("auto") {
+        "" | "auto" => Ok(!users_existed),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "FIBER_SEED_SHOWCASE=`{other}` is not one of auto, 1, 0"
+        )),
+    }
+}
 
 pub async fn ensure_showcase(store: &Store, owner_id: Uuid) -> Result<()> {
     let project = match store.get_project_by_slug(SHOWCASE_SLUG).await? {
@@ -17,15 +48,11 @@ pub async fn ensure_showcase(store: &Store, owner_id: Uuid) -> Result<()> {
                 .await?;
             p
         }
+        // Not `create_project`: the API path refuses the reserved slug, and this is the
+        // one caller entitled to it.
         None => {
             store
-                .create_project(
-                    owner_id,
-                    CreateProjectRequest {
-                        name: "Showcase".into(),
-                        slug: Some(SHOWCASE_SLUG.into()),
-                    },
-                )
+                .insert_project(owner_id, "Showcase", SHOWCASE_SLUG)
                 .await?
         }
     };
@@ -237,6 +264,11 @@ mod tests {
     use fiber_proto::PipelineDefinition;
 
     fn compiled(definition: &Value) -> crate::dag::CompiledDag {
+        // `ensure_showcase` saves these through `create_pipeline`, which audits the
+        // submitted definition — so a seeded pipeline with a stray key would be a boot
+        // failure, not a demo.
+        crate::dag::audit_definition(definition)
+            .unwrap_or_else(|e| panic!("seed pipeline would be rejected on save: {e}"));
         let parsed: PipelineDefinition = serde_json::from_value(definition.clone())
             .unwrap_or_else(|e| panic!("seed pipeline is not a PipelineDefinition: {e}"));
         compile_definition(&parsed)
@@ -258,6 +290,40 @@ mod tests {
         for (name, _) in showcase_pipelines() {
             assert!(seen.insert(name), "two seeded pipelines are called {name}");
         }
+    }
+
+    /// `slugify` can never produce `showcase` from a name the caller does not control —
+    /// but a *supplied* slug used to skip `slugify` and land verbatim.
+    #[test]
+    fn the_showcase_slug_is_reserved_and_supplied_slugs_are_slugified() {
+        assert!(is_reserved_slug("showcase"));
+        assert!(is_reserved_slug(&crate::tokens::slugify("Showcase")));
+        assert!(!is_reserved_slug(&crate::tokens::slugify("SHOW CASE")));
+        assert!(!is_reserved_slug("showcase-2"));
+        // What the API path now does with a caller's slug, before the reserved check.
+        assert_eq!(crate::tokens::slugify("Show/Case"), "show-case");
+        assert_eq!(crate::tokens::slugify("../etc"), "etc");
+        assert_eq!(crate::tokens::slugify("showcase"), "showcase");
+    }
+
+    #[test]
+    fn the_demo_project_is_seeded_on_a_fresh_instance_only() {
+        // Default: first boot yes, every boot after that no.
+        assert_eq!(should_seed_showcase(None, false), Ok(true));
+        assert_eq!(should_seed_showcase(None, true), Ok(false));
+        assert_eq!(should_seed_showcase(Some("auto"), true), Ok(false));
+        assert_eq!(should_seed_showcase(Some("  "), true), Ok(false));
+        // Explicit wins either way.
+        assert_eq!(should_seed_showcase(Some("1"), true), Ok(true));
+        assert_eq!(should_seed_showcase(Some("true"), true), Ok(true));
+        assert_eq!(should_seed_showcase(Some("0"), false), Ok(false));
+        assert_eq!(should_seed_showcase(Some("off"), false), Ok(false));
+        // A value nobody can act on stops the boot rather than picking a side.
+        assert!(
+            should_seed_showcase(Some("maybe"), false)
+                .expect_err("rejected")
+                .contains("FIBER_SEED_SHOWCASE")
+        );
     }
 
     #[test]

@@ -12,7 +12,59 @@ see, and two background jobs stop scanning whole tables on a timer.
 Migration `017_metrics_window.sql` adds one index on `step_attempts(started_at)`. It is
 additive and applies at boot.
 
+### Upgrading
+
+- **This release rejects definitions that earlier versions accepted** (see *Changed*).
+  A pipeline that was stored before the upgrade and no longer compiles cannot start:
+  `fiber-api` now **audits every stored pipeline at boot** and logs one `ERROR` per
+  broken one with its project id, pipeline id and reason, plus a count — read the boot
+  log after upgrading. A scheduled pipeline in that state keeps its due time instead of
+  silently burning the occurrence, so it starts firing again as soon as the definition is
+  fixed, with no re-arming. A webhook delivery starts every other pipeline it matched and
+  reports the failures in its response. Nothing needs a migration.
+- Creating a *failed run* for a definition that will not compile, so the breakage is
+  visible in the UI rather than only in the log, is a follow-up: it needs a `runs.error`
+  column, a snapshot the canvas tolerates that is not a `CompiledDag`, care that a
+  zero-step run does not finalise as *succeeded*, and a policy split so a manual start
+  still gets its `400`.
+
 ### Security
+
+- **An unprivileged caller could OOM the API with one request.**
+  `POST /api/pipelines/parse-yaml` takes only `AuthUser`, so any logged-in account with
+  no project membership could kill the process and take the scheduler, every agent socket
+  and every in-flight durable fiber with it. Compiling *amplifies* — a matrix multiplies
+  each step, the pipeline `env` is merged into every expanded cell, and each `needs`
+  entry is rewritten to the dependency's cells — so the quantity to bound is **bytes of
+  the request body**, which nothing bounded below axum's 2 MB default. Three known
+  shapes, all inside that limit:
+  - 16 900 steps × 64 cells → 1 081 600 cells, **3.2 GB**, 9.8 s. The step cap was
+    tested after the expansion it exists to bound.
+  - 500 trivial steps + one 1.8 MB `env` value → compiled **successfully** at **1.88 GB**,
+    because the cap counts cells and a cell is not a fixed size.
+  - `needs: [build]` repeated 133 000 times against a 64-cell dependency → 8.5 M strings
+    and edges, **881 MB**, inside a 65-step definition that passes every cap.
+
+  Fixed at each layer: a 256 KiB `DefaultBodyLimit` on the three routes that accept a
+  definition (`parse-yaml` and pipeline create/update — the largest example pipeline is a
+  few KB); the step cap checked against the declared count *before* expanding and as a
+  running total during it; a non-configurable 8 MiB budget on the bytes a definition
+  expands to, charged per cell before the copy is made; `needs` deduplicated before
+  matrix substitution (correct at any size — depending on a step twice is depending on it
+  once); the expansion borrowing each step rather than cloning it into every cell; and
+  the matrix product bounded before it is built rather than after. Measured after:
+  the first shape is refused in 23 ms, the second in 1.4 ms at 20 MB peak, and on the
+  third the compiler now adds ~1 MB over the parsed input instead of 344 MB.
+- **`showcase` is a reserved project slug, and the demo project is seeded once.** A
+  caller-supplied `slug` on `POST /api/projects` skipped `slugify` entirely and landed
+  verbatim, so anyone who could create a project could claim `showcase` — and the boot
+  seeder adopts whatever project holds that slug and adds the bootstrap admin to it as
+  **owner**. Supplied slugs are now `slugify`d like derived ones, and `showcase` is
+  refused with a `400`. Separately, the seed ran on every boot, so a demo project you
+  deleted came back on the next restart; it now runs only when the users table was empty
+  at boot — the same condition the admin bootstrap uses — or when `FIBER_SEED_SHOWCASE=1`
+  asks for it explicitly.
+
 
 - **Redaction now covers the encodings a step produces by accident.** Masking matched a
   secret's literal bytes, so `base64 <<< "$TOKEN"`, a token percent-encoded in a `curl`
@@ -54,7 +106,52 @@ additive and applies at boot.
   a second stat (a step can leave a process behind to swap the file between the two), and
   the declaration fails the step instead.
 
+### Added
+
+- `FIBER_SEED_SHOWCASE` (`auto` / `1` / `0`) — whether to seed the Showcase demo project
+  this boot. `auto` means "only on a fresh instance". An unreadable value fails the boot
+  rather than guessing. See [configuration](docs/configuration.md).
+- `FIBER_MAX_STEPS` — raise the 500-step cap for a generated fan-out. `0` or a
+  non-number fails the boot. It bounds the number of cells only; the expanded-bytes
+  budget and the request-body limit are separate and not configurable. `fiber validate`
+  reads it too, so set it in both places or local and server validation disagree.
+- **A boot-time audit of every stored pipeline**, logging the ones that would no longer
+  compile with project, pipeline, name and reason.
+
 ### Changed
+
+- **A pipeline that is wrong now says so instead of quietly doing nothing.** Five silent
+  misconfigurations became errors where the author can still see them:
+  - An `if:` this server cannot evaluate fails the compile, naming the expression and what
+    was wrong with it. `!=`, `&&`, `||`, `failure()`, `cancelled()`, a `${{ … }}` wrapper
+    and contexts other than `matrix.` / `env.` all used to evaluate to `false` **forever**,
+    so the step was skipped on every run with no diagnosis. They are rejected, not
+    implemented — richer conditions remain a roadmap item.
+  - A `paths` / `paths_ignore` glob that does not compile is a `400`. It used to be
+    dropped, leaving an empty filter set, which matches no file — so the trigger never
+    fired.
+  - A cron that parses but can never occur (`0 0 0 31 2 *`) is a `400`; it used to leave
+    `next_due_at` `NULL` forever.
+  - An empty step id is rejected. `needs`, the snapshot and the UI all refer to a step
+    by id.
+  - An `if:` that reads a name the step does not have — `matrix.osx` where the axis is
+    `os` — is rejected with the names it does have. What a condition can read is fully
+    known when the pipeline compiles.
+  - **Unknown YAML and JSON fields are rejected**, naming the field and the nearest valid
+    one. `continue-on-error`, `working-directory`, `need:`, `artifact:` and every other
+    typo parsed clean and produced a step that ran without the field. This covers the
+    **save API** as well as `fiber validate` / `parse-yaml` / the Import panel: the JSON
+    definition on `POST`/`PUT /api/projects/{id}/pipelines` went through serde directly,
+    so `"continue-on-error": true` returned `201` and ran the step with the flag off.
+    Top-level anchor holders (`_common: &labels [...]`, `x-…`) are allowed, since that is
+    how a YAML file is written DRY; YAML merge keys (`<<`) are rejected with a message
+    saying the merged fields would be dropped. A pipeline **already stored** is still read
+    leniently, so existing rows and run snapshots keep executing. All 10 `examples/*.yml`
+    and the repo's own `fiber.yml` compile unchanged.
+- **A definition is capped at 500 expanded steps** (`DagError::TooManySteps`). Only the
+  per-step matrix (64 cells) was capped before, so 80 steps of 64 cells was a legal
+  5 120-step pipeline that opened a transaction and did one `INSERT` per step.
+
 
 - **A directory under `artifacts:` fails the step** instead of being skipped with a note
   that left the build green and the artifact absent. Archive it in the step (`tar czf
@@ -89,6 +186,44 @@ additive and applies at boot.
   lines are also no longer masked twice.
 
 ### Fixed
+
+- **One uncompilable pipeline no longer blocks every other pipeline on the same push.**
+  The webhook loop `?`-ed on the first failure, so with pipelines A, B and C matching a
+  branch and B carrying a definition that no longer compiles, A started, B failed the
+  delivery and C never ran — then GitHub redelivered and started a *second* run of A for
+  the same commit. Deterministic, so it repeated on every push. Both webhook branches now
+  collect per-pipeline failures and answer `{ "started": [...], "failed": [...] }`. A
+  partial success is a `200` — redelivering would duplicate the runs that did start — but
+  a delivery where **nothing** started is a `500`, since there is nothing to duplicate and
+  a red delivery is where a repository admin looks. Reported failures carry the same
+  classified text a client would get from the equivalent status code, never an sqlx or
+  `anyhow` chain: GitHub stores the body and renders it in the Deliveries tab.
+- **A scheduled pipeline that does not compile no longer stops firing for good.** The
+  occurrence was claimed before the run was started and the failure was only a warning,
+  so a nightly pipeline consumed its slot every night and never ran again. It is compiled
+  first; the due time stays put and the schedule resumes on its own once fixed. It is
+  logged once per pipeline per reason rather than on every tick, and a failed queue wake
+  no longer aborts the rest of the tick — the same treatment the webhook path gives the
+  same call.
+- **Store errors are classified by type, not by substring.** `access.rs` and seven
+  handlers matched on `contains("forbidden")` and `ends_with("not found")`: rewording a store
+  message silently turned a `404` into a `500`, and any error from any layer whose text
+  happened to contain "forbidden" became a `403`. A typed `fiber_core::StoreError`
+  (`Forbidden` / `NotFound` / `Validation` / `Other`) now carries the classification, with
+  one `From` impl mapping it to a status. Every HTTP status is unchanged; `Internal` still
+  masks its body and logs the full cause chain. `ValidationError` is replaced by
+  `StoreError::Validation`. A project slug collision is now a `400` naming the slug
+  rather than a `500`: slugifying supplied slugs makes a clash an ordinary thing for a
+  caller to do.
+- **Starting a run is one insert, and propagation no longer scans the snapshot per step.**
+  `start_run` and `retry_run` issued one `INSERT` per step inside the run's transaction
+  (500 round-trips for a 500-step DAG) and now use a single `UNNEST` insert;
+  `propagate_after_step` indexes the definition snapshot by id once instead of scanning
+  the whole JSON array for every pending step on every planning pass, under the run lock.
+  Measured on a synthetic 500-step run, one planning pass went from **12.9 ms to 1.1 ms**
+  (debug build). A `failed_only` retry likewise copies carried-over artifacts in one
+  statement.
+
 
 - **`fiber run --wait/--follow` no longer reports a proxy hiccup as a failed build.** One
   502 or a dropped connection exited `1`; a stalled connection ignored `--timeout-secs`
