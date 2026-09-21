@@ -15,6 +15,8 @@ export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
 # Demo project: auto seeds it only when the users table is empty (a fresh database).
 # Set 1 to re-seed on this boot, 0 to never seed.
 export FIBER_SEED_SHOWCASE="${FIBER_SEED_SHOWCASE:-auto}"
+# Most expanded steps (matrix cells included) one pipeline may compile to.
+# export FIBER_MAX_STEPS=500
 export FIBER_RETENTION_DAYS="${FIBER_RETENTION_DAYS:-30}"
 export RUST_LOG="${RUST_LOG:-info,fiber_api=info,fiber_agent=info}"
 # Browser origins allowed by the API (default already covers the :3100 dev server).

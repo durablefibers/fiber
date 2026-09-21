@@ -177,6 +177,8 @@ services:
       # Showcase demo project: auto = only on the first boot of an empty database, so a
       # deleted demo project stays deleted. 1 = seed on this boot, 0 = never.
       FIBER_SEED_SHOWCASE: ${FIBER_SEED_SHOWCASE:-auto}
+      # Most expanded steps (matrix cells included) one pipeline may compile to.
+      FIBER_MAX_STEPS: ${FIBER_MAX_STEPS:-}
       # Required for encrypted project/webhook secrets: openssl rand -hex 32 → deploy/.env.
       # Empty = plaintext at rest (fiber-api warns at boot).
       FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}

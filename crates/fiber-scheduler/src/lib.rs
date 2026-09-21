@@ -1099,6 +1099,21 @@ impl Scheduler {
             let Some(observed_due) = p.next_due_at else {
                 continue;
             };
+            // Compiled *before* the slot is claimed. `claim_schedule_slot` advances the
+            // occurrence, and a start that then fails was only a `warn!` — so a nightly
+            // pipeline whose definition no longer compiles (a validator tightened, a
+            // field renamed) consumed its occurrence every night and never fired again,
+            // with no way to re-arm it but an edit. Leaving the occurrence alone means
+            // the due time stays put, each tick says why, and the schedule resumes by
+            // itself the moment the definition is fixed.
+            if let Err(e) = fiber_core::compile_definition(&def) {
+                warn!(
+                    pipeline = %p.id, error = %e,
+                    "scheduled pipeline does not compile; the occurrence is left in place \
+                     and will fire once the definition is fixed"
+                );
+                continue;
+            }
             let next = next_due_from_triggers(on, Utc::now());
             // Compare-and-set on next_due_at (plus "no active run"): across several API
             // instances exactly one claims the slot; the rest see it already advanced.

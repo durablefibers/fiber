@@ -116,7 +116,14 @@ impl Store {
         .bind(name)
         .bind(slug)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        // Slugifying a supplied slug enlarges the collision class — `Web UI` and
+        // `web-ui` now land on one slug — so a clash is an ordinary thing for a caller
+        // to do, and answering it with a 500 tells them nothing.
+        .map_err(|e| match unique_violation(&e) {
+            true => crate::StoreError::Validation(format!("slug `{slug}` is already taken")).into(),
+            false => anyhow::Error::new(e),
+        })?;
         sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)")
             .bind(project.id)
             .bind(owner_id)
@@ -598,6 +605,9 @@ impl Store {
         project_id: Uuid,
         req: CreatePipelineRequest,
     ) -> Result<Pipeline> {
+        // The submitted value is audited; what is already stored is not. See
+        // `dag::audit_definition`.
+        crate::dag::audit_definition(&req.definition).map_err(crate::StoreError::Validation)?;
         let def = value_to_definition(&req.definition)?;
         compile_definition(&def).context("invalid pipeline definition")?;
         if let Some(on) = &def.on {
@@ -626,6 +636,7 @@ impl Store {
         pipeline_id: Uuid,
         req: UpdatePipelineRequest,
     ) -> Result<Pipeline> {
+        crate::dag::audit_definition(&req.definition).map_err(crate::StoreError::Validation)?;
         let def = value_to_definition(&req.definition)?;
         compile_definition(&def).context("invalid pipeline definition")?;
         if let Some(on) = &def.on {
@@ -734,6 +745,33 @@ impl Store {
     }
 
     /// Backfill `next_due_at` for pipelines that have a schedule but no due time yet.
+    /// Every stored pipeline whose definition no longer compiles.
+    ///
+    /// Run at boot. A validator that tightens — an `if:` expression that used to evaluate
+    /// to `false`, a glob that used to be dropped — turns a pipeline that was accepted
+    /// into one that cannot start, and the operator finds out on the next push. Walking
+    /// them once at startup answers "what did this upgrade break" while there is still a
+    /// log to read it in. Nothing is changed or blocked; the boot continues.
+    pub async fn unstartable_pipelines(&self) -> Result<Vec<PipelineDefect>> {
+        let mut out = Vec::new();
+        for p in self.list_all_pipelines().await? {
+            let reason = match value_to_definition(&p.definition) {
+                Err(e) => format!("{e:#}"),
+                Ok(def) => match compile_definition(&def) {
+                    Ok(_) => continue,
+                    Err(e) => format!("{e}"),
+                },
+            };
+            out.push(PipelineDefect {
+                project_id: p.project_id,
+                pipeline_id: p.id,
+                name: p.name,
+                reason,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn backfill_schedule_dues(&self) -> Result<u64> {
         let pipelines = self.list_all_pipelines().await?;
         let mut n = 0u64;
@@ -1905,7 +1943,7 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
             if exists.is_none() {
-                return Err(anyhow!("project not found"));
+                return Err(crate::StoreError::not_found("project").into());
             }
         }
         let id = Uuid::new_v4();
@@ -2595,6 +2633,23 @@ impl StepRows {
         .await?;
         Ok(())
     }
+}
+
+/// Whether an sqlx error is Postgres `23505 unique_violation`.
+///
+/// Read from the SQLSTATE, not the message: the message is localised and contains the
+/// constraint name, which is exactly the kind of text this crate stopped matching on.
+fn unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+/// A stored pipeline that would not compile today. See [`Store::unstartable_pipelines`].
+#[derive(Debug, Clone)]
+pub struct PipelineDefect {
+    pub project_id: Uuid,
+    pub pipeline_id: Uuid,
+    pub name: String,
+    pub reason: String,
 }
 
 pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {

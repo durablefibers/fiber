@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const MAX_MATRIX_CELLS: usize = 64;
 
-/// The most expanded steps one pipeline may compile to.
+/// Default for [`max_steps`]: the most expanded steps one pipeline may compile to.
 ///
 /// Only the per-step matrix was capped, so 80 steps each expanding to 64 cells was a
 /// legal 5 120-step definition — and every run of it did one `INSERT` per step inside one
@@ -18,7 +18,45 @@ const MAX_MATRIX_CELLS: usize = 64;
 /// `examples/` by an order of magnitude. A definition past it is far likelier to be a
 /// generator bug than an intention, and it fails at compile time with a number in the
 /// message rather than at run time with a slow transaction.
-const MAX_STEPS: usize = 500;
+pub const DEFAULT_MAX_STEPS: usize = 500;
+
+/// The cap in force, from `FIBER_MAX_STEPS` (read once).
+///
+/// 500 is justified on cost, not on correctness, and a generated monorepo fan-out can
+/// legitimately exceed it with no other way out. Raising it raises what one
+/// `POST /api/pipelines/parse-yaml` can allocate — each expanded cell clones its step
+/// definition — but not without bound: the expansion stops the moment the running total
+/// passes the cap, so the peak is the cap plus one step's matrix, whatever the cap is.
+///
+/// An unusable value warns and falls back here; `fiber-api` additionally refuses to boot
+/// on one, via [`max_steps_from`].
+pub fn max_steps() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let raw = std::env::var("FIBER_MAX_STEPS").ok();
+        match max_steps_from(raw.as_deref()) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "ignoring FIBER_MAX_STEPS");
+                DEFAULT_MAX_STEPS
+            }
+        }
+    })
+}
+
+/// Parse a `FIBER_MAX_STEPS` value. Unset or empty is the default; 0 and anything
+/// non-numeric is an error, so a typo is not silently a different limit.
+pub fn max_steps_from(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_MAX_STEPS);
+    };
+    match raw.parse::<usize>() {
+        Ok(0) | Err(_) => Err(format!(
+            "FIBER_MAX_STEPS=`{raw}` is not a positive whole number of steps"
+        )),
+        Ok(n) => Ok(n),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DagError {
@@ -58,8 +96,11 @@ pub enum DagError {
     BadIf { step: String, message: String },
     #[error("every step needs a non-empty id")]
     EmptyStepId,
-    #[error("pipeline expands to {count} steps, more than the limit of {MAX_STEPS}")]
-    TooManySteps { count: usize },
+    #[error(
+        "pipeline expands to at least {count} steps, more than the limit of {max} \
+         (raise FIBER_MAX_STEPS to allow more)"
+    )]
+    TooManySteps { count: usize, max: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,12 +221,21 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         }
     }
 
-    let expanded = expand_all(def)?;
-    if expanded.len() > MAX_STEPS {
+    // Before the expansion, not after it. Every step yields at least one cell, so more
+    // declared steps than the cap is already over it — and the check that used to sit
+    // after `expand_all` had to materialise every cell (each one a full clone of its step
+    // definition) to learn that. A 2 MB definition of 16 900 steps x 64 cells reached
+    // 1 081 600 cells and 3.2 GB before failing, on a route any authenticated user can
+    // call, which made an OOM of the whole process — scheduler, agent sockets and
+    // in-flight fibers included — a request.
+    let max = max_steps();
+    if def.steps.len() > max {
         return Err(DagError::TooManySteps {
-            count: expanded.len(),
+            count: def.steps.len(),
+            max,
         });
     }
+    let expanded = expand_all(def, max)?;
     let expanded_ids: HashSet<_> = expanded.iter().map(|c| c.id.as_str()).collect();
     for cell in &expanded {
         for dep in &cell.template.needs {
@@ -262,6 +312,14 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     let mut compiled = Vec::with_capacity(with_needs.len());
 
     for (cell, needs) in &with_needs {
+        // Now that the cell's env is merged, a condition that reads a name this step does
+        // not have is decidable — and is the same silent-skip bug one typo further in.
+        crate::step_if::validate_key(cell.template.if_expr.as_deref(), &cell.env).map_err(
+            |message| DagError::BadIf {
+                step: cell.id.clone(),
+                message,
+            },
+        )?;
         let level = levels_map[cell.id.as_str()];
         levels[level].push(cell.id.clone());
         compiled.push(CompiledStep {
@@ -310,10 +368,19 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     })
 }
 
-fn expand_all(def: &PipelineDefinition) -> Result<Vec<ExpandedCell>, DagError> {
+fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell>, DagError> {
     let mut out = Vec::new();
     for step in &def.steps {
         let combos = matrix_combos(step)?;
+        // A running total, so the peak is the cap plus one step's matrix rather than the
+        // whole expansion. The count reported is a lower bound, which is what the message
+        // says: knowing the true total would mean building it.
+        if out.len() + combos.len() > max {
+            return Err(DagError::TooManySteps {
+                count: out.len() + combos.len(),
+                max,
+            });
+        }
         for combo in combos {
             let (id, name, matrix, env) = if combo.is_empty() {
                 (
@@ -432,7 +499,16 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
     }
     let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
     for (axis, values) in axes {
-        let mut next = Vec::new();
+        // Checked *before* the product is built. Testing `combos.len()` afterwards meant
+        // one axis of a million values allocated a million maps to then reject them.
+        if combos
+            .len()
+            .checked_mul(values.len())
+            .is_none_or(|n| n > MAX_MATRIX_CELLS)
+        {
+            return Err(DagError::MatrixTooLarge(step.id.clone()));
+        }
+        let mut next = Vec::with_capacity(combos.len() * values.len());
         for base in &combos {
             for v in &values {
                 let mut m = base.clone();
@@ -441,9 +517,6 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
             }
         }
         combos = next;
-        if combos.len() > MAX_MATRIX_CELLS {
-            return Err(DagError::MatrixTooLarge(step.id.clone()));
-        }
     }
     Ok(combos)
 }
@@ -650,12 +723,35 @@ mod keys {
 /// typo — all parsed clean and produced a step that ran without the field. The step was
 /// not the step the author wrote and nothing said so. Unknown keys are the one class of
 /// mistake where being permissive is indistinguishable from being wrong.
-fn audit_keys(what: &str, map: &serde_yaml::Mapping, allowed: &[&str]) -> Result<(), String> {
+fn audit_keys(
+    what: &str,
+    map: &serde_yaml::Mapping,
+    allowed: &[&str],
+    extensions: Extensions,
+) -> Result<(), String> {
     for key in map.keys() {
         let Some(key) = key.as_str() else {
             return Err(format!("{what}: keys must be strings"));
         };
         if allowed.contains(&key) {
+            continue;
+        }
+        // YAML's merge key. serde does not apply it, so the fields would be silently
+        // absent — which is the thing this audit exists to stop — and "unknown field
+        // `<<`" would send the author looking for a field called `<<`.
+        if key == "<<" {
+            return Err(format!(
+                "{what}: YAML merge keys (`<<`) are not supported — the merged fields \
+                 would be dropped; write them out on the step"
+            ));
+        }
+        // An anchor holder, the standard way to write a YAML file DRY:
+        // `_common: &labels [os=linux]` at the top level, referenced as `*labels`. It is
+        // not a field, it is a place to hang an anchor, and it is only ever read through
+        // the alias. Compose reserves `x-` for the same purpose; `_` is the convention
+        // this schema already saw in the wild. An audit with a false positive is worse
+        // than no audit, because it refuses a file that works.
+        if extensions == Extensions::Allowed && (key.starts_with("x-") || key.starts_with('_')) {
             continue;
         }
         return Err(match nearest(key, allowed) {
@@ -667,6 +763,14 @@ fn audit_keys(what: &str, map: &serde_yaml::Mapping, allowed: &[&str]) -> Result
         });
     }
     Ok(())
+}
+
+/// Whether `x-` / `_` keys are tolerated at this level. Top level only: that is where an
+/// anchor holder goes, and allowing them everywhere would hide a typo behind a `_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extensions {
+    Allowed,
+    Rejected,
 }
 
 /// The valid field a typo most likely meant, or `None` when nothing is close.
@@ -713,7 +817,7 @@ fn audit_map(
     allowed: &[&str],
 ) -> Result<(), String> {
     match value {
-        Some(serde_yaml::Value::Mapping(m)) => audit_keys(what, m, allowed),
+        Some(serde_yaml::Value::Mapping(m)) => audit_keys(what, m, allowed, Extensions::Rejected),
         _ => Ok(()),
     }
 }
@@ -723,7 +827,7 @@ fn audit_pipeline_keys(root: &serde_yaml::Value) -> Result<(), String> {
     let serde_yaml::Value::Mapping(top) = root else {
         return Ok(());
     };
-    audit_keys("pipeline", top, keys::PIPELINE)?;
+    audit_keys("pipeline", top, keys::PIPELINE, Extensions::Allowed)?;
     audit_map(top.get("workspace"), "workspace", keys::WORKSPACE)?;
     if let Some(on) = top.get("on") {
         audit_map(Some(on), "on", keys::ON)?;
@@ -766,6 +870,28 @@ fn audit_pipeline_keys(root: &serde_yaml::Value) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+/// Audit a definition submitted to the API, in whichever shape it arrives.
+///
+/// `POST /api/projects/{id}/pipelines` takes the definition as **JSON**, and JSON goes
+/// through serde directly — which ignores what it does not know, so
+/// `"continue-on-error": true` returned `201` and produced a step that ran with the flag
+/// off. The UI and the CLI parse the YAML strictly first and were never exposed, but the
+/// API is the contract, not the clients. Reading a *stored* definition stays lenient
+/// (`value_to_definition`); this is only for a value someone is submitting now.
+pub fn audit_definition(value: &serde_json::Value) -> Result<(), String> {
+    // The legacy `{"yaml": "..."}` submission shape gets the strict YAML parser, which
+    // is the same audit plus the map/list handling.
+    if let Some(yaml) = value.get("yaml").and_then(|v| v.as_str()) {
+        return parse_pipeline_yaml(yaml)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    // One implementation of the schema, not two: JSON is re-encoded as a YAML value so
+    // the same walk runs over it. Definitions are small and this happens on save only.
+    let as_yaml = serde_yaml::to_value(value).map_err(|e| e.to_string())?;
+    audit_pipeline_keys(&as_yaml)
 }
 
 /// Parse YAML where `steps` may be a map (GitHub Actions style) or a list.
@@ -1204,10 +1330,61 @@ mod tests {
             // The message has to say what was wrong, or it is the same silence in a 400.
             assert!(err.to_string().contains(expr), "{err}");
         }
-        // A well-formed condition that is simply never true still compiles.
+        // A well-formed condition whose *name* resolves but whose value never matches
+        // still compiles: the shape is checked, the outcome is not.
         let mut ok = step("a", &[], "true");
+        ok.matrix = Some(
+            [("os".to_string(), vec!["linux".to_string()])]
+                .into_iter()
+                .collect(),
+        );
         ok.if_expr = Some("matrix.os == 'plan9'".into());
         assert!(compile_definition(&def_of(vec![ok])).is_ok());
+    }
+
+    /// `matrix.osx` where the axis is `os`: well-formed, and false on every run forever.
+    #[test]
+    fn an_if_that_reads_a_name_the_step_does_not_have_is_rejected() {
+        let mut s = step("t", &[], "true");
+        s.matrix = Some(
+            [("os".to_string(), vec!["linux".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        s.if_expr = Some("matrix.osx == 'linux'".into());
+        let err = compile_definition(&def_of(vec![s.clone()])).expect_err("rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("osx"), "{msg}");
+        assert!(msg.contains("available: os"), "{msg}");
+
+        // The axis that does exist compiles.
+        s.if_expr = Some("matrix.os == 'linux'".into());
+        assert!(compile_definition(&def_of(vec![s.clone()])).is_ok());
+        // So does the generated alias, because `eval_if` resolves it.
+        s.if_expr = Some("MATRIX_OS == 'linux'".into());
+        assert!(compile_definition(&def_of(vec![s])).is_ok());
+
+        // Pipeline env counts, since it is merged into every step.
+        let mut a = step("a", &[], "true");
+        a.if_expr = Some("env.CHANNEL == 'nightly'".into());
+        let mut def = def_of(vec![a.clone()]);
+        assert!(
+            compile_definition(&def).is_err(),
+            "no CHANNEL anywhere on the step"
+        );
+        def.env = [("CHANNEL".to_string(), "stable".to_string())]
+            .into_iter()
+            .collect();
+        assert!(compile_definition(&def).is_ok());
+
+        // A step with nothing to compare against says so rather than naming an empty list.
+        let mut b = step("b", &[], "true");
+        b.if_expr = Some("nope == 'x'".into());
+        let err = compile_definition(&def_of(vec![b])).expect_err("rejected");
+        assert!(
+            err.to_string().contains("no matrix axes and no env"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1222,41 +1399,106 @@ mod tests {
         ));
     }
 
+    fn matrix_step_of(id: &str, cells_per_axis: usize) -> StepDefinition {
+        let mut s = step(id, &[], "true");
+        s.matrix = Some(
+            [
+                (
+                    "a".to_string(),
+                    (0..cells_per_axis).map(|n| n.to_string()).collect(),
+                ),
+                (
+                    "b".to_string(),
+                    (0..cells_per_axis).map(|n| n.to_string()).collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        s
+    }
+
     /// The matrix cap alone let 80 steps x 64 cells through as one definition.
     #[test]
     fn a_pipeline_past_the_step_cap_is_rejected() {
-        let at_cap: Vec<StepDefinition> = (0..MAX_STEPS)
+        let cap = max_steps();
+        let at_cap: Vec<StepDefinition> = (0..cap)
             .map(|i| step(&format!("s{i}"), &[], "true"))
             .collect();
         assert!(compile_definition(&def_of(at_cap)).is_ok());
 
-        let over: Vec<StepDefinition> = (0..=MAX_STEPS)
+        let over: Vec<StepDefinition> = (0..=cap)
             .map(|i| step(&format!("s{i}"), &[], "true"))
             .collect();
         assert!(matches!(
             compile_definition(&def_of(over)),
-            Err(DagError::TooManySteps { count }) if count == MAX_STEPS + 1
+            Err(DagError::TooManySteps { count, max }) if count == cap + 1 && max == cap
         ));
 
         // Expanded cells, not written steps: 16 steps of 64 cells is 1 024.
         let matrixed: Vec<StepDefinition> = (0..16)
-            .map(|i| {
-                let mut s = step(&format!("m{i}"), &[], "true");
-                s.matrix = Some(
-                    [
-                        ("a".to_string(), (0..8).map(|n| n.to_string()).collect()),
-                        ("b".to_string(), (0..8).map(|n| n.to_string()).collect()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-                s
-            })
+            .map(|i| matrix_step_of(&format!("m{i}"), 8))
             .collect();
+        let err = compile_definition(&def_of(matrixed)).expect_err("1 024 cells is over");
+        let DagError::TooManySteps { count, .. } = err else {
+            panic!("wrong error: {err}");
+        };
+        assert!(count > cap, "{count}");
+        // And it stopped *during* the expansion: the peak is the cap plus one step's
+        // matrix, not the 1 024 cells the definition asks for.
+        assert!(
+            count <= cap + MAX_MATRIX_CELLS,
+            "expansion ran past the cap: {count}"
+        );
+    }
+
+    /// The route this guards (`parse-yaml`) takes only `AuthUser`, so the memory an
+    /// unprivileged caller can make the API allocate is the thing being bounded — not
+    /// just the eventual step count.
+    #[test]
+    fn a_huge_definition_is_refused_without_expanding_it() {
+        let cap = max_steps();
+        // More declared steps than the cap: refused before a single cell is built.
+        let many: Vec<StepDefinition> = (0..cap * 4)
+            .map(|i| matrix_step_of(&format!("s{i}"), 8))
+            .collect();
+        let declared = many.len();
+        // The declared count is what it refused, so nothing was expanded.
         assert!(matches!(
-            compile_definition(&def_of(matrixed)),
-            Err(DagError::TooManySteps { count }) if count == 1024
+            compile_definition(&def_of(many)),
+            Err(DagError::TooManySteps { count, .. }) if count == declared
         ));
+
+        // One axis far past the matrix cap: rejected before the product is allocated.
+        let mut wide = step("w", &[], "true");
+        wide.matrix = Some(
+            [(
+                "n".to_string(),
+                (0..500_000).map(|n| n.to_string()).collect(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(matches!(
+            compile_definition(&def_of(vec![wide])),
+            Err(DagError::MatrixTooLarge(id)) if id == "w"
+        ));
+    }
+
+    #[test]
+    fn the_step_cap_is_overridable_and_a_bad_value_is_an_error() {
+        assert_eq!(max_steps_from(None), Ok(DEFAULT_MAX_STEPS));
+        assert_eq!(max_steps_from(Some("  ")), Ok(DEFAULT_MAX_STEPS));
+        assert_eq!(max_steps_from(Some("2000")), Ok(2000));
+        assert_eq!(max_steps_from(Some(" 2000 ")), Ok(2000));
+        for bad in ["0", "-1", "lots", "500.5"] {
+            assert!(
+                max_steps_from(Some(bad))
+                    .expect_err("rejected")
+                    .contains("FIBER_MAX_STEPS"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1550,6 +1792,49 @@ steps:
         }
     }
 
+    /// The DRY idiom this audit must not break: an anchor is declared in a holder key
+    /// that no schema reads, and referenced by alias where it belongs.
+    #[test]
+    fn a_top_level_anchor_holder_is_not_an_unknown_field() {
+        let yaml = "\
+_common_labels: &labels [os=linux]
+x-shared: &img rust:1.98
+name: p
+steps:
+  a:
+    run: 'true'
+    labels: *labels
+    image: *img
+";
+        let def = parse_pipeline_yaml(yaml).expect("anchor holders are allowed");
+        assert_eq!(def.steps[0].labels, vec!["os=linux".to_string()]);
+        assert_eq!(def.steps[0].image.as_deref(), Some("rust:1.98"));
+        assert!(compile_definition(&def).is_ok());
+
+        // Only at the top level: inside a step, `_typo` is still a typo.
+        let err = parse_pipeline_yaml("name: p\nsteps:\n  a:\n    run: 'true'\n    _extra: 1\n")
+            .expect_err("rejected inside a step");
+        assert!(err.to_string().contains("_extra"), "{err}");
+    }
+
+    /// serde does not apply merge keys, so the merged fields would simply be missing.
+    #[test]
+    fn a_merge_key_says_what_it_is() {
+        let yaml = "\
+_base: &base
+  run: 'true'
+name: p
+steps:
+  a:
+    <<: *base
+    labels: [os=linux]
+";
+        let err = parse_pipeline_yaml(yaml).expect_err("rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("merge key"), "{msg}");
+        assert!(msg.contains("write them out"), "{msg}");
+    }
+
     #[test]
     fn the_map_form_names_the_step_and_refuses_a_second_id() {
         let err =
@@ -1563,6 +1848,41 @@ steps:
         assert!(
             parse_pipeline_yaml("name: p\nsteps:\n  - id: a\n    name: A\n    run: 'true'\n")
                 .is_ok()
+        );
+    }
+
+    /// The JSON save API is the contract; the UI and CLI parsing strictly first is not a
+    /// property of the server.
+    #[test]
+    fn the_json_save_path_is_audited_too() {
+        let bad = serde_json::json!({
+            "name": "p",
+            "steps": [{"id": "a", "name": "A", "run": "true", "continue-on-error": true}],
+        });
+        let err = audit_definition(&bad).expect_err("rejected");
+        assert!(err.contains("continue_on_error"), "{err}");
+        // Serde would have taken it and dropped the field.
+        let parsed: PipelineDefinition = serde_json::from_value(bad).unwrap();
+        assert!(!parsed.steps[0].continue_on_error, "silently off");
+
+        let good = serde_json::json!({
+            "name": "p",
+            "steps": [{"id": "a", "name": "A", "run": "true", "continue_on_error": true}],
+        });
+        assert_eq!(audit_definition(&good), Ok(()));
+
+        // The legacy submission shape gets the strict YAML parser.
+        assert!(
+            audit_definition(&serde_json::json!({
+                "yaml": "name: p\nsteps:\n  a:\n    run: 'true'\n    need: [b]\n"
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            audit_definition(&serde_json::json!({
+                "yaml": "name: p\nsteps:\n  a:\n    run: 'true'\n"
+            })),
+            Ok(())
         );
     }
 
@@ -1607,6 +1927,8 @@ steps:
             assert!(keys::ON.contains(&f.as_str()), "on field `{f}` missing");
         }
 
+        // A count alone would pass a *rename*: `paths_ignore` → `ignore_paths` keeps the
+        // length and rejects every pipeline using the new name.
         let push = serde_json::to_value(fiber_proto::PushTrigger {
             branches: vec![],
             paths: vec![],
@@ -1614,6 +1936,9 @@ steps:
         })
         .unwrap();
         assert_eq!(keys::PUSH.len(), fields(&push).len());
+        for f in fields(&push) {
+            assert!(keys::PUSH.contains(&f.as_str()), "push field `{f}` missing");
+        }
         let pr = serde_json::to_value(fiber_proto::PullRequestTrigger {
             branches: vec![],
             types: vec![],
@@ -1622,6 +1947,12 @@ steps:
         })
         .unwrap();
         assert_eq!(keys::PULL_REQUEST.len(), fields(&pr).len());
+        for f in fields(&pr) {
+            assert!(
+                keys::PULL_REQUEST.contains(&f.as_str()),
+                "pull_request field `{f}` missing"
+            );
+        }
         let ws = serde_json::to_value(fiber_proto::WorkspaceConfig {
             repo: "r".into(),
             git_ref: None,

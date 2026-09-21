@@ -36,13 +36,30 @@ steps:
 
 In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted. Give a map-form step its own `id:` and it is rejected — the key *is* the id, and two answers to the question is one of them going unread.
 
-**Unknown fields are errors.** A field no table on this page lists fails `fiber validate`,
-`POST /api/pipelines/parse-yaml`, and the Import panel, naming the field and the nearest
-one that exists. GitHub Actions spellings (`continue-on-error`, `working-directory`),
-near-misses (`need:`, `artifact:`, `imgae:`) and anything else serde used to drop on the
-floor previously parsed clean and produced a step that quietly ran without the field. A
-pipeline **already stored** is still read leniently, so an old row keeps executing; the
-strictness is on the authoring path, where there is someone to tell.
+**Unknown fields are errors.** A field no table on this page lists is rejected by
+`fiber validate`, `POST /api/pipelines/parse-yaml`, the Import panel, **and the save API**
+(`POST`/`PUT /api/projects/{id}/pipelines`, whether the definition arrives as YAML or as
+JSON), naming the field and the nearest one that exists. GitHub Actions spellings
+(`continue-on-error`, `working-directory`), near-misses (`need:`, `artifact:`, `imgae:`)
+and anything else serde used to drop on the floor previously parsed clean and produced a
+step that quietly ran without the field. A pipeline **already stored** is still read
+leniently, so an old row keeps executing; the strictness is on the authoring path, where
+there is someone to tell.
+
+Two exceptions, both at the top level only:
+
+```yaml
+_common_labels: &labels [os=linux]   # anchor holder — `_` or `x-` prefix, not audited
+name: p
+steps:
+  build:
+    run: cargo build
+    labels: *labels
+```
+
+YAML **merge keys (`<<`) are not supported** and are rejected with a message saying so:
+serde does not apply them, so the merged fields would simply be absent — the exact
+failure this audit exists to prevent. Write the fields out.
 
 ### `concurrency`
 
@@ -186,6 +203,12 @@ Compile produces cells like `test__os_linux`. `needs` that point at a matrixed s
 | `matrix.os == 'linux'` | Compare matrix (or env) axis |
 | `env.CHANNEL == "nightly"` | Same, against step / pipeline `env` |
 
+The **name** has to exist on the step. `matrix.osx == 'linux'` where the axis is `os` is
+well-formed and false on every run forever, so it is rejected too, with the names the
+step does have. What a condition can read is fully known when the pipeline compiles: the
+pipeline `env`, the step `env`, and the cell's matrix bindings (plus their `MATRIX_*`
+and `FIBER_MATRIX_*` aliases).
+
 Evaluated when a step becomes ready to queue (dependencies terminal), not at run create — except root steps, which are evaluated immediately.
 
 **That table is the whole grammar, and anything else is rejected when the pipeline
@@ -219,7 +242,7 @@ The check is on the shape, not the outcome.
 
 | Limit | Value | Why |
 |---|---|---|
-| Expanded steps per pipeline | 500 | A definition is expanded (matrix cells included) before it is counted, so 16 steps of 64 cells is 1 024 and is refused. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's |
+| Expanded steps per pipeline | 500, or `FIBER_MAX_STEPS` | Counted **as it expands**, matrix cells included, so 16 steps of 64 cells is 1 024 and is refused — and the expansion stops at the cap rather than building all 1 024 first. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's. Raise `FIBER_MAX_STEPS` for a generated fan-out |
 | Matrix cells per step | 64 | Unchanged |
 
 ## Semantics

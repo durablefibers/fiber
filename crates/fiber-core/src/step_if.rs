@@ -143,14 +143,71 @@ fn is_key(s: &str) -> bool {
 fn eval_equality(expr: &str, ctx: &IfContext) -> Option<bool> {
     // `matrix.os == 'linux'` or `env.FOO == "bar"`
     let (left, right) = split_eq(expr)?;
-    let left = left.trim();
     let right = unquote(right.trim())?;
-    let key = left
-        .strip_prefix("matrix.")
-        .or_else(|| left.strip_prefix("env."))
-        .unwrap_or(left);
-    let val = lookup_env(ctx, key)?;
-    Some(val == right)
+    let val = lookup_env(&ctx.env, referenced_key(left)?)?;
+    Some(*val == right)
+}
+
+/// The matrix/env name an equality reads, with any `matrix.` / `env.` prefix stripped.
+/// `None` for anything that is not an equality — `always()` reads nothing.
+fn referenced_key(left: &str) -> Option<&str> {
+    let left = left.trim();
+    if left.is_empty() {
+        return None;
+    }
+    Some(
+        left.strip_prefix("matrix.")
+            .or_else(|| left.strip_prefix("env."))
+            .unwrap_or(left),
+    )
+}
+
+/// Reject a condition that reads a name this step does not have.
+///
+/// [`validate`] checks the shape; this checks the one thing left that makes a condition
+/// silently false forever. `matrix.osx == 'linux'` on a step whose axis is `os` is
+/// well-formed, compiles, and skips the step on every run — the original finding, one
+/// typo further in. It is statically decidable: `eval_if` only ever sees
+/// `CompiledStep.env`, which is the pipeline env, the step env and the cell's matrix
+/// bindings, all known when the pipeline compiles. Save-time only, like the rest.
+pub fn validate_key(expr: Option<&str>, env: &[(String, String)]) -> Result<(), String> {
+    let Some(expr) = expr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if matches!(expr, "always()" | "never()" | "success()") {
+        return Ok(());
+    }
+    let Some((left, _)) = split_eq(expr) else {
+        return Ok(());
+    };
+    let Some(key) = referenced_key(left) else {
+        return Ok(());
+    };
+    if lookup_env(env, key).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "if: `{expr}` — `{key}` is not a matrix axis or an env name on this step{}",
+        available(env)
+    ))
+}
+
+/// `; available: a, b, c` — the names an author can actually compare against.
+///
+/// The generated `MATRIX_*` / `FIBER_MATRIX_*` aliases are left out: they all resolve,
+/// but listing three spellings of one axis makes the message harder to read, not easier.
+fn available(env: &[(String, String)]) -> String {
+    let mut names: Vec<&str> = env
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| !k.starts_with("MATRIX_") && !k.starts_with("FIBER_MATRIX_"))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return "; this step has no matrix axes and no env".into();
+    }
+    format!("; available: {}", names.join(", "))
 }
 
 fn split_eq(expr: &str) -> Option<(&str, &str)> {
@@ -168,15 +225,19 @@ fn unquote(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
-fn lookup_env(ctx: &IfContext, key: &str) -> Option<String> {
+/// The value `key` resolves to, under exactly the rules `eval_if` applies.
+///
+/// Shared with [`validate_key`] on purpose: a compile-time check that disagreed with the
+/// runtime lookup would reject a working pipeline or pass a broken one.
+fn lookup_env<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a String> {
     let upper = format!("MATRIX_{}", key.to_ascii_uppercase());
-    for (k, v) in &ctx.env {
+    for (k, v) in env {
         if k == key || k.eq_ignore_ascii_case(&upper) || k == &format!("MATRIX_{key}") {
-            return Some(v.clone());
+            return Some(v);
         }
         // FIBER_MATRIX_os style
         if k.eq_ignore_ascii_case(&format!("FIBER_MATRIX_{key}")) {
-            return Some(v.clone());
+            return Some(v);
         }
     }
     None

@@ -264,6 +264,11 @@ mod tests {
     use fiber_proto::PipelineDefinition;
 
     fn compiled(definition: &Value) -> crate::dag::CompiledDag {
+        // `ensure_showcase` saves these through `create_pipeline`, which audits the
+        // submitted definition — so a seeded pipeline with a stray key would be a boot
+        // failure, not a demo.
+        crate::dag::audit_definition(definition)
+            .unwrap_or_else(|e| panic!("seed pipeline would be rejected on save: {e}"));
         let parsed: PipelineDefinition = serde_json::from_value(definition.clone())
             .unwrap_or_else(|e| panic!("seed pipeline is not a PipelineDefinition: {e}"));
         compile_definition(&parsed)

@@ -1558,13 +1558,15 @@ async fn create_agent(
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_agent_scope(&state, &user, req.project_id).await?;
-    let mut resp = state.store.create_agent(req).await.map_err(|e| {
-        if e.to_string().contains("project not found") {
-            ApiError::NotFound
-        } else {
-            ApiError::from(e)
-        }
-    })?;
+    // `create_agent` returns `StoreError::NotFound` for an unknown `project_id`, which
+    // `ApiError::from` maps to 404. This is not a race: `require_agent_scope`
+    // short-circuits for an instance admin, so an admin posting a stale project id
+    // reaches the store's check on every call.
+    let mut resp = state
+        .store
+        .create_agent(req)
+        .await
+        .map_err(ApiError::from)?;
     resp.agent.token_hash = "***".into();
     Ok((StatusCode::CREATED, Json(resp)))
 }
@@ -1817,30 +1819,18 @@ async fn github_webhook(
                 .find_pipelines_for_push(id, &branch, &changed)
                 .await
                 .map_err(ApiError::from)?;
-            let mut run_ids = Vec::new();
-            for p in pipelines {
-                let (run, _, _) = state
-                    .scheduler
-                    .start_run_for_commit(p.id, &format!("github:push:{branch}"), commit.clone())
-                    .await
-                    .map_err(ApiError::from)?;
-                // Off the request path: a slow GitHub must not stall the delivery past
-                // its timeout and cause a redelivery (and a duplicate run).
-                let store = state.store.clone();
-                let run_for_status = run.clone();
-                tokio::spawn(async move {
-                    crate::github::report_run_status(&store, &run_for_status).await;
-                });
-                state
-                    .scheduler
-                    .enqueue_run_ready(run.id)
-                    .await
-                    .map_err(ApiError::from)?;
-                run_ids.push(run.id);
-            }
-            Ok(Json(
-                json!({ "started": run_ids, "changed_files": changed.len() }),
-            ))
+            let (run_ids, failed) = start_matched_pipelines(
+                &state,
+                pipelines,
+                &format!("github:push:{branch}"),
+                commit,
+            )
+            .await;
+            Ok(Json(json!({
+                "started": run_ids,
+                "failed": failed,
+                "changed_files": changed.len(),
+            })))
         }
         "pull_request" => {
             let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
@@ -1929,33 +1919,16 @@ async fn github_webhook(
                 .find_pipelines_for_pull_request(id, &base, action, &changed)
                 .await
                 .map_err(ApiError::from)?;
-            let mut run_ids = Vec::new();
-            for p in pipelines {
-                let (run, _, _) = state
-                    .scheduler
-                    .start_run_for_commit(
-                        p.id,
-                        &format!("github:pr:{number}:{action}"),
-                        commit.clone(),
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                // Off the request path: a slow GitHub must not stall the delivery past
-                // its timeout and cause a redelivery (and a duplicate run).
-                let store = state.store.clone();
-                let run_for_status = run.clone();
-                tokio::spawn(async move {
-                    crate::github::report_run_status(&store, &run_for_status).await;
-                });
-                state
-                    .scheduler
-                    .enqueue_run_ready(run.id)
-                    .await
-                    .map_err(ApiError::from)?;
-                run_ids.push(run.id);
-            }
+            let (run_ids, failed) = start_matched_pipelines(
+                &state,
+                pipelines,
+                &format!("github:pr:{number}:{action}"),
+                commit,
+            )
+            .await;
             Ok(Json(json!({
                 "started": run_ids,
+                "failed": failed,
                 "action": action,
                 "base": base,
                 "changed_files": changed.len(),
@@ -1964,6 +1937,55 @@ async fn github_webhook(
         }
         _ => Ok(Json(json!({ "ignored": true, "event": event }))),
     }
+}
+
+/// Start every pipeline a delivery matched, and keep going past one that will not start.
+///
+/// The loop used to `?` on the first error. With pipelines A, B, C matching a branch and
+/// B carrying a definition that no longer compiles, A started, B failed the whole
+/// request, and C never ran — then GitHub redelivered and started a *second* run of A for
+/// the same commit. The delivery reports what started and what did not, and stays a 200,
+/// because a redelivery cannot fix a pipeline that is broken on disk and duplicates the
+/// runs that did start.
+async fn start_matched_pipelines(
+    state: &AppState,
+    pipelines: Vec<fiber_core::Pipeline>,
+    trigger: &str,
+    commit: fiber_core::RunCommit,
+) -> (Vec<Uuid>, Vec<Value>) {
+    let mut started = Vec::new();
+    let mut failed = Vec::new();
+    for p in pipelines {
+        let run = match state
+            .scheduler
+            .start_run_for_commit(p.id, trigger, commit.clone())
+            .await
+        {
+            Ok((run, _, _)) => run,
+            Err(e) => {
+                tracing::error!(
+                    pipeline = %p.id, name = %p.name, error = ?e,
+                    "webhook could not start this pipeline; the others still run"
+                );
+                failed.push(json!({ "pipeline": p.id, "name": p.name, "error": format!("{e:#}") }));
+                continue;
+            }
+        };
+        // Off the request path: a slow GitHub must not stall the delivery past
+        // its timeout and cause a redelivery (and a duplicate run).
+        let store = state.store.clone();
+        let run_for_status = run.clone();
+        tokio::spawn(async move {
+            crate::github::report_run_status(&store, &run_for_status).await;
+        });
+        if let Err(e) = state.scheduler.enqueue_run_ready(run.id).await {
+            // The run exists and its root steps are queued; only the wake-up was lost, and
+            // the scheduler's own tick picks it up. Never worth failing the delivery.
+            tracing::warn!(run = %run.id, error = %e, "run started but the queue wake failed");
+        }
+        started.push(run.id);
+    }
+    (started, failed)
 }
 
 fn collect_push_changed_files(payload: &Value) -> Vec<String> {
@@ -2115,11 +2137,11 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod concurrency_funnel {
     //! Starting a run has to go through the scheduler, which is where a new run cancels
-    //! the older ones in its concurrency group. Four call sites reach this code — the
-    //! manual start, the retry, and both webhook paths (the schedule loop lives in the
-    //! scheduler itself) — and a fifth that called the store directly would silently opt
-    //! out of concurrency with nothing to show for it. Audit the source rather than
-    //! trust the next author to notice.
+    //! the older ones in its concurrency group. Three call sites reach this code — the
+    //! manual start, the retry, and `start_matched_pipelines` for both webhook paths
+    //! (the schedule loop lives in the scheduler itself) — and a fourth that called the
+    //! store directly would silently opt out of concurrency with nothing to show for it.
+    //! Audit the source rather than trust the next author to notice.
 
     /// Everything above the first `#[cfg(test)]`, so this module's own text — which
     /// necessarily contains the pattern it looks for — is not what gets audited.
@@ -2174,9 +2196,11 @@ mod concurrency_funnel {
             .lines()
             .filter(|l| l.trim().starts_with(".retry_run"))
             .count();
+        // Two sites: the manual start, and `start_matched_pipelines`, which both webhook
+        // branches call so that one uncompilable pipeline cannot abort the delivery.
         assert!(
-            starts >= 3,
-            "expected the manual and both webhook starts, found {starts}"
+            starts >= 2,
+            "expected the manual start and the webhook helper, found {starts}"
         );
         assert_eq!(retries, 1, "expected exactly the retry route's call");
     }

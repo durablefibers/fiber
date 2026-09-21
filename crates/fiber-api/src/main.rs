@@ -75,6 +75,10 @@ struct Args {
     /// `1` to seed on this boot, `0` never.
     #[arg(long, env = "FIBER_SEED_SHOWCASE", default_value = "auto")]
     seed_showcase: String,
+
+    /// Most expanded steps one pipeline may compile to (matrix cells included).
+    #[arg(long, env = "FIBER_MAX_STEPS")]
+    max_steps: Option<String>,
 }
 
 #[tokio::main]
@@ -82,6 +86,14 @@ async fn main() -> Result<()> {
     let otel = otel::init()?;
 
     let args = Args::parse();
+    // Validated here so a typo is a boot failure rather than a limit nobody chose.
+    // `fiber_core::dag::max_steps` reads the same variable and warns on its own for the
+    // CLI, which has no boot to fail.
+    let max_steps =
+        fiber_core::dag::max_steps_from(args.max_steps.as_deref()).map_err(anyhow::Error::msg)?;
+    if max_steps != fiber_core::dag::DEFAULT_MAX_STEPS {
+        tracing::info!(max_steps, "step cap overridden by FIBER_MAX_STEPS");
+    }
     std::fs::create_dir_all(&args.artifacts_dir)?;
     fiber_core::secrets::init_from_env();
 
@@ -91,6 +103,26 @@ async fn main() -> Result<()> {
     let n = store.backfill_schedule_dues().await?;
     if n > 0 {
         tracing::info!(count = n, "backfilled pipeline next_due_at");
+    }
+    // An upgrade can tighten a validator, which turns a stored pipeline that was accepted
+    // into one that cannot start. Say so here rather than on the next push.
+    match store.unstartable_pipelines().await {
+        Ok(defects) if !defects.is_empty() => {
+            for d in &defects {
+                tracing::error!(
+                    project = %d.project_id, pipeline = %d.pipeline_id, name = %d.name,
+                    reason = %d.reason,
+                    "stored pipeline no longer compiles and cannot start until it is fixed"
+                );
+            }
+            tracing::error!(
+                count = defects.len(),
+                "pipelines that will not start; see the lines above"
+            );
+        }
+        Ok(_) => tracing::debug!("all stored pipelines compile"),
+        // Never worth failing the boot: this is a report, not a gate.
+        Err(e) => tracing::warn!(error = %e, "could not audit stored pipeline definitions"),
     }
     // Read before `ensure_admin_user`, which creates one: this is what "fresh instance"
     // means for the seeder too, so a deleted demo project stays deleted across restarts.

@@ -6,8 +6,35 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Upgrading
+
+- **This release rejects definitions that earlier versions accepted** (see *Changed*).
+  A pipeline that was stored before the upgrade and no longer compiles cannot start:
+  `fiber-api` now **audits every stored pipeline at boot** and logs one `ERROR` per
+  broken one with its project id, pipeline id and reason, plus a count — read the boot
+  log after upgrading. A scheduled pipeline in that state keeps its due time instead of
+  silently burning the occurrence, so it starts firing again as soon as the definition is
+  fixed, with no re-arming. A webhook delivery starts every other pipeline it matched and
+  reports the failures in its response. Nothing needs a migration.
+- Creating a *failed run* for a definition that will not compile, so the breakage is
+  visible in the UI rather than only in the log, is a follow-up: it needs a `runs.error`
+  column, a snapshot the canvas tolerates that is not a `CompiledDag`, care that a
+  zero-step run does not finalise as *succeeded*, and a policy split so a manual start
+  still gets its `400`.
+
 ### Security
 
+- **An unprivileged caller could OOM the API with one request.** The step cap was tested
+  *after* the matrix expansion that materialised every cell, each one a clone of its step
+  definition. A 2 MB definition — inside axum's default body limit — of 16 900 steps × 64
+  cells expanded to 1 081 600 cells, 3.2 GB resident and 9.8 s before being refused, and
+  `POST /api/pipelines/parse-yaml` takes only `AuthUser`, so any logged-in account with
+  no project membership could kill the process and take the scheduler, every agent socket
+  and every in-flight durable fiber with it. The cap is now checked against the declared
+  step count before any expansion (every step yields at least one cell) and again as a
+  running total during it, so the peak is the cap plus one step's matrix. The matrix
+  product is likewise bounded before it is built, rather than after — one axis of a
+  million values used to allocate a million maps to then reject them.
 - **`showcase` is a reserved project slug, and the demo project is seeded once.** A
   caller-supplied `slug` on `POST /api/projects` skipped `slugify` entirely and landed
   verbatim, so anyone who could create a project could claim `showcase` — and the boot
@@ -23,6 +50,11 @@ minor versions may carry breaking changes.
 - `FIBER_SEED_SHOWCASE` (`auto` / `1` / `0`) — whether to seed the Showcase demo project
   this boot. `auto` means "only on a fresh instance". An unreadable value fails the boot
   rather than guessing. See [configuration](docs/configuration.md).
+- `FIBER_MAX_STEPS` — raise the 500-step cap for a generated fan-out. `0` or a
+  non-number fails the boot. The cap is enforced incrementally, so raising it raises the
+  ceiling but not the shape of the allocation.
+- **A boot-time audit of every stored pipeline**, logging the ones that would no longer
+  compile with project, pipeline, name and reason.
 
 ### Changed
 
@@ -40,27 +72,46 @@ minor versions may carry breaking changes.
     `next_due_at` `NULL` forever.
   - An empty step id is rejected. `needs`, the snapshot and the UI all refer to a step
     by id.
-  - **Unknown YAML fields are rejected**, naming the field and the nearest valid one.
-    `continue-on-error`, `working-directory`, `need:`, `artifact:` and every other typo
-    parsed clean and produced a step that ran without the field. A pipeline **already
-    stored** is still read leniently, so existing rows and run snapshots keep executing —
-    the strictness is on the authoring path (`fiber validate`, `POST
-    /api/pipelines/parse-yaml`, the Import panel). All 10 `examples/*.yml` and the repo's
-    own `fiber.yml` compile unchanged.
+  - An `if:` that reads a name the step does not have — `matrix.osx` where the axis is
+    `os` — is rejected with the names it does have. What a condition can read is fully
+    known when the pipeline compiles.
+  - **Unknown YAML and JSON fields are rejected**, naming the field and the nearest valid
+    one. `continue-on-error`, `working-directory`, `need:`, `artifact:` and every other
+    typo parsed clean and produced a step that ran without the field. This covers the
+    **save API** as well as `fiber validate` / `parse-yaml` / the Import panel: the JSON
+    definition on `POST`/`PUT /api/projects/{id}/pipelines` went through serde directly,
+    so `"continue-on-error": true` returned `201` and ran the step with the flag off.
+    Top-level anchor holders (`_common: &labels [...]`, `x-…`) are allowed, since that is
+    how a YAML file is written DRY; YAML merge keys (`<<`) are rejected with a message
+    saying the merged fields would be dropped. A pipeline **already stored** is still read
+    leniently, so existing rows and run snapshots keep executing. All 10 `examples/*.yml`
+    and the repo's own `fiber.yml` compile unchanged.
 - **A definition is capped at 500 expanded steps** (`DagError::TooManySteps`). Only the
   per-step matrix (64 cells) was capped before, so 80 steps of 64 cells was a legal
   5 120-step pipeline that opened a transaction and did one `INSERT` per step.
 
 ### Fixed
 
-- **Store errors are classified by type, not by substring.** `access.rs` and six handlers
-  matched on `contains("forbidden")` and `ends_with("not found")`: rewording a store
+- **One uncompilable pipeline no longer blocks every other pipeline on the same push.**
+  The webhook loop `?`-ed on the first failure, so with pipelines A, B and C matching a
+  branch and B carrying a definition that no longer compiles, A started, B failed the
+  delivery and C never ran — then GitHub redelivered and started a *second* run of A for
+  the same commit. Deterministic, so it repeated on every push. Both webhook branches now
+  collect per-pipeline failures and answer `{ "started": [...], "failed": [...] }`.
+- **A scheduled pipeline that does not compile no longer stops firing for good.** The
+  occurrence was claimed before the run was started and the failure was only a warning,
+  so a nightly pipeline consumed its slot every night and never ran again. It is compiled
+  first; the due time stays put and the schedule resumes on its own once fixed.
+- **Store errors are classified by type, not by substring.** `access.rs` and seven
+  handlers matched on `contains("forbidden")` and `ends_with("not found")`: rewording a store
   message silently turned a `404` into a `500`, and any error from any layer whose text
   happened to contain "forbidden" became a `403`. A typed `fiber_core::StoreError`
   (`Forbidden` / `NotFound` / `Validation` / `Other`) now carries the classification, with
   one `From` impl mapping it to a status. Every HTTP status is unchanged; `Internal` still
   masks its body and logs the full cause chain. `ValidationError` is replaced by
-  `StoreError::Validation`.
+  `StoreError::Validation`. A project slug collision is now a `400` naming the slug
+  rather than a `500`: slugifying supplied slugs makes a clash an ordinary thing for a
+  caller to do.
 - **Starting a run is one insert, and propagation no longer scans the snapshot per step.**
   `start_run` and `retry_run` issued one `INSERT` per step inside the run's transaction
   (500 round-trips for a 500-step DAG) and now use a single `UNNEST` insert;
