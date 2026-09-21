@@ -24,4 +24,4 @@ pub use schedule::{
 };
 pub use seed::ensure_showcase;
 pub use step_if::{IfContext, eval_if};
-pub use store::{PipelineDefect, Reclaimed, RunKey, StartedRun, Store, superseded};
+pub use store::{BootScan, PipelineDefect, Reclaimed, RunKey, StartedRun, Store, superseded};

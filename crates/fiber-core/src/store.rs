@@ -745,43 +745,43 @@ impl Store {
     }
 
     /// Backfill `next_due_at` for pipelines that have a schedule but no due time yet.
-    /// Every stored pipeline whose definition no longer compiles.
+    /// One walk over every pipeline at boot: back-fill missing schedule due times, and
+    /// report the definitions that no longer compile.
     ///
-    /// Run at boot. A validator that tightens — an `if:` expression that used to evaluate
-    /// to `false`, a glob that used to be dropped — turns a pipeline that was accepted
-    /// into one that cannot start, and the operator finds out on the next push. Walking
-    /// them once at startup answers "what did this upgrade break" while there is still a
-    /// log to read it in. Nothing is changed or blocked; the boot continues.
-    pub async fn unstartable_pipelines(&self) -> Result<Vec<PipelineDefect>> {
-        let mut out = Vec::new();
+    /// Both used to list and deserialise every pipeline separately, before the listener
+    /// binds — the same work twice on an instance with thousands of them.
+    ///
+    /// The audit exists because a validator that tightens — an `if:` that used to
+    /// evaluate to `false`, a glob that used to be dropped — turns a pipeline that was
+    /// accepted into one that cannot start, and the operator would otherwise find out on
+    /// the next push. Nothing is changed or blocked by it; the boot continues.
+    pub async fn scan_pipelines_at_boot(&self) -> Result<BootScan> {
+        let mut scan = BootScan::default();
         for p in self.list_all_pipelines().await? {
-            let reason = match value_to_definition(&p.definition) {
-                Err(e) => format!("{e:#}"),
-                Ok(def) => match compile_definition(&def) {
-                    Ok(_) => continue,
-                    Err(e) => format!("{e}"),
-                },
+            let def = match value_to_definition(&p.definition) {
+                Ok(def) => Some(def),
+                Err(e) => {
+                    scan.defects.push(PipelineDefect {
+                        project_id: p.project_id,
+                        pipeline_id: p.id,
+                        name: p.name.clone(),
+                        reason: format!("{e:#}"),
+                    });
+                    None
+                }
             };
-            out.push(PipelineDefect {
-                project_id: p.project_id,
-                pipeline_id: p.id,
-                name: p.name,
-                reason,
-            });
-        }
-        Ok(out)
-    }
-
-    pub async fn backfill_schedule_dues(&self) -> Result<u64> {
-        let pipelines = self.list_all_pipelines().await?;
-        let mut n = 0u64;
-        for p in pipelines {
+            let Some(def) = def else { continue };
+            if let Err(e) = compile_definition(&def) {
+                scan.defects.push(PipelineDefect {
+                    project_id: p.project_id,
+                    pipeline_id: p.id,
+                    name: p.name.clone(),
+                    reason: e.to_string(),
+                });
+            }
             if p.next_due_at.is_some() {
                 continue;
             }
-            let Ok(def) = value_to_definition(&p.definition) else {
-                continue;
-            };
             let Some(on) = def.on.as_ref().filter(|o| has_schedule(o)) else {
                 continue;
             };
@@ -796,9 +796,9 @@ impl Store {
             .bind(next)
             .execute(&self.pool)
             .await?;
-            n += 1;
+            scan.backfilled += 1;
         }
-        Ok(n)
+        Ok(scan)
     }
 
     /// Re-queue a failed step for another attempt, not offerable before `backoff_secs`.
@@ -2643,7 +2643,16 @@ fn unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
-/// A stored pipeline that would not compile today. See [`Store::unstartable_pipelines`].
+/// What [`Store::scan_pipelines_at_boot`] found.
+#[derive(Debug, Default)]
+pub struct BootScan {
+    /// Pipelines given a `next_due_at` they were missing.
+    pub backfilled: u64,
+    /// Pipelines that will not start until someone edits them.
+    pub defects: Vec<PipelineDefect>,
+}
+
+/// A stored pipeline that would not compile today. See [`Store::scan_pipelines_at_boot`].
 #[derive(Debug, Clone)]
 pub struct PipelineDefect {
     pub project_id: Uuid,

@@ -42,6 +42,18 @@ const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
 /// gets this long to answer before it is reported down.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most bytes a pipeline definition may arrive as, on the three routes that take one.
+///
+/// Compiling amplifies: a matrix multiplies each step, the pipeline `env` is merged into
+/// every expanded cell, and each `needs` entry is rewritten to the dependency's cells. So
+/// the quantity an attacker controls is **bytes of the body**, not the step count the DAG
+/// compiler caps — and axum's 2 MB default was enough to turn one request into gigabytes.
+/// `parse-yaml` takes only `AuthUser`, so that request needs no project membership at all.
+///
+/// 256 KiB against a few KB for the largest pipeline in `examples/` leaves three orders of
+/// magnitude of headroom for a generated definition while keeping the worst case bounded.
+/// The DAG-level caps stay: this bounds the input, they bound the output.
+const DEFINITION_MAX_BYTES: usize = 256 * 1024;
 
 pub fn router(state: AppState) -> Router {
     // Two sub-routers, one layer. `Router::layer` wraps the routes present when it is
@@ -54,6 +66,16 @@ pub fn router(state: AppState) -> Router {
     let webhook: MethodRouter<AppState> = post(github_webhook)
         .layer::<_, Infallible>(DefaultBodyLimit::max(WEBHOOK_MAX_BYTES))
         .layer(ConcurrencyLimitLayer::new(WEBHOOK_MAX_IN_FLIGHT));
+    // Same shape as the webhook limit above: the layer wraps what is on the method
+    // router when it runs, so the GET beside each of these keeps the default.
+    let create_pipeline_route: MethodRouter<AppState> = get(list_pipelines).merge(
+        post(create_pipeline).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES)),
+    );
+    let update_pipeline_route: MethodRouter<AppState> = get(get_pipeline).merge(
+        put(update_pipeline).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES)),
+    );
+    let parse_yaml_route: MethodRouter<AppState> =
+        post(parse_yaml).layer::<_, Infallible>(DefaultBodyLimit::max(DEFINITION_MAX_BYTES));
     let api = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -75,20 +97,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{id}", put(update_user))
-        .route(
-            "/api/projects/{id}/pipelines",
-            get(list_pipelines).post(create_pipeline),
-        )
+        .route("/api/projects/{id}/pipelines", create_pipeline_route)
         .route(
             "/api/projects/{id}/secrets",
             get(list_secrets).post(upsert_secret),
         )
         .route("/api/projects/{id}/secrets/{key}", delete(delete_secret))
-        .route("/api/pipelines/parse-yaml", post(parse_yaml))
-        .route(
-            "/api/pipelines/{id}",
-            get(get_pipeline).put(update_pipeline),
-        )
+        .route("/api/pipelines/parse-yaml", parse_yaml_route)
+        .route("/api/pipelines/{id}", update_pipeline_route)
         .route("/api/pipelines/{id}/runs", post(start_run))
         .route("/api/projects/{id}/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
@@ -1826,11 +1842,16 @@ async fn github_webhook(
                 commit,
             )
             .await;
-            Ok(Json(json!({
-                "started": run_ids,
-                "failed": failed,
-                "changed_files": changed.len(),
-            })))
+            let status = delivery_status(&run_ids, &failed);
+            Ok((
+                status,
+                Json(json!({
+                    "started": run_ids,
+                    "failed": failed,
+                    "changed_files": changed.len(),
+                })),
+            )
+                .into_response())
         }
         "pull_request" => {
             let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
@@ -1926,16 +1947,40 @@ async fn github_webhook(
                 commit,
             )
             .await;
-            Ok(Json(json!({
-                "started": run_ids,
-                "failed": failed,
-                "action": action,
-                "base": base,
-                "changed_files": changed.len(),
-                "files_source": files_source,
-            })))
+            let status = delivery_status(&run_ids, &failed);
+            Ok((
+                status,
+                Json(json!({
+                    "started": run_ids,
+                    "failed": failed,
+                    "action": action,
+                    "base": base,
+                    "changed_files": changed.len(),
+                    "files_source": files_source,
+                })),
+            )
+                .into_response())
         }
-        _ => Ok(Json(json!({ "ignored": true, "event": event }))),
+        _ => Ok(Json(json!({ "ignored": true, "event": event })).into_response()),
+    }
+}
+
+/// What a client may be told about an error, by the same rule `ApiError` applies.
+///
+/// A definition the caller wrote wrongly is described; anything else is "internal
+/// error", because the alternative is echoing an sqlx or anyhow chain — the rule
+/// `ApiError::Internal` exists to enforce. Used where the error is reported inside a
+/// successful response rather than as the response's status.
+fn client_safe_message(e: &anyhow::Error) -> String {
+    use fiber_core::StoreError as S;
+    match e.downcast_ref::<S>() {
+        Some(S::Validation(_)) => format!("{e:#}"),
+        Some(S::NotFound(_)) => "not found".into(),
+        Some(S::Forbidden(_)) => "forbidden".into(),
+        Some(S::Other(_)) | None if e.downcast_ref::<fiber_core::DagError>().is_some() => {
+            format!("{e:#}")
+        }
+        _ => "internal error".into(),
     }
 }
 
@@ -1944,9 +1989,13 @@ async fn github_webhook(
 /// The loop used to `?` on the first error. With pipelines A, B, C matching a branch and
 /// B carrying a definition that no longer compiles, A started, B failed the whole
 /// request, and C never ran — then GitHub redelivered and started a *second* run of A for
-/// the same commit. The delivery reports what started and what did not, and stays a 200,
-/// because a redelivery cannot fix a pipeline that is broken on disk and duplicates the
-/// runs that did start.
+/// the same commit.
+///
+/// A **partial** success stays 200: a redelivery cannot fix a pipeline that is broken on
+/// disk, and it would duplicate the runs that did start. When **nothing** started, that
+/// reasoning does not apply — there is nothing to duplicate, a redelivery is worth a try
+/// for a transient failure, and a red delivery is the one place a repository admin
+/// actually looks. See [`delivery_status`].
 async fn start_matched_pipelines(
     state: &AppState,
     pipelines: Vec<fiber_core::Pipeline>,
@@ -1963,11 +2012,16 @@ async fn start_matched_pipelines(
         {
             Ok((run, _, _)) => run,
             Err(e) => {
+                // The full chain goes to the log; the delivery body gets the classified
+                // message only. GitHub stores this response and renders it in the
+                // repository's Deliveries tab for every repo admin, so an sqlx pool
+                // timeout or a connection-string fragment would be published there.
                 tracing::error!(
                     pipeline = %p.id, name = %p.name, error = ?e,
                     "webhook could not start this pipeline; the others still run"
                 );
-                failed.push(json!({ "pipeline": p.id, "name": p.name, "error": format!("{e:#}") }));
+                let message = client_safe_message(&e);
+                failed.push(json!({ "pipeline": p.id, "name": p.name, "error": message }));
                 continue;
             }
         };
@@ -1986,6 +2040,18 @@ async fn start_matched_pipelines(
         started.push(run.id);
     }
     (started, failed)
+}
+
+/// `500` only when every pipeline that matched failed to start.
+///
+/// A delivery that matched nothing is a success: most pushes match no pipeline, and
+/// turning those red would make the Deliveries tab useless for spotting the real thing.
+fn delivery_status(started: &[Uuid], failed: &[Value]) -> StatusCode {
+    if started.is_empty() && !failed.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    }
 }
 
 fn collect_push_changed_files(payload: &Value) -> Vec<String> {
@@ -2707,6 +2773,50 @@ mod tests {
     }
 
     /// The status comes from the variant, not from the wording.
+    /// GitHub stores the delivery body and shows it to every repository admin, so it is
+    /// a client response like any other.
+    #[test]
+    fn a_reported_delivery_failure_never_carries_a_store_chain() {
+        use fiber_core::StoreError as S;
+        // A broken definition is the author's, and saying so is the point.
+        let dag = anyhow::Error::new(fiber_core::DagError::EmptyStepId).context("compiling");
+        assert_eq!(
+            client_safe_message(&dag),
+            "compiling: every step needs a non-empty id"
+        );
+        let v = anyhow::Error::new(S::Validation("cron `x` can never fire".into()));
+        assert!(client_safe_message(&v).contains("can never fire"));
+
+        // Everything else is masked, with the chain left to the log.
+        let sqlx_ish =
+            anyhow::anyhow!("pool timed out; connection postgres://fiber:hunter2@db:5432/fiber")
+                .context("start_run_for_commit");
+        let msg = client_safe_message(&sqlx_ish);
+        assert_eq!(msg, "internal error");
+        assert!(!msg.contains("hunter2") && !msg.contains("pool"));
+        assert_eq!(
+            client_safe_message(&anyhow::Error::new(S::Other("shard down".into()))),
+            "internal error"
+        );
+    }
+
+    #[test]
+    fn a_delivery_is_red_only_when_nothing_started() {
+        let run = || Uuid::new_v4();
+        let fail = || json!({ "pipeline": Uuid::new_v4() });
+        // Nothing matched: a normal push, not a failure.
+        assert_eq!(delivery_status(&[], &[]), StatusCode::OK);
+        // Partial: redelivering would duplicate the runs that did start.
+        assert_eq!(delivery_status(&[run()], &[fail()]), StatusCode::OK);
+        assert_eq!(delivery_status(&[run()], &[]), StatusCode::OK);
+        // Nothing started and something failed: nothing to duplicate, so say so where
+        // the repository admin will see it.
+        assert_eq!(
+            delivery_status(&[], &[fail()]),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[test]
     fn api_error_maps_the_store_error_type_not_its_message() {
         use fiber_core::StoreError as S;

@@ -242,13 +242,16 @@ The check is on the shape, not the outcome.
 
 | Limit | Value | Why |
 |---|---|---|
-| Expanded steps per pipeline | 500, or `FIBER_MAX_STEPS` | Counted **as it expands**, matrix cells included, so 16 steps of 64 cells is 1 024 and is refused — and the expansion stops at the cap rather than building all 1 024 first. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's. Raise `FIBER_MAX_STEPS` for a generated fan-out |
+| Expanded steps per pipeline | 500, or `FIBER_MAX_STEPS` | Counted **as it expands**, matrix cells included, so 16 steps of 64 cells is 1 024 and is refused — and the expansion stops at the cap rather than building all 1 024 first. Every run inserts one row per step and re-plans the DAG after each completion; past this the cost is the definition's, not the build's. Raise `FIBER_MAX_STEPS` for a generated fan-out, on the CLI as well as the server |
+| Expanded bytes per pipeline | 8 MiB | The step count alone is not a size: pipeline `env` is merged into **every** expanded cell, and each cell copies its step's `run`, `labels`, `artifacts` and `needs`. So a large value multiplies by the number of steps. Not configurable |
+| Request body for a definition | 256 KiB | On `POST /api/pipelines/parse-yaml` and pipeline create/update. Compiling amplifies, so the bytes of the body are what has to be bounded first |
 | Matrix cells per step | 64 | Unchanged |
 
 ## Semantics
 
 - Cycles are rejected at compile / save.
 - A step id cannot be empty. `needs`, the run snapshot, and the UI all refer to a step by id.
+- Depending on a step twice is the same as depending on it once: `needs` is deduplicated before matrix cells are substituted in.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
 - Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.

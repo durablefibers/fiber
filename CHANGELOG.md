@@ -24,17 +24,31 @@ minor versions may carry breaking changes.
 
 ### Security
 
-- **An unprivileged caller could OOM the API with one request.** The step cap was tested
-  *after* the matrix expansion that materialised every cell, each one a clone of its step
-  definition. A 2 MB definition — inside axum's default body limit — of 16 900 steps × 64
-  cells expanded to 1 081 600 cells, 3.2 GB resident and 9.8 s before being refused, and
+- **An unprivileged caller could OOM the API with one request.**
   `POST /api/pipelines/parse-yaml` takes only `AuthUser`, so any logged-in account with
   no project membership could kill the process and take the scheduler, every agent socket
-  and every in-flight durable fiber with it. The cap is now checked against the declared
-  step count before any expansion (every step yields at least one cell) and again as a
-  running total during it, so the peak is the cap plus one step's matrix. The matrix
-  product is likewise bounded before it is built, rather than after — one axis of a
-  million values used to allocate a million maps to then reject them.
+  and every in-flight durable fiber with it. Compiling *amplifies* — a matrix multiplies
+  each step, the pipeline `env` is merged into every expanded cell, and each `needs`
+  entry is rewritten to the dependency's cells — so the quantity to bound is **bytes of
+  the request body**, which nothing bounded below axum's 2 MB default. Three known
+  shapes, all inside that limit:
+  - 16 900 steps × 64 cells → 1 081 600 cells, **3.2 GB**, 9.8 s. The step cap was
+    tested after the expansion it exists to bound.
+  - 500 trivial steps + one 1.8 MB `env` value → compiled **successfully** at **1.88 GB**,
+    because the cap counts cells and a cell is not a fixed size.
+  - `needs: [build]` repeated 133 000 times against a 64-cell dependency → 8.5 M strings
+    and edges, **881 MB**, inside a 65-step definition that passes every cap.
+
+  Fixed at each layer: a 256 KiB `DefaultBodyLimit` on the three routes that accept a
+  definition (`parse-yaml` and pipeline create/update — the largest example pipeline is a
+  few KB); the step cap checked against the declared count *before* expanding and as a
+  running total during it; a non-configurable 8 MiB budget on the bytes a definition
+  expands to, charged per cell before the copy is made; `needs` deduplicated before
+  matrix substitution (correct at any size — depending on a step twice is depending on it
+  once); the expansion borrowing each step rather than cloning it into every cell; and
+  the matrix product bounded before it is built rather than after. Measured after:
+  the first shape is refused in 23 ms, the second in 1.4 ms at 20 MB peak, and on the
+  third the compiler now adds ~1 MB over the parsed input instead of 344 MB.
 - **`showcase` is a reserved project slug, and the demo project is seeded once.** A
   caller-supplied `slug` on `POST /api/projects` skipped `slugify` entirely and landed
   verbatim, so anyone who could create a project could claim `showcase` — and the boot
@@ -51,8 +65,9 @@ minor versions may carry breaking changes.
   this boot. `auto` means "only on a fresh instance". An unreadable value fails the boot
   rather than guessing. See [configuration](docs/configuration.md).
 - `FIBER_MAX_STEPS` — raise the 500-step cap for a generated fan-out. `0` or a
-  non-number fails the boot. The cap is enforced incrementally, so raising it raises the
-  ceiling but not the shape of the allocation.
+  non-number fails the boot. It bounds the number of cells only; the expanded-bytes
+  budget and the request-body limit are separate and not configurable. `fiber validate`
+  reads it too, so set it in both places or local and server validation disagree.
 - **A boot-time audit of every stored pipeline**, logging the ones that would no longer
   compile with project, pipeline, name and reason.
 
@@ -97,11 +112,19 @@ minor versions may carry breaking changes.
   branch and B carrying a definition that no longer compiles, A started, B failed the
   delivery and C never ran — then GitHub redelivered and started a *second* run of A for
   the same commit. Deterministic, so it repeated on every push. Both webhook branches now
-  collect per-pipeline failures and answer `{ "started": [...], "failed": [...] }`.
+  collect per-pipeline failures and answer `{ "started": [...], "failed": [...] }`. A
+  partial success is a `200` — redelivering would duplicate the runs that did start — but
+  a delivery where **nothing** started is a `500`, since there is nothing to duplicate and
+  a red delivery is where a repository admin looks. Reported failures carry the same
+  classified text a client would get from the equivalent status code, never an sqlx or
+  `anyhow` chain: GitHub stores the body and renders it in the Deliveries tab.
 - **A scheduled pipeline that does not compile no longer stops firing for good.** The
   occurrence was claimed before the run was started and the failure was only a warning,
   so a nightly pipeline consumed its slot every night and never ran again. It is compiled
-  first; the due time stays put and the schedule resumes on its own once fixed.
+  first; the due time stays put and the schedule resumes on its own once fixed. It is
+  logged once per pipeline per reason rather than on every tick, and a failed queue wake
+  no longer aborts the rest of the tick — the same treatment the webhook path gives the
+  same call.
 - **Store errors are classified by type, not by substring.** `access.rs` and seven
   handlers matched on `contains("forbidden")` and `ends_with("not found")`: rewording a store
   message silently turned a `404` into a `500`, and any error from any layer whose text

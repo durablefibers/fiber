@@ -20,19 +20,38 @@ const MAX_MATRIX_CELLS: usize = 64;
 /// message rather than at run time with a slow transaction.
 pub const DEFAULT_MAX_STEPS: usize = 500;
 
+/// The most text a definition may expand to, across every cell.
+///
+/// The step cap bounds how many cells there are; this bounds how big they are. Both are
+/// needed, because the two grow independently: a definition can be 500 cells of 4 MB
+/// each, or 64 cells carrying a `needs` list rewritten per dependency. The compiled DAG
+/// is also what gets written to `runs.definition_snapshot` on every run, so a definition
+/// that expands to hundreds of megabytes is a row that size per run, not just a peak.
+///
+/// 8 MiB is far above any real pipeline — the whole of `examples/` is a few KB, and a
+/// 500-cell DAG reaches it only at ~16 KiB of env per cell — and far below what makes a
+/// single request a memory event. Unlike the step cap this is not configurable: it
+/// bounds a cost nobody chooses on purpose.
+const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
+
 /// The cap in force, from `FIBER_MAX_STEPS` (read once).
 ///
 /// 500 is justified on cost, not on correctness, and a generated monorepo fan-out can
-/// legitimately exceed it with no other way out. Raising it raises what one
-/// `POST /api/pipelines/parse-yaml` can allocate — each expanded cell clones its step
-/// definition — but not without bound: the expansion stops the moment the running total
-/// passes the cap, so the peak is the cap plus one step's matrix, whatever the cap is.
+/// legitimately exceed it with no other way out.
 ///
-/// An unusable value warns and falls back here; `fiber-api` additionally refuses to boot
-/// on one, via [`max_steps_from`].
+/// Raising it raises the number of cells a definition may expand to, and nothing else:
+/// the cell count and the expanded *bytes* ([`MAX_EXPANDED_BYTES`], not configurable) are
+/// budgeted independently and both stop the expansion where they are reached, and the
+/// routes that accept a definition cap the request body. A cell is not a fixed size, so
+/// the cap alone was never a bound on memory — that was the bug this pair replaced.
+///
+/// Read by `fiber validate` too, from the developer's own shell: a server at 2000 and a
+/// developer unset means a pipeline that fails locally and is accepted on push.
+///
+/// An unusable value warns and falls back here; `fiber-api` refuses to boot on one, via
+/// [`max_steps_from`], and hands the result to [`set_max_steps`].
 pub fn max_steps() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
+    *CAP.get_or_init(|| {
         let raw = std::env::var("FIBER_MAX_STEPS").ok();
         match max_steps_from(raw.as_deref()) {
             Ok(n) => n,
@@ -42,6 +61,19 @@ pub fn max_steps() -> usize {
             }
         }
     })
+}
+
+static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Fix the cap for this process, before anything reads it.
+///
+/// `fiber-api` parses `FIBER_MAX_STEPS` through clap so a bad value fails the boot, and
+/// then has to hand the result here — reading the same variable twice, in two places,
+/// gave an API that logged "cap overridden to 2000" at boot and then refused a 900-step
+/// definition telling the operator to raise a variable they had raised. `Err` carries
+/// the value already in force, which only happens if something compiled first.
+pub fn set_max_steps(n: usize) -> Result<(), usize> {
+    CAP.set(n).map_err(|_| max_steps())
 }
 
 /// Parse a `FIBER_MAX_STEPS` value. Unset or empty is the default; 0 and anything
@@ -101,6 +133,12 @@ pub enum DagError {
          (raise FIBER_MAX_STEPS to allow more)"
     )]
     TooManySteps { count: usize, max: usize },
+    #[error(
+        "pipeline expands to at least {bytes} bytes of step definitions, more than the \
+         limit of {max} — pipeline `env` is merged into every expanded step, so a large \
+         value is multiplied by the number of steps"
+    )]
+    ExpansionTooLarge { bytes: usize, max: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,12 +193,18 @@ pub struct CompiledDag {
 }
 
 #[derive(Clone)]
-struct ExpandedCell {
+/// One matrix cell of one authored step, before it becomes a [`CompiledStep`].
+///
+/// `template` **borrows** the step it came from. Cloning it per cell copied every field
+/// of the definition — `needs`, `artifacts`, `run` — into each of up to 64 cells, so a
+/// step carrying a long `needs` list cost (repeats x cells) copies of it before anything
+/// had looked at whether the result was allowed.
+struct ExpandedCell<'a> {
     id: String,
     name: String,
     matrix: BTreeMap<String, String>,
     env: Vec<(String, String)>,
-    template: StepDefinition,
+    template: &'a StepDefinition,
 }
 
 pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagError> {
@@ -259,10 +303,20 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
             .push(cell.id.clone());
     }
 
-    let mut with_needs: Vec<(ExpandedCell, Vec<String>)> = Vec::with_capacity(expanded.len());
+    let mut with_needs: Vec<(ExpandedCell<'_>, Vec<String>)> = Vec::with_capacity(expanded.len());
     for cell in expanded {
         let mut needs = Vec::new();
+        // Deduped before expansion, not after. `needs: [build]` repeated N times used to
+        // be rewritten to N copies of every one of `build`'s matrix cells, so the graph
+        // grew as (repeats x cells x dependents) from a body that passes every step cap:
+        // 133 000 repeats against a 64-cell dependency is 8.5 M strings and 8.5 M edges.
+        // Depending on a step twice is the same as depending on it once, so this is the
+        // right behaviour at any size.
+        let mut seen_dep = HashSet::new();
         for dep in &cell.template.needs {
+            if !seen_dep.insert(dep.as_str()) {
+                continue;
+            }
             if let Some(dep_cells) = cells_by_base.get(dep) {
                 needs.extend(dep_cells.iter().cloned());
             }
@@ -368,13 +422,14 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     })
 }
 
-fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell>, DagError> {
+fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell<'_>>, DagError> {
     let mut out = Vec::new();
+    let mut bytes = 0usize;
     for step in &def.steps {
         let combos = matrix_combos(step)?;
-        // A running total, so the peak is the cap plus one step's matrix rather than the
-        // whole expansion. The count reported is a lower bound, which is what the message
-        // says: knowing the true total would mean building it.
+        // What this step's every cell will copy out of it, priced once.
+        let per_cell = step_bytes(step);
+        // A running total of cells, so the count never runs past the cap.
         if out.len() + combos.len() > max {
             return Err(DagError::TooManySteps {
                 count: out.len() + combos.len(),
@@ -460,12 +515,24 @@ fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell>,
                 .collect();
             merged.extend(env);
             let env = dedupe_last_wins(merged);
+            // The step cap counts *cells*, and a cell is not a fixed size: the pipeline
+            // `env` is merged into every one of them, so 500 trivial steps and one 1.8 MB
+            // env value is a legal 500-step definition that costs gigabytes. The body
+            // limit on the routes bounds the input; this bounds what the input expands
+            // to, which is the quantity that actually grows.
+            bytes = bytes.saturating_add(cell_bytes(&id, &name, &env, per_cell));
+            if bytes > MAX_EXPANDED_BYTES {
+                return Err(DagError::ExpansionTooLarge {
+                    bytes,
+                    max: MAX_EXPANDED_BYTES,
+                });
+            }
             out.push(ExpandedCell {
                 id,
                 name,
                 matrix,
                 env,
-                template: step.clone(),
+                template: step,
             });
         }
     }
@@ -486,21 +553,24 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
     if matrix.is_empty() {
         return Ok(vec![BTreeMap::new()]);
     }
-    let mut axes: Vec<(String, Vec<String>)> =
-        matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    axes.sort_by(|a, b| a.0.cmp(&b.0));
+    // Borrowed, not cloned: copying every axis value up front to then reject the product
+    // is the same amplification one level down.
+    let mut axes: Vec<(&String, &Vec<String>)> = matrix.iter().collect();
+    axes.sort_by(|a, b| a.0.cmp(b.0));
     for (axis, values) in &axes {
         if values.is_empty() {
             return Err(DagError::EmptyMatrixAxis {
                 step: step.id.clone(),
-                axis: axis.clone(),
+                axis: (*axis).clone(),
             });
         }
     }
     let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
     for (axis, values) in axes {
-        // Checked *before* the product is built. Testing `combos.len()` afterwards meant
-        // one axis of a million values allocated a million maps to then reject them.
+        // Checked before the product is built, and `axes` borrows rather than copies the
+        // values, so neither the product nor a copy of the axis is allocated to then be
+        // rejected. Testing `combos.len()` afterwards meant one axis of a million values
+        // allocated a million maps first.
         if combos
             .len()
             .checked_mul(values.len())
@@ -510,7 +580,7 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
         }
         let mut next = Vec::with_capacity(combos.len() * values.len());
         for base in &combos {
-            for v in &values {
+            for v in values {
                 let mut m = base.clone();
                 m.insert(axis.clone(), v.clone());
                 next.push(m);
@@ -580,6 +650,36 @@ fn dedupe_last_wins(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
             (k, v)
         })
         .collect()
+}
+
+/// Roughly what one expanded cell costs, in bytes of text it carries.
+///
+/// Approximate on purpose: it is a budget, not an accounting. What matters is that it
+/// counts everything that is **re-materialised per cell** — the merged env, and the
+/// fields each cell copies out of its step when it becomes a `CompiledStep`.
+fn cell_bytes(id: &str, name: &str, env: &[(String, String)], step: usize) -> usize {
+    id.len() + name.len() + step + env_bytes(env)
+}
+
+fn env_bytes(env: &[(String, String)]) -> usize {
+    env.iter().map(|(k, v)| k.len() + v.len() + 2).sum()
+}
+
+/// The text of a step that every one of its cells gets its own copy of.
+///
+/// Computed once per authored step and charged once per cell, so the budget is spent
+/// *before* the copies are made rather than measured after.
+fn step_bytes(step: &StepDefinition) -> usize {
+    let strings = |v: &[String]| -> usize { v.iter().map(|s| s.len() + 1).sum() };
+    step.run.as_deref().map_or(0, str::len)
+        + step.image.as_deref().map_or(0, str::len)
+        + step.working_directory.as_deref().map_or(0, str::len)
+        + step.shell.as_deref().map_or(0, str::len)
+        + step.if_expr.as_deref().map_or(0, str::len)
+        + strings(&step.labels)
+        + strings(&step.artifacts)
+        + strings(&step.needs)
+        + step.secrets.as_deref().map_or(0, strings)
 }
 
 fn matrix_env(combo: &BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -1485,8 +1585,71 @@ mod tests {
         ));
     }
 
+    /// The step cap counts cells, and a cell is not a fixed size. 500 trivial steps plus
+    /// one 1.8 MB pipeline `env` value is a legal 500-step definition that used to
+    /// compile — at gigabytes, from a body under axum's 2 MB default, on a route that
+    /// takes only a session.
+    #[test]
+    fn a_definition_whose_cells_are_huge_is_refused_even_at_the_step_cap() {
+        let steps: Vec<StepDefinition> = (0..max_steps())
+            .map(|i| step(&format!("s{i}"), &[], "true"))
+            .collect();
+        let mut def = def_of(steps);
+        def.env = [("BIG".to_string(), "x".repeat(1_800_000))]
+            .into_iter()
+            .collect();
+        let err = compile_definition(&def).expect_err("refused");
+        let DagError::ExpansionTooLarge { bytes, max } = err else {
+            panic!("wrong error: {err}");
+        };
+        assert!(bytes > max, "{bytes} vs {max}");
+        // And it stopped early: a few cells in, not after building all 500.
+        assert!(
+            bytes < max + 2_000_000,
+            "expansion ran on past the budget: {bytes}"
+        );
+
+        // The same env on a single step is fine — it is the multiplication that is not.
+        let mut small = def_of(vec![step("a", &[], "true")]);
+        small.env = [("BIG".to_string(), "x".repeat(1_800_000))]
+            .into_iter()
+            .collect();
+        assert!(compile_definition(&small).is_ok());
+    }
+
+    /// `needs: [build]` repeated is `needs: [build]`, and repeating it used to multiply
+    /// the dependency's matrix cells by the number of repeats.
+    #[test]
+    fn repeated_needs_are_deduped_not_multiplied() {
+        let mut build = step("build", &[], "true");
+        build.matrix = Some(
+            [(
+                "os".to_string(),
+                (0..8).map(|n| format!("os{n}")).collect::<Vec<_>>(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut test = step("test", &[], "true");
+        test.needs = vec!["build".to_string(); 5_000];
+        let dag = compile_definition(&def_of(vec![build, test])).expect("compiles");
+        let t = dag.steps.iter().find(|s| s.id == "test").expect("test");
+        // Eight cells of `build`, once each — not 8 x 5 000.
+        assert_eq!(t.needs.len(), 8, "needs: {:?}", t.needs);
+        let unique: std::collections::HashSet<&String> = t.needs.iter().collect();
+        assert_eq!(unique.len(), 8);
+        // Still a correct DAG: `test` runs after every cell.
+        assert_eq!(t.level, 1);
+    }
+
     #[test]
     fn the_step_cap_is_overridable_and_a_bad_value_is_an_error() {
+        // The setter is what `fiber-api` uses, and it has to be the same value
+        // `compile_definition` reads — a cap that is logged but not applied is worse than
+        // no override, because the error message then contradicts the boot log.
+        let _ = set_max_steps(max_steps());
+        assert_eq!(set_max_steps(9_999), Err(max_steps()));
+
         assert_eq!(max_steps_from(None), Ok(DEFAULT_MAX_STEPS));
         assert_eq!(max_steps_from(Some("  ")), Ok(DEFAULT_MAX_STEPS));
         assert_eq!(max_steps_from(Some("2000")), Ok(2000));
