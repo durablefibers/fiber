@@ -6,11 +6,19 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
-Hygiene from the September audit: secrets stop leaking into places a project *reader* can
-see, and two background jobs stop scanning whole tables on a timer.
+## [0.6.4] — 2026-09-22
+
+The hardening audit's last phase, the hygiene backlog: secrets stop leaking into places a
+project *reader* can see, an unprivileged caller can no longer OOM the API with one
+request, the artifact store stops leaking objects, and two background jobs stop scanning
+whole tables on a timer.
 
 Migration `017_metrics_window.sql` adds one index on `step_attempts(started_at)`. It is
-additive and applies at boot.
+additive and applies at boot. No wire change: agents on 0.6.3 keep working.
+
+Security: `POST /api/pipelines/parse-yaml` could take the process down, and `showcase` was
+a claimable slug that the boot seeder would then hand the bootstrap admin into as owner.
+Details in the Security section below.
 
 ### Upgrading
 
