@@ -137,6 +137,16 @@ impl ArtifactBackend {
         format!("artifacts/{run_id}/{step_run_id}/{name}")
     }
 
+    /// The object key inside a stored path, whatever root or bucket it was written
+    /// under — the suffix with the layout's own shape (`artifacts/<run>/<step>/<name>`),
+    /// so a root that happens to contain `artifacts/` cannot cut it in the wrong place.
+    pub fn key_of_stored_path(stored: &str) -> Option<&str> {
+        stored
+            .match_indices("artifacts/")
+            .map(|(i, _)| &stored[i..])
+            .find(|k| is_artifact_object_key(k))
+    }
+
     pub fn stored_path_for_key(&self, key: &str) -> String {
         match self {
             Self::Local { root } => root.join(key).to_string_lossy().to_string(),
@@ -616,6 +626,25 @@ mod tests {
             "only this process's own layout is swept, and the key comes back with it"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn key_of_stored_path_takes_the_layout_shaped_suffix() {
+        let run = "384c2415-e336-4d3a-82a4-a3cc75196411";
+        let step = "871edef2-b17c-465e-af40-ea36b6f57ca0";
+        let key = format!("artifacts/{run}/{step}/out__a.txt");
+        // A root that itself contains `artifacts/` must not be where the cut lands.
+        let local = format!("/srv/artifacts/data/artifacts/{key}");
+        assert_eq!(
+            ArtifactBackend::key_of_stored_path(&local),
+            Some(key.as_str())
+        );
+        let s3 = format!("s3://bucket/{key}");
+        assert_eq!(ArtifactBackend::key_of_stored_path(&s3), Some(key.as_str()));
+        assert_eq!(
+            ArtifactBackend::key_of_stored_path("/srv/artifacts/other.bin"),
+            None
+        );
     }
 
     #[test]

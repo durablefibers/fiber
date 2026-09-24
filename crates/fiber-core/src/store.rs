@@ -1844,6 +1844,20 @@ impl Store {
         Ok(tail)
     }
 
+    /// Store the row for an artifact `step_run_id` uploaded, refusing it when it would
+    /// take the step past `caps`.
+    ///
+    /// The check and the insert are one transaction under a per-step advisory lock, so
+    /// two uploads racing for the last slot cannot both see room and both land. The
+    /// routes still ask [`Store::artifact_usage_for_step`] *before* the bytes move — a
+    /// presigned URL is better refused than signed — but that answer is advice; this is
+    /// the gate. A refusal is a [`crate::StoreError::Validation`] carrying the reason,
+    /// and no row is written.
+    ///
+    /// A step is at-least-once, so the same artifact can be uploaded twice; the second
+    /// upload replaces the row rather than adding a duplicate a restore would then fetch
+    /// twice, and the row being replaced does not count against the caps. `id` and
+    /// `created_at` stay with the first row.
     pub async fn create_artifact(
         &self,
         run_id: Uuid,
@@ -1851,12 +1865,32 @@ impl Store {
         name: &str,
         path: &str,
         size: i64,
+        caps: crate::ArtifactCaps,
     ) -> Result<Artifact> {
+        let mut tx = self.pool.begin().await?;
+        // A waiter holds a pool connection, and the pool is the whole control plane's
+        // budget: bound the wait so a holder stuck behind something else degrades to one
+        // failed upload the agent retries, not to every upload for the step queued on
+        // connections. `LOCAL` scopes it to this transaction.
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        // `hashtext` folds the key to 32 bits, and the space is shared with the
+        // concurrency-group lock, which is held for a whole run start; a collision (one
+        // in 2^32) parks an upload behind that start, or a start behind this insert, and
+        // never loses either. No deadlock: both take their lock as the transaction's
+        // first statement and neither takes the other's. The lock goes with the
+        // transaction, so a refusal or a failed insert cannot hold it.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("artifact:{step_run_id}"))
+            .execute(&mut *tx)
+            .await?;
+        let (count, bytes) = Self::artifact_usage_for_step_on(&mut tx, step_run_id, name).await?;
+        if let Some(why) = caps.refusal(count, bytes, size) {
+            return Err(crate::StoreError::Validation(why).into());
+        }
         let id = Uuid::new_v4();
-        // A step is at-least-once, so the same artifact can be uploaded twice; the second
-        // upload replaces the row rather than adding a duplicate a restore would then
-        // fetch twice. `id` and `created_at` stay with the first row.
-        Ok(sqlx::query_as::<_, Artifact>(
+        let art = sqlx::query_as::<_, Artifact>(
             "INSERT INTO artifacts (id, run_id, step_run_id, name, path, size)
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (step_run_id, name) DO UPDATE
@@ -1869,8 +1903,10 @@ impl Store {
         .bind(name)
         .bind(path)
         .bind(size)
-        .fetch_one(&self.pool)
-        .await?)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(art)
     }
 
     /// `(count, total bytes)` of the artifacts this step has stored under names other
@@ -1884,13 +1920,22 @@ impl Store {
         step_run_id: Uuid,
         name: &str,
     ) -> Result<(i64, i64)> {
+        let mut conn = self.pool.acquire().await?;
+        Self::artifact_usage_for_step_on(&mut conn, step_run_id, name).await
+    }
+
+    async fn artifact_usage_for_step_on(
+        conn: &mut sqlx::PgConnection,
+        step_run_id: Uuid,
+        name: &str,
+    ) -> Result<(i64, i64)> {
         Ok(sqlx::query_as::<_, (i64, i64)>(
             "SELECT COUNT(*)::int8, COALESCE(SUM(GREATEST(size, 0)), 0)::int8
              FROM artifacts WHERE step_run_id = $1 AND name <> $2",
         )
         .bind(step_run_id)
         .bind(name)
-        .fetch_one(&self.pool)
+        .fetch_one(conn)
         .await?)
     }
 

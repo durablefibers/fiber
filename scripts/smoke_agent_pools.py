@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +41,20 @@ def req(method: str, path: str, token: str | None = None, body: dict | None = No
         except json.JSONDecodeError:
             payload = {"error": raw}
         return e.code, payload
+
+
+def put_raw(path: str, token: str, data: bytes, headers: dict[str, str]) -> tuple[int, object]:
+    """An agent's proxy artifact upload: raw bytes, the path and attempt in headers."""
+    h = {"Content-Type": "application/octet-stream", "Authorization": f"Bearer {token}", **headers}
+    r = urllib.request.Request(API + path, data=data, headers=h, method="PUT")
+    try:
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            raw = resp.read().decode()
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()[:200]
+    except Exception as e:  # a dropped connection must count, not kill the thread
+        return 0, repr(e)
 
 
 def check(name: str, cond: bool, detail: object = None) -> None:
@@ -299,6 +314,86 @@ def main() -> int:
     finished_b = wait_run(admin, rid_b, "succeeded", timeout=30)
     b_status = finished_b.get("status") or finished_b.get("run", {}).get("status")
     check("global agent runs project B", b_status == "succeeded", finished_b)
+
+    # The per-step artifact caps are enforced at the insert, under a per-step lock: uploads
+    # racing for the last slot must not all land. The scoped agent holds a step open while
+    # this script, as that agent, fires more concurrent proxy uploads than the cap allows,
+    # then counts rows. Before the lock existed every upload passed the read-then-act
+    # check and the cap was advisory against exactly this.
+    cap = int(os.environ.get("FIBER_MAX_ARTIFACTS_PER_STEP", "50"))
+    over = cap + 10
+    code, hold_pipe = req(
+        "POST",
+        f"/api/projects/{pid_a}/pipelines",
+        token=admin,
+        body={
+            "name": "pool-a-hold",
+            "definition": {
+                "name": "pool-hold",
+                "steps": [
+                    {
+                        "id": "hold",
+                        "name": "hold",
+                        "needs": [],
+                        "run": "sleep 90",
+                        "labels": ["os=linux", "pool=smoke"],
+                    }
+                ],
+            },
+        },
+    )
+    check("pipeline A hold", code in (200, 201) and "id" in hold_pipe, hold_pipe)
+    code, run_h = req("POST", f"/api/pipelines/{hold_pipe['id']}/runs", token=admin, body={})
+    check("start hold run", code in (200, 201) and "run" in run_h, run_h)
+    rid_h = run_h.get("run", {}).get("id")
+    # Both agents are online with the same labels and either may take the step; the
+    # uploads must come from whichever did, on the attempt it holds, or every one of
+    # them is a 401 for a reason unrelated to the caps.
+    tokens_by_agent = {scoped_id: scoped_tok, glob["agent"]["id"]: glob["token"]}
+    hold_sid = hold_tok = hold_attempt = None
+    deadline = time.time() + 30
+    while time.time() < deadline and not hold_sid:
+        code, steps = req("GET", f"/api/runs/{rid_h}/steps", token=admin)
+        if isinstance(steps, dict) and "steps" in steps:
+            steps = steps["steps"]
+        for st in steps if isinstance(steps, list) else []:
+            if st.get("status") == "running" and st.get("agent_id") in tokens_by_agent:
+                hold_sid = st["id"]
+                hold_tok = tokens_by_agent[st["agent_id"]]
+                hold_attempt = str(st.get("attempt", 1))
+        time.sleep(0.5)
+    check("hold step running on one of this script's agents", bool(hold_sid), steps)
+    if hold_sid:
+        results: list[int] = []
+        lock = threading.Lock()
+        gate = threading.Barrier(over)
+
+        def upload(i: int) -> None:
+            gate.wait()
+            code, _ = put_raw(
+                f"/api/agent/steps/{hold_sid}/artifacts",
+                hold_tok,
+                b"x" * 16,
+                {"X-Fiber-Artifact-Path": f"out/f{i}.txt", "X-Fiber-Attempt": hold_attempt},
+            )
+            with lock:
+                results.append(code)
+
+        threads = [threading.Thread(target=upload, args=(i,)) for i in range(over)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        accepted = results.count(200)
+        refused = results.count(400)
+        code, arts = req("GET", f"/api/runs/{rid_h}/artifacts", token=admin)
+        rows = len(arts) if isinstance(arts, list) else len(arts.get("items", []))
+        check(
+            f"{over} concurrent uploads under a cap of {cap} store exactly {cap}",
+            rows == cap and accepted == cap and refused == over - cap,
+            {"rows": rows, "accepted": accepted, "refused": refused, "other": sorted(set(results) - {200, 400})},
+        )
+        req("POST", f"/api/runs/{rid_h}/cancel", token=admin)
 
     # Cleanup
     for p in (proc, glob_proc):

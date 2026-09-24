@@ -1150,7 +1150,7 @@ async fn handle_agent(
                         let stored = match refusal {
                             Some(why) => Err(anyhow::anyhow!("{why}")),
                             None => match state.artifacts.put(&key, &bytes).await {
-                                Ok(stored_path) => state
+                                Ok(stored_path) => match state
                                     .store
                                     .create_artifact(
                                         step.run_id,
@@ -1158,9 +1158,28 @@ async fn handle_agent(
                                         &rel,
                                         &stored_path,
                                         bytes.len() as i64,
+                                        crate::artifact_util::caps_from_env(),
                                     )
                                     .await
-                                    .map(|_| ()),
+                                {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => {
+                                        // The insert is the gate the pre-check above only
+                                        // advises on; a refusal there leaves an object no
+                                        // row points at, so remove it as the HTTP paths do.
+                                        if matches!(
+                                            e.downcast_ref::<fiber_core::StoreError>(),
+                                            Some(fiber_core::StoreError::Validation(_))
+                                        ) {
+                                            crate::routes::delete_unreferenced_object(
+                                                &state,
+                                                &stored_path,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e)
+                                    }
+                                },
                                 Err(e) => Err(e),
                             },
                         };

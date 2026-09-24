@@ -1169,11 +1169,21 @@ async fn agent_upload_artifact(
         .put(&key, &body)
         .await
         .map_err(ApiError::from)?;
-    let art = state
+    let art = match state
         .store
-        .create_artifact(step.run_id, step_run_id, &rel, &stored, body.len() as i64)
+        .create_artifact(
+            step.run_id,
+            step_run_id,
+            &rel,
+            &stored,
+            body.len() as i64,
+            crate::artifact_util::caps_from_env(),
+        )
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(art) => art,
+        Err(e) => return Err(artifact_row_failure(&state, &stored, e).await),
+    };
     Ok(Json(json!({
         "id": art.id,
         "name": art.name,
@@ -1214,7 +1224,7 @@ pub(crate) async fn artifact_cap_refusal(
         .store
         .artifact_usage_for_step(step_run_id, name)
         .await?;
-    Ok(crate::artifact_util::ArtifactCaps::from_env().refusal(count, bytes, size))
+    Ok(crate::artifact_util::caps_from_env().refusal(count, bytes, size))
 }
 
 /// Whether an agent's artifact call is for a step it still holds, on the attempt it
@@ -1372,7 +1382,7 @@ async fn agent_complete_artifact(
         };
         return Err(reject_uploaded_object(&state, &body.stored_path, why).await);
     }
-    let art = state
+    let art = match state
         .store
         .create_artifact(
             step.run_id,
@@ -1380,14 +1390,32 @@ async fn agent_complete_artifact(
             &rel,
             &body.stored_path,
             body.size as i64,
+            crate::artifact_util::caps_from_env(),
         )
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(art) => art,
+        Err(e) => return Err(artifact_row_failure(&state, &body.stored_path, e).await),
+    };
     Ok(Json(json!({
         "id": art.id,
         "name": art.name,
         "size": art.size,
     })))
+}
+
+/// The insert is the gate the pre-check only advises on (`Store::create_artifact` checks
+/// the caps again under a per-step lock): a refusal there means the bytes are already
+/// stored with no row to find them by, so remove them as a rejected `complete` would.
+/// Any other error is the store failing, and the object is left for the retention sweep
+/// the way a crash between the two would leave it.
+async fn artifact_row_failure(state: &AppState, stored_path: &str, e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<fiber_core::StoreError>() {
+        Some(fiber_core::StoreError::Validation(why)) => {
+            reject_uploaded_object(state, stored_path, why.clone()).await
+        }
+        _ => ApiError::from(e),
+    }
 }
 
 /// Refuse a completed upload and remove the object it left behind.
@@ -1397,13 +1425,61 @@ async fn agent_complete_artifact(
 /// cheap half of that leak; the prefix sweep in `retention.rs` catches whatever this
 /// misses (a crash between the PUT and the `complete`, say).
 async fn reject_uploaded_object(state: &AppState, stored_path: &str, why: String) -> ApiError {
+    delete_unreferenced_object(state, stored_path).await;
+    ApiError::BadRequest(why)
+}
+
+/// Remove the object behind a refused upload — unless a row still points at it.
+///
+/// Object keys are not injective over artifact names (`out/log` and `out__log` share
+/// one), and a same-name re-upload lands on the key its committed row already
+/// references. Deleting on refusal in either case would leave that row pointing at
+/// nothing, and a dependent step's restore would fail on an artifact the run lists.
+/// A referenced object stays; only an object no row can find is removed. Best effort
+/// either way: what this misses, the orphan sweep in `retention.rs` picks up.
+///
+/// Asked by path and by key, as the sweep asks: a row written by a release that did
+/// not canonicalise the local root spells the same object differently, and a delete
+/// that trusted the path alone would take it out from under that row.
+pub(crate) async fn delete_unreferenced_object(state: &AppState, stored_path: &str) {
+    let path = [stored_path.to_string()];
+    let by_path = state.store.artifact_paths_still_referenced(&path);
+    let key =
+        crate::artifacts::ArtifactBackend::key_of_stored_path(stored_path).map(str::to_string);
+    let by_key = async {
+        match key {
+            Some(k) => state.store.artifact_keys_still_referenced(&[k]).await,
+            None => Ok(vec![]),
+        }
+    };
+    let referenced = match tokio::try_join!(by_path, by_key) {
+        Ok((paths, keys)) => Ok(!paths.is_empty() || !keys.is_empty()),
+        Err(e) => Err(e),
+    };
+    match referenced {
+        Ok(true) => {
+            tracing::warn!(
+                stored_path,
+                "refused upload landed on an object a row still references; keeping it"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                stored_path,
+                error = format!("{e:#}"),
+                "could not check whether a refused upload's object is referenced; keeping it"
+            );
+            return;
+        }
+    }
     if let Err(e) = state.artifacts.delete(stored_path).await {
         tracing::warn!(
             stored_path, error = %e,
             "could not delete the object behind a rejected artifact upload"
         );
     }
-    ApiError::BadRequest(why)
 }
 
 /// Restore download. An agent may only read artifacts produced by the steps its own
