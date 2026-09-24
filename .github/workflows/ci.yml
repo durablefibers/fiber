@@ -210,8 +210,8 @@ jobs:
   # compose smoke proves the stack boots and runs one pipeline; this proves the
   # role gate, the project-scoped agent pools, and artifact upload/restore.
   #
-  # Deliberately NOT a required status check — see the pull request description. Making
-  # it one means editing the `main` ruleset, which pins job names.
+  # ⚠ `smoke-host` is pinned as a required status check by the `main` ruleset — see
+  # `check`. It became one after catching five real regressions in its first week.
   smoke-host:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

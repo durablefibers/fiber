@@ -27,19 +27,41 @@ pointed Compose at them, so a deployment no longer needs a build toolchain. `v0.
 agent that cannot reach object storage transfer artifacts through the API instead, which is
 what the containerised agent needs, and added `/metrics`.
 
+`v0.6.0`–`v0.6.4` shipped the September hardening audit: per-pipeline concurrency groups
+with cancel-in-progress, FIFO by enqueue time, a step-validation boundary on `image:` and
+`workspace.repo`, guarded status transitions with an attempt cap, leases that survive an
+agent or API restart, batched log ingest with a per-step cap and a `resync` frame for
+viewers that fall behind, cooperative fiber cancel with a `cancelled` status, the task-list
+endpoint, fiber retention, supervised background loops surfaced in `/ready`, a non-root
+`fiber-api` image, Compose that refuses defaulted credentials, `cargo-deny` and SHA-pinned
+actions in CI, and build provenance on every release asset and image.
+
 | # | Item | Goal |
 |---|---|---|
 | 1 | **Dogfood on this repo** | Point a public Fiber at `durablefibers/fiber` with a webhook secret set, build `fiber.yml` on a labeled agent, require the commit status on pull requests, and fix what breaks under real push/PR traffic. Needs a public URL for the instance. |
+| 2 | **One step-validation module** | `fiber_proto::validate` is called by compile, offer and agent for `image:` and `workspace.repo`; extend it to every field a step carries, with the agent treating the server as untrusted, so a new YAML field cannot bypass the boundary. |
+| 3 | **Status transitions as a state machine** | `StepTransition` / `RunTransition` enums, one guarded `UPDATE … WHERE status IN (…) RETURNING` each, `inflight` derived from the database; split `store.rs` by aggregate along the `*_on(&mut PgConnection)` seam. |
+| 4 | **Secrets key rotation and admin recovery** | Key id in the ciphertext prefix, AAD bound to `(project_id, name)`, `FIBER_SECRETS_KEY_PREVIOUS` decrypt-only, `fiber secrets rekey`; `fiber users reset-password` for a locked-out admin. Neither can be done today without raw SQL. |
+| 5 | **Control-plane work on `fiber-durable`** | Commit statuses, PR file listing, retention and rekey as registered tasks with claims and retries — webhook idempotency and status-report retry fall out of it, and it dogfoods the runtime the product advertises. |
+| 6 | **Throughput tier** | Persistent per-repo git mirror, streaming artifact upload/download, push-based offers over a Redis wake, label matching in SQL, leader-elected sweeps with jitter. Needed before autoscaling pools make sense. |
+| 7 | **Rolling-deploy contract** | An N-1 job in CI that boots the previous image against the PR-migrated database, an expand/contract rule in [operations](./operations.md), `PROTOCOL_VERSION` gating for agents. Prerequisite for any multi-replica claim. |
+| 8 | **End-to-end coverage** | Smoke scenarios for every feature since 0.3 (retry, cancel, groups, statuses, fibers, untrusted PRs, timeouts, retention) and a Playwright login → run flow inside the compose job. |
+| 9 | **Operator kit** | `alerts.yml`, the disaster matrix and backup ordering, JSON logs and request ids, a Postgres major-upgrade runbook, and a `deploy/.env` that can drive every documented knob. |
+
+Three follow-ups the audit deferred and the changelog records: a visible *failed* run when a
+stored pipeline no longer compiles (needs a `runs.error` column), artifact caps enforced by
+a conditional insert rather than advisory, and pipeline `env` shared in the run snapshot
+rather than repeated per step (a wire change).
 
 ## Later
 
 | Area | Ideas |
 |---|---|
-| **Pipeline YAML** | Artifact globs, richer `if` (`failure()`, `&&`, `\|\|`), branch globs |
-| **Scheduling** | Per-project / per-pipeline concurrency with cancel-in-progress, FIFO by `created_at`, single-step cancel, batched log inserts with a per-step cap |
-| **Durable fibers** | A user-definable task type (shell on an agent), task list endpoint, cooperative cancel + `cancelled` status, resumes not counted as attempts, events on `fiber:events`, retention |
-| **Observability** | JSON logs, request ids, supervised background loops surfaced in `/ready` |
-| **Packaging** | Run `fiber-api` as a non-root user (needs a chown path for existing artifact volumes); a runtime-configurable UI image so it can be published; build attestations for release assets |
+| **Pipeline YAML** | Artifact globs, richer `if` (`failure()`, `&&`, `\|\|` — today they are rejected at save time rather than silently false), branch globs |
+| **Scheduling** | Single-step cancel |
+| **Durable fibers** | A user-definable task type (shell on an agent), resumes not counted as attempts, events on `fiber:events` |
+| **Observability** | JSON logs, request ids (also under **Next** 9) |
+| **Packaging** | A runtime-configurable UI image so it can be published (`VITE_FIBER_API_URL` is baked at build time) |
 | **Sessions** | Sliding expiry |
 | **SCM** | GitLab / Bitbucket webhooks; multibranch indexing |
 | **Secrets** | Vault / OIDC / external secret stores (beyond encrypted project secrets) |

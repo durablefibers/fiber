@@ -160,13 +160,16 @@ jobs:
     needs: images
     runs-on: ubuntu-24.04
     # `packages: write` pushes the manifest list *and* the attestation referrer next to
-    # it in GHCR; `id-token`/`attestations` mint and store the provenance itself. This
-    # job never touches release assets, so it has no `contents: write`.
+    # it in GHCR; `id-token`/`attestations` mint and store the provenance itself;
+    # `artifact-metadata: write` lets the action also record the image digest as an
+    # artifact-metadata storage record (v4 warns without it — the attestation itself is
+    # unaffected). This job never touches release assets, so it has no `contents: write`.
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     strategy:
       matrix:
         name: [fiber-api, fiber-agent]
