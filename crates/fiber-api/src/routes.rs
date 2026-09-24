@@ -1169,11 +1169,21 @@ async fn agent_upload_artifact(
         .put(&key, &body)
         .await
         .map_err(ApiError::from)?;
-    let art = state
+    let art = match state
         .store
-        .create_artifact(step.run_id, step_run_id, &rel, &stored, body.len() as i64)
+        .create_artifact(
+            step.run_id,
+            step_run_id,
+            &rel,
+            &stored,
+            body.len() as i64,
+            crate::artifact_util::caps_from_env(),
+        )
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(art) => art,
+        Err(e) => return Err(artifact_row_failure(&state, &stored, e).await),
+    };
     Ok(Json(json!({
         "id": art.id,
         "name": art.name,
@@ -1214,7 +1224,7 @@ pub(crate) async fn artifact_cap_refusal(
         .store
         .artifact_usage_for_step(step_run_id, name)
         .await?;
-    Ok(crate::artifact_util::ArtifactCaps::from_env().refusal(count, bytes, size))
+    Ok(crate::artifact_util::caps_from_env().refusal(count, bytes, size))
 }
 
 /// Whether an agent's artifact call is for a step it still holds, on the attempt it
@@ -1372,7 +1382,7 @@ async fn agent_complete_artifact(
         };
         return Err(reject_uploaded_object(&state, &body.stored_path, why).await);
     }
-    let art = state
+    let art = match state
         .store
         .create_artifact(
             step.run_id,
@@ -1380,14 +1390,32 @@ async fn agent_complete_artifact(
             &rel,
             &body.stored_path,
             body.size as i64,
+            crate::artifact_util::caps_from_env(),
         )
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(art) => art,
+        Err(e) => return Err(artifact_row_failure(&state, &body.stored_path, e).await),
+    };
     Ok(Json(json!({
         "id": art.id,
         "name": art.name,
         "size": art.size,
     })))
+}
+
+/// The insert is the gate the pre-check only advises on (`Store::create_artifact` checks
+/// the caps again under a per-step lock): a refusal there means the bytes are already
+/// stored with no row to find them by, so remove them as a rejected `complete` would.
+/// Any other error is the store failing, and the object is left for the retention sweep
+/// the way a crash between the two would leave it.
+async fn artifact_row_failure(state: &AppState, stored_path: &str, e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<fiber_core::StoreError>() {
+        Some(fiber_core::StoreError::Validation(why)) => {
+            reject_uploaded_object(state, stored_path, why.clone()).await
+        }
+        _ => ApiError::from(e),
+    }
 }
 
 /// Refuse a completed upload and remove the object it left behind.

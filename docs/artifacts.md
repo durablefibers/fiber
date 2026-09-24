@@ -47,11 +47,12 @@ and again when a direct upload is completed. Re-uploading the *same* name does n
 twice: a step is at-least-once, and its row is replaced rather than added. Over a cap, the
 upload is a 400 and the step fails with the server's reason in its log.
 
-The check reads the step's current usage and then acts, so two uploads racing each other
-can overshoot the byte cap by one artifact. The stock agent uploads a step's artifacts one
-at a time; overshooting needs a modified agent, which already holds that project's
-secrets. Treat the caps as a bound on accident and runaway loops, not as a quota against
-a hostile agent.
+The checks before the bytes move are advice — a presigned URL is better refused than
+signed. The gate is the row: `create_artifact` re-checks the caps under a per-step lock in
+the transaction that inserts it, so two uploads racing for the last slot cannot both see
+room and both land. An upload refused there has already stored its bytes, and the object
+is deleted the way a rejected `complete` is. The caps hold against a modified agent, not
+only the stock one that uploads a step's artifacts one at a time.
 
 ### When an upload fails
 

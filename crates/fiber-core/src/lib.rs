@@ -1,3 +1,4 @@
+pub mod artifact_caps;
 pub mod dag;
 pub mod db;
 pub mod due_index;
@@ -13,6 +14,7 @@ pub mod store;
 pub mod tokens;
 mod toolchain_audit;
 
+pub use artifact_caps::ArtifactCaps;
 pub use dag::{CompiledDag, DagError, compile_definition};
 pub use due_index::DueIndex;
 pub use error::{SecretDecryptError, StoreError};
