@@ -53,6 +53,8 @@ def put_raw(path: str, token: str, data: bytes, headers: dict[str, str]) -> tupl
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()[:200]
+    except Exception as e:  # a dropped connection must count, not kill the thread
+        return 0, repr(e)
 
 
 def check(name: str, cond: bool, detail: object = None) -> None:
@@ -344,17 +346,23 @@ def main() -> int:
     code, run_h = req("POST", f"/api/pipelines/{hold_pipe['id']}/runs", token=admin, body={})
     check("start hold run", code in (200, 201) and "run" in run_h, run_h)
     rid_h = run_h.get("run", {}).get("id")
-    hold_sid = None
+    # Both agents are online with the same labels and either may take the step; the
+    # uploads must come from whichever did, on the attempt it holds, or every one of
+    # them is a 401 for a reason unrelated to the caps.
+    tokens_by_agent = {scoped_id: scoped_tok, glob["agent"]["id"]: glob["token"]}
+    hold_sid = hold_tok = hold_attempt = None
     deadline = time.time() + 30
     while time.time() < deadline and not hold_sid:
         code, steps = req("GET", f"/api/runs/{rid_h}/steps", token=admin)
         if isinstance(steps, dict) and "steps" in steps:
             steps = steps["steps"]
         for st in steps if isinstance(steps, list) else []:
-            if st.get("status") == "running":
+            if st.get("status") == "running" and st.get("agent_id") in tokens_by_agent:
                 hold_sid = st["id"]
+                hold_tok = tokens_by_agent[st["agent_id"]]
+                hold_attempt = str(st.get("attempt", 1))
         time.sleep(0.5)
-    check("hold step running on the scoped agent", bool(hold_sid), steps)
+    check("hold step running on one of this script's agents", bool(hold_sid), steps)
     if hold_sid:
         results: list[int] = []
         lock = threading.Lock()
@@ -364,9 +372,9 @@ def main() -> int:
             gate.wait()
             code, _ = put_raw(
                 f"/api/agent/steps/{hold_sid}/artifacts",
-                scoped_tok,
+                hold_tok,
                 b"x" * 16,
-                {"X-Fiber-Artifact-Path": f"out/f{i}.txt", "X-Fiber-Attempt": "1"},
+                {"X-Fiber-Artifact-Path": f"out/f{i}.txt", "X-Fiber-Attempt": hold_attempt},
             )
             with lock:
                 results.append(code)

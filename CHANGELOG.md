@@ -8,20 +8,21 @@ minor versions may carry breaking changes.
 
 ### Fixed
 
-- **The per-step artifact caps are enforced at the insert, not only before it.** The
-  count and byte caps were checked by reading the step's usage and then acting, so two
-  uploads racing for the last slot both saw room and both landed — `FIBER_MAX_ARTIFACTS_PER_STEP`
+- **The per-step artifact caps are enforced at the insert, not only before it.** The count
+  and byte caps were checked by reading the step's usage and then acting, so two uploads
+  racing for the last slot both saw room and both landed — `FIBER_MAX_ARTIFACTS_PER_STEP`
   (50) held against the stock agent, which uploads one artifact at a time, and against
   nothing else. `Store::create_artifact` now takes the caps and re-checks them under a
   per-step advisory lock in the transaction that inserts the row; a refusal there writes
   nothing and, since the bytes are already stored, deletes the object the way a rejected
   `complete` does. The checks before the bytes move stay as advice (a presigned URL is
   better refused than signed). Verified with 20 concurrent proxy uploads into one running
-  step under a cap of 5: exactly 5 rows, 15 refusals; the same script against 0.6.4
-  stored 6. The pools smoke now runs that race (cap + 10 uploads) and counts rows, so
-  the gap cannot come back quietly. A refused proxy upload also carries the server's
-  reason into the step log now, as the presign path already did. The decision (`ArtifactCaps`) moved into `fiber-core` next to the store
-  that enforces it. [artifacts](docs/artifacts.md#caps).
+  step under a cap of 5: exactly 5 rows, 15 refusals; the same script against 0.6.4 stored
+  6. The pools smoke now runs that race (cap + 10 uploads) and counts rows, so the gap
+  cannot come back quietly. A refused proxy upload also carries the server's reason into
+  the step log now, as the presign path already did. The decision (`ArtifactCaps`) moved
+  into `fiber-core` next to the store that enforces it.
+  [artifacts](docs/artifacts.md#caps).
 
 ## [0.6.4] — 2026-09-22
 

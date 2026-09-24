@@ -1437,13 +1437,27 @@ async fn reject_uploaded_object(state: &AppState, stored_path: &str, why: String
 /// nothing, and a dependent step's restore would fail on an artifact the run lists.
 /// A referenced object stays; only an object no row can find is removed. Best effort
 /// either way: what this misses, the orphan sweep in `retention.rs` picks up.
+///
+/// Asked by path and by key, as the sweep asks: a row written by a release that did
+/// not canonicalise the local root spells the same object differently, and a delete
+/// that trusted the path alone would take it out from under that row.
 pub(crate) async fn delete_unreferenced_object(state: &AppState, stored_path: &str) {
-    match state
-        .store
-        .artifact_paths_still_referenced(std::slice::from_ref(&stored_path.to_string()))
-        .await
-    {
-        Ok(referenced) if !referenced.is_empty() => {
+    let path = [stored_path.to_string()];
+    let by_path = state.store.artifact_paths_still_referenced(&path);
+    let key =
+        crate::artifacts::ArtifactBackend::key_of_stored_path(stored_path).map(str::to_string);
+    let by_key = async {
+        match key {
+            Some(k) => state.store.artifact_keys_still_referenced(&[k]).await,
+            None => Ok(vec![]),
+        }
+    };
+    let referenced = match tokio::try_join!(by_path, by_key) {
+        Ok((paths, keys)) => Ok(!paths.is_empty() || !keys.is_empty()),
+        Err(e) => Err(e),
+    };
+    match referenced {
+        Ok(true) => {
             tracing::warn!(
                 stored_path,
                 "refused upload landed on an object a row still references; keeping it"
