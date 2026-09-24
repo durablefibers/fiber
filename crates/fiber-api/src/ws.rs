@@ -1171,14 +1171,11 @@ async fn handle_agent(
                                             e.downcast_ref::<fiber_core::StoreError>(),
                                             Some(fiber_core::StoreError::Validation(_))
                                         ) {
-                                            if let Err(del) =
-                                                state.artifacts.delete(&stored_path).await
-                                            {
-                                                tracing::warn!(
-                                                    %stored_path, error = %del,
-                                                    "could not delete the object behind a refused artifact"
-                                                );
-                                            }
+                                            crate::routes::delete_unreferenced_object(
+                                                &state,
+                                                &stored_path,
+                                            )
+                                            .await;
                                         }
                                         Err(e)
                                     }

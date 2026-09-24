@@ -18,7 +18,9 @@ minor versions may carry breaking changes.
   `complete` does. The checks before the bytes move stay as advice (a presigned URL is
   better refused than signed). Verified with 20 concurrent proxy uploads into one running
   step under a cap of 5: exactly 5 rows, 15 refusals; the same script against 0.6.4
-  stored 6. The decision (`ArtifactCaps`) moved into `fiber-core` next to the store
+  stored 6. The pools smoke now runs that race (cap + 10 uploads) and counts rows, so
+  the gap cannot come back quietly. A refused proxy upload also carries the server's
+  reason into the step log now, as the presign path already did. The decision (`ArtifactCaps`) moved into `fiber-core` next to the store
   that enforces it. [artifacts](docs/artifacts.md#caps).
 
 ## [0.6.4] — 2026-09-22

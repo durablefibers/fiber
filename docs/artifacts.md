@@ -51,8 +51,11 @@ The checks before the bytes move are advice — a presigned URL is better refuse
 signed. The gate is the row: `create_artifact` re-checks the caps under a per-step lock in
 the transaction that inserts it, so two uploads racing for the last slot cannot both see
 room and both land. An upload refused there has already stored its bytes, and the object
-is deleted the way a rejected `complete` is. The caps hold against a modified agent, not
-only the stock one that uploads a step's artifacts one at a time.
+is deleted the way a rejected `complete` is — unless a row still points at it, since a
+same-name re-upload lands on the object its earlier row references. That case keeps the
+object, so a re-upload refused by the byte cap leaves its row describing the old size of
+bytes that were already replaced; the step fails either way. The caps hold against a
+modified agent, not only the stock one that uploads a step's artifacts one at a time.
 
 ### When an upload fails
 

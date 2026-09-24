@@ -3247,9 +3247,13 @@ async fn upload_via_proxy(
     if resp.status().is_success() {
         Ok("proxy".into())
     } else {
+        // The body names the cap and its limit; without it a refused upload reads as a
+        // bare `HTTP 400` and the reason is only in the server log.
+        let status = resp.status();
+        let why = error_detail(resp).await;
         Err(ApiFailure::from_status(
-            resp.status(),
-            format!("upload {rel} failed: HTTP {}", resp.status()),
+            status,
+            format!("upload {rel} failed: HTTP {status}{why}"),
         ))
     }
 }

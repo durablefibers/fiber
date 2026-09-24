@@ -1425,13 +1425,47 @@ async fn artifact_row_failure(state: &AppState, stored_path: &str, e: anyhow::Er
 /// cheap half of that leak; the prefix sweep in `retention.rs` catches whatever this
 /// misses (a crash between the PUT and the `complete`, say).
 async fn reject_uploaded_object(state: &AppState, stored_path: &str, why: String) -> ApiError {
+    delete_unreferenced_object(state, stored_path).await;
+    ApiError::BadRequest(why)
+}
+
+/// Remove the object behind a refused upload — unless a row still points at it.
+///
+/// Object keys are not injective over artifact names (`out/log` and `out__log` share
+/// one), and a same-name re-upload lands on the key its committed row already
+/// references. Deleting on refusal in either case would leave that row pointing at
+/// nothing, and a dependent step's restore would fail on an artifact the run lists.
+/// A referenced object stays; only an object no row can find is removed. Best effort
+/// either way: what this misses, the orphan sweep in `retention.rs` picks up.
+pub(crate) async fn delete_unreferenced_object(state: &AppState, stored_path: &str) {
+    match state
+        .store
+        .artifact_paths_still_referenced(std::slice::from_ref(&stored_path.to_string()))
+        .await
+    {
+        Ok(referenced) if !referenced.is_empty() => {
+            tracing::warn!(
+                stored_path,
+                "refused upload landed on an object a row still references; keeping it"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                stored_path,
+                error = format!("{e:#}"),
+                "could not check whether a refused upload's object is referenced; keeping it"
+            );
+            return;
+        }
+    }
     if let Err(e) = state.artifacts.delete(stored_path).await {
         tracing::warn!(
             stored_path, error = %e,
             "could not delete the object behind a rejected artifact upload"
         );
     }
-    ApiError::BadRequest(why)
 }
 
 /// Restore download. An agent may only read artifacts produced by the steps its own

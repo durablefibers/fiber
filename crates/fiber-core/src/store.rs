@@ -1868,10 +1868,19 @@ impl Store {
         caps: crate::ArtifactCaps,
     ) -> Result<Artifact> {
         let mut tx = self.pool.begin().await?;
+        // A waiter holds a pool connection, and the pool is the whole control plane's
+        // budget: bound the wait so a holder stuck behind something else degrades to one
+        // failed upload the agent retries, not to every upload for the step queued on
+        // connections. `LOCAL` scopes it to this transaction.
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
         // `hashtext` folds the key to 32 bits, and the space is shared with the
-        // concurrency-group lock; a collision only makes two unrelated writers wait on
-        // each other for the length of one insert. The lock goes with the transaction,
-        // so a refusal or a failed insert cannot hold it.
+        // concurrency-group lock, which is held for a whole run start; a collision (one
+        // in 2^32) parks an upload behind that start, or a start behind this insert, and
+        // never loses either. No deadlock: both take their lock as the transaction's
+        // first statement and neither takes the other's. The lock goes with the
+        // transaction, so a refusal or a failed insert cannot hold it.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(format!("artifact:{step_run_id}"))
             .execute(&mut *tx)
