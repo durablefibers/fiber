@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-09-25
+
+One fix: the per-step artifact caps are now hard limits. No migration and no wire change —
+agents on 0.6.4 keep working.
+
 ### Fixed
 
 - **The per-step artifact caps are enforced at the insert, not only before it.** The count
