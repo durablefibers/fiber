@@ -6,6 +6,16 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **A macOS agent that runs Docker steps now warns at startup.** Docker Desktop's file
+  sharing intermittently loses files a build has just written, so `cargo` fails with
+  `can't find crate for …` naming a crate it compiled seconds earlier (#90). Reproduced
+  without Fiber: a plain `docker run` of `cargo test --workspace --no-run` on a bind-mounted
+  macOS directory failed 4 builds out of 10, and the same loop inside Docker's Linux VM
+  passed 3 out of 3. Run agents that execute Docker steps on Linux.
+  [agents](docs/agents.md#macos-and-docker-desktop).
+
 ### Fixed
 
 - **The per-step artifact caps are enforced at the insert, not only before it.** The count

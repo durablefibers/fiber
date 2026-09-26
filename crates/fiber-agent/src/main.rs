@@ -1418,6 +1418,18 @@ async fn main() -> Result<()> {
         }
     }
     info!(workspace_dir = %args.workspace_dir.display(), "workspace root");
+    // A macOS workspace reaches step containers through Docker Desktop's file sharing,
+    // which intermittently loses files a build has just written — `cargo` fails with
+    // `can't find crate for …` naming a crate it compiled seconds earlier. Same image and
+    // command on a Linux filesystem pass (#90). Warned, not refused: plenty of steps
+    // never hit it, and a laptop agent is still useful for trying Fiber out.
+    if cfg!(target_os = "macos") && args.use_docker {
+        warn!(
+            "docker steps on macOS run through Docker Desktop file sharing, which can drop \
+             freshly written build output mid-step; run production agents on Linux \
+             (see docs/agents.md#macos-and-docker-desktop)"
+        );
+    }
     // Anything left from a previous process (crash, kill -9) is nobody's to finish.
     sweep_stale_workspaces(&args.workspace_dir, args.workspace_ttl_hours).await;
     // One set for the life of the process: the sweep below excludes this boot id, and
