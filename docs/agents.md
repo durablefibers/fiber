@@ -413,6 +413,21 @@ need distinct names anyway.
 refuses a relative bind source, so the documented default `./data/workspaces` could not be
 used in docker mode before.
 
+### macOS and Docker Desktop
+
+Run agents that execute Docker steps on **Linux**. On macOS, a step's workspace reaches its
+container through Docker Desktop's file sharing, and that path intermittently loses files a
+build has just written. `cargo` then fails with `error[E0463]: can't find crate for …`,
+naming a crate it logged as `Compiling` seconds earlier, and a different crate each time.
+The agent logs a warning at startup when it runs Docker steps on macOS.
+
+This is Docker Desktop, not Fiber. A plain `docker run` of `cargo test --workspace --no-run`
+in `rust:1.98-bookworm` on a bind-mounted macOS directory failed 4 builds out of 10 with
+no agent involved. The same loop on a directory inside Docker's Linux VM passed 3 out of 3,
+and so did two full runs of this repository's `fiber.yml` on a Linux agent against
+that VM-local directory ([#90](https://github.com/durablefibers/fiber/issues/90)). A macOS
+agent is fine for trying Fiber out, and for shell steps (`image:` omitted).
+
 Steps and git run with no stdin and `GIT_TERMINAL_PROMPT=0`: anything that would wait on a terminal fails at once instead of at the timeout. Git is limited to the `file`, `git`, `http`, `https`, and `ssh` transports (`GIT_ALLOW_PROTOCOL`, unless the operator set it), and the agent refuses a `workspace.repo` that is not one of those or an scp-like `user@host:path`, so the `ext::` transport — which runs a command on the host — is unreachable however the definition was written. A credential in the remote URL is masked in the log.
 
 ## What a step can see
