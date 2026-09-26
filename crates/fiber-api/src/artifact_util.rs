@@ -23,7 +23,9 @@ pub fn caps_from_env() -> ArtifactCaps {
 /// Sanitize a workspace-relative artifact path. Rejects `..` and absolute paths.
 pub fn sanitize_artifact_rel_path(name: &str) -> Option<String> {
     let name = name.trim().trim_start_matches('/').trim_start_matches('\\');
-    if name.is_empty() || name.contains("..") {
+    // `..` as a component is refused by the predicate below; `app..tar` is a file name,
+    // and refusing it here while compile accepted it failed the upload on every run.
+    if name.is_empty() {
         return None;
     }
     let cleaned: String = name
@@ -90,10 +92,51 @@ mod tests {
     fn rejects_traversal_and_empty() {
         assert_eq!(sanitize_artifact_rel_path("../secret"), None);
         assert_eq!(sanitize_artifact_rel_path("out/../../secret"), None);
-        assert_eq!(sanitize_artifact_rel_path("a/..b"), None);
         assert_eq!(sanitize_artifact_rel_path(""), None);
         assert_eq!(sanitize_artifact_rel_path("   "), None);
         assert_eq!(sanitize_artifact_rel_path("/"), None);
+    }
+
+    #[test]
+    fn a_double_dot_inside_a_file_name_is_not_traversal() {
+        // Compile and the agent accept these (a `..` *component* is what escapes); the
+        // server refusing them failed the upload on every run instead.
+        assert_eq!(
+            sanitize_artifact_rel_path("dist/app..tar").as_deref(),
+            Some("dist/app..tar")
+        );
+        assert_eq!(
+            sanitize_artifact_rel_path("a/..b").as_deref(),
+            Some("a/..b")
+        );
+        assert_eq!(sanitize_artifact_rel_path(".."), None);
+    }
+
+    #[test]
+    fn never_stores_a_name_the_agent_would_refuse_to_restore() {
+        for raw in [
+            "./x",
+            "/./x",
+            " ./x",
+            "\\./x",
+            ".",
+            "a/./b",
+            "dir/",
+            "a b/c",
+            "../x",
+            "x/..",
+            "ünï/cødé",
+            "a\tb",
+            "..b",
+            "app..tar",
+        ] {
+            if let Some(stored) = sanitize_artifact_rel_path(raw) {
+                assert!(
+                    fiber_proto::validate::artifact_path_ok(&stored),
+                    "{raw:?} stored as {stored:?}, which the agent refuses"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2843,7 +2843,7 @@ async fn write_restored(work_dir: &Path, rel: &str, bytes: &[u8]) -> Result<Path
         // Not at open: that would shorten a hard-linked file before the check below
         // refuses it. Truncated with `set_len` once it is known to be ours.
         .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(&cur)
         .await
         .with_context(|| format!("open {}", cur.display()))?;
