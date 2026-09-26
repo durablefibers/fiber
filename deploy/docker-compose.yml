@@ -10,7 +10,7 @@ name: fiber
 #
 # Networks: everything shares `backend`, except the agent, which sits alone with the API
 # on `agentnet`. Pipeline steps are repo-supplied shell, so an agent that could reach
-# fiber-postgres / fiber-redis / fiber-minio directly would hand every pipeline author the
+# fiber-postgres / fiber-redis / fiber-s3 directly would hand every pipeline author the
 # control plane.
 networks:
   backend:
@@ -79,39 +79,48 @@ services:
       timeout: 3s
       retries: 10
 
-  # Optional: `docker compose --profile minio up -d`, together with
+  # Optional: `docker compose --profile s3 up -d`, together with
   # FIBER_S3_BUCKET=fiber-artifacts in deploy/.env. Without both, fiber-api stores
   # artifact blobs on the fiber_artifacts volume (docs/artifacts.md) and this service
-  # never starts. MinIO is what a multi-host deployment wants — presigned URLs let
+  # never starts. An S3 store is what a multi-host deployment wants — presigned URLs let
   # agents upload without going through the API — but it is not a dependency of running
   # a pipeline.
-  fiber-minio:
-    profiles: ["minio"]
+  fiber-s3:
+    profiles: ["s3"]
     networks: [backend]
-    # quay.io, not Docker Hub: `minio/minio` there now refuses anonymous pulls with
-    # "pull access denied ... repository does not exist", so a machine without the image
-    # already cached — a new contributor, or CI — cannot bring the stack up at all.
-    # Pinned, not `:latest`: a fresh host would otherwise pull a MinIO nobody has
-    # smoke-tested, and the presign behaviour the artifact path depends on is exactly the
-    # sort of thing a server release changes. This digest-equivalent tag is what `:latest`
-    # resolved to when it was pinned; Dependabot's docker ecosystem watches /deploy.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # RustFS, an S3-compatible server. This was MinIO until quay.io/minio/minio began
+    # refusing anonymous pulls (Docker Hub's minio/minio had already gone the same way),
+    # so a machine without the image cached — a new contributor, or CI — could not bring
+    # the profile up at all. Pinned, not `:latest`: the presign behaviour the artifact
+    # path depends on is exactly what a server release changes, and 1.0.0 is the version
+    # `scripts/smoke_s3_presign.py` passed against. Dependabot's docker ecosystem
+    # watches /deploy.
+    image: rustfs/rustfs:1.0.0
     restart: unless-stopped
     logging: *logging
-    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      # Required even when the minio profile is off: Compose interpolates the whole file
-      # before it filters by profile. Left unset, MinIO would fall back to its own
-      # minioadmin/minioadmin.
-      MINIO_ROOT_USER: ${FIBER_S3_ACCESS_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
-      MINIO_ROOT_PASSWORD: ${FIBER_S3_SECRET_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+      # Required even when the s3 profile is off: Compose interpolates the whole file
+      # before it filters by profile. Left unset, RustFS would fall back to its own
+      # rustfsadmin/rustfsadmin.
+      RUSTFS_ACCESS_KEY: ${FIBER_S3_ACCESS_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+      RUSTFS_SECRET_KEY: ${FIBER_S3_SECRET_KEY:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+      # Empty = stdout. The image's default is a file under /logs in the container's
+      # writable layer, where `docker compose logs` cannot see it and the json-file cap
+      # above does not apply.
+      RUSTFS_OBS_LOG_DIRECTORY: ""
+      # The image allows `*`; the console is only published on loopback, so that is the
+      # one origin that needs it.
+      RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: http://127.0.0.1:19001
     ports:
       - "127.0.0.1:19000:9000"
+      # Console at http://127.0.0.1:19001/rustfs/console/
       - "127.0.0.1:19001:9001"
     volumes:
-      - fiber_minio:/data
+      # A new volume, not the old fiber_minio: RustFS is not handed MinIO's on-disk
+      # format. Moving existing objects is in docs/operations.md#upgrades.
+      - fiber_s3:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -160,10 +169,10 @@ services:
       FIBER_LISTEN: 0.0.0.0:8080
       FIBER_ARTIFACTS_DIR: /data/artifacts
       # Empty = the local filesystem backend on the fiber_artifacts volume. Set this to
-      # a bucket name and start the `minio` profile (or point the endpoint at real S3)
+      # a bucket name and start the `s3` profile (or point the endpoint at real S3)
       # to switch. Changing it later does not move existing blobs.
       FIBER_S3_BUCKET: ${FIBER_S3_BUCKET:-}
-      FIBER_S3_ENDPOINT: ${FIBER_S3_ENDPOINT:-http://fiber-minio:9000}
+      FIBER_S3_ENDPOINT: ${FIBER_S3_ENDPOINT:-http://fiber-s3:9000}
       # Where agents and browsers reach the object store; it appears in every presigned
       # URL. The loopback default only works for an agent on this host.
       FIBER_S3_PUBLIC_ENDPOINT: ${FIBER_S3_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
@@ -241,9 +250,9 @@ services:
         condition: service_healthy
       fiber-redis:
         condition: service_healthy
-      # `required: false` so this is ordering, not a dependency: with the minio profile
+      # `required: false` so this is ordering, not a dependency: with the s3 profile
       # off the service does not exist and the API starts anyway on the local backend.
-      fiber-minio:
+      fiber-s3:
         condition: service_healthy
         required: false
 
@@ -322,5 +331,5 @@ services:
 volumes:
   fiber_pg:
   fiber_artifacts:
-  fiber_minio:
+  fiber_s3:
   fiber_workspaces:

@@ -8,14 +8,14 @@ Day-to-day workflow for Fiber. Product docs: [README](./README.md) index.
 # Rust stable + Docker + pnpm
 docker compose -f deploy/docker-compose.yml up -d fiber-postgres fiber-redis
 # optional artifacts backend:
-make infra-minio
+make infra-s3
 ```
 
 Copy [`.env.example`](../.env.example) into your shell, or always use:
 
 ```bash
 source scripts/dev-env.sh          # local FS artifacts
-FIBER_USE_S3=1 source scripts/dev-env.sh   # MinIO
+FIBER_USE_S3=1 source scripts/dev-env.sh   # S3 store
 ```
 
 ## Make targets
@@ -25,7 +25,7 @@ make help          # list
 make infra         # Postgres + Redis
 make build         # api + agent + cli
 make api           # fiber-api :18080
-make api-s3        # fiber-api with MinIO
+make api-s3        # fiber-api with the S3 store
 make ui            # UI :3100
 make agent         # needs FIBER_AGENT_TOKEN
 make login         # session → ~/.fiber/token
@@ -35,7 +35,7 @@ make deny          # cargo deny check (advisories, licences, crates.io-only sour
 make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace --locked + apps/ui vitest
 make smoke           # authz + artifacts + concurrency + pools (pools last: it kills every agent)
-make smoke-s3        # MinIO presign (api-s3 running)
+make smoke-s3        # S3 presign (api-s3 running)
 make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
 make ready         # GET /ready
 ```
@@ -50,7 +50,7 @@ Login defaults: **admin** / **fiber**.
 | UI (dev) | 3100 |
 | Postgres | 15432 |
 | Redis | 16379 |
-| MinIO API / console | 19000 / 19001 |
+| S3 store (RustFS) API / console | 19000 / 19001 |
 
 ## Naming
 

@@ -11,7 +11,7 @@ Self-hosted, canvas-first Jenkins alternative. Rust control plane, TypeScript UI
 ```bash
 make help
 make infra          # Postgres + Redis
-make api            # :18080  (or make api-s3 after make infra-minio)
+make api            # :18080  (or make api-s3 after make infra-s3)
 make ui             # :3100
 make login
 ```
@@ -65,7 +65,7 @@ Full walkthrough: [docs/getting-started.md](./docs/getting-started.md).
 ```bash
 python3 scripts/smoke_authz_agents.py   # roles + agent CRUD/rotate
 python3 scripts/smoke_artifacts.py      # artifacts + path filters (needs agent)
-python3 scripts/smoke_s3_presign.py     # MinIO presign (needs MinIO + FIBER_S3_*)
+python3 scripts/smoke_s3_presign.py     # S3 presign (needs make infra-s3 + FIBER_S3_*)
 ```
 
 ### 1. Infrastructure
@@ -119,7 +119,7 @@ Add a worker with `docker compose -f deploy/docker-compose.yml --profile agent u
 [`scripts/install-agent.sh`](scripts/install-agent.sh) — see [agents](docs/agents.md#install).
 
 - UI: http://localhost:3100 · API: http://localhost:18080 (both loopback-only by default — see [operations](docs/operations.md#deployment) for TLS / exposure)
-- Postgres **15432** · Redis **16379** · MinIO **19000** (loopback-only)
+- Postgres **15432** · Redis **16379** · S3 store (RustFS) **19000** (loopback-only)
 
 ## Workspace
 

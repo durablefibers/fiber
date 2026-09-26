@@ -25,7 +25,7 @@ curl -sf -m 1 http://127.0.0.1:18080/ready >/dev/null 2>&1 && echo "api: ready" 
 | `make smoke-authz` | roles, membership, agent CRUD, token rotate | infra + API |
 | `make smoke-pools` | project-scoped vs global agent pools | infra + API |
 | `make smoke-artifacts` | artifact upload/restore, path filters | infra + API + running agent |
-| `make smoke-s3` | MinIO presign upload/restore/download | `make infra-minio`, `make api-s3`, built agent |
+| `make smoke-s3` | S3 presign upload/restore/download | `make infra-s3`, `make api-s3`, built agent |
 | `make smoke-compose` | full `up --build` | Docker, ports free |
 | `make smoke` | authz + artifacts + pools, in that order | infra + API + agent |
 
@@ -45,7 +45,7 @@ Establish preconditions before blaming code — `make ready`, `docker ps` for `f
 | Step stays `queued` | Label mismatch or no connected agent | `FIBER_AGENT_LABELS` vs the pipeline's `labels`; offer matching in `fiber-scheduler` |
 | Step leased, never completes | Agent execution or lease expiry | agent logs, `requeue_expired_leases` |
 | Artifact missing | Path rejected, size cap, or backend misconfig | `sanitize_artifact_rel_path`, `MAX_*_BYTES`, `FIBER_USE_S3` |
-| Presign 403 from MinIO | Credentials or endpoint | `FIBER_S3_*` in `scripts/dev-env.sh`, MinIO up on 19000 |
+| Presign 403 from the S3 store | Credentials or endpoint | `FIBER_S3_*` in `scripts/dev-env.sh`, S3 store up on 19000 |
 | Intermittent | Poll timing | Re-run; query run/step status directly to tell "slow" from "stuck" |
 
 ## Cleaning up agents

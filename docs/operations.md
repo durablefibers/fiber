@@ -4,14 +4,14 @@
 
 `deploy/docker-compose.yml` is the reference deployment. Its defaults are chosen so that `docker compose up` on a shared host does not expose anything by accident:
 
-- **Four credentials have no default and must be set in `deploy/.env` before anything starts**: `FIBER_POSTGRES_PASSWORD`, `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY`, and `FIBER_ADMIN_PASSWORD`. `docker compose config` (and therefore `up`, `pull`, `logs`) fails with the name of the first one missing until they are. A default that works is a default nobody changes, and `FIBER_API_BIND=0.0.0.0` plus a published admin password is a public instance with a known login. The S3 pair is required even when MinIO is off — Compose interpolates the whole file before it filters by profile — so give it any non-empty placeholder if you do not use the object store.
-- Postgres, Redis, and MinIO publish only on **127.0.0.1**; Redis requires a password, which reaches it through a Compose `configs:` entry rather than `--requirepass` on the command line, where every process in the host's pid namespace could read it out of `ps`. Its healthcheck is unauthenticated on purpose (`NOAUTH` counts as an answer) so the password does not go back into the service's environment to satisfy a probe. This is not secrecy from the host: `fiber-api`'s own environment still carries both passwords inside `FIBER_DATABASE_URL` and `FIBER_REDIS_URL`, so anyone who can reach the Docker daemon — which is root-equivalent anyway — can read them from `docker inspect`. Treat `deploy/.env` and the daemon socket as the trust boundary.
+- **Four credentials have no default and must be set in `deploy/.env` before anything starts**: `FIBER_POSTGRES_PASSWORD`, `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY`, and `FIBER_ADMIN_PASSWORD`. `docker compose config` (and therefore `up`, `pull`, `logs`) fails with the name of the first one missing until they are. A default that works is a default nobody changes, and `FIBER_API_BIND=0.0.0.0` plus a published admin password is a public instance with a known login. The S3 pair is required even when the S3 store is off — Compose interpolates the whole file before it filters by profile — so give it any non-empty placeholder if you do not use the object store.
+- Postgres, Redis, and the S3 store publish only on **127.0.0.1**; Redis requires a password, which reaches it through a Compose `configs:` entry rather than `--requirepass` on the command line, where every process in the host's pid namespace could read it out of `ps`. Its healthcheck is unauthenticated on purpose (`NOAUTH` counts as an answer) so the password does not go back into the service's environment to satisfy a probe. This is not secrecy from the host: `fiber-api`'s own environment still carries both passwords inside `FIBER_DATABASE_URL` and `FIBER_REDIS_URL`, so anyone who can reach the Docker daemon — which is root-equivalent anyway — can read them from `docker inspect`. Treat `deploy/.env` and the daemon socket as the trust boundary.
 - **Compose 2.20 or newer**, and **2.23** for `docker compose up` to work at all: the Redis password uses an inline `configs:` `content:` block (2.23) and `depends_on.required` (2.20). An older Compose fails to parse the file rather than silently ignoring either, so the failure is loud — `docker compose version` tells you what you have.
 - `fiber-api` (`18080`) and `fiber-ui` (`3100`) also bind to `127.0.0.1` by default — terminate TLS with a reverse proxy and forward to them. Set `FIBER_API_BIND=0.0.0.0` / `FIBER_UI_BIND=0.0.0.0` only for a trusted network.
-- **Artifacts go to the local filesystem by default** (the `fiber_artifacts` volume). MinIO is optional and sits behind a Compose profile: set `FIBER_S3_BUCKET=fiber-artifacts` and start it with `--profile minio`. See [artifacts](./artifacts.md).
+- **Artifacts go to the local filesystem by default** (the `fiber_artifacts` volume). An S3 store ([RustFS](https://github.com/rustfs/rustfs)) is optional and sits behind a Compose profile: set `FIBER_S3_BUCKET=fiber-artifacts` and start it with `--profile s3`. See [artifacts](./artifacts.md).
 - **`fiber-api` and `fiber-ui` run unprivileged**: uid 10001 and uid 101, `read_only: true` rootfs with a tmpfs for the few scratch paths they need, `cap_drop: [ALL]`, `no-new-privileges`. The API writes nothing outside `FIBER_ARTIFACTS_DIR`; the UI image is `nginxinc/nginx-unprivileged` and listens on 8080 inside the container.
 - **Container logs are capped** at `max-size: 10m` × `max-file: 5` per service (~50 MB each). Docker's default keeps every line for ever, and a full host disk stops Postgres. Point the daemon at a real log system if you need more history.
-- Every service has `restart: unless-stopped`; the API waits for Postgres and Redis health, and for MinIO too when the `minio` profile is active.
+- Every service has `restart: unless-stopped`; the API waits for Postgres and Redis health, and for the S3 store too when the `s3` profile is active.
 - Both images carry a `HEALTHCHECK` (API: `GET /ready`; UI: `GET /`), so `docker run` and non-Compose orchestrators get the same probe Compose uses.
 - `fiber-api` runs with `init: true` and `stop_grace_period: 30s`, so `docker stop` and a `compose up` of a new image deliver SIGTERM and the API drains (see [Shutdown and deploys](#shutdown-and-deploys)) instead of being killed after Docker's default 10 s.
 - Settings live in `deploy/.env` (copy `deploy/.env.example`). Generate `FIBER_SECRETS_KEY` with `openssl rand -hex 32` before storing any real secret; without it, secrets are stored in plaintext and the API warns at boot.
@@ -528,7 +528,7 @@ Agent presence (labels, concurrency) is per replica: an agent is offered steps b
 python3 scripts/smoke_authz_agents.py   # roles + agent CRUD/rotate
 python3 scripts/smoke_agent_pools.py    # project-scoped vs global agents
 python3 scripts/smoke_artifacts.py      # artifacts + path filters
-python3 scripts/smoke_s3_presign.py     # MinIO presign upload/restore/download
+python3 scripts/smoke_s3_presign.py     # S3 presign upload/restore/download
 bash scripts/smoke_compose.sh           # full compose up --build smoke
 ```
 
@@ -559,7 +559,7 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
 
 ### Artifacts & secrets key
 
-- Backup `FIBER_ARTIFACTS_DIR` **or** the S3/MinIO bucket (`fiber-artifacts`).
+- Backup `FIBER_ARTIFACTS_DIR` **or** the S3 bucket (`fiber-artifacts`).
 - Keep **`FIBER_SECRETS_KEY`** offline and backed up separately — without it, encrypted project and webhook secrets cannot be decrypted. Compose reads it from `deploy/.env`; it is intentionally not committed anywhere.
 
 ### What to include
@@ -601,7 +601,45 @@ Volume name may be prefixed by the Compose project (`fiber_fiber_pg` when using 
   sudo chown -R 10001:10001 /srv/fiber/artifacts
   ```
 
-  Whether this affects a Compose install depends on which backend it used. Until this version Compose set `FIBER_S3_BUCKET` unconditionally, so blobs went to MinIO and the `fiber_artifacts` volume held nothing — but the same upgrade **makes the local filesystem the default**, so an install that says nothing in `deploy/.env` switches backends and starts writing to that root-owned volume. Either run the `chown` above, or keep MinIO by setting `FIBER_S3_BUCKET=fiber-artifacts` in `deploy/.env` and bringing the stack up with `--profile minio`. Artifacts already in MinIO are not copied to the local disk (or the other way round); the rows keep pointing at the backend that stored them, so switching leaves older artifacts undownloadable until you switch back.
+  Whether this affects a Compose install depends on which backend it used. Until this version Compose set `FIBER_S3_BUCKET` unconditionally, so blobs went to MinIO and the `fiber_artifacts` volume held nothing — but the same upgrade **makes the local filesystem the default**, so an install that says nothing in `deploy/.env` switches backends and starts writing to that root-owned volume. Either run the `chown` above, or keep the object store by setting `FIBER_S3_BUCKET=fiber-artifacts` in `deploy/.env` and bringing the stack up with `--profile s3` (`--profile minio` before 0.6.6, see below). Artifacts already in MinIO are not copied to the local disk (or the other way round); the rows keep pointing at the backend that stored them, so switching leaves older artifacts undownloadable until you switch back.
 - **The four Compose credentials are now required.** `FIBER_POSTGRES_PASSWORD`, `FIBER_REDIS_PASSWORD`, `FIBER_S3_ACCESS_KEY`/`FIBER_S3_SECRET_KEY` and `FIBER_ADMIN_PASSWORD` no longer default to `fiber` / `fiberfiber`; `docker compose` refuses to read the file until `deploy/.env` sets them. An existing deployment that relied on the defaults must write those same values into `deploy/.env` before the upgrade — Postgres keeps the password its volume was initialised with, and Redis keeps whatever the new config file says, so putting the old values back is the no-downtime path. Changing the Postgres password needs `ALTER ROLE fiber PASSWORD …` inside the container as well as the `.env` edit; `FIBER_ADMIN_PASSWORD` is read only on the first boot of an empty database, so for an existing instance any placeholder is fine.
+- **The Compose S3 store is now RustFS, not MinIO** (`quay.io/minio/minio` stopped serving anonymous pulls). The service is `fiber-s3`, the profile `s3`, the volume `fiber_s3`, and the default `FIBER_S3_ENDPOINT` is `http://fiber-s3:9000`. An install on the local filesystem backend (`FIBER_S3_BUCKET` empty, the default) needs nothing. An install that stored artifacts in MinIO needs three things:
+  - **Edit `deploy/.env`.** If it sets `FIBER_S3_ENDPOINT=http://fiber-minio:9000` (the old example did), change it to `http://fiber-s3:9000`. Start the stack with `--profile s3` instead of `--profile minio`.
+  - **Copy the objects.** The old data stays in the `fiber_fiber_minio` volume, and RustFS is deliberately not pointed at it. Rows store `s3://<bucket>/<key>`, so copying the bucket unchanged keeps every existing artifact downloadable. The copy reads from the MinIO container the install already has, so nothing needs pulling from quay.io. It writes into a temporary RustFS without published ports, because the old MinIO still holds 19000 until the end:
+
+    ```bash
+    # First: the commands below need the S3 keys. This parses deploy/.env as shell, so a
+    # value containing `$`, a backtick or a space must be quoted there.
+    set -a; . deploy/.env; set +a
+    C="docker compose -f deploy/docker-compose.yml"
+    OLD=$(docker ps -aq --filter volume=fiber_fiber_minio)   # the old MinIO container
+    $C stop fiber-api
+    docker start "$OLD"                         # a no-op if it is already running
+    $C --profile s3 create fiber-s3             # creates the fiber_s3 volume, starts nothing
+    docker run -d --name fiber-s3-import --network fiber_backend -v fiber_fiber_s3:/data \
+      -e RUSTFS_ACCESS_KEY="$FIBER_S3_ACCESS_KEY" -e RUSTFS_SECRET_KEY="$FIBER_S3_SECRET_KEY" \
+      rustfs/rustfs:1.0.0
+    sleep 5
+    # Remotes as env vars: an inline `:s3,endpoint=http://…` remote breaks on the URL's colon.
+    rclone() {
+      docker run --rm --network fiber_backend \
+        -e RCLONE_CONFIG_OLD_TYPE=s3 -e RCLONE_CONFIG_OLD_PROVIDER=Minio \
+        -e RCLONE_CONFIG_OLD_ENDPOINT=http://fiber-minio:9000 \
+        -e RCLONE_CONFIG_OLD_ACCESS_KEY_ID="$FIBER_S3_ACCESS_KEY" \
+        -e RCLONE_CONFIG_OLD_SECRET_ACCESS_KEY="$FIBER_S3_SECRET_KEY" \
+        -e RCLONE_CONFIG_NEW_TYPE=s3 -e RCLONE_CONFIG_NEW_PROVIDER=Other \
+        -e RCLONE_CONFIG_NEW_ENDPOINT=http://fiber-s3-import:9000 \
+        -e RCLONE_CONFIG_NEW_ACCESS_KEY_ID="$FIBER_S3_ACCESS_KEY" \
+        -e RCLONE_CONFIG_NEW_SECRET_ACCESS_KEY="$FIBER_S3_SECRET_KEY" \
+        rclone/rclone:1.71 "$@"
+    }
+    rclone sync  old:fiber-artifacts new:fiber-artifacts
+    rclone check old:fiber-artifacts new:fiber-artifacts   # must report 0 differences
+    docker rm -f fiber-s3-import "$OLD"
+    $C --profile s3 up -d --remove-orphans
+    ```
+
+    The names assume the Compose project is `fiber`, which the file sets. If you ran it with `-p` or `COMPOSE_PROJECT_NAME`, substitute your prefix: `docker volume ls | grep minio` shows it. Only once `check` passes and an old artifact downloads, remove the old volume with `docker volume rm fiber_fiber_minio`.
+  - **Nothing else.** No migration and no wire change. `make infra-minio` still works, as an alias of `make infra-s3`.
 - Postgres major bumps (e.g. 16 → 17): Compose volume recreate (`down -v`) if needed  
 - Agent tokens are hashes only — rotating requires distributing a new plaintext token

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke: full Compose stack (postgres, redis, minio, api, ui).
+# Smoke: full Compose stack (postgres, redis, s3, api, ui).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT/deploy/docker-compose.yml")
@@ -23,14 +23,14 @@ export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
 # rootfs. That combination is what an operator gets by default, so it is the one that
 # needs end-to-end coverage; the S3 path is covered by `make smoke-s3`. The pipeline
 # below declares an artifact and the run asserts it was stored, so this is a real test of
-# that backend rather than of the container merely starting. MinIO is still started below
-# so the `minio` profile is exercised, but nothing depends on it.
+# that backend rather than of the container merely starting. The S3 store is still started
+# below so the `s3` profile is exercised, but nothing depends on it.
 
 echo "== compose build + up =="
 # Stop legacy Compose project that may own 15432/16379
 docker compose -p deploy -f "$ROOT/deploy/docker-compose.yml" stop fiber-postgres fiber-redis 2>/dev/null || true
 pkill -x fiber-api 2>/dev/null || true
-"${COMPOSE[@]}" up -d --build fiber-postgres fiber-redis fiber-minio
+"${COMPOSE[@]}" up -d --build fiber-postgres fiber-redis fiber-s3
 "${COMPOSE[@]}" up -d --build fiber-api fiber-ui
 
 echo "== wait ready =="
@@ -83,10 +83,10 @@ else
   fail "login: $LOGIN"
 fi
 
-if curl -sf http://127.0.0.1:19000/minio/health/live >/dev/null; then
-  ok "minio health"
+if curl -sf http://127.0.0.1:19000/health >/dev/null; then
+  ok "s3 health"
 else
-  fail "minio health"
+  fail "s3 health"
 fi
 
 # A stack that cannot run a pipeline is not a working stack: mint an agent token,

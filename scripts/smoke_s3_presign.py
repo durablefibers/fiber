@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke: S3/MinIO artifact presign — upload via PUT URL, restore next step, s3:// paths."""
+"""Smoke: S3 artifact presign — upload via PUT URL, restore next step, s3:// paths."""
 from __future__ import annotations
 
 import json
@@ -29,7 +29,7 @@ FAILS = 0
 
 
 class NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow redirects without forwarding Authorization (breaks MinIO SigV4)."""
+    """Follow redirects without forwarding Authorization (breaks SigV4 on the object store)."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -251,7 +251,7 @@ def main() -> int:
         arts = arts["artifacts"]
     check("has artifacts", isinstance(arts, list) and len(arts) >= 2, arts)
 
-    # Public list omits storage path; confirm via DB + download redirect to MinIO.
+    # Public list omits storage path; confirm via DB + download redirect to the object store.
     try:
         import subprocess as sp
 
@@ -286,7 +286,7 @@ def main() -> int:
     else:
         check("agent used presign path", False, "no produce step")
 
-    # Download: API 307 → MinIO; do not forward Authorization (MinIO returns 400).
+    # Download: API 307 → object store; do not forward Authorization (it returns 400).
     if isinstance(arts, list) and arts:
         aid = next(
             (a["id"] for a in arts if "VERSION" in a.get("name", "")),
@@ -305,7 +305,7 @@ def main() -> int:
                 check("download VERSION content", b"s3-marker" in body, body[:80])
                 final_url = resp.geturl()
                 check(
-                    "download redirected to MinIO",
+                    "download redirected to the object store",
                     "19000" in final_url or "fiber-artifacts" in final_url,
                     final_url,
                 )

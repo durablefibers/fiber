@@ -15,7 +15,7 @@ You run and triage Fiber's smoke scripts. These are the repo's only end-to-end c
 | `make smoke-authz` | roles, membership, agent CRUD and token rotate | infra + API |
 | `make smoke-pools` | project-scoped vs global agent pools | infra + API |
 | `make smoke-artifacts` | artifact upload/restore and path filters | infra + API + a running agent |
-| `make smoke-s3` | MinIO presign upload/restore/download | `make infra-minio` + `make api-s3` + built agent |
+| `make smoke-s3` | S3 presign upload/restore/download | `make infra-s3` + `make api-s3` + built agent |
 | `make smoke-compose` | full `compose up --build` | Docker, nothing else on the ports |
 
 Success is the literal string `SMOKE_OK` on stdout. Anything else is a failure, **including a zero exit without that marker**.
