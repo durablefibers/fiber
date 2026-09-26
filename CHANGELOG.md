@@ -22,6 +22,17 @@ minor versions may carry breaking changes.
   is not a plain relative path. Refusal fails the step with the path named. Upgrade the
   **agents**. The new server-side checks only add the courtesy of an earlier error.
   [artifacts](docs/artifacts.md#restoring).
+- **A retried attempt ran host `git` inside a directory the previous attempt's container
+  had mounted read-write.** When a step's directory survived cleanup, the agent ran
+  `git reset --hard` and `git clean -fdx` in it for the retry, on the host. `cleanup_workspace`
+  ignored deletion errors, and a container running as root can leave files the agent user
+  cannot delete, so a `.git/config` the container wrote survived. `core.fsmonitor` in that
+  file is a command that `git reset --hard` runs (verified with git 2.50). That meant code
+  execution on the host from inside a container, given `retries:` and another step of the
+  same run still in flight on that agent. Every execution now gets a new directory,
+  `<step_run_id>.<random>`, and the agent refuses to clone into anything but an empty
+  directory it has just made. A restore also refuses a leaf that is a FIFO, a device node
+  or a hard link, judging the opened handle as the upload already did.
 
 ### Changed
 
@@ -29,8 +40,10 @@ minor versions may carry breaking changes.
   plain relative path components, nothing else. It is checked when the pipeline compiles
   (a new `BadArtifactPath` error, so `/abs`, `..` and `./x` fail at save instead of at
   upload), when the server builds a restore list, and by the agent on upload and restore.
-  A stored pipeline that declares such a path already failed at upload on every run. It
-  now fails to compile, so fix the path.
+  Any step that declared such a path and ran already failed at upload. The pipeline now
+  fails to compile, which also stops runs where that step would have been skipped, so fix
+  the path. The server's name sanitizer also rejects what the predicate rejects (a leading
+  `./`), so it can no longer store a name the agent would refuse to restore.
 
 ## [0.6.5] — 2026-09-27
 

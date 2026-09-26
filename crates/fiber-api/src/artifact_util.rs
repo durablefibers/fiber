@@ -36,11 +36,9 @@ pub fn sanitize_artifact_rel_path(name: &str) -> Option<String> {
             }
         })
         .collect();
-    if cleaned.is_empty() || cleaned.starts_with('/') {
-        None
-    } else {
-        Some(cleaned)
-    }
+    // The agent restores only names this accepts; storing one it would refuse loses the
+    // artifact silently at the next step instead of now.
+    fiber_proto::validate::artifact_path_ok(&cleaned).then_some(cleaned)
 }
 
 /// Basename for Content-Disposition / object key leaf.
