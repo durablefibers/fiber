@@ -6,6 +6,32 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **A restored artifact could be written through a symlink in the checkout, onto the
+  agent host.** The agent restores a prior step's artifacts into the dependent step's
+  fresh checkout on the host, before that step's container starts, with `create_dir_all`
+  and `write`. Both follow symlinks, and the only check on the name was `..`. The checkout
+  is the repository's to shape, so a commit with a symlink at the path of an artifact the
+  pipeline declares got the agent to write bytes an earlier step produced to wherever the
+  link pointed, as the agent's user. That step's `run` may have executed inside a
+  container, from a fork's pull request, and this crossed the boundary that fork-PR
+  containment relies on. Reproduced against the 0.6.5 agent with a two-step pipeline: the
+  artifact landed outside the workspace. The agent now creates directories one component
+  at a time and refuses any symlink, opens the file `O_NOFOLLOW`, and refuses a name that
+  is not a plain relative path. Refusal fails the step with the path named. Upgrade the
+  **agents**. The new server-side checks only add the courtesy of an earlier error.
+  [artifacts](docs/artifacts.md#restoring).
+
+### Changed
+
+- **One predicate decides what an artifact path may be,** `fiber_proto::validate::artifact_path_ok`:
+  plain relative path components, nothing else. It is checked when the pipeline compiles
+  (a new `BadArtifactPath` error, so `/abs`, `..` and `./x` fail at save instead of at
+  upload), when the server builds a restore list, and by the agent on upload and restore.
+  A stored pipeline that declares such a path already failed at upload on every run. It
+  now fails to compile, so fix the path.
+
 ## [0.6.5] — 2026-09-27
 
 The Compose S3 store moves from MinIO to RustFS, the per-step artifact caps become hard

@@ -114,6 +114,10 @@ pub enum DagError {
     BadWorkingDirectory { step: String, path: String },
     #[error("step `{step}` shell `{shell}` must be a bare program name")]
     BadShell { step: String, shell: String },
+    #[error(
+        "step `{step}` artifact `{path}` must be a plain relative path inside the workspace (no leading `/` or `./`, no `..`)"
+    )]
+    BadArtifactPath { step: String, path: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
     #[error(
@@ -491,6 +495,19 @@ fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell<'
                 return Err(DagError::BadShell {
                     step: step.id.clone(),
                     shell: sh.clone(),
+                });
+            }
+            // Each path is read from, and later restored to, `work_dir.join(path)` on the
+            // agent host. The agent refuses a bad one at upload; saying so here is the
+            // courtesy of finding out before a build has run.
+            if let Some(bad) = step
+                .artifacts
+                .iter()
+                .find(|p| !fiber_proto::validate::artifact_path_ok(p.trim()))
+            {
+                return Err(DagError::BadArtifactPath {
+                    step: step.id.clone(),
+                    path: bad.clone(),
                 });
             }
             // The image lands on the `docker run` command line. An empty string means
@@ -1225,6 +1242,38 @@ mod tests {
                 timeout_minutes: None,
             };
             assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn artifact_paths_must_stay_inside_the_workspace() {
+        let compile = |path: &str| {
+            let mut st = step("a", &[], "echo");
+            st.artifacts = vec!["ok/file".into(), path.to_string()];
+            compile_definition(&PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            })
+        };
+        for bad in [
+            "/etc/passwd",
+            "../outside",
+            "out/../../x",
+            "./dist/app.tar",
+            "",
+        ] {
+            assert!(
+                matches!(compile(bad), Err(DagError::BadArtifactPath { .. })),
+                "accepted {bad:?}"
+            );
+        }
+        for good in ["dist/app.tar", "VERSION", ".hidden/x", " padded/by/yaml "] {
+            assert!(compile(good).is_ok(), "rejected {good:?}");
         }
     }
 

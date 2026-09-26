@@ -98,9 +98,56 @@ pub fn repo_url_ok(s: &str) -> bool {
         .any(|piece| piece.starts_with('-'))
 }
 
+/// A workspace-relative artifact path: one or more plain path components, nothing else.
+///
+/// The agent reads a declared artifact from, and writes a restored one to,
+/// `work_dir.join(path)` on the host. An absolute path makes `join` discard the workspace,
+/// and `..` climbs out of it; a leading `./` is refused too, because the upload side has
+/// always refused it and a name that cannot be uploaded should not compile. Symlinks the
+/// checkout plants are a separate question, answered on the agent where the files are.
+pub fn artifact_path_ok(s: &str) -> bool {
+    if s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control) {
+        return false;
+    }
+    let mut components = std::path::Path::new(s).components().peekable();
+    components.peek().is_some() && components.all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_paths_that_leave_the_workspace_are_refused() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "out/../../x",
+            "./dist/app.tar",
+            ".",
+            "out/\nfile",
+            "out/\0file",
+        ] {
+            assert!(!artifact_path_ok(bad), "accepted {bad:?}");
+        }
+        assert!(!artifact_path_ok(&"a/".repeat(600)));
+    }
+
+    #[test]
+    fn plain_relative_artifact_paths_are_accepted() {
+        for good in [
+            "VERSION",
+            "dist/app.tar",
+            "out/nested/dir/file.log",
+            "target/release/fiber-agent",
+            ".hidden/file",
+            "a//b",
+            "dir/",
+        ] {
+            assert!(artifact_path_ok(good), "rejected {good:?}");
+        }
+    }
 
     #[test]
     fn image_references_that_are_really_docker_flags_are_refused() {
