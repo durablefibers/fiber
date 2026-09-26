@@ -29,7 +29,7 @@ export RUST_LOG="${RUST_LOG:-info,fiber_api=info,fiber_agent=info}"
 # Optional secrets encryption (generate once: openssl rand -hex 32)
 # export FIBER_SECRETS_KEY=...
 
-# Optional MinIO (make infra-minio first)
+# Optional S3 store (make infra-s3 first)
 if [[ "${FIBER_USE_S3:-}" == "1" || "${FIBER_USE_S3:-}" == "true" ]]; then
   export FIBER_S3_BUCKET="${FIBER_S3_BUCKET:-fiber-artifacts}"
   export FIBER_S3_ENDPOINT="${FIBER_S3_ENDPOINT:-http://127.0.0.1:19000}"
