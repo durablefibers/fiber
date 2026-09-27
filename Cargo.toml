@@ -74,7 +74,7 @@ opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 # reactor, so the async reqwest client panics there and nothing is ever exported.
 # `reqwest-blocking-client` matches that threading model. Native roots for the same
 # reason the rest of the workspace uses them: a collector behind a private CA.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"] }
 tracing-opentelemetry = "0.33"
 
 [workspace.lints.clippy]
