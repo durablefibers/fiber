@@ -6,6 +6,18 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-09-27
+
+The Compose S3 store moves from MinIO to RustFS, the per-step artifact caps become hard
+limits, and a macOS agent that runs Docker steps warns at startup. No migration and no
+wire change: agents on 0.6.4 keep working. Also bumps the OpenTelemetry crates to 0.33 and
+the usual dependency updates.
+
+**Compose installs that keep artifacts in MinIO** (`FIBER_S3_BUCKET` set, `--profile minio`)
+must follow the upgrade procedure in [operations](docs/operations.md#upgrades) to copy the
+bucket into RustFS before starting 0.6.5 with `--profile s3`. Installs on the default local
+filesystem backend need nothing.
+
 ### Changed
 
 - **The Compose S3 store is RustFS 1.0.0, not MinIO.** `quay.io/minio/minio` began
