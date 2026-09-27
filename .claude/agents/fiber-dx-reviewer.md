@@ -24,7 +24,7 @@ Fiber's DX contract is explicit (`.claude/rules/dx.md`): **`make help` is the en
 - The `pkill` pattern that matches parent shells and kills the session — must stay in `docs/development.md` and enforced by the toolkit's Bash guard.
 - The Postgres 16 to 17 volume incompatibility and its data-destroying recovery.
 - `make agent` needs `FIBER_AGENT_TOKEN` from `fiber agents create` first.
-- The smoke scripts need the API already running; `smoke-s3` also needs MinIO and a built agent.
+- The smoke scripts need the API already running; `smoke-s3` also needs the S3 store (`make infra-s3`) and a built agent.
 
 ## Output
 

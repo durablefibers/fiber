@@ -62,4 +62,4 @@ A new `FIBER_*` variable lands in four places in the same change: `.env.example`
 
 ## Ports
 
-API 18080 · UI 3100 · Postgres 15432 · Redis 16379 · MinIO 19000/19001. Deliberately non-default; do not normalize them.
+API 18080 · UI 3100 · Postgres 15432 · Redis 16379 · S3 store (RustFS) 19000/19001. Deliberately non-default; do not normalize them.

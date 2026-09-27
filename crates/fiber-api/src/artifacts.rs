@@ -1,4 +1,4 @@
-//! Artifact blob storage: local filesystem (default) or S3-compatible (MinIO).
+//! Artifact blob storage: local filesystem (default) or S3-compatible (RustFS in Compose, or any S3).
 
 use anyhow::{Context, Result, anyhow};
 use aws_credential_types::Credentials;
@@ -24,7 +24,7 @@ pub enum ArtifactBackend {
 }
 
 impl ArtifactBackend {
-    /// Build from env. If `FIBER_S3_BUCKET` is set, use S3/MinIO; else local dir.
+    /// Build from env. If `FIBER_S3_BUCKET` is set, use S3; else local dir.
     pub async fn from_env(artifacts_dir: &str) -> Result<Self> {
         let bucket = std::env::var("FIBER_S3_BUCKET")
             .ok()
@@ -54,7 +54,7 @@ impl ArtifactBackend {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| endpoint.clone());
         let region = std::env::var("FIBER_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-        // No silent fallback to the MinIO dev credentials: a bucket without keys is a misconfiguration.
+        // No silent fallback to the dev S3 credentials: a bucket without keys is a misconfiguration.
         let access = std::env::var("FIBER_S3_ACCESS_KEY")
             .ok()
             .filter(|s| !s.is_empty())
