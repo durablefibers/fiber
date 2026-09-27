@@ -69,7 +69,7 @@ cron = "0.17"
 aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
 opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics"] }
 # The SDK runs batch and periodic exporters on their own OS threads, with no Tokio
 # reactor, so the async reqwest client panics there and nothing is ever exported.
 # `reqwest-blocking-client` matches that threading model. Native roots for the same
