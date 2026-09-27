@@ -6,6 +6,23 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **The Compose S3 store is RustFS 1.0.0, not MinIO.** `quay.io/minio/minio` began
+  refusing anonymous pulls (Docker Hub's `minio/minio` already had), so the `minio`
+  profile could not start on a machine without the image cached, and CI's Compose smoke
+  failed on every branch. The service is now `fiber-s3`, the profile `s3`, the volume
+  `fiber_s3`, and `FIBER_S3_ENDPOINT` defaults to `http://fiber-s3:9000`. `make infra-s3`
+  replaces `make infra-minio`, which stays as an alias. `scripts/smoke_s3_presign.py`
+  passes against it with only its messages renamed: presigned upload, restore into a
+  wiped workspace, `s3://` paths, and the 307 download. RustFS logs to stdout
+  (`docker compose logs fiber-s3`), not to a file inside the container, and console CORS
+  is limited to its loopback origin. **Installs that stored artifacts in MinIO must copy
+  the bucket across.** The procedure is in [operations](docs/operations.md#upgrades); it
+  was rehearsed on a scratch Compose project upgraded from the previous file, and the
+  artifact read back with a matching SHA-256. Installs on the default local filesystem
+  backend need nothing.
+
 ### Fixed
 
 - **The per-step artifact caps are enforced at the insert, not only before it.** The count
