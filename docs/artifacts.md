@@ -11,7 +11,7 @@ Steps declare workspace-relative paths under `artifacts:`. After a **successful*
 Presigned URLs name the storage endpoint as the outside world reaches it
 (`FIBER_S3_PUBLIC_ENDPOINT`), which is right for a browser and for an agent on the same
 network. An agent placed behind a boundary — the Compose agent runs on its own network,
-deliberately away from Postgres, Redis, and MinIO — cannot use that address.
+deliberately away from Postgres, Redis, and the S3 store — cannot use that address.
 
 Such an agent falls back to the API, which it can reach by definition, since that is where
 its offers come from. Uploads go through `PUT /api/agent/steps/{id}/artifacts` and restores
@@ -74,7 +74,7 @@ way, so check the step's `system` log lines if a `restore` list looks short.
 - Agent uploads: `PUT /api/agent/steps/{step_run_id}/artifacts` with header `X-Fiber-Artifact-Path` and raw body (max **64 MiB**)
 - Download: user `GET /api/artifacts/{id}/download`; agent `GET /api/agent/artifacts/{id}/download`
 
-## S3 / MinIO
+## S3
 
 Set `FIBER_S3_BUCKET` (and usually endpoint/credentials). API uses the AWS SDK with path-style addressing.
 
@@ -124,10 +124,10 @@ sharing one.
 
 ### Public endpoint
 
-When the API talks to MinIO as `http://fiber-minio:9000` but agents run on the host, set:
+When the API talks to the Compose S3 store as `http://fiber-s3:9000` but agents run on the host, set:
 
 ```bash
-FIBER_S3_ENDPOINT=http://fiber-minio:9000
+FIBER_S3_ENDPOINT=http://fiber-s3:9000
 FIBER_S3_PUBLIC_ENDPOINT=http://127.0.0.1:19000
 ```
 
@@ -135,28 +135,28 @@ Presign uses a **separate SigV4 client** bound to the public endpoint (host rewr
 
 ### Compose
 
-`deploy/docker-compose.yml` uses the **local filesystem by default** — the `fiber_artifacts` volume — and keeps MinIO
-behind a Compose profile. To store artifacts in MinIO instead, set `FIBER_S3_BUCKET=fiber-artifacts` in
+`deploy/docker-compose.yml` uses the **local filesystem by default** — the `fiber_artifacts` volume — and keeps an S3
+store ([RustFS](https://github.com/rustfs/rustfs)) behind a Compose profile. To store artifacts there instead, set `FIBER_S3_BUCKET=fiber-artifacts` in
 `deploy/.env` and bring the stack up with the profile:
 
 ```bash
-docker compose -f deploy/docker-compose.yml --profile minio up -d
+docker compose -f deploy/docker-compose.yml --profile s3 up -d
 ```
 
 Switching backends does not move existing blobs: each artifact row keeps the path it was written with, so
 artifacts stored under the other backend stop downloading until you switch back. Host-run API: `make api-s3`
-after `make infra-minio`.
+after `make infra-s3`.
 
-### Local MinIO smoke
+### Local S3 smoke
 
 ```bash
-make infra-minio
+make infra-s3
 # other terminal:
 make api-s3
 python3 scripts/smoke_s3_presign.py
 ```
 
-The API creates the bucket on boot if missing. Downloads are **307** to a presigned GET URL — clients must not forward the session `Authorization` header to MinIO.
+The API creates the bucket on boot if missing. Downloads are **307** to a presigned GET URL — clients must not forward the session `Authorization` header to the object store.
 
 ## UI
 

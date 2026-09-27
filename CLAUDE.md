@@ -12,7 +12,7 @@ Prefer `make` targets and `scripts/dev-env.sh` over ad-hoc env in shell one-line
 
 ```bash
 make infra          # Postgres :15432 + Redis :16379 (docker compose, deploy/docker-compose.yml)
-make infra-minio    # + MinIO :19000 / console :19001 (for S3 artifact path)
+make infra-s3       # + S3 store (RustFS) :19000 / console :19001 (for S3 artifact path)
 make api            # fiber-api on :18080 (sources scripts/dev-env.sh)
 make api-s3         # same with FIBER_USE_S3=1
 make ui             # pnpm dev in apps/ui on :3100
@@ -43,7 +43,7 @@ End-to-end coverage is the **smoke scripts**, not integration tests — they dri
 
 ```bash
 make smoke                # authz + agent pools + artifacts (needs infra + api running)
-make smoke-s3             # needs infra-minio + api-s3 + a built fiber-agent
+make smoke-s3             # needs infra-s3 + api-s3 + a built fiber-agent
 make smoke-compose        # full `compose up --build` smoke
 ```
 

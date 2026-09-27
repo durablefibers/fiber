@@ -1,4 +1,4 @@
-.PHONY: help infra infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny test test-rust test-ui \
+.PHONY: help infra infra-s3 infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny test test-rust test-ui \
 	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-s3 smoke-compose \
 	login validate ready
 
@@ -36,7 +36,7 @@ CARGO_GATE_FLAGS := --workspace --all-targets --locked
 help:
 	@echo "Fiber DX targets:"
 	@echo "  infra         Postgres + Redis (ports 15432 / 16379)"
-	@echo "  infra-minio   Also MinIO (19000 API / 19001 console)"
+	@echo "  infra-s3      Also the S3 store, RustFS (19000 API / 19001 console)"
 	@echo "  down          Stop Compose services"
 	@echo "  build         cargo build workspace + fiber-cli"
 	@echo "  check         THE gate: fmt --check + clippy --workspace --all-targets --locked -D warnings"
@@ -48,7 +48,7 @@ help:
 	@echo "  fmt           cargo fmt"
 	@echo "  clippy        cargo clippy"
 	@echo "  api           Run fiber-api on :18080 (source scripts/dev-env.sh)"
-	@echo "  api-s3        Same with FIBER_USE_S3=1 (needs infra-minio)"
+	@echo "  api-s3        Same with FIBER_USE_S3=1 (needs infra-s3)"
 	@echo "  agent         Run fiber-agent (needs FIBER_AGENT_TOKEN)"
 	@echo "  ui            pnpm dev in apps/ui (:3100)"
 	@echo "  cli           cargo run -p fiber-cli -- …  (ARGS='login')"
@@ -57,7 +57,7 @@ help:
 	@echo "  ready         curl /ready"
 	@echo "  smoke         authz + artifacts + concurrency + pools (needs an agent; pools kills them last)"
 	@echo "  smoke-authz / smoke-artifacts / smoke-concurrency / smoke-pools   one scenario each"
-	@echo "  smoke-s3      MinIO presign path (needs infra-minio + api-s3)"
+	@echo "  smoke-s3      S3 presign path (needs infra-s3 + api-s3)"
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
 	@echo "Docs: docs/development.md · docs/roadmap.md · docs/cli.md"
@@ -66,10 +66,13 @@ help:
 infra:
 	$(COMPOSE) up -d fiber-postgres fiber-redis
 
-# MinIO sits behind the `minio` Compose profile: artifacts default to the local
+# The S3 store sits behind the `s3` Compose profile: artifacts default to the local
 # filesystem, and only `make api-s3` / `make smoke-s3` need the object store.
-infra-minio: infra
-	$(COMPOSE) --profile minio up -d fiber-minio
+infra-s3: infra
+	$(COMPOSE) --profile s3 up -d fiber-s3
+
+# The old name, from when the store was MinIO.
+infra-minio: infra-s3
 
 down:
 	$(COMPOSE) down
@@ -153,7 +156,7 @@ smoke-concurrency:
 	python3 scripts/smoke_concurrency.py
 
 smoke-s3:
-	@echo "Requires: make infra-minio && make api-s3 (in another terminal) + a built fiber-agent"
+	@echo "Requires: make infra-s3 && make api-s3 (in another terminal) + a built fiber-agent"
 	python3 scripts/smoke_s3_presign.py
 
 smoke-compose:
