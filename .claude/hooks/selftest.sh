@@ -56,6 +56,10 @@ printf 'let x = std::env::var("DF_DATABASE_URL");\n' > "$tmp/bad.rs"
 printf 'let x = std::env::var("FIBER_DATABASE_URL");\n' > "$tmp/good.rs"
 expect deny  "DF_ env var prefix"              "$HOOKS/naming-guard.sh" "$(path_payload "$tmp/bad.rs")"
 expect allow "FIBER_ env var prefix"           "$HOOKS/naming-guard.sh" "$(path_payload "$tmp/good.rs")"
+printf 'image: ghcr.io/durablefibers/fiber-api:latest\nrepo: https://github.com/durablefibers/fiber.git\n' > "$tmp/org.yml"
+printf 'services:\n  durablefibers-api:\n    image: ghcr.io/durablefibers/fiber-api\n' > "$tmp/mixed.yml"
+expect allow "GitHub org in image/repo URLs"   "$HOOKS/naming-guard.sh" "$(path_payload "$tmp/org.yml")"
+expect deny  "durablefibers as a service name" "$HOOKS/naming-guard.sh" "$(path_payload "$tmp/mixed.yml")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

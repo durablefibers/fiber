@@ -13,6 +13,6 @@ Never use `df`, `durablefibers`, or `durable_fibers` for crates, binaries, env v
 | Config file | `fiber.yml` | pipeline config-as-code |
 | TS packages | `@fiber/*` if split | UI app stays `apps/ui` |
 
-The repo folder may be named `durablefibers`; code and packages must use `fiber`.
+The repo folder may be named `durablefibers`, and so is the GitHub organisation — `github.com/durablefibers/fiber` and `ghcr.io/durablefibers/fiber-*` are correct references to it. Code and packages must use `fiber`.
 
 Enforced by `.claude/hooks/naming-guard.sh` on every edit.
