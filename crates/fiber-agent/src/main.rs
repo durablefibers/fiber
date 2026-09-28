@@ -2043,7 +2043,12 @@ async fn execute_step(
     shell: Option<&str>,
 ) -> Result<i32> {
     let run_dir = workspace_root.join(run_id.to_string());
-    let work_dir = run_dir.join(step_run_id.to_string());
+    // A fresh directory per execution, never a reused one. A previous attempt's container
+    // had this step's directory mounted read-write, and as root it can leave files the
+    // agent user cannot delete; the old path reused whatever survived and ran host `git`
+    // inside it, so a `.git/config` the container wrote (`core.fsmonitor`, …) ran on the
+    // host. What cleanup cannot remove stays behind for the stale-workspace sweep.
+    let work_dir = run_dir.join(format!("{step_run_id}.{}", Uuid::new_v4().simple()));
     workspaces.enter(run_id);
     let span = tracing::info_span!(
         "fiber.step",
@@ -2740,12 +2745,12 @@ async fn restore_artifacts(
 ) -> Result<()> {
     let client = artifact_client()?;
     for art in restore {
-        if art.name.contains("..") {
-            log(
-                "system",
-                format!("skipping unsafe restore path: {}", art.name),
-            );
-            continue;
+        // Refused before any bytes move. The name comes from the server, which sanitizes
+        // it on insert; the agent does not take that on trust.
+        if artifact_components(&art.name).is_none() {
+            let msg = format!("unsafe restore path: {}", art.name);
+            log("system", msg.clone());
+            bail!("{msg}");
         }
         let url = format!("{http_api}/api/agent/artifacts/{}/download", art.id);
         log(
@@ -2765,19 +2770,94 @@ async fn restore_artifacts(
                 bail!("{msg}");
             }
         };
-        let dest = work_dir.join(&art.name);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&dest, &bytes)
-            .await
-            .with_context(|| format!("write restored artifact {}", art.name))?;
+        let dest = match write_restored(work_dir, &art.name, &bytes).await {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("RESTORE FAILED {}: {e:#}", art.name);
+                log("system", msg.clone());
+                bail!("{msg}");
+            }
+        };
         log(
             "system",
             format!("restored artifact {} → {}", art.name, dest.display()),
         );
     }
     Ok(())
+}
+
+async fn dir_is_empty(dir: &Path) -> bool {
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(None)),
+        Err(_) => false,
+    }
+}
+
+/// Write a restored artifact to `rel` under `work_dir` without following a symlink.
+///
+/// This runs on the host, after the step's checkout and before its container exists, so
+/// the checkout is the repository's to shape: a commit with `dist -> ~/.ssh` (or a leaf
+/// `dist/app.tar -> ~/.bashrc`) would turn `create_dir_all` + `write` into a host write
+/// of bytes an earlier step of the same commit produced — from inside its container, on a
+/// fork's pull request. So each directory is created or checked one component at a time
+/// and a symlink anywhere refuses the restore, and the file itself is opened `O_NOFOLLOW`
+/// so a link that appears between the check and the open is refused too.
+async fn write_restored(work_dir: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf> {
+    use tokio::io::AsyncWriteExt;
+    let parts = artifact_components(rel).ok_or_else(|| anyhow!("unsafe restore path"))?;
+    let (leaf, dirs) = parts.split_last().ok_or_else(|| anyhow!("empty path"))?;
+    let mut cur = work_dir.to_path_buf();
+    for d in dirs {
+        cur.push(d);
+        match tokio::fs::symlink_metadata(&cur).await {
+            Ok(m) if m.is_symlink() => bail!(
+                "{} is a symlink in the checkout; refusing to write through it",
+                cur.display()
+            ),
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => bail!("{} exists and is not a directory", cur.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&cur)
+                    .await
+                    .with_context(|| format!("create {}", cur.display()))?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("stat {}", cur.display())),
+        }
+    }
+    cur.push(leaf);
+    if tokio::fs::symlink_metadata(&cur)
+        .await
+        .is_ok_and(|m| m.is_symlink())
+    {
+        bail!(
+            "{} is a symlink in the checkout; refusing to write through it",
+            cur.display()
+        );
+    }
+    // Judged on the handle, as the upload does: `O_NONBLOCK` so a FIFO cannot hold the
+    // open, then only a regular file with one link is truncated and written — a device
+    // node or a hard link to something else is refused.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        // Not at open: that would shorten a hard-linked file before the check below
+        // refuses it. Truncated with `set_len` once it is known to be ours.
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(&cur)
+        .await
+        .with_context(|| format!("open {}", cur.display()))?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() || std::os::unix::fs::MetadataExt::nlink(&meta) != 1 {
+        bail!(
+            "{} is not a plain file in the checkout; refusing to write to it",
+            cur.display()
+        );
+    }
+    file.set_len(0).await?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    Ok(cur)
 }
 
 /// One download of a prior artifact. A failure on the direct URL is usually the 307 to
@@ -2948,6 +3028,9 @@ async fn error_detail(resp: reqwest::Response) -> String {
 /// substring check: `work_dir.join("/etc/passwd")` discards the workspace entirely, so
 /// an absolute declaration read a file outside the checkout and uploaded it.
 fn artifact_components(rel: &str) -> Option<Vec<std::ffi::OsString>> {
+    if !fiber_proto::validate::artifact_path_ok(rel) {
+        return None;
+    }
     let mut out = Vec::new();
     for c in Path::new(rel).components() {
         match c {
@@ -3386,13 +3469,19 @@ async fn clone_step_workspace(
     work_dir: &Path,
     log: &mut impl FnMut(&str, String),
 ) -> Result<()> {
-    if work_dir.join(".git").exists() {
-        // A retried attempt reuses this path: put it back to a clean tree.
-        let _ = run_git(work_dir, &["reset", "--hard", "HEAD"], log).await;
-        let _ = run_git(work_dir, &["clean", "-fdx"], log).await;
-        return Ok(());
+    // Each execution gets a new path (see `execute_step`), which the caller has only just
+    // created, empty. Anything else here was not made by this agent for this step: refuse
+    // it rather than run host `git` in it.
+    match tokio::fs::symlink_metadata(work_dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(m) if m.is_dir() && dir_is_empty(work_dir).await => {
+            tokio::fs::remove_dir(work_dir).await?;
+        }
+        _ => bail!(
+            "step workspace {} already exists; refusing to reuse it",
+            work_dir.display()
+        ),
     }
-    let _ = tokio::fs::remove_dir(work_dir).await;
     let src = format!("file://{}", reference.display());
     let dest = work_dir.to_string_lossy();
     // Through `run_git` like every other invocation: no stdin, no prompt, pinned
@@ -4662,6 +4751,145 @@ mod tests {
         // Nothing there yet is not a symlink; the caller reports it as missing.
         assert_eq!(symlink_in(&root, "out/absent").await, None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restore_does_not_write_through_a_symlink_the_checkout_planted() {
+        // The checkout is outside the container's control but inside the repository's:
+        // a fork can commit `dist -> ~/.ssh` or `dist/app.tar -> ~/.bashrc`, and the
+        // restore runs on the host. Neither may land outside the workspace.
+        let root = std::env::temp_dir().join(format!("fiber-restore-{}", Uuid::new_v4()));
+        let work = root.join("work");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("bashrc");
+        std::fs::write(&victim, b"ORIGINAL").unwrap();
+
+        std::os::unix::fs::symlink(&outside, work.join("dist")).unwrap();
+        let err = write_restored(&work, "dist/app.tar", b"PAYLOAD")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert!(
+            !outside.join("app.tar").exists(),
+            "wrote through a symlinked directory"
+        );
+
+        std::fs::create_dir_all(work.join("out")).unwrap();
+        std::os::unix::fs::symlink(&victim, work.join("out/app.tar")).unwrap();
+        assert!(
+            write_restored(&work, "out/app.tar", b"PAYLOAD")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"ORIGINAL",
+            "wrote through a symlinked leaf"
+        );
+
+        // A deeper symlinked directory is the same escape.
+        std::fs::create_dir_all(work.join("a")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("a/b")).unwrap();
+        assert!(
+            write_restored(&work, "a/b/c/app.tar", b"PAYLOAD")
+                .await
+                .is_err()
+        );
+        assert!(!outside.join("c").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restore_refuses_a_leaf_that_is_not_a_plain_file() {
+        let root = std::env::temp_dir().join(format!("fiber-restore-{}", Uuid::new_v4()));
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("out")).unwrap();
+        // A hard link to a file outside: truncating it would rewrite that file.
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"ORIGINAL").unwrap();
+        std::fs::hard_link(&victim, work.join("out/linked")).unwrap();
+        assert!(
+            write_restored(&work, "out/linked", b"PAYLOAD")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"ORIGINAL");
+        // A FIFO: without O_NONBLOCK the open would wait for a reader until the timeout.
+        let fifo = work.join("out/fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_restored(&work, "out/fifo", b"PAYLOAD"),
+        )
+        .await
+        .expect("a FIFO blocked the restore");
+        assert!(r.is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_step_workspace_that_already_exists_is_never_reused() {
+        // A previous attempt's container could have written `.git/config`; running host
+        // `git` in what it left is running its config on the host.
+        let root = std::env::temp_dir().join(format!("fiber-reuse-{}", Uuid::new_v4()));
+        let work = root.join("step");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::write(
+            work.join(".git/config"),
+            b"[core]\n\tfsmonitor = touch PWNED\n",
+        )
+        .unwrap();
+        let mut log = |_: &str, _: String| {};
+        let err = clone_step_workspace(&root.join(".repo"), &work, &mut log)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to reuse"), "{err:#}");
+        assert!(!work.join("PWNED").exists());
+        // The empty directory the caller creates first is not a reuse: the clone goes
+        // ahead (and fails here only because there is no `.repo` to clone from).
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let err = clone_step_workspace(&root.join(".repo"), &fresh, &mut log)
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("refusing to reuse"), "{err:#}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restore_refuses_names_that_leave_the_workspace() {
+        let root = std::env::temp_dir().join(format!("fiber-restore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let abs = root.join("abs-target");
+        for bad in [abs.to_str().unwrap(), "../escape", "./dist/x", ""] {
+            assert!(
+                write_restored(&root.join("work"), bad, b"x").await.is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(!abs.exists(), "an absolute name replaced the workspace");
+        assert!(!root.join("escape").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restore_creates_its_directories_and_overwrites_a_regular_file() {
+        let work = std::env::temp_dir().join(format!("fiber-restore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(work.join("out")).unwrap();
+        std::fs::write(work.join("out/VERSION"), b"stale-and-longer").unwrap();
+        let dest = write_restored(&work, "out/VERSION", b"1.2.3")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"1.2.3", "not truncated");
+        let dest = write_restored(&work, "dist/nested/app.tar", b"tar")
+            .await
+            .unwrap();
+        assert_eq!(dest, work.join("dist/nested/app.tar"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"tar");
+        std::fs::remove_dir_all(&work).ok();
     }
 
     #[test]

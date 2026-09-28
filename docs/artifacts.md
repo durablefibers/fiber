@@ -31,8 +31,20 @@ workspace:
   and the artifact absent — the dependent step then failed at restore time, or worse, ran
   without it. Archive it in the step instead: `tar czf dist.tgz dist` and declare
   `dist.tgz`.
-- **An absolute path, `..`, or anything else that is not a plain relative path is
-  refused.** These read outside the workspace entirely.
+- **An absolute path, `..`, a leading `./`, or anything else that is not a plain
+  relative path is refused** when the pipeline compiles, and again by the agent. These
+  read outside the workspace entirely.
+
+### Restoring
+
+A restore writes the file into the dependent step's fresh checkout **on the agent host**,
+before that step's container starts. It is refused, and the step fails, when any
+component of the path is a symlink in that checkout, for the same reason as above in the
+other direction. A commit carrying `dist -> ~/.ssh`, or `dist/app.tar -> ~/.bashrc`, would
+otherwise have the agent write bytes an earlier step produced, possibly inside a container
+and from a fork's pull request, to that file on the host. Directories are created one
+component at a time without following links, and the file is opened `O_NOFOLLOW`. The
+agent refuses a restore name that is not a plain relative path whatever the server sent.
 
 ### Caps
 

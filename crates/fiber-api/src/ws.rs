@@ -524,6 +524,12 @@ async fn restore_list(
         {
             continue;
         }
+        // The agent refuses these too; a name that could not have come from its own upload
+        // (absolute, `..`, not a plain relative path) is left out of the offer.
+        if !fiber_proto::validate::artifact_path_ok(&a.name) {
+            tracing::warn!(artifact_id = %a.id, name = %a.name, "unsafe artifact name left out of restore");
+            continue;
+        }
         by_name.insert(
             a.name.clone(),
             ArtifactRestore {

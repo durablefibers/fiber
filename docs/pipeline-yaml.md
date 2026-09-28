@@ -254,5 +254,5 @@ The check is on the shape, not the outcome.
 - Depending on a step twice is the same as depending on it once: `needs` is deduplicated before matrix cells are substituted in.
 - On upstream failure, dependents are typically **skipped** (fail-fast).
 - Steps are **at-least-once**; prefer idempotent `run` scripts.
-- Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.
+- Each step gets its **own workspace**, so parallel steps cannot overwrite each other. Every attempt, a retry included, starts from a fresh checkout in a new directory; nothing a previous attempt left behind is reused. Files reach a later step as **artifacts**, and a step is given only the artifacts produced by the steps it (transitively) `needs`.
 - What a run executes is frozen when it starts (`workspace`, `run`, `image`, `artifacts`, matrix env). Saving the pipeline afterwards affects only future runs.
