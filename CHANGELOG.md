@@ -6,6 +6,14 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-09-28
+
+A security release for the agent. Two bugs, present in every release since 0.2.0, let
+code running inside a step's container write to or execute on the agent host. **Upgrade
+the agents.** The server-side checks that come with the fix only move an error earlier.
+No migration and no wire change: a 0.6.6 agent works with a 0.6.5 server and the other
+way round.
+
 ### Security
 
 - **A restored artifact could be written through a symlink in the checkout, onto the
