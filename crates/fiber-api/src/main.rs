@@ -15,7 +15,7 @@ mod ws;
 
 use anyhow::Result;
 use artifacts::ArtifactBackend;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use fiber_core::{Store, db};
 use fiber_durable::{FiberRegistry, FiberScheduler, FiberStore, tasks};
 use fiber_scheduler::Scheduler;
@@ -80,6 +80,45 @@ struct Args {
     /// Most expanded steps one pipeline may compile to (matrix cells included).
     #[arg(long, env = "FIBER_MAX_STEPS")]
     max_steps: Option<String>,
+
+    /// Run a maintenance command against the database instead of serving.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Set a user's password and sign them out everywhere, for an operator locked out of
+    /// the UI. Needs only FIBER_DATABASE_URL; the server does not have to be running.
+    ResetPassword {
+        username: String,
+        /// Read the new password from stdin (first line). Without it, one is generated
+        /// and printed.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+}
+
+/// `fiber-api reset-password`: no migrations, no server — just the one update.
+async fn reset_password(database_url: &str, username: &str, from_stdin: bool) -> Result<()> {
+    let (password, generated) = if from_stdin {
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        let s = s.trim_end_matches(['\r', '\n']).to_string();
+        anyhow::ensure!(!s.is_empty(), "stdin was empty");
+        (s, false)
+    } else {
+        (fiber_core::tokens::generate_password(), true)
+    };
+    let store = Store::new(db::connect(database_url).await?);
+    match store.reset_password(username, &password).await? {
+        Some(_) if generated => {
+            println!("password for {username} reset; sessions revoked\n{password}")
+        }
+        Some(_) => println!("password for {username} reset; sessions revoked"),
+        None => anyhow::bail!("no user named {username:?}"),
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -87,6 +126,13 @@ async fn main() -> Result<()> {
     let otel = otel::init()?;
 
     let args = Args::parse();
+    if let Some(Command::ResetPassword {
+        username,
+        password_stdin,
+    }) = &args.command
+    {
+        return reset_password(&args.database_url, username, *password_stdin).await;
+    }
     // Validated here so a typo is a boot failure rather than a limit nobody chose.
     // `fiber_core::dag::max_steps` reads the same variable and warns on its own for the
     // CLI, which has no boot to fail.
@@ -398,4 +444,35 @@ fn cors_layer() -> CorsLayer {
         .collect();
     tracing::info!(?origins, "CORS allowed origins");
     base.allow_origin(AllowOrigin::list(origins))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_no_subcommand_the_binary_still_serves() {
+        let args = Args::try_parse_from(["fiber-api"]).unwrap();
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn reset_password_takes_a_username_and_an_optional_stdin_flag() {
+        let args = Args::try_parse_from(["fiber-api", "reset-password", "admin"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::ResetPassword { ref username, password_stdin: false }) if username == "admin"
+        ));
+        let args =
+            Args::try_parse_from(["fiber-api", "reset-password", "admin", "--password-stdin"])
+                .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::ResetPassword {
+                password_stdin: true,
+                ..
+            })
+        ));
+        assert!(Args::try_parse_from(["fiber-api", "reset-password"]).is_err());
+    }
 }

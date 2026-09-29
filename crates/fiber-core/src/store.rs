@@ -2594,6 +2594,30 @@ impl Store {
         Ok(true)
     }
 
+    /// Set a user's password without knowing the current one, and sign them out everywhere.
+    ///
+    /// The recovery path behind `fiber-api reset-password`, for an operator with database
+    /// access and no working login. `None` when no user has that name.
+    pub async fn reset_password(&self, username: &str, new_password: &str) -> Result<Option<Uuid>> {
+        let hash = crate::tokens::hash_password(new_password);
+        let mut tx = self.pool.begin().await?;
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE users SET password_hash = $2 WHERE username = $1 RETURNING id",
+        )
+        .bind(username)
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = id {
+            sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// Drop every session for a user except, optionally, the one making the request.
     ///
     /// Returns how many were removed. The remedy for a leaked token: without it the only

@@ -21,6 +21,14 @@ pub fn generate_session_token() -> String {
     format!("fiber_sess_{}", hex::encode(bytes))
 }
 
+/// A password for `fiber-api reset-password` to print when none is given: 128 bits from
+/// the same CSPRNG as the tokens, hex so it survives any terminal and any paste.
+pub fn generate_password() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -82,6 +90,16 @@ pub fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_generated_password_is_long_random_and_verifies() {
+        let a = generate_password();
+        let b = generate_password();
+        assert_eq!(a.len(), 32, "16 random bytes, hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert!(verify_password(&a, &hash_password(&a)));
+    }
 
     /// The token bytes must come from a cryptographically secure generator.
     ///

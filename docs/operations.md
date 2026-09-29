@@ -534,6 +534,25 @@ bash scripts/smoke_compose.sh           # full compose up --build smoke
 
 Expect `SMOKE_OK` on success.
 
+## Locked out of the admin account
+
+`fiber-api reset-password <username>` sets a new password straight in the database and
+signs that user out everywhere. It needs only `FIBER_DATABASE_URL`, runs no migrations,
+and does not need the server to be up. Without `--password-stdin` it generates a password
+and prints it once:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec fiber-api fiber-api reset-password admin
+# or choose one:
+printf '%s\n' "$NEW_PASSWORD" | docker compose -f deploy/docker-compose.yml exec -T fiber-api \
+  fiber-api reset-password admin --password-stdin
+```
+
+It exits non-zero if no user has that name. If the account has lost instance admin as
+well, set `FIBER_ADMIN_USER` to it and restart: an instance with no admin promotes that
+user at boot. Too many failed logins lock a username only in memory and for a few
+minutes, so there is nothing to clear.
+
 ## Backups
 
 ### Postgres
