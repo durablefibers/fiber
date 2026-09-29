@@ -146,6 +146,16 @@ fn is_valid_env_key(k: &str) -> bool {
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A name the host `docker` client, or the loader that starts it, acts on. Only matters
+/// for a multi-line value, which reaches the step through that client's environment.
+fn docker_client_reads(k: &str) -> bool {
+    ENV_ALLOWLIST.contains(&k)
+        || DOCKER_CLIENT_ENV.contains(&k)
+        || ["DOCKER_", "LD_", "DYLD_", "GO"]
+            .iter()
+            .any(|p| k.starts_with(p))
+}
+
 /// Execution policy for one step, resolved once from the agent's flags.
 #[derive(Clone)]
 struct ExecConfig {
@@ -2651,6 +2661,18 @@ fn write_env_file(
             continue;
         }
         if v.contains('\n') {
+            // Deferred values are set on the `docker` client's own environment (an
+            // env-file cannot hold a newline), so a name that client or the loader reads
+            // would steer the host process rather than reach the step.
+            if docker_client_reads(k) {
+                log(
+                    "system",
+                    format!(
+                        "ignoring multi-line value for {k}: the docker client itself reads that name"
+                    ),
+                );
+                continue;
+            }
             deferred.push((k.clone(), v.clone()));
             continue;
         }
@@ -3385,6 +3407,17 @@ async fn prepare_reference_clone(
     let repo = ws.repo.trim();
     if !fiber_proto::validate::repo_url_ok(repo) {
         bail!("workspace repo is not a fetchable URL");
+    }
+    // Same boundary for what gets fetched and checked out. The sha goes to `git checkout`
+    // *before* its `--`, where a leading `-` is an option; the ref follows a `--`, and is
+    // checked so a bad value fails here with a reason rather than inside git.
+    if !fiber_proto::validate::git_ref_ok(&ws.git_ref) {
+        bail!("workspace ref {:?} is not a single ref name", ws.git_ref);
+    }
+    if let Some(sha) = &ws.sha
+        && !fiber_proto::validate::commit_sha_ok(sha)
+    {
+        bail!("workspace sha {sha:?} is not a full commit id");
     }
     log(
         "system",
@@ -4555,6 +4588,32 @@ mod tests {
         for line in body.lines() {
             assert!(line.contains('='), "every line must bind a value: {line:?}");
         }
+    }
+
+    #[test]
+    fn a_multi_line_value_never_reaches_the_docker_clients_own_environment() {
+        // Deferred values are set on the host `docker` process; these names would steer it.
+        let e = env(&[
+            ("LD_PRELOAD", "/tmp/evil.so\n"),
+            ("PATH", "/tmp/bin\n"),
+            ("DOCKER_HOST", "tcp://elsewhere\n"),
+            ("GODEBUG", "x=1\n"),
+            ("CERT_PEM", "-----BEGIN-----\nabc\n-----END-----"),
+            ("LD_LIBRARY_PATH", "/opt/lib"),
+        ]);
+        let mut notes = Vec::new();
+        let mut log = |_: &str, m: String| notes.push(m);
+        let (f, deferred) = write_env_file(&e, &mut log).unwrap();
+        let names: Vec<&str> = deferred.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            names,
+            ["CERT_PEM"],
+            "only the harmless multi-line value is deferred"
+        );
+        // Single-line, it goes in the env-file and only ever reaches the container.
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(body, "LD_LIBRARY_PATH=/opt/lib\n");
+        assert_eq!(notes.len(), 4, "{notes:?}");
     }
 
     #[test]

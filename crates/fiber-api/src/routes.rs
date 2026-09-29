@@ -1910,25 +1910,6 @@ async fn set_github_secret(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// A commit id we are willing to hand to `git checkout`. Anything else (an empty string,
-/// a revision expression, a value starting with `-` that git would read as an option) is
-/// dropped rather than passed through.
-fn valid_head_sha(sha: &str) -> bool {
-    matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// A ref safe to pass to `git fetch`. Rejects option-looking values and path tricks.
-fn valid_head_ref(r: &str) -> bool {
-    !r.is_empty()
-        && r.len() <= 255
-        && !r.starts_with('-')
-        && !r.contains("..")
-        && !r.contains(char::is_whitespace)
-        && !r
-            .chars()
-            .any(|c| c.is_control() || c == '~' || c == '^' || c == ':' || c == '?')
-}
-
 async fn github_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1985,9 +1966,11 @@ async fn github_webhook(
                     .get("after")
                     .or_else(|| payload.pointer("/head_commit/id"))
                     .and_then(|v| v.as_str())
-                    .filter(|s| valid_head_sha(s) && !s.chars().all(|c| c == '0'))
+                    .filter(|s| {
+                        fiber_proto::validate::commit_sha_ok(s) && !s.chars().all(|c| c == '0')
+                    })
                     .map(str::to_string),
-                head_ref: Some(branch.clone()).filter(|b| valid_head_ref(b)),
+                head_ref: Some(branch.clone()).filter(|b| fiber_proto::validate::git_ref_ok(b)),
                 pr_number: None,
                 repo_full_name: crate::github::repo_full_name(&payload)
                     .map(|(o, r)| format!("{o}/{r}")),
@@ -2077,7 +2060,7 @@ async fn github_webhook(
                 head_sha: payload
                     .pointer("/pull_request/head/sha")
                     .and_then(|v| v.as_str())
-                    .filter(|s| valid_head_sha(s))
+                    .filter(|s| fiber_proto::validate::commit_sha_ok(s))
                     .map(str::to_string),
                 head_ref: (number > 0).then(|| format!("refs/pull/{number}/head")),
                 pr_number: (number > 0).then_some(number as i32),

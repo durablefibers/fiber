@@ -28,7 +28,7 @@ steps:
 |---|---|---|
 | `name` | yes | Pipeline display name |
 | `env` | no | Environment for every step; see below |
-| `workspace` | no | Git clone into the step workspace. `repo` must be an `http(s)://`, `ssh://`, `git://`, or `file://` URL, an scp-like `user@host:path`, or a path — rejected when the pipeline compiles otherwise, and again by the agent, which also pins `GIT_ALLOW_PROTOCOL`. Git's `ext::` transport runs a command, and the repo is added on the agent host before any container exists |
+| `workspace` | no | Git clone into the step workspace. `repo` must be an `http(s)://`, `ssh://`, `git://`, or `file://` URL, an scp-like `user@host:path`, or a path — rejected when the pipeline compiles otherwise, and again by the agent, which also pins `GIT_ALLOW_PROTOCOL`. Git's `ext::` transport runs a command, and the repo is added on the agent host before any container exists. `ref` must be one branch, tag, ref or SHA: no leading `-`, `..`, spaces, or `~ ^ : ?` |
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
 | `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
@@ -113,7 +113,7 @@ API replicas still leave exactly one run in flight.
 | `shell` | `sh` | Interpreter for `run`, invoked as `<shell> -c`. A bare program name only: `bash` yes, `/bin/bash` or `bash -e` no. It has to exist in the `image`, or on the host for a shell step |
 | `continue_on_error` | `false` | The step's failure is recorded but does not fail the run, and its dependents still run. See below |
 | `artifacts` | `[]` | Workspace-relative paths to upload after **success** |
-| `matrix` | — | Axis → values; expanded at compile time |
+| `matrix` | — | Axis → values; expanded at compile time. Each axis name becomes an env var (`os`, `MATRIX_OS`, `FIBER_MATRIX_OS`), so it must be letters, digits and `_`, not starting with a digit |
 | `if` | `success()` | Gate whether the step is queued |
 
 Injected env (among others): `FIBER_RUN_ID`, `FIBER_STEP_ID`, project secrets as env vars (see `secrets:` to narrow them), and for matrix cells `MATRIX_<AXIS>` / `FIBER_MATRIX_<AXIS>`. Secret **values** are masked as `***` in step logs (a substring match, so it will not catch a value the step re-encodes first). Nothing else from the agent's own environment reaches a step.
