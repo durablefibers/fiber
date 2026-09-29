@@ -6,6 +6,14 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`fiber-api reset-password <username>`** recovers a locked-out account without raw SQL.
+  It sets the password in the database, revokes every session of that user, and prints a
+  generated password unless `--password-stdin` gives one. Only `FIBER_DATABASE_URL` is
+  needed, and the server does not have to be running.
+  [operations](docs/operations.md#locked-out-of-the-admin-account).
+
 ## [0.6.6] — 2026-09-28
 
 A security release for the agent. Two bugs, present in every release since 0.2.0, let
