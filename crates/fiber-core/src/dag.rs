@@ -497,7 +497,7 @@ fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell<'
                 }
             }
             if let Some(wd) = &step.working_directory
-                && !is_contained_relative_path(wd)
+                && !fiber_proto::validate::working_directory_ok(wd)
             {
                 return Err(DagError::BadWorkingDirectory {
                     step: step.id.clone(),
@@ -505,7 +505,7 @@ fn expand_all(def: &PipelineDefinition, max: usize) -> Result<Vec<ExpandedCell<'
                 });
             }
             if let Some(sh) = &step.shell
-                && !is_bare_program_name(sh)
+                && !fiber_proto::validate::shell_ok(sh)
             {
                 return Err(DagError::BadShell {
                     step: step.id.clone(),
@@ -629,33 +629,6 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
         combos = next;
     }
     Ok(combos)
-}
-
-/// A path that stays inside the workspace when joined to it.
-///
-/// Rejects absolute paths, `..` in any position, and Windows-style roots. The agent checks
-/// again before it uses the value — this is the early, legible failure, not the boundary.
-fn is_contained_relative_path(p: &str) -> bool {
-    let p = p.trim();
-    !p.is_empty()
-        && !p.starts_with('/')
-        && !p.starts_with('\\')
-        && !p.contains(':')
-        && !p.split(['/', '\\']).any(|seg| seg == "..")
-}
-
-/// A program name, not a command line.
-///
-/// `bash` yes, `/bin/bash` or `bash -e` no. Keeping it a bare name means the agent invokes
-/// `<shell> -c <run>` predictably, and the image decides which binary that resolves to.
-fn is_bare_program_name(s: &str) -> bool {
-    let s = s.trim();
-    !s.is_empty()
-        && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        && s != "."
-        && s != ".."
 }
 
 /// A name a shell and `docker --env-file` will both accept.

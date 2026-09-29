@@ -39,3 +39,7 @@ tracing-opentelemetry = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Builds an in-memory reqwest::Response for the download-cap test; already in the lockfile via reqwest.
+http = "1"

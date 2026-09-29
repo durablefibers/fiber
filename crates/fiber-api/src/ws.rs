@@ -122,29 +122,6 @@ fn current_traceparent() -> Option<String> {
     tp
 }
 
-/// A workspace-relative path that cannot climb out of it. Mirrors the compile-time check in
-/// `fiber-core`; kept here so a snapshot written by an older or edited definition still
-/// cannot send an agent outside its workspace.
-fn is_contained_relative_path(p: &str) -> bool {
-    let p = p.trim();
-    !p.is_empty()
-        && !p.starts_with('/')
-        && !p.starts_with('\\')
-        && !p.contains(':')
-        && !p.split(['/', '\\']).any(|seg| seg == "..")
-}
-
-/// A bare program name, not a command line.
-fn is_bare_program_name(s: &str) -> bool {
-    let s = s.trim();
-    !s.is_empty()
-        && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        && s != "."
-        && s != ".."
-}
-
 /// Why an offer could not be built, sorted by what to do about the lease. An offer sent
 /// without its workspace, secrets or restore list would run the step in an empty
 /// directory, fail it, and spend a retry — so none is sent; the question is only
@@ -214,19 +191,21 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
             timeout_minutes = s
                 .get("timeout_minutes")
                 .and_then(|v| v.as_u64())
-                .map(|m| m as u32);
+                // Out of range falls back to the default below; `as u32` wrapped 2^32 to
+                // 0, which the agent reads as no deadline at all.
+                .and_then(|m| u32::try_from(m).ok());
             // Re-checked here rather than trusted from the snapshot: it was
             // validated when the pipeline compiled, but a snapshot is a stored
             // document and this is the last point before it reaches an agent.
             working_directory = s
                 .get("working_directory")
                 .and_then(|v| v.as_str())
-                .filter(|d| is_contained_relative_path(d))
+                .filter(|d| fiber_proto::validate::working_directory_ok(d))
                 .map(str::to_string);
             shell = s
                 .get("shell")
                 .and_then(|v| v.as_str())
-                .filter(|sh| is_bare_program_name(sh))
+                .filter(|sh| fiber_proto::validate::shell_ok(sh))
                 .map(str::to_string);
             // Absent (or null) = every project secret; a list = only those names.
             secret_allow = s
