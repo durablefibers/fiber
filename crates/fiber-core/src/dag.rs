@@ -128,6 +128,14 @@ pub enum DagError {
         "workspace repo `{0}` must be an http(s), ssh, git, or file URL, an scp-like `user@host:path`, or a path"
     )]
     BadRepo(String),
+    #[error(
+        "workspace ref `{0}` must be a single branch, tag or ref name (no leading `-`, `..`, spaces, or `~ ^ : ?`)"
+    )]
+    BadRef(String),
+    #[error(
+        "step `{step}` matrix axis `{axis}` is not a usable environment variable name (letters, digits and `_`, not starting with a digit)"
+    )]
+    BadMatrixAxis { step: String, axis: String },
     #[error("step `{step}` has an unusable condition — {message}")]
     BadIf { step: String, message: String },
     #[error("every step needs a non-empty id")]
@@ -224,6 +232,13 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         && !fiber_proto::validate::repo_url_ok(&ws.repo)
     {
         return Err(DagError::BadRepo(ws.repo.clone()));
+    }
+    // The ref reaches `git fetch` on the same host. It follows a `--` there, so it cannot
+    // be an option; this is so a typo fails at save rather than on the agent.
+    if let Some(r) = def.workspace.as_ref().and_then(|ws| ws.git_ref.as_deref())
+        && !fiber_proto::validate::git_ref_ok(r)
+    {
+        return Err(DagError::BadRef(r.to_string()));
     }
     for step in &def.steps {
         if step.timeout_minutes == Some(0) {
@@ -569,6 +584,14 @@ fn matrix_combos(step: &StepDefinition) -> Result<Vec<BTreeMap<String, String>>,
     };
     if matrix.is_empty() {
         return Ok(vec![BTreeMap::new()]);
+    }
+    // Each axis name becomes an env var name three times over (`os`, `MATRIX_OS`,
+    // `FIBER_MATRIX_OS`), so it gets the same check as a step's own `env` keys.
+    if let Some(axis) = matrix.keys().find(|k| !is_usable_env_name(k)) {
+        return Err(DagError::BadMatrixAxis {
+            step: step.id.clone(),
+            axis: axis.clone(),
+        });
     }
     // Borrowed, not cloned: copying every axis value up front to then reject the product
     // is the same amplification one level down.
@@ -1242,6 +1265,63 @@ mod tests {
                 timeout_minutes: None,
             };
             assert!(compile_definition(&d).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_ref_must_be_one_ref_name() {
+        let compile = |r: &str| {
+            compile_definition(&PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: Some(fiber_proto::WorkspaceConfig {
+                    repo: "https://github.com/org/repo.git".into(),
+                    git_ref: Some(r.into()),
+                }),
+                concurrency: None,
+                on: None,
+                steps: vec![step("a", &[], "echo")],
+                timeout_minutes: None,
+            })
+        };
+        for bad in ["-x", "a..b", "main~1", "src:dst", "has space", ""] {
+            assert!(
+                matches!(compile(bad), Err(DagError::BadRef(_))),
+                "accepted {bad:?}"
+            );
+        }
+        for good in ["main", "release/1.x", "refs/pull/7/head"] {
+            assert!(compile(good).is_ok(), "rejected {good:?}");
+        }
+    }
+
+    #[test]
+    fn matrix_axis_names_must_be_usable_env_names() {
+        let compile = |axis: &str| {
+            let mut st = step("a", &[], "echo");
+            st.matrix = Some(
+                [(axis.to_string(), vec!["x".to_string()])]
+                    .into_iter()
+                    .collect(),
+            );
+            compile_definition(&PipelineDefinition {
+                name: "p".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![st],
+                timeout_minutes: None,
+            })
+        };
+        for bad in ["LD_PRELOAD=x", "has space", "9os", "a\nb", ""] {
+            assert!(
+                matches!(compile(bad), Err(DagError::BadMatrixAxis { .. })),
+                "accepted {bad:?}"
+            );
+        }
+        for good in ["os", "node_version", "ARCH"] {
+            assert!(compile(good).is_ok(), "rejected {good:?}");
         }
     }
 

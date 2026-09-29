@@ -6,6 +6,24 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **More of a step is checked at compile time and again on the agent.**
+  - A `workspace.ref` must be one ref name (no leading `-`, `..`, spaces, or `~ ^ : ?`).
+  - A matrix axis name must be a usable env var name (letters, digits, `_`). Before, an
+    axis like `node-version` compiled, but its env vars were silently dropped on the
+    agent.
+  - The agent refuses a `sha` that is not a full commit id before it reaches
+    `git checkout`, where a leading `-` would be an option.
+  - A multi-line env value whose name the host `docker` client or loader reads
+    (`PATH`, `LD_*`, `DYLD_*`, `DOCKER_*`, `GO*`, the proxy and CA names) is no longer
+    set on that client's own environment. It is dropped with a system log line, since
+    an env-file cannot hold a newline. Single-line values still reach the container as
+    before.
+
+  The sha and ref checks now live in `fiber_proto::validate`, with the webhook ingest
+  using the same functions.
+
 ### Added
 
 - **`fiber-api reset-password <username>`** recovers a locked-out account without raw SQL.

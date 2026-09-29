@@ -98,6 +98,28 @@ pub fn repo_url_ok(s: &str) -> bool {
         .any(|piece| piece.starts_with('-'))
 }
 
+/// A full commit id: 40 hex characters (SHA-1) or 64 (SHA-256).
+///
+/// The agent passes it to `git checkout` *before* the `--`, where a value starting with
+/// `-` would be read as an option. Hex never starts with one.
+pub fn commit_sha_ok(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A ref safe to hand to `git fetch`: no leading `-`, no `..`, whitespace, control
+/// characters, or the revision syntax (`~ ^ : ?`) that would make it something other
+/// than one ref.
+pub fn git_ref_ok(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 255
+        && !r.starts_with('-')
+        && !r.contains("..")
+        && !r.contains(char::is_whitespace)
+        && !r
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '~' | '^' | ':' | '?'))
+}
+
 /// A workspace-relative artifact path: one or more plain path components, nothing else.
 ///
 /// The agent reads a declared artifact from, and writes a restored one to,
@@ -116,6 +138,41 @@ pub fn artifact_path_ok(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commit_sha_is_forty_or_sixty_four_hex_characters() {
+        assert!(commit_sha_ok(&"a".repeat(40)));
+        assert!(commit_sha_ok(&"0123456789abcdef".repeat(4)));
+        for bad in [
+            "",
+            "abc123",
+            "--pathspec-from-file=/etc/passwd",
+            &"g".repeat(40),
+            &"a".repeat(41),
+        ] {
+            assert!(!commit_sha_ok(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_git_ref_cannot_be_an_option_or_a_revision_expression() {
+        for good in ["main", "release/1.x", "refs/pull/12/head", "v1.0.0"] {
+            assert!(git_ref_ok(good), "rejected {good:?}");
+        }
+        for bad in [
+            "",
+            "-oops",
+            "--upload-pack=x",
+            "a..b",
+            "main~1",
+            "HEAD^",
+            "src:dst",
+            "has space",
+            "new\nline",
+        ] {
+            assert!(!git_ref_ok(bad), "accepted {bad:?}");
+        }
+    }
 
     #[test]
     fn artifact_paths_that_leave_the_workspace_are_refused() {
