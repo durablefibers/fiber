@@ -1139,6 +1139,21 @@ impl Scheduler {
                          place and will fire once the definition is fixed (said once \
                          per reason)"
                     );
+                    // Once per reason, like the warning: a failed run on the pipeline's
+                    // page says why the schedule stopped, without one per tick.
+                    if let Err(e) = self
+                        .store
+                        .record_unstartable_run(
+                            p.id,
+                            &schedule_trigger_label(on),
+                            &fiber_core::RunCommit::default(),
+                            &reason,
+                            true,
+                        )
+                        .await
+                    {
+                        warn!(pipeline = %p.id, error = %e, "could not record the failed start");
+                    }
                 } else {
                     debug!(pipeline = %p.id, error = %reason, "still not compiling");
                 }

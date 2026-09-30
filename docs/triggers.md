@@ -14,7 +14,7 @@ on:
 
 Webhook: `POST /api/projects/{id}/webhooks/github` with header `X-GitHub-Event: push`.
 
-A delivery starts **every** pipeline that matched. One that will not start (a definition that no longer compiles, say) is reported in the response's `failed` array alongside `started`, and the delivery still succeeds — failing it would have GitHub redeliver and duplicate the runs that did start, without fixing the broken pipeline.
+A delivery starts **every** pipeline that matched. One that will not start (a definition that no longer compiles, say) is reported in the response's `failed` array alongside `started`. A definition that no longer compiles also gets a **failed run** carrying the compile error and no steps, so the breakage shows on the pipeline's page and, for GitHub, as a failed commit status; its id is the entry's `run`. The delivery succeeds if anything it matched started — failing it would have GitHub redeliver and duplicate the runs that did start — and is a `500` only when nothing it matched could start.
 
 Changed files come from the payload (`commits` / `head_commit` added·modified·removed). Empty `changed` + non-empty filters → do not fire.
 
@@ -50,7 +50,7 @@ on:
 ```
 
 - Cron wins if both are set.
-- A scheduled pipeline is **compiled before its occurrence is claimed**. One that no longer compiles leaves the due time where it is, warns on each tick with the reason, and fires by itself once the definition is fixed — it used to consume the occurrence first, so the pipeline silently stopped firing for good.
+- A scheduled pipeline is **compiled before its occurrence is claimed**. One that no longer compiles leaves the due time where it is, warns on each tick with the reason, and fires by itself once the definition is fixed — it used to consume the occurrence first, so the pipeline silently stopped firing for good. The first tick that sees a new reason also records a failed run with it, so the stop is visible on the pipeline's page; later ticks with the same reason add nothing.
 - A cron has to **parse and have a next occurrence**. `0 0 0 31 2 *` — the 31st of February — parses fine and can never fire; saving it is now a `400` rather than a pipeline whose `next_due_at` stays `NULL` forever.
 - Due times stored on `pipelines.next_due_at`; the scheduler polls Postgres every 30 s, so a schedule saved through the API or UI fires on the next tick without a restart. With several API replicas the slot is claimed with a compare-and-set, so each occurrence starts exactly one run; while a previous run of the pipeline is still active the occurrence is skipped and retried next tick.
 - Trigger label looks like `schedule:60m` or cron-derived.

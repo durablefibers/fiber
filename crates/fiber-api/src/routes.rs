@@ -2168,7 +2168,34 @@ async fn start_matched_pipelines(
                     "webhook could not start this pipeline; the others still run"
                 );
                 let message = client_safe_message(&e);
-                failed.push(json!({ "pipeline": p.id, "name": p.name, "error": message }));
+                // A definition that no longer compiles gets a failed run to show for the
+                // push, so the breakage is on the pipeline's page (and on the commit)
+                // rather than only in this log line.
+                let recorded = match e.downcast_ref::<fiber_core::DagError>() {
+                    Some(dag) => state
+                        .store
+                        .record_unstartable_run(p.id, trigger, &commit, &dag.to_string(), false)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::warn!(pipeline = %p.id, error = ?e, "could not record the failed start")
+                        })
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+                if let Some(run) = &recorded {
+                    let store = state.store.clone();
+                    let run = run.clone();
+                    tokio::spawn(async move {
+                        crate::github::report_run_status(&store, &run).await;
+                    });
+                }
+                failed.push(json!({
+                    "pipeline": p.id,
+                    "name": p.name,
+                    "error": message,
+                    "run": recorded.map(|r| r.id),
+                }));
                 continue;
             }
         };

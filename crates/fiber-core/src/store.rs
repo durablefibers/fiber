@@ -863,6 +863,81 @@ impl Store {
             .await
     }
 
+    /// Record a triggered start that could not happen because the stored definition no
+    /// longer compiles: a run that is already `failed`, with the reason and no steps.
+    ///
+    /// Without it a push or a schedule against a broken pipeline leaves nothing behind but
+    /// a log line. The snapshot is an empty DAG so everything that reads snapshots sees the
+    /// usual shape, and the run is finished at insert, so nothing can finalise it later as
+    /// *succeeded* for having no steps left.
+    ///
+    /// `only_if_new` is for the scheduler, which is told about the same broken definition
+    /// on every tick, by every replica, and again after every restart: it records nothing
+    /// (`None`) when the pipeline's newest run already failed with this error. Checked under
+    /// a per-pipeline lock, so two replicas cannot both pass it. A webhook passes `false`:
+    /// each push is its own attempt.
+    pub async fn record_unstartable_run(
+        &self,
+        pipeline_id: Uuid,
+        trigger: &str,
+        commit: &RunCommit,
+        error: &str,
+        only_if_new: bool,
+    ) -> Result<Option<Run>> {
+        let pipeline = self
+            .get_pipeline(pipeline_id)
+            .await?
+            .ok_or_else(|| anyhow!("pipeline not found"))?;
+        let snapshot = serde_json::to_value(CompiledDag {
+            name: pipeline.name.clone(),
+            workspace: None,
+            steps: Vec::new(),
+            levels: Vec::new(),
+            timeout_minutes: None,
+        })?;
+        let mut tx = self.pool.begin().await?;
+        if only_if_new {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('unstartable:' || $1::text))")
+                .bind(pipeline_id)
+                .execute(&mut *tx)
+                .await?;
+            let newest: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT error FROM runs WHERE pipeline_id = $1
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(pipeline_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if newest.flatten().as_deref() == Some(error) {
+                return Ok(None);
+            }
+        }
+        let run = sqlx::query_as::<_, Run>(AssertSqlSafe(format!(
+            "INSERT INTO runs
+               (id, pipeline_id, project_id, status, trigger, definition_snapshot, created_at,
+                started_at, finished_at, head_sha, head_ref, pr_number, repo_full_name,
+                untrusted, error)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NOW(), $7, $8, $9, $10, $11, $12)
+             RETURNING {RUN_COLS}"
+        )))
+        .bind(Uuid::new_v4())
+        .bind(pipeline_id)
+        .bind(pipeline.project_id)
+        .bind(status_str(RunStatus::Failed))
+        .bind(trigger)
+        .bind(&snapshot)
+        .bind(&commit.head_sha)
+        .bind(&commit.head_ref)
+        .bind(commit.pr_number)
+        .bind(&commit.repo_full_name)
+        .bind(commit.untrusted)
+        .bind(error)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(run))
+    }
+
     /// Start a run for a specific commit. The agent checks out `head_sha` rather than
     /// whatever the branch points at by the time it clones, so a second push mid-build
     /// cannot retarget this run.
@@ -1007,6 +1082,17 @@ impl Store {
                     "run snapshot is not a compiled pipeline: {e}"
                 ))
             })?;
+        // A run recorded because its definition did not compile has an empty snapshot.
+        // Re-running that would finalise as *succeeded* with nothing done — and report a
+        // green commit status on the commit that broke the pipeline.
+        if original.error.is_some() || compiled.steps.is_empty() {
+            return Err(crate::StoreError::Validation(
+                "this run never started because the pipeline did not compile; fix the \
+                 pipeline and start a new run"
+                    .into(),
+            )
+            .into());
+        }
         let previous = self.list_step_runs(run_id).await?;
 
         let new_run_id = Uuid::new_v4();
@@ -2973,7 +3059,7 @@ fn step_status_str(s: StepStatus) -> &'static str {
 
 const RUN_COLS: &str = "id, pipeline_id, project_id, status, trigger, definition_snapshot, \
      created_at, started_at, finished_at, retry_of, head_sha, head_ref, pr_number, \
-     repo_full_name, untrusted, concurrency_group";
+     repo_full_name, untrusted, concurrency_group, error";
 
 const STEP_RUN_COLS: &str = "id, run_id, step_id, step_name, status, image, run_cmd, labels, needs, \
      retries, attempt, agent_id, lease_expires_at, exit_code, error, started_at, finished_at";

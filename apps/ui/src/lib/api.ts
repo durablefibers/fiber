@@ -154,6 +154,11 @@ export type Run = {
   retry_of?: string | null
   /** Resolved concurrency group, when the pipeline declared one. */
   concurrency_group?: string | null
+  /**
+   * Set only when a webhook or schedule could not start the run because the stored
+   * definition no longer compiles. Such a run is `failed` and has no steps.
+   */
+  error?: string | null
 }
 
 /** One page of runs, newest first. Pass `next_cursor` back as `before` for the next. */

@@ -6,6 +6,24 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A push or schedule against a pipeline that no longer compiles leaves a failed run.**
+  Before, it only left a log line, so the pipeline just stopped building with nothing on
+  its page saying why. The run is `failed` from the start, has no steps, and carries the
+  compile error in a new `runs.error` field. The run page shows that error, and on
+  GitHub the commit gets a failed status. A schedule records one such run per distinct
+  reason, not one per tick, and not again after a restart or on another replica.
+  Retrying such a run is refused (`400`): fix the pipeline and start a new one. A manual
+  start still gets its `400`. Migration
+  `018_run_error.sql` adds the nullable column. [triggers](docs/triggers.md).
+
+- **`fiber-api reset-password <username>`** recovers a locked-out account without raw SQL.
+  It sets the password in the database, revokes every session of that user, and prints a
+  generated password unless `--password-stdin` gives one. Only `FIBER_DATABASE_URL` is
+  needed, and the server does not have to be running.
+  [operations](docs/operations.md#locked-out-of-the-admin-account).
+
 ### Changed
 
 - **The agent caps an artifact download at 64 MiB,** counting bytes as they arrive
@@ -31,14 +49,6 @@ minor versions may carry breaking changes.
 
   The sha and ref checks now live in `fiber_proto::validate`, with the webhook ingest
   using the same functions.
-
-### Added
-
-- **`fiber-api reset-password <username>`** recovers a locked-out account without raw SQL.
-  It sets the password in the database, revokes every session of that user, and prints a
-  generated password unless `--password-stdin` gives one. Only `FIBER_DATABASE_URL` is
-  needed, and the server does not have to be running.
-  [operations](docs/operations.md#locked-out-of-the-admin-account).
 
 ## [0.6.6] — 2026-09-28
 
