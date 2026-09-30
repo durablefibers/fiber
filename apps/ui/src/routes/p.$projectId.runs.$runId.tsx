@@ -820,7 +820,7 @@ function RunPage() {
             })()}
           </div>
         </div>
-        {!canRun ? null : isActiveStatus(run?.status) ? (
+        {!canRun || run?.error ? null : isActiveStatus(run?.status) ? (
           <Button variant="outline" onClick={() => void cancel()}>
             <Ban className="size-4" />
             Cancel
@@ -842,6 +842,16 @@ function RunPage() {
       </header>
       {error ? (
         <p className="px-6 pt-3 text-destructive text-sm">{error}</p>
+      ) : null}
+      {run?.error ? (
+        <div className="mx-6 mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm">
+          <p className="font-medium text-destructive">
+            This run could not start: the pipeline no longer compiles.
+          </p>
+          <p className="mt-1 font-mono text-muted-foreground text-xs">
+            {run.error}
+          </p>
+        </div>
       ) : null}
       {/*
         `min-h-0` is what lets the two panes scroll independently side by side, but it

@@ -48,10 +48,9 @@ actions in CI, and build provenance on every release asset and image.
 | 8 | **End-to-end coverage** | Smoke scenarios for every feature since 0.3 (retry, cancel, groups, statuses, fibers, untrusted PRs, timeouts, retention) and a Playwright login → run flow inside the compose job. |
 | 9 | **Operator kit** | `alerts.yml`, the disaster matrix and backup ordering, JSON logs and request ids, a Postgres major-upgrade runbook, and a `deploy/.env` that can drive every documented knob. |
 
-Three follow-ups the audit deferred and the changelog records: a visible *failed* run when a
-stored pipeline no longer compiles (needs a `runs.error` column), artifact caps enforced by
-a conditional insert rather than advisory, and pipeline `env` shared in the run snapshot
-rather than repeated per step (a wire change).
+One follow-up the audit deferred is still open: pipeline `env` shared in the run snapshot
+rather than repeated per step (a wire change). The other two have shipped: hard artifact
+caps (0.6.5) and a visible failed run when a stored pipeline no longer compiles.
 
 ## Later
 

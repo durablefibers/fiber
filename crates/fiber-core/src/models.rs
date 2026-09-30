@@ -64,6 +64,9 @@ pub struct Run {
     /// Resolved concurrency group, when the pipeline declared one. Runs sharing it
     /// contend; a newer one cancels the older.
     pub concurrency_group: Option<String>,
+    /// Set only on a run that failed before any step existed, because the stored
+    /// definition no longer compiled when a webhook or schedule tried to start it.
+    pub error: Option<String>,
 }
 
 /// What a webhook says a run is for. Carried onto the run so the agent checks out the
