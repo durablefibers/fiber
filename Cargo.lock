@@ -1134,6 +1134,7 @@ dependencies = [
  "clap",
  "fiber-proto",
  "futures-util",
+ "http",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",

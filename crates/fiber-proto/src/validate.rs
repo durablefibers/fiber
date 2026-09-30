@@ -120,6 +120,30 @@ pub fn git_ref_ok(r: &str) -> bool {
             .any(|c| c.is_control() || matches!(c, '~' | '^' | ':' | '?'))
 }
 
+/// A step's `working_directory`: a path that stays inside the workspace when joined to
+/// it. No absolute path, no `..` in any position, no Windows root or drive.
+pub fn working_directory_ok(p: &str) -> bool {
+    let p = p.trim();
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('\\')
+        && !p.contains(':')
+        && !p.split(['/', '\\']).any(|seg| seg == "..")
+}
+
+/// A step's `shell`: a bare program name, not a command line — `bash`, never
+/// `/bin/bash`, `bash -e`, or anything starting with `-`. The agent runs `<shell> -c <run>`.
+pub fn shell_ok(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 32
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && s != "."
+        && s != ".."
+}
+
 /// A workspace-relative artifact path: one or more plain path components, nothing else.
 ///
 /// The agent reads a declared artifact from, and writes a restored one to,
@@ -138,6 +162,44 @@ pub fn artifact_path_ok(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_working_directory_stays_inside_the_workspace() {
+        for good in ["apps/ui", "sub", "a/b/c", " padded "] {
+            assert!(working_directory_ok(good), "rejected {good:?}");
+        }
+        for bad in [
+            "",
+            "/etc",
+            "\\\\server\\x",
+            "C:\\x",
+            "../up",
+            "a/../../b",
+            "a\\..\\b",
+        ] {
+            assert!(!working_directory_ok(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_shell_is_a_bare_program_name() {
+        for good in ["sh", "bash", "python3", "pwsh-7.4"] {
+            assert!(shell_ok(good), "rejected {good:?}");
+        }
+        for bad in [
+            "",
+            "/bin/bash",
+            "bash -e",
+            "bash;rm",
+            "-i",
+            "--login",
+            ".",
+            "..",
+            &"x".repeat(33),
+        ] {
+            assert!(!shell_ok(bad), "accepted {bad:?}");
+        }
+    }
 
     #[test]
     fn a_commit_sha_is_forty_or_sixty_four_hex_characters() {

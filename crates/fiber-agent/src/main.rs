@@ -2274,14 +2274,14 @@ async fn execute_step_inner(
     let subdir = working_directory
         .map(str::trim)
         .filter(|d| !d.is_empty())
-        .filter(|d| is_contained_relative_path(d));
+        .filter(|d| fiber_proto::validate::working_directory_ok(d));
     if working_directory.is_some() && subdir.is_none() {
         bail!("working_directory is not a path inside the workspace");
     }
     let shell_prog = shell
         .map(str::trim)
         .filter(|sh| !sh.is_empty())
-        .filter(|sh| is_bare_program_name(sh))
+        .filter(|sh| fiber_proto::validate::shell_ok(sh))
         .unwrap_or("sh");
     if shell.is_some() && shell.map(str::trim) != Some(shell_prog) {
         bail!("shell must be a bare program name");
@@ -2682,28 +2682,6 @@ fn write_env_file(
     Ok((file, deferred))
 }
 
-/// A workspace-relative path that cannot climb out of it. The server checks this twice
-/// already; this is the copy that guards the process actually being spawned.
-fn is_contained_relative_path(p: &str) -> bool {
-    let p = p.trim();
-    !p.is_empty()
-        && !p.starts_with('/')
-        && !p.starts_with('\\')
-        && !p.contains(':')
-        && !p.split(['/', '\\']).any(|seg| seg == "..")
-}
-
-/// A bare program name, not a command line: `bash`, never `/bin/bash` or `bash -e`.
-fn is_bare_program_name(s: &str) -> bool {
-    let s = s.trim();
-    !s.is_empty()
-        && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-        && s != "."
-        && s != ".."
-}
-
 /// Stop a step: the container (if any) first, then the client's process group.
 async fn kill_step(child: &mut tokio::process::Child, container: Option<&str>) {
     if let Some(name) = container {
@@ -2911,9 +2889,29 @@ async fn fetch_artifact(
         };
         return Err(ApiFailure::from_status(status, msg));
     }
-    resp.bytes()
+    read_capped(resp, MAX_ARTIFACT_BYTES).await
+}
+
+/// Read a download into memory, refusing it past `cap` bytes. `bytes()` would buffer
+/// whatever the server sent; the server enforces its caps on upload, but the agent does
+/// not take a response's size on trust.
+async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<bytes::Bytes, ApiFailure> {
+    // Counted as it arrives rather than trusted from Content-Length, and stopped within
+    // one chunk of the cap.
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| ApiFailure::Transient(format!("read body: {e}")))
+        .map_err(|e| ApiFailure::Transient(format!("read body: {e}")))?
+    {
+        if (buf.len() + chunk.len()) as u64 > cap {
+            return Err(ApiFailure::Fatal(format!(
+                "artifact larger than the {cap}-byte limit"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
 }
 
 /// Whether a failed call gets another go: only a transient failure, and only while the
@@ -4614,6 +4612,22 @@ mod tests {
         let body = std::fs::read_to_string(f.path()).unwrap();
         assert_eq!(body, "LD_LIBRARY_PATH=/opt/lib\n");
         assert_eq!(notes.len(), 4, "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_download_is_refused_past_the_cap_whatever_it_claims() {
+        let resp = |body: Vec<u8>| reqwest::Response::from(http::Response::new(body));
+        assert_eq!(
+            read_capped(resp(vec![7; 10]), 10)
+                .await
+                .ok()
+                .map(|b| b.len()),
+            Some(10)
+        );
+        assert!(
+            read_capped(resp(vec![7; 11]), 10).await.is_err(),
+            "one byte over the cap"
+        );
     }
 
     #[test]

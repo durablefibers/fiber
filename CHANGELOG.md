@@ -8,6 +8,14 @@ minor versions may carry breaking changes.
 
 ### Changed
 
+- **The agent caps an artifact download at 64 MiB,** counting bytes as they arrive
+  rather than buffering whatever the server sends.
+- **The `shell` check refuses a leading `-`.** It is now one shared
+  `fiber_proto::validate::shell_ok`, as `working_directory` is `working_directory_ok`.
+  Before, each check had three identical copies, in compile, offer and agent.
+- **A step `timeout_minutes` too large for the agent now falls back to the default.**
+  Before, it wrapped to 0, which the agent read as no deadline.
+
 - **More of a step is checked at compile time and again on the agent.**
   - A `workspace.ref` must be one ref name (no leading `-`, `..`, spaces, or `~ ^ : ?`).
   - A matrix axis name must be a usable env var name (letters, digits, `_`). Before, an
