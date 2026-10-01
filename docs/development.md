@@ -36,7 +36,10 @@ make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace --locked + apps/ui vitest
 make smoke           # authz + artifacts + concurrency + runs + pools (pools last: it kills every agent)
 make smoke-s3        # S3 presign (api-s3 running)
-make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
+make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent,
+                     # and the browser flow (apps/ui/e2e) when pnpm + Playwright are installed
+cd apps/ui && pnpm e2e   # just the browser flow, against a running stack (FIBER_E2E_UI /
+                         # FIBER_E2E_API / FIBER_E2E_USER / FIBER_E2E_PASSWORD; needs an os=linux agent)
 make ready         # GET /ready
 ```
 
