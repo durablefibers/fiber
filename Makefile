@@ -1,5 +1,5 @@
 .PHONY: help infra infra-s3 infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny test test-rust test-ui \
-	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-s3 smoke-compose \
+	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-runs smoke-s3 smoke-compose \
 	login validate ready
 
 # deploy/docker-compose.yml has no working default for the four credentials — a
@@ -56,7 +56,7 @@ help:
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
 	@echo "  smoke         authz + artifacts + concurrency + pools (needs an agent; pools kills them last)"
-	@echo "  smoke-authz / smoke-artifacts / smoke-concurrency / smoke-pools   one scenario each"
+	@echo "  smoke-authz / smoke-artifacts / smoke-concurrency / smoke-runs / smoke-pools   one scenario each"
 	@echo "  smoke-s3      S3 presign path (needs infra-s3 + api-s3)"
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
 	@echo ""
@@ -155,6 +155,11 @@ smoke-artifacts:
 smoke-concurrency:
 	python3 scripts/smoke_concurrency.py
 
+# Retry (failed-only and full), continue_on_error, a push to a pipeline that no longer
+# compiles, and a durable fiber. Needs an online agent and psql.
+smoke-runs:
+	python3 scripts/smoke_runs.py
+
 smoke-s3:
 	@echo "Requires: make infra-s3 && make api-s3 (in another terminal) + a built fiber-agent"
 	python3 scripts/smoke_s3_presign.py
@@ -164,5 +169,5 @@ smoke-compose:
 
 # Order matters: smoke-pools terminates every fiber-agent on the host before starting
 # its own, so anything needing the agent you already have must run before it.
-smoke: smoke-authz smoke-artifacts smoke-concurrency smoke-pools
+smoke: smoke-authz smoke-artifacts smoke-concurrency smoke-runs smoke-pools
 	@echo "Run smoke-s3 / smoke-compose separately as needed"
