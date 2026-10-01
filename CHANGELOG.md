@@ -8,6 +8,12 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **`make smoke-runs`**, part of `make smoke` and so of CI's `smoke-host`. It drives the
+  run lifecycle end to end: a failed-steps retry that carries passing steps over without
+  re-running them, a full retry, `continue_on_error`, the failed run a push leaves on a
+  pipeline that no longer compiles (with its retry refused and a manual start still a
+  `400`), and one durable fiber run to completion. None of these had end-to-end coverage.
+
 - **A push or schedule against a pipeline that no longer compiles leaves a failed run.**
   Before, it only left a log line, so the pipeline just stopped building with nothing on
   its page saying why. The run is `failed` from the start, has no steps, and carries the

@@ -23,11 +23,12 @@ curl -sf -m 1 http://127.0.0.1:18080/ready >/dev/null 2>&1 && echo "api: ready" 
 | Command | Covers | Preconditions |
 |---|---|---|
 | `make smoke-authz` | roles, membership, agent CRUD, token rotate | infra + API |
+| `make smoke-runs` | retry (failed-only + full), continue_on_error, failed run for an uncompilable pipeline, a durable fiber | infra + API + agent + `psql` |
 | `make smoke-pools` | project-scoped vs global agent pools | infra + API |
 | `make smoke-artifacts` | artifact upload/restore, path filters | infra + API + running agent |
 | `make smoke-s3` | S3 presign upload/restore/download | `make infra-s3`, `make api-s3`, built agent |
 | `make smoke-compose` | full `up --build` | Docker, ports free |
-| `make smoke` | authz + artifacts + pools, in that order | infra + API + agent |
+| `make smoke` | authz + artifacts + concurrency + runs + pools, in that order | infra + API + agent |
 
 **Pass means the literal string `SMOKE_OK` on stdout.** A zero exit without that marker is a failure.
 

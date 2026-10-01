@@ -34,7 +34,7 @@ make check         # THE gate: fmt --check + clippy --workspace --all-targets --
 make deny          # cargo deny check (advisories, licences, crates.io-only sources)
 make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace --locked + apps/ui vitest
-make smoke           # authz + artifacts + concurrency + pools (pools last: it kills every agent)
+make smoke           # authz + artifacts + concurrency + runs + pools (pools last: it kills every agent)
 make smoke-s3        # S3 presign (api-s3 running)
 make smoke-compose   # full Compose stack incl. a real pipeline on the containerised agent
 make ready         # GET /ready
@@ -92,7 +92,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`:
 | `ui` | Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`, and `git diff --exit-code src/routeTree.gen.ts` | yes |
 | `docker` | `docker build` of `deploy/Dockerfile` (both targets) and `apps/ui/Dockerfile.ui` | yes |
 | `smoke` | `scripts/smoke_compose.sh` — the whole Compose stack and one real pipeline | no |
-| `smoke-host` | `make smoke` (authz + artifacts + concurrency + pools) against a host-built API and agent, with Postgres and Redis as service containers | no |
+| `smoke-host` | `make smoke` (authz + artifacts + concurrency + runs + pools) against a host-built API and agent, with Postgres and Redis as service containers | no |
 
 The three "required check" jobs are pinned **by name** in the `main` ruleset: renaming
 one blocks every pull request until the ruleset is edited to match, which is why each
