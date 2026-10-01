@@ -73,6 +73,13 @@ else
   fail "ui :3100 HTTP $CODE"
   "${COMPOSE[@]}" logs --tail=40 fiber-ui || true
 fi
+# The status code alone proved nothing: a build that emitted no index.html left nginx's own
+# welcome page in place, which also answers 200. A client route must get the app shell.
+if curl -sf http://127.0.0.1:3100/p/x/runs/y | grep -q 'Fiber'; then
+  ok "ui serves the app shell on a client route"
+else
+  fail "ui does not serve the app (nginx welcome page?)"
+fi
 
 LOGIN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \
   -H 'Content-Type: application/json' \
@@ -128,6 +135,19 @@ else
       "${COMPOSE[@]}" logs --tail=60 fiber-api || true
       "${COMPOSE[@]}" logs --tail=40 fiber-agent || true
     fi
+  fi
+  # The browser flow, while the agent is still up: log in through the UI, run a pipeline,
+  # watch the run page reach `succeeded`. CI sets FIBER_SMOKE_BROWSER=require; elsewhere
+  # it runs when pnpm and the Playwright browser are installed (apps/ui: `pnpm install &&
+  # pnpm exec playwright install chromium`) and is skipped with a note otherwise.
+  if [[ "${FIBER_SMOKE_BROWSER:-auto}" == "require" ]] || command -v pnpm >/dev/null 2>&1; then
+    if (cd "$ROOT/apps/ui" && pnpm exec playwright test); then
+      ok "browser: logged in, ran a pipeline, saw it succeed"
+    else
+      fail "browser flow (apps/ui/e2e)"
+    fi
+  else
+    echo "skip browser flow: pnpm not found (CI requires it)"
   fi
   "${COMPOSE[@]}" --profile agent rm -sf fiber-agent >/dev/null 2>&1 || true
   python3 "$ROOT/scripts/_compose_pipeline.py" cleanup >/dev/null 2>&1 || true

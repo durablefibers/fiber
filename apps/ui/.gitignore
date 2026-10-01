@@ -13,3 +13,7 @@ todos.json
 
 # typescript
 *.tsbuildinfo
+
+# Playwright (pnpm e2e)
+test-results/
+playwright-report/

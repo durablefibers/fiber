@@ -8,6 +8,10 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **A browser test of the main path:** log in through the UI, start a pipeline from its page,
+  and watch the run page reach `succeeded` (`apps/ui/e2e`, `pnpm e2e`, Playwright). It runs
+  inside CI's Compose smoke against the real images, which is how it found the bug below
+  on its first run.
 - **`make smoke-runs`**, part of `make smoke` and so of CI's `smoke-host`. It drives the
   run lifecycle end to end: a failed-steps retry that carries passing steps over without
   re-running them, a full retry, `continue_on_error`, the failed run a push leaves on a
@@ -32,6 +36,16 @@ minor versions may carry breaking changes.
   generated password unless `--password-stdin` gives one. Only `FIBER_DATABASE_URL` is
   needed, and the server does not have to be running.
   [operations](docs/operations.md#locked-out-of-the-admin-account).
+
+### Fixed
+
+- **The `fiber-ui` image served nginx's welcome page, not Fiber.** The UI build ran
+  TanStack Start in its server-rendering mode, which writes no `index.html`, so the
+  container shipped the base image's default page. Nothing noticed, because every
+  check asked only for a `200`. `pnpm dev` was unaffected, which is how the UI is
+  usually run. The build now uses SPA mode and writes the app shell as `index.html`,
+  nginx's fallback for client routes. The Compose smoke now asserts that a client route
+  serves the app.
 
 ### Changed
 
