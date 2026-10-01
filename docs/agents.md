@@ -271,6 +271,35 @@ echo "FIBER_AGENT_TOKEN=…" >> deploy/.env
 docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent
 ```
 
+### Docker steps from Compose
+
+Pipelines with `image:` steps need the `agent-docker` profile instead. It builds the
+published agent plus the Docker CLI locally (`deploy/agent-docker.Dockerfile`), mounts the
+engine's socket, and runs as root, because the socket is root on the host anyway:
+
+```bash
+echo "FIBER_AGENT_DOCKER_WORKSPACE=/var/lib/fiber/workspaces" >> deploy/.env
+docker compose -f deploy/docker-compose.yml --profile agent-docker build fiber-agent-docker
+docker compose -f deploy/docker-compose.yml --profile agent-docker up -d --no-build fiber-agent-docker
+```
+
+**The workspace is bound at the same absolute path inside the agent and on the engine's
+host.** A step runs as `docker run -v <workspace>/<step>:/workspace`, and the daemon
+resolves that path on its own host, not inside the agent. With the plain agent's named
+volume at `/data/workspaces`, every step container got an empty directory.
+
+- On a Linux host, any directory works; the default is `/var/lib/fiber/workspaces`.
+- On **Docker Desktop**, the path must be inside Docker's VM, not a macOS bind mount
+  (see [macOS and Docker Desktop](#macos-and-docker-desktop)). `docker volume create
+  fiber_docker_ws` and use `/var/lib/docker/volumes/fiber_docker_ws/_data`.
+- On a **Podman** machine (rootful, the default), `podman volume create fiber_docker_ws`
+  and use `/var/lib/containers/storage/volumes/fiber_docker_ws/_data`. The VM links
+  `/var/run/docker.sock` to Podman's socket, and the service sets `label=disable` so
+  SELinux lets the agent use it.
+
+Build only this service and start it with `--no-build`: `up --build` would also rebuild
+`fiber-api` from source, because the agent depends on it.
+
 ### From source
 
 ```bash
