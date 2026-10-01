@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Smoke: run lifecycle — retry (failed-only and full), continue_on_error, a push to a
-pipeline that no longer compiles, and one durable fiber.
+pipeline that no longer compiles, a step timeout, fork-PR isolation, and one durable fiber.
 
 Needs an agent already online with `os=linux` (CI's smoke-host starts one; locally see
 docs/development.md), and `psql` for the one check that has to break a stored definition
-the API would refuse to save.
+the API would refuse to save. The fork-PR check starts its own project-scoped agent from
+`target/debug/fiber-agent` and stops it by PID afterwards.
 """
 from __future__ import annotations
 
 import hashlib
+import signal
 import hmac
 import json
 import os
@@ -24,6 +26,8 @@ import uuid
 # happens to be there instead of the API you started.
 API = os.environ.get("FIBER_API_URL", "http://127.0.0.1:18080").rstrip("/")
 DSN = os.environ.get("FIBER_DATABASE_URL", "postgres://fiber:fiber@127.0.0.1:15432/fiber")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+WS = API.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
 TERMINAL = ("succeeded", "failed", "cancelled")
 
 
@@ -70,6 +74,25 @@ def steps_by_id(full: dict) -> dict:
 def log_lines(token: str, step_run_id: str) -> list:
     _, logs = req("GET", f"/api/steps/{step_run_id}/logs?limit=500", token=token)
     return logs if isinstance(logs, list) else logs.get("lines", logs.get("items", []))
+
+
+def signed(secret: str, payload: dict) -> tuple[bytes, dict]:
+    raw = json.dumps(payload).encode()
+    return raw, {"X-Hub-Signature-256": "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()}
+
+
+def pull_request(pid: str, secret: str, head_repo: str, number: int) -> dict:
+    """Deliver a signed `pull_request/opened` for `head_repo` into `octo/base`."""
+    raw, sig = signed(secret, {
+        "action": "opened", "number": number,
+        "repository": {"full_name": "octo/base"},
+        "pull_request": {"base": {"ref": "main"},
+                         "head": {"sha": f"{number:040x}", "repo": {"full_name": head_repo}}},
+    })
+    code, body = req("POST", f"/api/projects/{pid}/webhooks/github", raw=raw,
+                     headers={"X-GitHub-Event": "pull_request", **sig})
+    check(f"pull_request from {head_repo} is accepted", code == 200 and body.get("started"), (code, body))
+    return body
 
 
 def create_pipeline(token: str, pid: str, name: str, definition: dict) -> str:
@@ -169,11 +192,10 @@ def main() -> None:
                        check=True)
         secret = "smoke-runs-secret"
         req("PUT", f"/api/projects/{pid}/webhooks/github", token, {"secret": secret})
-        payload = json.dumps({"ref": "refs/heads/main", "after": "a" * 40, "commits": [],
-                              "head_commit": {"added": [], "modified": ["x"], "removed": []}}).encode()
-        sig = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+        payload, sig = signed(secret, {"ref": "refs/heads/main", "after": "a" * 40, "commits": [],
+                                       "head_commit": {"added": [], "modified": ["x"], "removed": []}})
         code, body = req("POST", f"/api/projects/{pid}/webhooks/github", raw=payload,
-                         headers={"X-GitHub-Event": "push", "X-Hub-Signature-256": sig})
+                         headers={"X-GitHub-Event": "push", **sig})
         failed = (body.get("failed") or [{}])[0] if isinstance(body, dict) else {}
         check("the push reports the pipeline as failed, with a run", bool(failed.get("run")), body)
         _, full = req("GET", f"/api/runs/{failed['run']}", token=token)
@@ -184,6 +206,67 @@ def main() -> None:
         check("retrying it is refused", code == 400, (code, body))
         code, body = req("POST", f"/api/pipelines/{broken_pipe}/runs", token, {})
         check("a manual start still gets 400", code == 400, (code, body))
+
+        # ---- a step that runs past timeout_minutes is stopped by the agent -------------
+        timeout_pipe = create_pipeline(token, pid, "timeout", {
+            "name": "timeout",
+            "steps": [{"id": "slow", "name": "slow", "needs": [], "labels": labels,
+                       "run": "sleep 300", "timeout_minutes": 1}],
+        })
+        began = time.time()
+        timed = wait_run(token, start(token, timeout_pipe), timeout=150)
+        slow = steps_by_id(timed)["slow"]
+        check("a step past its timeout fails as timed out, well before it would end",
+              timed["run"]["status"] == "failed" and "timed out" in (slow.get("error") or "")
+              and time.time() - began < 150, (slow["status"], slow.get("error"), round(time.time() - began)))
+
+        # ---- a fork's pull request: untrusted, no secrets, never on a global agent -----
+        req("POST", f"/api/projects/{pid}/secrets", token, {"key": "SMOKE_SECRET", "value": "s3cret"})
+        pr_secret = "smoke-runs-pr"
+        req("PUT", f"/api/projects/{pid}/webhooks/github", token, {"secret": pr_secret})
+        create_pipeline(token, pid, "pr", {
+            "name": "pr",
+            "on": {"pull_request": {"branches": ["main"]}},
+            "steps": [{"id": "probe", "name": "probe", "needs": [], "labels": labels,
+                       "run": '[ -n "$SMOKE_SECRET" ] && echo has-secret || echo no-secret'}],
+        })
+        # Same repository: trusted, so any agent runs it and the secret is there. This is
+        # the contrast that makes the fork's `no-secret` mean something.
+        trusted = wait_run(token, pull_request(pid, pr_secret, "octo/base", 41)["started"][0])
+        probe = steps_by_id(trusted)["probe"]
+        check("a same-repository PR runs trusted, with the project's secrets",
+              trusted["run"]["status"] == "succeeded" and not trusted["run"].get("untrusted")
+              and any("has-secret" in l["data"] for l in log_lines(token, probe["id"])), trusted["run"])
+
+        fork_run = pull_request(pid, pr_secret, "mallory/fork", 42)["started"][0]
+        _, full = req("GET", f"/api/runs/{fork_run}", token=token)
+        check("a fork's PR is marked untrusted", full["run"].get("untrusted") is True, full["run"])
+        time.sleep(8)
+        _, full = req("GET", f"/api/runs/{fork_run}", token=token)
+        check("no global agent takes it", steps_by_id(full)["probe"]["status"] == "queued",
+              steps_by_id(full)["probe"]["status"])
+
+        code, scoped = req("POST", "/api/agents", token,
+                           {"name": "smoke-runs-scoped", "labels": labels, "concurrency": 1, "project_id": pid})
+        check("create a project-scoped agent", code == 201, scoped)
+        env = dict(os.environ, FIBER_AGENT_TOKEN=scoped["token"], FIBER_API_URL=WS,
+                   FIBER_AGENT_USE_DOCKER="false", FIBER_AGENT_LABELS=",".join(labels),
+                   FIBER_AGENT_NAME="smoke-runs-scoped",
+                   FIBER_AGENT_WORKSPACE_DIR=os.path.join(tempfile.gettempdir(), "fiber-smoke-runs-ws"))
+        agent = subprocess.Popen([os.path.join(ROOT, "target/debug/fiber-agent")], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            fork = wait_run(token, fork_run)
+            probe = steps_by_id(fork)["probe"]
+            check("the project's own agent runs it, without the project's secrets",
+                  fork["run"]["status"] == "succeeded"
+                  and any("no-secret" in l["data"] for l in log_lines(token, probe["id"])),
+                  [l["data"] for l in log_lines(token, probe["id"])])
+        finally:
+            # By PID, never by name: a pattern can match the shell that started this.
+            agent.send_signal(signal.SIGTERM)
+            agent.wait(timeout=30)
+            req("DELETE", f"/api/agents/{scoped['agent']['id']}", token)
 
         # ---- one durable fiber runs to completion ------------------------------------
         code, fiber = req("POST", f"/api/projects/{pid}/fibers", token, {"name": "ping", "input": {}})
