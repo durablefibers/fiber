@@ -12,7 +12,10 @@ minor versions may carry breaking changes.
   run lifecycle end to end: a failed-steps retry that carries passing steps over without
   re-running them, a full retry, `continue_on_error`, the failed run a push leaves on a
   pipeline that no longer compiles (with its retry refused and a manual start still a
-  `400`), and one durable fiber run to completion. None of these had end-to-end coverage.
+  `400`), a step stopped at its `timeout_minutes`, a fork's pull request (marked
+  untrusted, never offered to a global agent, run by a project-scoped one without the
+  project's secrets, against a same-repository PR that does get them), and one durable
+  fiber run to completion. None of these had end-to-end coverage.
 
 - **A push or schedule against a pipeline that no longer compiles leaves a failed run.**
   Before, it only left a log line, so the pipeline just stopped building with nothing on

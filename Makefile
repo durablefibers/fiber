@@ -156,7 +156,8 @@ smoke-concurrency:
 	python3 scripts/smoke_concurrency.py
 
 # Retry (failed-only and full), continue_on_error, a push to a pipeline that no longer
-# compiles, and a durable fiber. Needs an online agent and psql.
+# compiles, a step timeout (~1 min), fork-PR isolation (starts its own scoped agent), and a
+# durable fiber. Needs an online agent, psql, and a built target/debug/fiber-agent.
 smoke-runs:
 	python3 scripts/smoke_runs.py
 
