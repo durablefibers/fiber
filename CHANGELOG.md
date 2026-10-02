@@ -6,6 +6,22 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-10-01
+
+**The `fiber-ui` image now serves Fiber.** Every earlier image served nginx's welcome page
+(see *Fixed*); anyone running the published UI image should upgrade. Also: an
+`agent-docker` Compose profile that actually runs `image:` steps, and works under Podman;
+a failed run, with the reason, when a push or schedule hits a pipeline that no longer
+compiles; `fiber-api reset-password`; tighter step validation; and end-to-end coverage
+for retries, timeouts, fork PRs and the UI itself.
+
+Migration `018_run_error.sql` adds one nullable column, `runs.error`. It is additive and
+applies at boot; a 0.6.6 server ignores it. No wire change: 0.6.6 agents keep working.
+
+A stored pipeline with a hyphenated matrix axis, or a `workspace.ref` containing `..`, `~`,
+`^`, `:` or `?`, now fails to compile. The boot scan names each one, and a push or
+schedule against it leaves a failed run saying why.
+
 ### Added
 
 - **An `agent-docker` Compose profile for pipelines with `image:` steps.** It builds the
