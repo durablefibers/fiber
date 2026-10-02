@@ -284,17 +284,58 @@ services:
       FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
       FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
       RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
-      # `image:` steps need the docker CLI and a socket, which this image deliberately
-      # lacks — mounting /var/run/docker.sock grants root on the host. To allow them, build
-      # a variant with the CLI and add:
-      #   volumes: [/var/run/docker.sock:/var/run/docker.sock]
-      #   group_add: ["<host docker gid>"]
-      #   environment: FIBER_AGENT_USE_DOCKER=true
+      # `image:` steps need the docker CLI and the socket, which this image deliberately
+      # lacks — mounting /var/run/docker.sock grants root on the host. Use the
+      # `agent-docker` profile below for those pipelines instead.
     volumes:
       - fiber_workspaces:/data/workspaces
     # Reap step grandchildren that reparent to the agent when a process group is killed.
     init: true
     # Match the systemd unit: SIGTERM stops steps and lets the server requeue them.
+    stop_grace_period: 30s
+    depends_on:
+      fiber-api:
+        condition: service_healthy
+
+  # Optional worker for pipelines with `image:` steps:
+  # `docker compose --profile agent-docker up -d fiber-agent-docker`. Same token and labels
+  # as fiber-agent (run one or the other). It gets the Docker socket — root on the host.
+  #
+  # The workspace is bound at the SAME absolute path inside this container and on the
+  # Docker host. Steps run as `docker run -v <workspace>/<step>:/workspace`, and the daemon
+  # resolves that path on its own host, not inside this container: the named volume the
+  # plain agent uses would hand every step an empty directory. On Docker Desktop the path
+  # must also live inside Docker's VM, not on a macOS bind mount (docs/agents.md).
+  fiber-agent-docker:
+    networks: [agentnet]
+    profiles: ["agent-docker"]
+    image: fiber-agent-docker:${FIBER_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: agent-docker.Dockerfile
+      args:
+        FIBER_VERSION: ${FIBER_VERSION:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      FIBER_API_URL: ws://fiber-api:8080
+      FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
+      FIBER_AGENT_NAME: ${FIBER_AGENT_NAME:-compose}
+      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
+      FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
+      FIBER_AGENT_USE_DOCKER: "true"
+      FIBER_AGENT_WORKSPACE_DIR: ${FIBER_AGENT_DOCKER_WORKSPACE:-/var/lib/fiber/workspaces}
+      RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${FIBER_AGENT_DOCKER_WORKSPACE:-/var/lib/fiber/workspaces}:${FIBER_AGENT_DOCKER_WORKSPACE:-/var/lib/fiber/workspaces}
+    # SELinux (enforcing in the Podman machine, Fedora and RHEL hosts) otherwise refuses
+    # the container a connection to the engine's socket: "permission denied while trying
+    # to connect to the docker API". It adds nothing the socket does not already grant,
+    # and Docker without SELinux ignores it.
+    security_opt:
+      - label=disable
+    init: true
     stop_grace_period: 30s
     depends_on:
       fiber-api:
@@ -319,7 +360,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
-      - /var/cache/nginx:size=16m,uid=101,gid=101
+      # mode, not uid=101/gid=101: Podman's Docker-compatible API rejects uid/gid on a
+      # tmpfs. World-writable costs nothing in a read-only, single-user, no-capability
+      # container, and works under both engines.
+      - /var/cache/nginx:size=16m,mode=1777
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

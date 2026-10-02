@@ -8,6 +8,14 @@ minor versions may carry breaking changes.
 
 ### Added
 
+- **An `agent-docker` Compose profile for pipelines with `image:` steps.** It builds the
+  published agent plus the Docker CLI, mounts the engine socket, and binds the workspace
+  at the same path inside the agent and on the engine's host. The documented recipe it
+  replaces could not work: the plain agent's workspace is a named volume at
+  `/data/workspaces`, so `docker run -v /data/workspaces/...` handed every step an empty
+  directory. It runs under Docker and Podman, with `label=disable` so an SELinux host
+  allows the socket. Found by building this repository with Fiber.
+  [agents](docs/agents.md#docker-steps-from-compose).
 - **A browser test of the main path:** log in through the UI, start a pipeline from its page,
   and watch the run page reach `succeeded` (`apps/ui/e2e`, `pnpm e2e`, Playwright). It runs
   inside CI's Compose smoke against the real images, which is how it found the bug below
@@ -48,6 +56,11 @@ minor versions may carry breaking changes.
   serves the app.
 
 ### Changed
+
+- **The UI container's nginx cache `tmpfs` uses `mode=1777` instead of `uid=101,gid=101`,**
+  which Podman's Docker-compatible API refuses. The container is read-only, runs a single
+  unprivileged user and drops every capability, so a world-writable scratch dir there
+  costs nothing.
 
 - **The agent caps an artifact download at 64 MiB,** counting bytes as they arrive
   rather than buffering whatever the server sends.
