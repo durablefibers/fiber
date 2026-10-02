@@ -8,8 +8,10 @@ minor versions may carry breaking changes.
 
 ## [0.6.7] — 2026-10-01
 
-**The `fiber-ui` image now serves Fiber.** Every earlier image served nginx's welcome page
-(see *Fixed*); anyone running the published UI image should upgrade. Also: an
+**The `fiber-ui` image now serves Fiber.** Every earlier build of it served nginx's welcome
+page (see *Fixed*). The UI is not a published image — Compose builds it from source — so
+after upgrading, rebuild it: `docker compose -f deploy/docker-compose.yml build fiber-ui`,
+then `up -d --no-build fiber-ui`. Also: an
 `agent-docker` Compose profile that actually runs `image:` steps, and works under Podman;
 a failed run, with the reason, when a push or schedule hits a pipeline that no longer
 compiles; `fiber-api reset-password`; tighter step validation; and end-to-end coverage
