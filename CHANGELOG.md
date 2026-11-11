@@ -6,6 +6,12 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+**Three things to do before upgrading** (details under *Changed*): put a
+`FIBER_SECRETS_KEY` in `deploy/.env` — Compose now requires it; change the admin password
+if it is still `fiber` — the API no longer starts on a non-loopback address with it; and
+set `FIBER_LISTEN` for a host-run API that other machines connect to — the default is now
+loopback.
+
 ### Security
 
 - **Seven RustSec advisories in the lockfile, all fixed by upgrades.** `rustls` 0.23.46
@@ -53,9 +59,43 @@ minor versions may carry breaking changes.
   as commit statuses already did. Checking the payload's repository against the
   project's pipelines would not have closed it, since the same user writes the pipeline.
   See *Changed*. [triggers](docs/triggers.md#pull-request).
+- **A `FIBER_SECRETS_KEY` that was set but invalid meant plaintext secrets, silently.** A
+  key that was not hex, or not 64 characters — a truncated paste, a passphrase, a value
+  with quotes round it — was treated as no key: the boot log carried the ordinary "unset
+  (dev only)" line and every secret written afterwards was stored in plaintext, for an
+  operator who had configured encryption. It is now a boot error that says what is wrong
+  with the value (never the value), and encrypting or decrypting with such a key fails
+  rather than passing plaintext through. Unset is still allowed, and still warned about.
+- **A bare `fiber-api` listened on every interface with `admin` / `fiber`.** The default
+  `FIBER_LISTEN` was `0.0.0.0:18080`, while `SECURITY.md` said the defaults were all
+  loopback. It is now `127.0.0.1:18080`, and on any other address the API refuses to
+  start while the bootstrap admin can still log in with `fiber`. The check asks the
+  database, not the environment, so an instance whose password was changed in the UI is
+  not refused, and one where only the variable was changed (it applies to an empty
+  database only) is.
 
 ### Changed
 
+- **Compose: set `FIBER_SECRETS_KEY` in `deploy/.env` before upgrading.**
+  `docker compose` now refuses to read the file without it, as it does for the four
+  credentials. Generate one with `openssl rand -hex 32` and keep a backup. If you ran
+  without a key until now, existing secrets stay readable — a stored value without the
+  `enc:v1:` prefix is read as plaintext — and each is encrypted the next time it is
+  written. If your key was set but not 64 hex characters, your secrets are in plaintext
+  today and the API will not start until the key is valid. `make infra` and
+  `scripts/smoke_compose.sh` supply a throwaway key themselves.
+- **Change the admin password if it is still `fiber`, or the API will not start in a
+  container.** Any `FIBER_LISTEN` other than loopback — which is every container, Compose
+  included — now refuses to boot while the bootstrap admin can log in with the default
+  password. `fiber-api reset-password admin` changes it without a running server
+  (`docker compose -f deploy/docker-compose.yml run --rm fiber-api fiber-api reset-password admin`).
+  `FIBER_ALLOW_DEFAULT_ADMIN=1` starts anyway; the Compose smoke uses it.
+- **A host-run `fiber-api` listens on `127.0.0.1:18080` by default, not `0.0.0.0`.** If
+  agents on other machines, or a reverse proxy in a container, connect to it, set
+  `FIBER_LISTEN=0.0.0.0:18080` (and a real admin password, per the item above). Compose
+  is unaffected: it sets `FIBER_LISTEN` itself. The `fiber-api` image now sets
+  `FIBER_LISTEN=0.0.0.0:8080`, matching its `EXPOSE` and `HEALTHCHECK`; a bare
+  `docker run` of it previously listened on 18080 and reported unhealthy.
 - **Check each agent's registered labels and concurrency against its flags before
   upgrading.** Until now the agent's own `--labels` / `--concurrency` won at connect and
   the values on its row (the UI's Agents page, `fiber agents list`) were only applied

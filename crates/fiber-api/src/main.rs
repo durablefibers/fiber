@@ -43,6 +43,13 @@ const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the boot-time Redis probe waits before the process starts without it.
 const REDIS_BOOT_PROBE: Duration = Duration::from_secs(5);
 
+/// Loopback: a bare `fiber-api` comes up with a bootstrap admin whose password is in the
+/// README, so the address it answers on by default must not be one a network can reach.
+/// A deployment sets `FIBER_LISTEN` (Compose and the image do).
+const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
+/// The bootstrap admin's password when `FIBER_ADMIN_PASSWORD` is not set.
+const DEFAULT_ADMIN_PASSWORD: &str = "fiber";
+
 #[derive(Parser, Debug)]
 #[command(name = "fiber-api", version)]
 struct Args {
@@ -60,7 +67,7 @@ struct Args {
     )]
     redis_url: String,
 
-    #[arg(long, env = "FIBER_LISTEN", default_value = "0.0.0.0:18080")]
+    #[arg(long, env = "FIBER_LISTEN", default_value = DEFAULT_LISTEN)]
     listen: SocketAddr,
 
     #[arg(long, env = "FIBER_ARTIFACTS_DIR", default_value = "./data/artifacts")]
@@ -69,8 +76,13 @@ struct Args {
     #[arg(long, env = "FIBER_ADMIN_USER", default_value = "admin")]
     admin_user: String,
 
-    #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = "fiber")]
+    #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = DEFAULT_ADMIN_PASSWORD)]
     admin_password: String,
+
+    /// `1` to start on a non-loopback address even though the bootstrap admin can still
+    /// log in with the default password. Without it that combination refuses to boot.
+    #[arg(long, env = "FIBER_ALLOW_DEFAULT_ADMIN")]
+    allow_default_admin: Option<String>,
 
     /// Seed the Showcase demo project: `auto` (only when the instance has no users yet),
     /// `1` to seed on this boot, `0` never.
@@ -97,6 +109,37 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
     },
+}
+
+/// What to do about a bootstrap admin that can log in with the default password.
+#[derive(Debug, PartialEq, Eq)]
+enum DefaultAdmin {
+    /// Nobody can log in with it.
+    Absent,
+    /// Usable, but only from this machine, or the operator said to start anyway.
+    Warn,
+    /// Usable from the network. `admin` / `fiber` is in the README.
+    Refuse,
+}
+
+fn default_admin_exposure(
+    listen: std::net::IpAddr,
+    default_login_works: bool,
+    allowed: bool,
+) -> DefaultAdmin {
+    if !default_login_works {
+        DefaultAdmin::Absent
+    } else if listen.is_loopback() || allowed {
+        DefaultAdmin::Warn
+    } else {
+        DefaultAdmin::Refuse
+    }
+}
+
+/// `FIBER_ALLOW_DEFAULT_ADMIN`: on for `1` or `true`. Compose passes an empty string for
+/// an unset variable, so anything else — including empty — is off.
+fn flag_is_on(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true"))
 }
 
 /// `fiber-api reset-password`: no migrations, no server — just the one update.
@@ -152,7 +195,9 @@ async fn main() -> Result<()> {
         tracing::info!(max_steps, "step cap overridden");
     }
     std::fs::create_dir_all(&args.artifacts_dir)?;
-    fiber_core::secrets::init_from_env();
+    // A key that is set but unusable stops the boot: carrying on would store secrets in
+    // plaintext for an operator who believes they are encrypted.
+    fiber_core::secrets::init_from_env()?;
 
     let pool = db::connect(&args.database_url).await?;
     db::migrate(&pool).await?;
@@ -186,6 +231,40 @@ async fn main() -> Result<()> {
     // Read before `ensure_admin_user`, which creates one: this is what "fresh instance"
     // means for the seeder too, so a deleted demo project stays deleted across restarts.
     let users_existed = store.count_users().await? > 0;
+    // Decided before the admin is created, not after: `FIBER_ADMIN_PASSWORD` is applied
+    // only to an empty database, so refusing *after* creating `admin` / `fiber` would
+    // leave an instance that setting the variable could no longer fix.
+    let default_login_works = if users_existed {
+        store
+            .password_is(&args.admin_user, DEFAULT_ADMIN_PASSWORD)
+            .await?
+    } else {
+        args.admin_password == DEFAULT_ADMIN_PASSWORD
+    };
+    match default_admin_exposure(
+        args.listen.ip(),
+        default_login_works,
+        flag_is_on(args.allow_default_admin.as_deref()),
+    ) {
+        DefaultAdmin::Absent => {}
+        DefaultAdmin::Warn => tracing::warn!(
+            user = %args.admin_user,
+            "the bootstrap admin can log in with the default password (`fiber`) — change it before exposing this instance"
+        ),
+        DefaultAdmin::Refuse if users_existed => anyhow::bail!(
+            "refusing to listen on {}: `{user}` can still log in with the default password `fiber`. \
+             Change it (`fiber-api reset-password {user}` works without the server), \
+             or listen on a loopback address, or set FIBER_ALLOW_DEFAULT_ADMIN=1 to start anyway",
+            args.listen,
+            user = args.admin_user,
+        ),
+        DefaultAdmin::Refuse => anyhow::bail!(
+            "refusing to listen on {} with the default admin password `fiber`. \
+             Set FIBER_ADMIN_PASSWORD, or listen on a loopback address, \
+             or set FIBER_ALLOW_DEFAULT_ADMIN=1 to start anyway",
+            args.listen,
+        ),
+    }
     let admin = store
         .ensure_admin_user(&args.admin_user, &args.admin_password)
         .await?;
@@ -309,12 +388,6 @@ async fn main() -> Result<()> {
         shutdown: shutdown_rx.clone(),
         sessions: sessions.clone(),
     };
-
-    if args.admin_password == "fiber" {
-        tracing::warn!(
-            "FIBER_ADMIN_PASSWORD is the default (`fiber`) — change it before exposing this instance"
-        );
-    }
 
     let app = routes::router(state)
         .layer(cors_layer())
@@ -452,6 +525,69 @@ fn cors_layer() -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_listen_address_is_loopback() {
+        let addr: SocketAddr = DEFAULT_LISTEN.parse().unwrap();
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 18080);
+    }
+
+    #[test]
+    fn a_default_admin_login_is_refused_on_any_address_a_network_can_reach() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for public in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.10",
+            "10.0.0.5",
+            "::ffff:127.0.0.1",
+        ] {
+            assert_eq!(
+                default_admin_exposure(ip(public), true, false),
+                DefaultAdmin::Refuse,
+                "{public}"
+            );
+            // The operator's explicit override, and a changed password, both start.
+            assert_eq!(
+                default_admin_exposure(ip(public), true, true),
+                DefaultAdmin::Warn
+            );
+            assert_eq!(
+                default_admin_exposure(ip(public), false, false),
+                DefaultAdmin::Absent
+            );
+        }
+        for local in ["127.0.0.1", "127.8.8.8", "::1"] {
+            assert_eq!(
+                default_admin_exposure(ip(local), true, false),
+                DefaultAdmin::Warn,
+                "{local}"
+            );
+            assert_eq!(
+                default_admin_exposure(ip(local), false, false),
+                DefaultAdmin::Absent
+            );
+        }
+    }
+
+    #[test]
+    fn the_override_is_on_only_when_it_says_so() {
+        for on in ["1", "true", " 1 "] {
+            assert!(flag_is_on(Some(on)), "{on:?}");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("yes"),
+        ] {
+            assert!(!flag_is_on(off), "{off:?}");
+        }
+    }
 
     #[test]
     fn with_no_subcommand_the_binary_still_serves() {

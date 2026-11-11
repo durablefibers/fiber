@@ -2630,6 +2630,20 @@ impl Store {
         }))
     }
 
+    /// Whether `username` exists and `password` is its password. Creates no session.
+    ///
+    /// For the boot check that refuses to serve a known login on a public address; it
+    /// asks the database rather than the configuration, because the configured admin
+    /// password is applied only on the first boot of an empty database.
+    pub async fn password_is(&self, username: &str, password: &str) -> Result<bool> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?;
+        crate::tokens::verify_password_blocking(password, stored.as_deref()).await
+    }
+
     pub async fn user_by_session_token(&self, token: &str) -> Result<Option<PublicUser>> {
         let hash = crate::tokens::hash_token(token);
         Ok(sqlx::query_as::<_, PublicUser>(

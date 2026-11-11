@@ -83,7 +83,7 @@ Now **fill in the four credentials** in `deploy/.env` — `FIBER_POSTGRES_PASSWO
 `FIBER_ADMIN_PASSWORD`. They have no defaults on purpose; Compose refuses to read the
 file until each one has a value, naming the one it is missing. The S3 pair is only used
 by the optional S3 profile, but it still needs a placeholder. Then generate the
-secrets key and start:
+secrets key, which Compose also requires, and start:
 
 ```bash
 sed -i'' -e "s/^FIBER_SECRETS_KEY=.*/FIBER_SECRETS_KEY=$(openssl rand -hex 32)/" deploy/.env   # keep a backup of this key
