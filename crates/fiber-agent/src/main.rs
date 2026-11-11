@@ -53,6 +53,18 @@ struct Args {
     #[arg(long, env = "FIBER_AGENT_USE_DOCKER", default_value_t = true)]
     use_docker: bool,
 
+    /// Whether a step may run on this host's shell: `true`/`false`/`1`/`0`. Unset, it is
+    /// `false` for a Docker agent (a step without `image:` is refused) and `true` for a
+    /// shell agent. A fork pull request's steps never run on the host shell, whatever
+    /// this says. Kept as text and checked at startup (`host_shell_policy`), so a typo
+    /// stops the agent instead of quietly meaning one or the other.
+    #[arg(long, env = "FIBER_AGENT_ALLOW_HOST_SHELL")]
+    allow_host_shell: Option<String>,
+
+    /// `allow_host_shell` resolved against `use_docker`, once, in `main`.
+    #[arg(skip)]
+    host_shell_allowed: bool,
+
     #[arg(
         long,
         env = "FIBER_AGENT_WORKSPACE_DIR",
@@ -160,6 +172,8 @@ fn docker_client_reads(k: &str) -> bool {
 #[derive(Clone)]
 struct ExecConfig {
     use_docker: bool,
+    /// Whether a trusted step may run on the host shell (`host_shell_policy`).
+    allow_host_shell: bool,
     /// `--label`s on every step container: this agent, and this process of it. The
     /// startup sweep uses them to find its own orphans without touching another agent's
     /// running containers.
@@ -176,6 +190,7 @@ impl ExecConfig {
     fn from_args(args: &Args, container_labels: ContainerLabels) -> Self {
         Self {
             use_docker: args.use_docker,
+            allow_host_shell: args.host_shell_allowed,
             container_labels,
             env_passthrough: args
                 .env_passthrough
@@ -190,6 +205,112 @@ impl ExecConfig {
             docker_pids_limit: args.docker_pids_limit,
         }
     }
+}
+
+/// Where one step runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode<'a> {
+    /// `docker run` of this image (trimmed), with the step's workspace mounted.
+    Container(&'a str),
+    /// The agent's own shell, as the agent's user.
+    HostShell,
+}
+
+/// Why a step that would have run on the host shell was refused instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostShellRefusal {
+    /// The run builds code from outside the project. Not the operator's to override.
+    Untrusted,
+    /// This agent does not run steps on its host (`FIBER_AGENT_ALLOW_HOST_SHELL`).
+    NotAllowed,
+}
+
+impl HostShellRefusal {
+    /// What the step's log and `error` say. `has_image` and `use_docker` pick the remedy:
+    /// telling someone to add an `image:` the step already has, or that a shell agent
+    /// will never use, sends them the wrong way.
+    fn message(self, has_image: bool, use_docker: bool) -> String {
+        match (self, use_docker) {
+            (HostShellRefusal::Untrusted, true) => "fork pull request steps only run in \
+                 containers: this run builds code from outside the project and the step has \
+                 no `image:`, so it would have run on the agent's host. Add `image:` to the \
+                 step (FIBER_AGENT_ALLOW_HOST_SHELL does not apply to fork pull requests)"
+                .into(),
+            (HostShellRefusal::Untrusted, false) => format!(
+                "fork pull request steps only run in containers, and this is a shell agent \
+                 (FIBER_AGENT_USE_DOCKER=false) that runs every step on its host: run fork \
+                 pull requests on a project agent with FIBER_AGENT_USE_DOCKER=true{}",
+                if has_image {
+                    ""
+                } else {
+                    ", and add `image:` to the step"
+                }
+            ),
+            (HostShellRefusal::NotAllowed, true) => "this agent runs steps in containers \
+                 only: add `image:` to the step, or set FIBER_AGENT_ALLOW_HOST_SHELL=true on \
+                 the agent"
+                .into(),
+            // `host_shell_policy` refuses to start an agent configured like this, so no
+            // offer reaches here; worded anyway rather than left to mislead.
+            (HostShellRefusal::NotAllowed, false) => "this agent has host shell turned off \
+                 (FIBER_AGENT_ALLOW_HOST_SHELL=false) and Docker turned off \
+                 (FIBER_AGENT_USE_DOCKER=false), so it cannot run any step"
+                .into(),
+        }
+    }
+}
+
+/// Decide where a step runs, or that it must not run here at all.
+///
+/// A step runs in a container when it names an image and the agent uses Docker.
+/// Everything else is the host shell — a step with no `image:`, and any step on a shell
+/// agent, which ignores `image:` — and the host shell is the agent's own user, token and
+/// (on a Docker agent) engine socket. So it is refused for a fork's pull request always,
+/// and otherwise unless the agent allows it.
+fn execution_mode(
+    image: Option<&str>,
+    use_docker: bool,
+    allow_host_shell: bool,
+    untrusted: bool,
+) -> std::result::Result<ExecutionMode<'_>, HostShellRefusal> {
+    // Trimmed here as at compile time, so the value docker sees is the value that was
+    // checked. Empty means "no image".
+    let image = image.map(str::trim).filter(|i| !i.is_empty());
+    match image {
+        Some(img) if use_docker => Ok(ExecutionMode::Container(img)),
+        // Before `allow_host_shell`: that flag is the operator vouching for the people
+        // who can write the pipeline, and a fork's author is not one of them.
+        _ if untrusted => Err(HostShellRefusal::Untrusted),
+        _ if !allow_host_shell => Err(HostShellRefusal::NotAllowed),
+        _ => Ok(ExecutionMode::HostShell),
+    }
+}
+
+/// Resolve `FIBER_AGENT_ALLOW_HOST_SHELL` at startup. Unset (or empty, which is what
+/// Compose passes for a variable nobody set) takes the default: allowed on a shell
+/// agent, where the host is all there is, and refused on a Docker agent. Anything that is
+/// not a boolean is an error rather than a guess, since guessing wrong in one direction
+/// runs pipeline code on the host.
+fn host_shell_policy(raw: Option<&str>, use_docker: bool) -> std::result::Result<bool, String> {
+    let explicit = match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => None,
+        Some("true" | "1") => Some(true),
+        Some("false" | "0") => Some(false),
+        Some(other) => {
+            return Err(format!(
+                "FIBER_AGENT_ALLOW_HOST_SHELL must be true, false, 1 or 0 (got `{other}`)"
+            ));
+        }
+    };
+    let allowed = explicit.unwrap_or(!use_docker);
+    if !allowed && !use_docker {
+        return Err(
+            "FIBER_AGENT_ALLOW_HOST_SHELL=false with FIBER_AGENT_USE_DOCKER=false leaves the \
+             agent unable to run any step: enable Docker, or allow host shell"
+                .into(),
+        );
+    }
+    Ok(allowed)
 }
 
 /// Per-run workspace refcount: the last step of a run to finish on this agent deletes
@@ -1428,6 +1549,28 @@ async fn main() -> Result<()> {
         }
     }
     info!(workspace_dir = %args.workspace_dir.display(), "workspace root");
+    match host_shell_policy(args.allow_host_shell.as_deref(), args.use_docker) {
+        Ok(allowed) => args.host_shell_allowed = allowed,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(2);
+        }
+    }
+    match (args.use_docker, args.host_shell_allowed) {
+        (true, false) => info!(
+            "steps run in containers only: a step without `image:` is refused \
+             (FIBER_AGENT_ALLOW_HOST_SHELL=true allows it)"
+        ),
+        (true, true) => warn!(
+            "FIBER_AGENT_ALLOW_HOST_SHELL=true: a step without `image:` runs on this host as \
+             the agent's user, with whatever that user can reach — including the Docker \
+             engine. Fork pull request steps are still refused"
+        ),
+        (false, _) => info!(
+            "shell agent: every step runs on this host as the agent's user, `image:` is \
+             ignored, and fork pull request steps are refused"
+        ),
+    }
     // A macOS workspace reaches step containers through Docker Desktop's file sharing,
     // which intermittently loses files a build has just written — `cargo` fails with
     // `can't find crate for …` naming a crate it compiled seconds earlier. Same image and
@@ -1842,6 +1985,7 @@ async fn run_session(
                                 working_directory,
                                 shell,
                                 attempt,
+                                untrusted,
                             }) => {
                                 info!(%step_id, %step_name, %run_id, ?attempt, "offered step");
                                 // Anything still queued about this step_run_id is from an
@@ -1898,6 +2042,7 @@ async fn run_session(
                                         traceparent.as_deref(),
                                         working_directory.as_deref(),
                                         shell.as_deref(),
+                                        untrusted,
                                     ).await;
 
                                     if let Ok(mut g) = cancels.lock() {
@@ -2051,6 +2196,7 @@ async fn execute_step(
     traceparent: Option<&str>,
     working_directory: Option<&str>,
     shell: Option<&str>,
+    untrusted: bool,
 ) -> Result<i32> {
     let run_dir = workspace_root.join(run_id.to_string());
     // A fresh directory per execution, never a reused one. A previous attempt's container
@@ -2096,6 +2242,7 @@ async fn execute_step(
         workspaces,
         working_directory,
         shell,
+        untrusted,
     )
     // `.instrument`, not `span.enter()`: a guard held across an await point attributes
     // whatever else the runtime schedules on this thread to this step.
@@ -2138,6 +2285,7 @@ async fn execute_step_inner(
     workspaces: &Workspaces,
     working_directory: Option<&str>,
     shell: Option<&str>,
+    untrusted: bool,
 ) -> Result<i32> {
     // One sequence for system/stdout/stderr so the server's `ORDER BY seq` interleaves
     // streams in emission order (the old per-stream bases collided after 1000 lines).
@@ -2201,6 +2349,18 @@ async fn execute_step_inner(
     if let Some(m) = timeout_minutes {
         log("system", format!("step timeout: {m} min"));
     }
+
+    // Decided before anything touches the disk or the network: a step this agent will
+    // not run gets no checkout, no artifact restore, and no directory.
+    let mode = match execution_mode(image, exec.use_docker, exec.allow_host_shell, untrusted) {
+        Ok(mode) => mode,
+        Err(refusal) => {
+            let has_image = image.is_some_and(|i| !i.trim().is_empty());
+            let msg = refusal.message(has_image, exec.use_docker);
+            log("system", format!("step refused: {msg}"));
+            bail!("{msg}");
+        }
+    };
 
     tokio::fs::create_dir_all(work_dir).await?;
 
@@ -2318,13 +2478,8 @@ async fn execute_step_inner(
     }
 
     let mut env_file: Option<tempfile::NamedTempFile> = None;
-    // Trimmed here as at compile time, so the value docker sees is the value that was
-    // checked. Empty means "no image".
-    let mut child = if let Some(img) = image
-        .map(str::trim)
-        .filter(|i| !i.is_empty())
-        .filter(|_| exec.use_docker)
-    {
+    // `mode` was settled at the top (`execution_mode`), before the workspace existed.
+    let mut child = if let ExecutionMode::Container(img) = mode {
         let mount = format!("{}:/workspace", work_dir.display());
         log(
             "system",
@@ -3785,6 +3940,141 @@ mod tests {
                     seq: *seq,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn execution_mode_covers_every_combination() {
+        use ExecutionMode::{Container, HostShell};
+        use HostShellRefusal::{NotAllowed, Untrusted};
+        let img = Some("alpine:3");
+        // (image, use_docker, allow_host_shell, untrusted) -> outcome. All sixteen rows,
+        // so a change to any arm of the decision moves at least one of them.
+        let table = [
+            // An image on a Docker agent is a container, whoever asks and whatever the flag.
+            (img, true, true, false, Ok(Container("alpine:3"))),
+            (img, true, false, false, Ok(Container("alpine:3"))),
+            (img, true, true, true, Ok(Container("alpine:3"))),
+            (img, true, false, true, Ok(Container("alpine:3"))),
+            // No image on a Docker agent: the host, so only when the operator allows it,
+            // and never for a fork's pull request.
+            (None, true, true, false, Ok(HostShell)),
+            (None, true, false, false, Err(NotAllowed)),
+            (None, true, true, true, Err(Untrusted)),
+            (None, true, false, true, Err(Untrusted)),
+            // A shell agent ignores `image:` — the documented behaviour — so both of
+            // these are the host too.
+            (img, false, true, false, Ok(HostShell)),
+            (None, false, true, false, Ok(HostShell)),
+            (img, false, true, true, Err(Untrusted)),
+            (None, false, true, true, Err(Untrusted)),
+            // Not a configuration the agent starts with (`host_shell_policy`), but the
+            // decision still has to refuse rather than run.
+            (img, false, false, false, Err(NotAllowed)),
+            (None, false, false, false, Err(NotAllowed)),
+            (img, false, false, true, Err(Untrusted)),
+            (None, false, false, true, Err(Untrusted)),
+        ];
+        for (image, use_docker, allow, untrusted, want) in table {
+            assert_eq!(
+                execution_mode(image, use_docker, allow, untrusted),
+                want,
+                "image={image:?} use_docker={use_docker} allow_host_shell={allow} untrusted={untrusted}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_image_is_no_image_and_a_padded_one_is_trimmed() {
+        // The server trims at compile time; a snapshot from before that can hold either.
+        assert_eq!(
+            execution_mode(Some("   "), true, false, false),
+            Err(HostShellRefusal::NotAllowed)
+        );
+        assert_eq!(
+            execution_mode(Some(""), true, true, false),
+            Ok(ExecutionMode::HostShell)
+        );
+        assert_eq!(
+            execution_mode(Some(" alpine:3 "), true, false, true),
+            Ok(ExecutionMode::Container("alpine:3"))
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_remedy_that_applies() {
+        let not_allowed = HostShellRefusal::NotAllowed.message(false, true);
+        assert!(not_allowed.contains("add `image:` to the step"));
+        assert!(not_allowed.contains("FIBER_AGENT_ALLOW_HOST_SHELL=true"));
+
+        // The flag is no way out for a fork, so the message must not offer it as one.
+        let fork = HostShellRefusal::Untrusted.message(false, true);
+        assert!(fork.starts_with("fork pull request steps only run in containers"));
+        assert!(fork.contains("add `image:`") || fork.contains("Add `image:`"));
+        assert!(!fork.contains("FIBER_AGENT_ALLOW_HOST_SHELL=true"));
+
+        // On a shell agent an `image:` changes nothing; the agent is what has to change.
+        let shell = HostShellRefusal::Untrusted.message(true, false);
+        assert!(shell.starts_with("fork pull request steps only run in containers"));
+        assert!(shell.contains("FIBER_AGENT_USE_DOCKER=true"));
+        assert!(!shell.contains("`image:`"));
+        assert!(
+            HostShellRefusal::Untrusted
+                .message(false, false)
+                .contains("add `image:`")
+        );
+
+        // The completion handler reads these two prefixes as a cancel and a timeout.
+        for refusal in [HostShellRefusal::Untrusted, HostShellRefusal::NotAllowed] {
+            for (has_image, use_docker) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let m = refusal.message(has_image, use_docker);
+                assert!(
+                    !m.contains("cancelled") && !m.starts_with("timed out"),
+                    "{m}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_shell_defaults_off_for_a_docker_agent_and_on_for_a_shell_agent() {
+        assert_eq!(host_shell_policy(None, true), Ok(false));
+        assert_eq!(host_shell_policy(None, false), Ok(true));
+        // Compose passes an unset variable as empty; that is unset, not a value.
+        assert_eq!(host_shell_policy(Some(""), true), Ok(false));
+        assert_eq!(host_shell_policy(Some("  "), false), Ok(true));
+    }
+
+    #[test]
+    fn an_explicit_host_shell_setting_overrides_the_default() {
+        for yes in ["true", "1", " true "] {
+            assert_eq!(host_shell_policy(Some(yes), true), Ok(true), "{yes}");
+            assert_eq!(host_shell_policy(Some(yes), false), Ok(true), "{yes}");
+        }
+        for no in ["false", "0"] {
+            assert_eq!(host_shell_policy(Some(no), true), Ok(false), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_host_shell_setting_that_is_not_a_boolean_stops_the_agent() {
+        for bad in ["yes", "no", "TRUE", "on", "2", "tru"] {
+            let err = host_shell_policy(Some(bad), true).unwrap_err();
+            assert!(
+                err.contains("FIBER_AGENT_ALLOW_HOST_SHELL") && err.contains(bad),
+                "{err}"
+            );
+            assert!(host_shell_policy(Some(bad), false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_could_run_nothing_does_not_start() {
+        for no in ["false", "0"] {
+            let err = host_shell_policy(Some(no), false).unwrap_err();
+            assert!(err.contains("FIBER_AGENT_USE_DOCKER=false"), "{err}");
         }
     }
 

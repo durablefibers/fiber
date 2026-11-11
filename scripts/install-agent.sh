@@ -57,6 +57,10 @@ NAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo fiber-agent)"
 LABELS="os=linux"
 CONCURRENCY="2"
 USE_DOCKER="false"
+# Never set by a flag: the agent's own default is the safe one (--docker refuses a step
+# without `image:`). Only carried over from an existing agent.env, so an upgrade does not
+# undo a choice the operator made there.
+ALLOW_HOST_SHELL=""
 BIN_DIR="/usr/local/bin"
 ETC_DIR="/etc/fiber"
 STATE_DIR="/var/lib/fiber"
@@ -75,7 +79,10 @@ Usage: install-agent.sh --api-url <url> --token <token> [options]
   --name NAME        Agent display name                     [default: hostname]
   --labels LIST      Comma-separated labels                 [default: os=linux]
   --concurrency N    Max parallel steps                             [default: 2]
-  --docker           Enable Docker steps (needs docker + group membership)
+  --docker           Enable Docker steps (needs docker + group membership). The agent
+                     then runs steps in containers only: one without `image:` is
+                     refused unless FIBER_AGENT_ALLOW_HOST_SHELL=true is added to
+                     /etc/fiber/agent.env.
   --version VER      Release tag to install                   [default: latest]
   --tarball PATH     Install from a local release tarball instead of downloading
   --check-only       Resolve, download and verify a release, then exit (no root).
@@ -527,8 +534,11 @@ fi
 PREV_VERSION="unknown"
 # Re-running is the upgrade path: keep settings that were not passed this time.
 if [[ -f "$ETC_DIR/agent.env" ]]; then
+  # From the file only, never from whatever environment this script was started in.
+  unset FIBER_AGENT_ALLOW_HOST_SHELL
   # shellcheck disable=SC1091
   . "$ETC_DIR/agent.env"
+  ALLOW_HOST_SHELL="${FIBER_AGENT_ALLOW_HOST_SHELL:-}"
   API_URL="${API_URL:-${FIBER_API_URL:-}}"
   TOKEN="${TOKEN:-${FIBER_AGENT_TOKEN:-}}"
   [[ "$NAME" == "$(hostname -s 2>/dev/null || echo "$NAME")" ]] && NAME="${FIBER_AGENT_NAME:-$NAME}"
@@ -595,6 +605,10 @@ RUST_LOG=info,fiber_agent=info
 FIBER_AGENT_INSTALLED_VERSION=$INSTALLED_FROM
 FIBER_AGENT_INSTALLED_SHA256=$BIN_SHA256
 ENV
+if [[ -n "$ALLOW_HOST_SHELL" ]]; then
+  echo "FIBER_AGENT_ALLOW_HOST_SHELL=$ALLOW_HOST_SHELL" >> "$ETC_DIR/agent.env"
+  echo "keeping FIBER_AGENT_ALLOW_HOST_SHELL=$ALLOW_HOST_SHELL from the previous agent.env"
+fi
 chown root:fiber "$ETC_DIR/agent.env"
 chmod 0640 "$ETC_DIR/agent.env"
 umask 022

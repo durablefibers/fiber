@@ -106,6 +106,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_AGENT_LABELS` | `os=linux,docker=true` | Comma-separated |
 | `FIBER_AGENT_CONCURRENCY` | `1` | Max parallel steps |
 | `FIBER_AGENT_USE_DOCKER` | `true` | Docker vs host shell |
+| `FIBER_AGENT_ALLOW_HOST_SHELL` | `false` with Docker, `true` without | Whether a step may run on the agent's host shell. On a Docker agent the default refuses a step without `image:`; `true` runs it on the host as the agent's user, which can reach the Docker engine. `true`, `false`, `1` or `0` — anything else, or `false` on a shell agent, stops the agent at startup. A fork pull request's steps are never run on the host shell, whatever this is set to. [agents](./agents.md#steps-that-would-run-on-the-host) |
 | `FIBER_AGENT_WORKSPACE_DIR` | `./data/workspaces` | Root for per-step work dirs |
 | `FIBER_AGENT_ENV_PASSTHROUGH` | empty | Comma-separated names to pass from the agent's environment into steps, on top of the built-in allowlist (shell basics, proxy and CA settings). Everything else is cleared — use this for `SSH_AUTH_SOCK`, `CARGO_HOME`, `JAVA_HOME`, `NVM_DIR` and similar. **Under systemd, `SSH_AUTH_SOCK` needs a drop-in** — see below |
 | `FIBER_AGENT_WORKSPACE_TTL_HOURS` | `24` | Sweep run workspaces older than this at startup; `0` disables |
@@ -118,7 +119,10 @@ file passes the variable through as an empty string and each reader falls back.
 
 Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned, mode `0640`);
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,
-`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`). The installer also writes
+`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`). The Compose
+`agent-docker` profile pins `FIBER_AGENT_ALLOW_HOST_SHELL=false` and appends `docker=true`
+to the labels; the installer writes `FIBER_AGENT_ALLOW_HOST_SHELL` only to carry over a
+line already in `agent.env`. The installer also writes
 `FIBER_AGENT_INSTALLED_VERSION` and `FIBER_AGENT_INSTALLED_SHA256` there so a re-run can say
 what it is replacing; no crate reads them, and they are not deployment configuration.
 

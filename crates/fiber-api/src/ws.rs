@@ -292,6 +292,9 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
         shell,
         secret_keys,
         traceparent: current_traceparent(),
+        // From the run row, like the secrets decision above: provenance is the run's,
+        // fixed when it started, and a retry of an untrusted run stays untrusted.
+        untrusted: run.untrusted,
     })
 }
 

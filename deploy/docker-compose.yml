@@ -299,7 +299,12 @@ services:
 
   # Optional worker for pipelines with `image:` steps:
   # `docker compose --profile agent-docker up -d fiber-agent-docker`. Same token and labels
-  # as fiber-agent (run one or the other). It gets the Docker socket — root on the host.
+  # as fiber-agent (run one or the other), plus `docker=true` so a step can ask for it.
+  # It gets the Docker socket — root on the host.
+  #
+  # Which is why FIBER_AGENT_ALLOW_HOST_SHELL is pinned to false here rather than read
+  # from .env: a step without `image:` would run in THIS container, as root, next to that
+  # socket. Such a step is refused; give it an `image:` or run it on the plain agent.
   #
   # The workspace is bound at the SAME absolute path inside this container and on the
   # Docker host. Steps run as `docker run -v <workspace>/<step>:/workspace`, and the daemon
@@ -321,9 +326,10 @@ services:
       FIBER_API_URL: ws://fiber-api:8080
       FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
       FIBER_AGENT_NAME: ${FIBER_AGENT_NAME:-compose}
-      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
+      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux},docker=true
       FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
       FIBER_AGENT_USE_DOCKER: "true"
+      FIBER_AGENT_ALLOW_HOST_SHELL: "false"
       FIBER_AGENT_WORKSPACE_DIR: ${FIBER_AGENT_DOCKER_WORKSPACE:-/var/lib/fiber/workspaces}
       RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
     volumes:
