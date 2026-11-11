@@ -2,7 +2,7 @@
 
 Agents are outbound WebSocket workers that execute CI steps.
 
-An agent's identity is the token it connected with. The server binds `agent_id` from that token and ignores the `agent_id` carried in messages (a mismatch is logged). Log lines are accepted only for a step **last leased to that agent** (so the tail of a cancelled or reclaimed step is still recorded); artifacts and completions additionally require the lease to be **live** — anything after a reclaim or cancel is dropped, which is the at-least-once contract: the re-leased attempt reports its own result. Artifact restore downloads are limited to runs in which the agent holds a running step. A socket that never sends `Hello` is offered nothing, and pool scope always comes from the agent's database row, never from the connection.
+An agent's identity is the token it connected with. The server binds `agent_id` from that token and ignores the `agent_id` carried in messages (a mismatch is logged). Log lines are accepted only for a step **last leased to that agent** (so the tail of a cancelled or reclaimed step is still recorded); artifacts and completions additionally require the lease to be **live** — anything after a reclaim or cancel is dropped, which is the at-least-once contract: the re-leased attempt reports its own result. Artifact restore downloads are limited to runs in which the agent holds a running step. A socket that never sends `Hello` is offered nothing, and pool scope always comes from the agent's database row, never from the connection. Labels and concurrency are capped by the row too — see [Labels and concurrency](#labels-and-concurrency-the-registration-is-the-ceiling).
 
 A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
@@ -317,6 +317,30 @@ cargo run -p fiber-agent
 ## Run
 
 Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client). A `concurrency` below 1 is treated as 1 — an agent that is online but can never be offered anything is a misconfiguration nobody would notice.
+
+### Labels and concurrency: the registration is the ceiling
+
+The agent's row (what you set at **Register**, or later with `PUT /api/agents/{id}` /
+`fiber agents update`) says what the agent **may** do. `--labels` / `--concurrency` on the
+agent (`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`) say what this host **can** do. The
+agent is registered with what both agree on:
+
+| | Registered with |
+|---|---|
+| Labels | The row's labels that the agent also sent. A label the agent claims but the row lacks is dropped |
+| Concurrency | The smaller of the row's and the agent's (at least 1) |
+
+So to give an agent a new label or more slots, change **both**: the row, and the agent's
+flags. Changing only the agent's flags does nothing, and the API logs a warning naming the
+agent id each time it connects asking for more than its row has
+(`agent hello asked for more than its registration allows`). An agent that claims *less*
+than its row is fine and is offered only what it claimed.
+
+One exception: a row registered with **no labels** (`"labels": []`) does not restrict
+labels — the agent's own are used as sent. Give such a row labels to close that; until
+then, whoever holds that agent's token chooses its labels.
+
+The UI and `GET /api/agents` show the row, not the effective registration.
 
 ## Label matching
 

@@ -32,6 +32,34 @@ minor versions may carry breaking changes.
   The `429` body's `error` text changed from "too many failed logins" to "too many login
   attempts", since it now also covers attempts refused while others are being verified.
   [authz](docs/authz.md#authentication).
+- **An agent token could claim any labels and any concurrency.** `Hello` carries the
+  agent's labels and concurrency, and the server registered the agent with them as sent —
+  it reloaded the agent's row for pool scope and ignored the labels and concurrency stored
+  beside it. Anyone holding one agent token could reconnect claiming every label and
+  `u32::MAX` slots, and be offered steps, with their secrets, meant for other agents in
+  the same pool. The row is now the ceiling: an agent is registered with the row's labels
+  that it also claims, and the smaller of the two concurrencies. Asking for more is logged
+  with the agent id. See *Changed* for what this does to an existing agent.
+  [agents](docs/agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
+
+### Changed
+
+- **Check each agent's registered labels and concurrency against its flags before
+  upgrading.** Until now the agent's own `--labels` / `--concurrency` won at connect and
+  the values on its row (the UI's Agents page, `fiber agents list`) were only applied
+  after an edit. Now the row caps both, so an agent whose flags ask for more than its row
+  gets less than it did:
+  - *Concurrency.* `fiber agents create` and the UI default to **1**; `install-agent.sh`
+    and the Compose agent default to **2**. An agent registered and installed with those
+    defaults ran two steps at once and will now run one. Raise the row:
+    `fiber agents update <id> --concurrency 2`.
+  - *Labels.* A label passed to the agent but missing from its row no longer matches
+    steps. Add it to the row: `fiber agents update <id> --labels os=linux,docker=true`.
+
+  A row with no labels at all keeps the agent's own labels, so an agent registered with
+  `"labels": []` is not stripped. The API logs
+  `agent hello asked for more than its registration allows` with the agent id for every
+  agent this affects, each time it connects.
 
 ### Changed
 
