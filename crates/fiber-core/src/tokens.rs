@@ -64,6 +64,47 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     hex::encode(hasher.finalize()) == expected
 }
 
+/// [`hash_password`] off the async workers.
+///
+/// argon2id is tens of milliseconds of CPU and 19 MiB by design. Run inline in a handler
+/// it parks a tokio worker for that long, so a burst of logins stalls everything else the
+/// runtime is driving — agent heartbeats and lease renewals included.
+pub async fn hash_password_blocking(password: &str) -> anyhow::Result<String> {
+    let password = password.to_owned();
+    Ok(tokio::task::spawn_blocking(move || hash_password(&password)).await?)
+}
+
+/// [`verify_password`] off the async workers, at the same cost whether or not there is a
+/// stored hash to verify against.
+///
+/// `stored` is `None` when no such user exists. Answering that case without doing the
+/// work made "unknown username" return in microseconds and "wrong password" in tens of
+/// milliseconds — an oracle for which usernames exist. The password is checked against
+/// [`dummy_password_hash`] instead and the answer is always `false`.
+pub async fn verify_password_blocking(
+    password: &str,
+    stored: Option<&str>,
+) -> anyhow::Result<bool> {
+    let password = password.to_owned();
+    let stored = stored.map(str::to_owned);
+    Ok(tokio::task::spawn_blocking(move || match stored {
+        Some(stored) => verify_password(&password, &stored),
+        None => {
+            let _ = verify_password(&password, dummy_password_hash());
+            false
+        }
+    })
+    .await?)
+}
+
+/// An argon2id hash of a random password nobody knows, made once per process with the
+/// same parameters as [`hash_password`], so verifying against it costs what verifying a
+/// real one does.
+pub fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password(&generate_password()))
+}
+
 pub fn password_needs_rehash(stored: &str) -> bool {
     !stored.starts_with("$argon2")
 }
@@ -133,6 +174,29 @@ mod tests {
         assert!(h.starts_with("$argon2"));
         assert!(verify_password("fiber", &h));
         assert!(!verify_password("wrong", &h));
+    }
+
+    /// Everything in a PHC string before the salt: algorithm, version, cost parameters.
+    fn phc_params(hash: &str) -> &str {
+        let hash_at = hash.rfind('$').unwrap();
+        &hash[..hash[..hash_at].rfind('$').unwrap()]
+    }
+
+    #[test]
+    fn the_dummy_hash_costs_what_a_real_one_does() {
+        let dummy = dummy_password_hash();
+        assert!(phc_params(dummy).starts_with("$argon2id$"));
+        assert_eq!(phc_params(dummy), phc_params(&hash_password("fiber")));
+        assert_eq!(dummy, dummy_password_hash(), "computed once");
+    }
+
+    #[tokio::test]
+    async fn blocking_verify_matches_the_inline_one_and_never_accepts_a_missing_user() {
+        let h = hash_password_blocking("fiber").await.unwrap();
+        assert!(verify_password_blocking("fiber", Some(&h)).await.unwrap());
+        assert!(!verify_password_blocking("wrong", Some(&h)).await.unwrap());
+        assert!(!verify_password_blocking("fiber", None).await.unwrap());
+        assert!(!verify_password_blocking("", None).await.unwrap());
     }
 
     #[test]

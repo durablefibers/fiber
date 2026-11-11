@@ -189,6 +189,9 @@ async fn main() -> Result<()> {
     let admin = store
         .ensure_admin_user(&args.admin_user, &args.admin_password)
         .await?;
+    // Make the dummy hash now, so the first login for an unknown username does not pay
+    // for it and stand out against the ones after.
+    tokio::task::spawn_blocking(fiber_core::tokens::dummy_password_hash);
     if fiber_core::seed::should_seed_showcase(Some(&args.seed_showcase), users_existed)
         .map_err(anyhow::Error::msg)?
     {

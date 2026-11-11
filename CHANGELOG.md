@@ -13,6 +13,25 @@ minor versions may carry breaking changes.
   verification could accept a distrusted intermediate), `tokio` 1.54.1 (RUSTSEC-2026-0386)
   and `ctutils` 0.4.8 (RUSTSEC-2026-0385). TLS is on every path that carries an agent
   token or a session, so the 0.6.7 agent, CLI and images are affected; upgrade all three.
+- **The login lockout could be outrun by sending the guesses in parallel.** The handler
+  checked the lockout, verified the password, and only then recorded the failure, so every
+  request in a burst passed the check before any of them counted. The guess rate against a
+  known username was bounded by the server's CPU, not by "10 failures, then 60 s". An
+  attempt is now reserved before the verify and settled after it, and attempts still in
+  flight count against the same ten; a request that errors or is dropped gives its slot
+  back. Three things next to it:
+  - argon2id ran inline on the async workers, so the same burst stalled agent heartbeats
+    and lease renewals. Hashing and verifying now run on the blocking pool, and at most
+    8 logins are verified at once; the rest get the guard's `429`.
+  - An unknown username returned before any hashing, a wrong password after it, so
+    response time said which usernames exist. Both now cost one argon2id verify.
+  - Once the guard held 10 000 usernames it dropped every entry that was not locked out,
+    so a flood of made-up usernames reset a real account's failure count on demand. It
+    now evicts expired entries, then the fewest failures first.
+
+  The `429` body's `error` text changed from "too many failed logins" to "too many login
+  attempts", since it now also covers attempts refused while others are being verified.
+  [authz](docs/authz.md#authentication).
 
 ### Changed
 

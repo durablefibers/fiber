@@ -38,6 +38,13 @@ const WEBHOOK_MAX_BYTES: usize = 25 << 20;
 /// hit the request timeout if none frees up. GitHub does not retry a failed delivery on
 /// its own: it is recorded under the webhook's Deliveries and must be redelivered by hand.
 const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
+/// Logins verified at once, across all usernames. Each is an argon2id verify — tens of
+/// milliseconds of CPU and 19 MiB — on the blocking pool, so this bounds what a flood of
+/// distinct usernames (which the per-username guard does not see as one attacker) can
+/// make the process spend. Excess logins are refused with the guard's own `429` rather
+/// than queued: a queue would only move the flood into memory.
+const LOGIN_MAX_IN_FLIGHT: usize = 8;
+static LOGIN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LOGIN_MAX_IN_FLIGHT);
 /// A readiness probe that hangs is worse than one that fails: the orchestrator's own
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
 /// gets this long to answer before it is reported down.
@@ -424,9 +431,16 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     let key = crate::login_guard::LoginGuard::key(&req.username);
-    if let Err(retry_after) = state.login_guard.check(&key) {
-        return Ok(too_many_logins(retry_after));
-    }
+    // Reserve the attempt before verifying, so parallel requests share one budget. The
+    // reservation releases itself if this handler returns early or is dropped.
+    let attempt = match state.login_guard.begin_attempt(&key) {
+        Ok(attempt) => attempt,
+        Err(retry_after) => return Ok(too_many_logins(retry_after)),
+    };
+    // After the per-username check, so a locked-out username never takes a slot.
+    let Ok(_slot) = LOGIN_SLOTS.try_acquire() else {
+        return Ok(too_many_logins(crate::login_guard::IN_FLIGHT_RETRY));
+    };
     let resp = state
         .store
         .login(&req.username, &req.password)
@@ -434,11 +448,11 @@ async fn login(
         .map_err(ApiError::from)?;
     match resp {
         Some(resp) => {
-            state.login_guard.record_success(&key);
+            attempt.finish(true);
             Ok(Json(resp).into_response())
         }
         None => {
-            if let Some(lock) = state.login_guard.record_failure(&key) {
+            if let Some(lock) = attempt.finish(false) {
                 tracing::warn!(username = %key, lock_secs = lock.as_secs(), "login locked out");
             } else {
                 tracing::warn!(username = %key, "login failed");
@@ -454,7 +468,7 @@ fn too_many_logins(retry_after: std::time::Duration) -> axum::response::Response
         StatusCode::TOO_MANY_REQUESTS,
         [(header::RETRY_AFTER, secs.to_string())],
         Json(json!({
-            "error": "too many failed logins; try again later",
+            "error": "too many login attempts; try again later",
             "retry_after_secs": secs,
         })),
     )
