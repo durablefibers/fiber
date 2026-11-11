@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use fiber_core::tokens::constant_time_eq;
 use fiber_core::{
     AddMemberRequest, CreateAgentRequest, CreatePipelineRequest, CreateProjectRequest,
     CreateUserRequest, LoginRequest, ProjectRole, StartRunRequest, StepRun, UpdateAgentRequest,
@@ -38,13 +39,6 @@ const WEBHOOK_MAX_BYTES: usize = 25 << 20;
 /// hit the request timeout if none frees up. GitHub does not retry a failed delivery on
 /// its own: it is recorded under the webhook's Deliveries and must be redelivered by hand.
 const WEBHOOK_MAX_IN_FLIGHT: usize = 8;
-/// Logins verified at once, across all usernames. Each is an argon2id verify — tens of
-/// milliseconds of CPU and 19 MiB — on the blocking pool, so this bounds what a flood of
-/// distinct usernames (which the per-username guard does not see as one attacker) can
-/// make the process spend. Excess logins are refused with the guard's own `429` rather
-/// than queued: a queue would only move the flood into memory.
-const LOGIN_MAX_IN_FLIGHT: usize = 8;
-static LOGIN_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LOGIN_MAX_IN_FLIGHT);
 /// A readiness probe that hangs is worse than one that fails: the orchestrator's own
 /// probe timeout kills the pod with "probe timeout" and no diagnosis. Each dependency
 /// gets this long to answer before it is reported down.
@@ -437,10 +431,10 @@ async fn login(
         Ok(attempt) => attempt,
         Err(retry_after) => return Ok(too_many_logins(retry_after)),
     };
-    // After the per-username check, so a locked-out username never takes a slot.
-    let Ok(_slot) = LOGIN_SLOTS.try_acquire() else {
-        return Ok(too_many_logins(crate::login_guard::IN_FLIGHT_RETRY));
-    };
+    // The verify waits its turn for one of a few process-wide hashing slots
+    // (`fiber_core::tokens::MAX_CONCURRENT_HASHES`). If none comes free in time that is
+    // `ApiError::Busy`, a 503 — and the `?` drops the reservation, so being turned away
+    // by a busy server never counts as a failed login.
     let resp = state
         .store
         .login(&req.username, &req.password)
@@ -2314,16 +2308,6 @@ fn verify_github_sig(secret: &str, body: &str, signature: &str) -> bool {
     constant_time_eq(expected.as_bytes(), hex_sig.as_bytes())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
 #[derive(Debug)]
 pub enum ApiError {
     NotFound,
@@ -2331,7 +2315,13 @@ pub enum ApiError {
     Forbidden,
     BadRequest(String),
     Internal(String),
+    /// The server could not take the request on right now (password hashing is
+    /// saturated). Nothing was decided about the caller: not a `401`, not a lockout.
+    Busy,
 }
+
+/// `Retry-After` for [`ApiError::Busy`]: a hashing slot turns over in well under this.
+const BUSY_RETRY_AFTER_SECS: u64 = 2;
 
 impl From<fiber_core::StoreError> for ApiError {
     fn from(e: fiber_core::StoreError) -> Self {
@@ -2362,6 +2352,9 @@ impl From<anyhow::Error> for ApiError {
                 S::Other(_) => ApiError::Internal(format!("{e:#}")),
             };
         }
+        if e.downcast_ref::<fiber_core::tokens::HashBusy>().is_some() {
+            return ApiError::Busy;
+        }
         // A definition the caller wrote wrongly is the caller's fault.
         if e.downcast_ref::<fiber_core::DagError>().is_some() {
             return ApiError::BadRequest(format!("{e:#}"));
@@ -2382,6 +2375,18 @@ impl IntoResponse for ApiError {
                 // Never echo sqlx / Redis / anyhow chains to clients.
                 tracing::error!(error = %m, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
+            ApiError::Busy => {
+                tracing::warn!("password hashing saturated; request turned away");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS.to_string())],
+                    Json(json!({
+                        "error": "server busy; nothing was checked — try again shortly",
+                        "retry_after_secs": BUSY_RETRY_AFTER_SECS,
+                    })),
+                )
+                    .into_response();
             }
         };
         (status, Json(json!({ "error": msg }))).into_response()
@@ -3002,6 +3007,21 @@ mod tests {
         assert_eq!(
             delivery_status(&[], &[fail()]),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A saturated hasher is the server's condition, not a verdict on the caller: it must
+    /// not come back as the 401 of a bad password, the 429 of a lockout, or a 500.
+    #[test]
+    fn a_busy_hasher_is_a_503_with_retry_after_through_a_context_layer() {
+        let e = anyhow::Error::new(fiber_core::tokens::HashBusy).context("login");
+        let api = ApiError::from(e);
+        assert!(matches!(api, ApiError::Busy), "{api:?}");
+        let resp = api.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            BUSY_RETRY_AFTER_SECS.to_string().as_str()
         );
     }
 

@@ -27,16 +27,23 @@ loopback.
   flight count against the same ten; a request that errors or is dropped gives its slot
   back. Three things next to it:
   - argon2id ran inline on the async workers, so the same burst stalled agent heartbeats
-    and lease renewals. Hashing and verifying now run on the blocking pool, and at most
-    8 logins are verified at once; the rest get the guard's `429`.
+    and lease renewals. Hashing and verifying now run on the blocking pool, at most four
+    at a time across the whole process (login, password change, user creation). A slot
+    is held until the hash finishes, not until the request that asked for it goes away,
+    so hanging up mid-login does not free it for more. A request that finds all four
+    busy waits its turn for up to 5 s and then gets a `503` that says nothing was
+    checked; it is not a lockout and does not count as a failed login.
   - An unknown username returned before any hashing, a wrong password after it, so
-    response time said which usernames exist. Both now cost one argon2id verify.
+    response time said which usernames exist. Both now cost one argon2id verify, and so
+    does an account still on a legacy SHA-256 hash, which is also now compared in
+    constant time.
   - Once the guard held 10 000 usernames it dropped every entry that was not locked out,
     so a flood of made-up usernames reset a real account's failure count on demand. It
     now evicts expired entries, then the fewest failures first.
 
   The `429` body's `error` text changed from "too many failed logins" to "too many login
-  attempts", since it now also covers attempts refused while others are being verified.
+  attempts", since it now also covers attempts refused while others for the same
+  username are being verified.
   [authz](docs/authz.md#authentication).
 - **An agent token could claim any labels and any concurrency.** `Hello` carries the
   agent's labels and concurrency, and the server registered the agent with them as sent —
@@ -120,9 +127,6 @@ loopback.
   `fiber-api` logs one warning the first time a project needed the environment's token.
   The docs also said the environment variable was a fallback for commit statuses; it has
   not been since statuses moved to the project's secret, and they now say so.
-
-### Changed
-
 - **The advisory gate can no longer go red unseen.** `deny` only ran on a push or pull
   request, was not a required check, and was not run on a release tag — so with no
   pushes to `main` since early October, the advisories above went unreported. A daily
