@@ -1786,9 +1786,14 @@ async fn update_agent(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // Narrow a live agent at once; never widen it here. What the agent may be offered
+    // is `row ∩ Hello`, and only its WebSocket session knows what `Hello` claimed —
+    // installing the row verbatim gave a live agent labels it never said it could run.
+    // The session recomputes the full registration from the row on its next heartbeat,
+    // which is when a widening takes effect.
     state
         .scheduler
-        .update_agent_presence(id, labels, agent.concurrency.max(1) as u32)
+        .narrow_agent_presence(id, &labels, agent.concurrency.max(1) as u32)
         .await;
     agent.token_hash = "***".into();
     Ok(Json(agent))

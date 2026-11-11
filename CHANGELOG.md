@@ -51,8 +51,10 @@ loopback.
   beside it. Anyone holding one agent token could reconnect claiming every label and
   `u32::MAX` slots, and be offered steps, with their secrets, meant for other agents in
   the same pool. The row is now the ceiling: an agent is registered with the row's labels
-  that it also claims, and the smaller of the two concurrencies. Asking for more is logged
-  with the agent id. See *Changed* for what this does to an existing agent.
+  that it also claims, and the smaller of the two concurrencies — at connect, and again
+  whenever the row is edited while the agent is connected. A row with no labels grants
+  none. Asking for more is logged with the agent id. See *Changed* for what this does to
+  an existing agent.
   [agents](docs/agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
 - **The instance's GitHub token could be aimed at any repository by a project admin.**
   Listing a pull request's files (for `paths` filters) fell back from the project's
@@ -115,10 +117,15 @@ loopback.
   - *Labels.* A label passed to the agent but missing from its row no longer matches
     steps. Add it to the row: `fiber agents update <id> --labels os=linux,docker=true`.
 
-  A row with no labels at all keeps the agent's own labels, so an agent registered with
-  `"labels": []` is not stripped. The API logs
-  `agent hello asked for more than its registration allows` with the agent id for every
-  agent this affects, each time it connects.
+  - *No labels on the row.* An agent whose row has no labels at all now receives only
+    steps that require no labels, whatever its own flags say. Find such rows with
+    `SELECT id, name FROM agents WHERE labels = '[]'::jsonb;` and give each the labels it
+    should have.
+
+  The API logs `agent hello asked for more than its registration allows` with the agent
+  id for every agent this affects, each time it connects. Editing a connected agent's row
+  no longer needs a reconnect to be applied correctly: narrowing takes effect at once,
+  widening on the agent's next heartbeat, and never beyond the agent's own flags.
 - **If you rely on `FIBER_GITHUB_TOKEN` in `fiber-api`'s environment, add a project secret
   before upgrading.** It is no longer read. A project with `pull_request` `paths` /
   `paths_ignore` filters and no `GITHUB_TOKEN` secret of its own will stop starting those

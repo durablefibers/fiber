@@ -336,9 +336,14 @@ agent id each time it connects asking for more than its row has
 (`agent hello asked for more than its registration allows`). An agent that claims *less*
 than its row is fine and is offered only what it claimed.
 
-One exception: a row registered with **no labels** (`"labels": []`) does not restrict
-labels — the agent's own are used as sent. Give such a row labels to close that; until
-then, whoever holds that agent's token chooses its labels.
+A row with **no labels** (`"labels": []`, `--labels ""`) grants none: whatever the agent
+claims, it is offered only steps that require no labels. Clearing an agent's labels is
+therefore a way to restrict it, not to open it up.
+
+Editing the row of a connected agent takes effect without a reconnect. Removing a label
+or lowering concurrency applies at once on the API replica that handled the edit, and
+within one heartbeat (10 s) on any other. Adding a label or raising concurrency applies
+on the agent's next heartbeat, and only as far as the agent's own flags go.
 
 The UI and `GET /api/agents` show the row, not the effective registration.
 
@@ -379,7 +384,7 @@ The server counts an agent's in-flight steps **from the database** (`step_runs` 
 | Server shutdown | On SIGTERM the API sends Close 1012 ("server shutting down") to every agent and waits for the sessions to end (up to 20 s) before exiting; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect and Reconnect rows — they keep running |
 | Older agent | An agent whose `Hello` has no `protocol_version` cancels its steps on any close, so for it a close is still the end of the attempt: the server requeues its steps at once on disconnect, exactly as before |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
-| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |
+| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged). A connected agent is re-registered as *row ∩ its own flags*: narrowing at once, widening on its next heartbeat |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |
 
 ## Log path

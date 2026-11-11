@@ -19,8 +19,8 @@ The token decides **which** agent a connection is; the agent's database row deci
 that agent may be offered. Pool scope comes from the row alone. Labels and concurrency are
 capped by the row: a connecting agent is registered with the row's labels that it also
 claims and the smaller of the two concurrencies, so holding a token does not let its
-holder claim labels or slots the agent was not registered with (a row with no labels at
-all is the exception — see [agents](./agents.md#labels-and-concurrency-the-registration-is-the-ceiling)).
+holder claim labels or slots the agent was not registered with. A row with no labels
+grants none. See [agents](./agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
 
 ## Roles
 
