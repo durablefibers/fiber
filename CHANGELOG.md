@@ -6,10 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
-A stored pipeline with a `timeout_minutes` above `525600` (one year), on the pipeline or on
-a step, or a step with `retries` above `100`, now fails to compile. The boot scan names
-each one, and a push or schedule against it leaves a failed run saying why. Runs already started keep their snapshot and are
-unaffected: the timeout sweep reads an out-of-range value in one as a year.
+A stored pipeline with a `timeout_minutes` above `525600` (one year), on the pipeline or
+on a step, or a step with `retries` above `100`, now fails to compile. The boot scan names
+each one, and a push or schedule against it leaves a failed run saying why. Runs already
+started keep their snapshot and are unaffected: a `timeout_minutes` too large in one is
+enforced as a year, by the agent and by the server alike.
 
 ### Security
 
@@ -26,17 +27,27 @@ unaffected: the timeout sweep reads an out-of-range value in one as a year.
   chained, so every tick on every replica ended there: no expired lease reclaimed, no
   step or run timed out, no orphaned run finalised, in any project. `/ready` stayed `ok`,
   because a failed tick is a logged error and not a dead loop. Any project `writer` could
-  do it with one saved pipeline and one run. Three changes, each sufficient alone:
-  - `timeout_minutes` above `525600` is rejected when the pipeline compiles, on the
-    pipeline and on a step. [pipeline-yaml](docs/pipeline-yaml.md).
-  - Both sweep queries clamp to that bound before the cast, so a snapshot stored by an
-    earlier version cannot raise. A `timeout_minutes` in a snapshot that is not a
-    non-negative whole number is read as absent, as the offer already reads it.
-  - A reclaim stage that fails no longer ends the tick. Stale agents, step timeouts, run
-    timeouts, expired leases and stalled runs each run regardless of the others, and
-    within the last four one step or run that errors does not shield the rest. Each
-    failure is logged at `error` with its stage, and the tick still reports
-    `lease reclaim failed`, naming the stages.
+  do it with one saved pipeline and one run.
+  - **The fix is in the two sweep queries.** They read the value as `numeric`, clamp it to
+    `525600` there, and only then cast, so no stored value can make them raise. That
+    covers a run that is already going, whose snapshot cannot be changed.
+  - **`timeout_minutes` above `525600` is rejected when the pipeline compiles,** on the
+    pipeline and on a step, which stops new values arriving. It does nothing for a run
+    already started. [pipeline-yaml](docs/pipeline-yaml.md).
+  - **A reclaim stage that fails no longer ends the tick,** which limits what the next
+    bug of this kind can do; on its own it would have left the timeout sweep failing on
+    every tick. Stale agents, step timeouts, run timeouts, expired leases and stalled
+    runs each run regardless of the others, and within the last four one step or run
+    that errors does not shield the rest. Each failure is logged at `error` with its
+    stage, and the tick still reports `lease reclaim failed`, naming the stages. A run
+    deleted between being found timed out and being cancelled is not a failure.
+
+  The agent and the server now read a stored `timeout_minutes` by one rule. A whole
+  number of at least 1 is the timeout, clamped to a year however large; anything else —
+  a fraction, zero, a negative, a string — is no timeout, and the default applies (for a
+  whole run, no limit). Before, the offer sent an agent the 60-minute default for a
+  value above 4 294 967 295 while the server's backstop waited far longer for the same
+  step.
 
 ### Fixed
 
@@ -63,9 +74,11 @@ unaffected: the timeout sweep reads an out-of-range value in one as a year.
     a debug build, and in release a wrap to `0`, a retry with no backoff.
 
   `retries` above `100` is now rejected when the pipeline compiles, and each of the three
-  is total for whatever a row or a snapshot from an earlier version holds: the column
-  saturates, the lease decision saturates, and the backoff stays at its 60 s cap. The
-  backoff for every attempt that used to fit is unchanged.
+  is total for whatever a row or a snapshot from an earlier version holds: the column is
+  clamped to `100`, the lease decision saturates, and the backoff stays at its 60 s cap.
+  Clamped, not saturated: a retry of an old run whose snapshot says `4294967295` gets
+  100 retries, not two billion. The backoff for every attempt that used to fit is
+  unchanged.
   [pipeline-yaml](docs/pipeline-yaml.md).
 
 ### Changed

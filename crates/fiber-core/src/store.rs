@@ -1,5 +1,5 @@
 use crate::dag::{
-    CompiledDag, MAX_TIMEOUT_MINUTES, compile_definition, parse_pipeline_yaml_lenient,
+    CompiledDag, MAX_RETRIES, MAX_TIMEOUT_MINUTES, compile_definition, parse_pipeline_yaml_lenient,
 };
 use crate::models::*;
 // sqlx 0.9 refuses a runtime-built query string unless it is asserted safe. Every
@@ -1528,11 +1528,10 @@ impl Store {
     /// The query is total over whatever a snapshot holds, because it runs for every
     /// project at once and one row that made it raise would stop the sweep for all of
     /// them. A snapshot is immutable, so a run stored before the compile-time bound can
-    /// still carry a `timeout_minutes` past what `make_interval` takes as an `int`:
-    /// each operand is clamped to [`MAX_TIMEOUT_MINUTES`] while still a `bigint`, and
-    /// only then cast. A value that is not a non-negative whole JSON number is read as
-    /// absent — the default applies — which is what the offer does with it
-    /// (`as_u64`, in `fiber-api`'s `offer_for_step`).
+    /// still carry a `timeout_minutes` past what `make_interval` takes as an `int`. The
+    /// SQL restates [`crate::dag::stored_timeout_minutes`], which the offer uses, so the
+    /// agent and this backstop read one value: a whole number of at least 1 is clamped
+    /// to [`MAX_TIMEOUT_MINUTES`], and anything else is absent and the default applies.
     pub async fn list_timed_out_steps(
         &self,
         default_minutes: i64,
@@ -1548,8 +1547,8 @@ impl Store {
 
     /// Running runs whose snapshot carries a whole-run `timeout_minutes` that has elapsed.
     ///
-    /// Total in the same way as [`Self::list_timed_out_steps`]: clamped before the cast,
-    /// and a value that is not a non-negative whole number means the run has no limit.
+    /// Total in the same way as [`Self::list_timed_out_steps`], by the same rule: too
+    /// large is a year, and a value that is not a timeout means the run has no limit.
     pub async fn list_timed_out_runs(&self) -> Result<Vec<(Uuid, i64)>> {
         Ok(sqlx::query_as::<_, (Uuid, i64)>(LIST_TIMED_OUT_RUNS_SQL)
             .bind(i64::from(MAX_TIMEOUT_MINUTES))
@@ -1779,7 +1778,7 @@ impl Store {
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| anyhow!("run not found"))?;
+        .ok_or_else(|| crate::StoreError::not_found("run"))?;
         // Locking the open steps blocks a concurrent lease until this commits; after
         // that the lease's `status = 'queued'` guard fails on its own. `ORDER BY id` is
         // the lock order every multi-row step lock in this file uses (see the reclaims),
@@ -2985,10 +2984,15 @@ pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {
 
 /// `$1` default minutes, `$2` grace minutes, `$3` the clamp ([`MAX_TIMEOUT_MINUTES`]).
 ///
-/// The `CASE` is what keeps the `::bigint` cast off text that is not a short run of
-/// digits; 18 of them always fit. `LEAST` on each operand bounds the sum at twice the
-/// clamp, so neither the addition nor the `::int` can overflow whatever the snapshot or
-/// the environment supplied.
+/// The snapshot value is read by the rule in [`crate::dag::stored_timeout_minutes`]. It
+/// goes through `numeric`, which holds any JSON number, and is clamped there; only the
+/// clamped value is ever cast to an integer type. The outer `CASE` keeps the `::numeric`
+/// cast off anything that is not a JSON number — a `CASE` evaluates only the branch it
+/// takes, where the operands of an `AND` may be evaluated in either order. `LEAST` on
+/// each operand of the sum bounds it at twice the clamp, so neither the addition nor
+/// the `::int` can overflow whatever the snapshot or the environment supplied.
+///
+/// `store::timeout_sql_tests` pins these properties against the text.
 const LIST_TIMED_OUT_STEPS_SQL: &str = "\
 SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
        LEAST(COALESCE(js.t, $1), $3)::bigint AS timeout_minutes
@@ -2997,9 +3001,12 @@ JOIN runs r ON r.id = s.run_id
 JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
                     AND a.finished_at IS NULL
 LEFT JOIN LATERAL (
-    SELECT CASE WHEN jsonb_typeof(e->'timeout_minutes') = 'number'
-                 AND e->>'timeout_minutes' ~ '^[0-9]{1,18}$'
-                THEN (e->>'timeout_minutes')::bigint END AS t
+    SELECT CASE WHEN jsonb_typeof(e->'timeout_minutes') = 'number' THEN
+                CASE WHEN (e->>'timeout_minutes')::numeric >= 1
+                      AND (e->>'timeout_minutes')::numeric
+                          = trunc((e->>'timeout_minutes')::numeric)
+                     THEN LEAST((e->>'timeout_minutes')::numeric, $3)::bigint END
+           END AS t
     FROM jsonb_array_elements(r.definition_snapshot->'steps') e
     WHERE e->>'id' = s.step_id
     LIMIT 1) js ON TRUE
@@ -3012,14 +3019,17 @@ const LIST_TIMED_OUT_RUNS_SQL: &str = "\
 SELECT t.id, t.minutes
 FROM (
     SELECT id, started_at,
-           CASE WHEN jsonb_typeof(definition_snapshot->'timeout_minutes') = 'number'
-                 AND definition_snapshot->>'timeout_minutes' ~ '^[0-9]{1,18}$'
-                THEN LEAST((definition_snapshot->>'timeout_minutes')::bigint, $1) END
-             AS minutes
+           CASE WHEN jsonb_typeof(definition_snapshot->'timeout_minutes') = 'number' THEN
+                CASE WHEN (definition_snapshot->>'timeout_minutes')::numeric >= 1
+                      AND (definition_snapshot->>'timeout_minutes')::numeric
+                          = trunc((definition_snapshot->>'timeout_minutes')::numeric)
+                     THEN LEAST((definition_snapshot->>'timeout_minutes')::numeric, $1)::bigint
+                END
+           END AS minutes
     FROM runs
     WHERE status = 'running') t
 WHERE t.minutes IS NOT NULL
-  AND t.started_at < NOW() - make_interval(mins => t.minutes::int)";
+  AND t.started_at < NOW() - make_interval(mins => LEAST(t.minutes, $1)::int)";
 
 /// The run's definition snapshot, keyed by step id.
 ///
@@ -3348,12 +3358,13 @@ fn run_status_terminal(status: &str) -> bool {
 
 /// A compiled step's `retries` as the `step_runs.retries` column (`int4`).
 ///
-/// Compile bounds it at [`crate::dag::MAX_RETRIES`], but `retry_run` builds rows from a
-/// stored snapshot without recompiling, and one from before the bound can hold any
-/// `u32`. `as i32` wrapped the top half of that range negative — `4294967295` became
-/// `-1`, a step that never retries — so an out-of-range value saturates instead.
+/// Compile bounds it at [`MAX_RETRIES`], but `retry_run` builds rows from a stored
+/// snapshot without recompiling, and one from before the bound can hold any `u32`.
+/// `as i32` wrapped the top half of that range negative — `4294967295` became `-1`, a
+/// step that never retries. Clamped to the bound rather than saturated to `i32::MAX`:
+/// re-running such a run must not turn "never retries" into "retries for ever".
 fn retries_column(retries: u32) -> i32 {
-    i32::try_from(retries).unwrap_or(i32::MAX)
+    i32::try_from(retries.min(MAX_RETRIES)).unwrap_or(i32::MAX)
 }
 
 /// What a reclaim (expired lease, agent disconnect) did to the steps it found running.
@@ -3588,6 +3599,97 @@ fn plan_transitions_indexed(
         }
     }
     plan
+}
+
+#[cfg(test)]
+mod timeout_sql_tests {
+    //! The timeout sweep's two queries run for every project on every reclaim tick, so
+    //! one that can raise on a stored value stops the sweep for the whole instance.
+    //! Postgres is not available to a unit test; what can be pinned is the text — the
+    //! properties that make the queries total, so an edit that drops one goes red here.
+    use super::*;
+
+    const BOTH: [(&str, &str); 2] = [
+        ("steps", LIST_TIMED_OUT_STEPS_SQL),
+        ("runs", LIST_TIMED_OUT_RUNS_SQL),
+    ];
+
+    /// Every place the raw snapshot value is cast, as `(cast type, text before it)`.
+    fn raw_casts(sql: &str) -> Vec<&str> {
+        sql.match_indices("'timeout_minutes')::")
+            .map(|(i, m)| {
+                let rest = &sql[i + m.len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_raw_snapshot_value_is_only_ever_cast_to_numeric() {
+        // `::int` overflowed past 2^31-1 and `::bigint` raises on `1.5`, `1e20` and
+        // text; `numeric` holds any JSON number.
+        for (name, sql) in BOTH {
+            let casts = raw_casts(sql);
+            assert!(!casts.is_empty(), "{name}: the snapshot value is not read");
+            assert!(
+                casts.iter().all(|c| *c == "numeric"),
+                "{name}: raw snapshot value cast to {casts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_numeric_cast_is_guarded_by_the_json_type() {
+        // The guard is its own CASE, opened before the first cast: an `AND` beside the
+        // cast would not promise the order.
+        for (name, sql) in BOTH {
+            let guard = sql
+                .find("jsonb_typeof(")
+                .unwrap_or_else(|| panic!("{name}: no jsonb_typeof guard"));
+            let then = guard
+                + sql[guard..]
+                    .find("= 'number' THEN")
+                    .expect("guard is a CASE arm");
+            let first_cast = sql.find("'timeout_minutes')::").expect("a cast");
+            assert!(then < first_cast, "{name}: a cast precedes the type guard");
+        }
+    }
+
+    #[test]
+    fn every_integer_cast_is_of_a_clamped_value() {
+        for (name, sql) in BOTH {
+            // The value leaves `numeric` only through LEAST(.., clamp).
+            // So every `::bigint` closes a parenthesis on a line that opened a LEAST —
+            // `x::numeric::bigint`, the unclamped form, closes nothing.
+            let to_bigint: Vec<_> = sql.match_indices("::bigint").collect();
+            assert!(!to_bigint.is_empty(), "{name}");
+            for (i, _) in to_bigint {
+                let line_start = sql[..i].rfind('\n').map_or(0, |n| n + 1);
+                assert!(
+                    sql[line_start..i].ends_with(')') && sql[line_start..i].contains("LEAST("),
+                    "{name}: `::bigint` of something not clamped: {}",
+                    &sql[line_start..i]
+                );
+            }
+            // And reaches `make_interval`'s int exactly once, clamped there too.
+            let to_int: Vec<_> = sql
+                .match_indices("::int")
+                .filter(|(i, _)| !sql[i + 5..].starts_with(|c: char| c.is_ascii_alphanumeric()))
+                .collect();
+            assert_eq!(to_int.len(), 1, "{name}: {to_int:?}");
+            let (i, _) = to_int[0];
+            let interval = sql.rfind("make_interval(").expect("make_interval");
+            assert!(interval < i, "{name}: `::int` outside make_interval");
+            assert!(
+                sql[interval..i].contains("LEAST("),
+                "{name}: make_interval takes an unclamped value: {}",
+                &sql[interval..i]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4359,14 +4461,17 @@ mod transition_tests {
     }
 
     #[test]
-    fn retries_reach_the_column_without_wrapping() {
-        for n in [0, 1, 3, 100] {
+    fn retries_reach_the_column_clamped_never_wrapped() {
+        for n in [0, 1, 3, MAX_RETRIES] {
             assert_eq!(retries_column(n), n as i32);
         }
-        assert_eq!(retries_column(i32::MAX as u32), i32::MAX);
-        // These wrapped to i32::MIN and -1.
-        assert_eq!(retries_column(i32::MAX as u32 + 1), i32::MAX);
-        assert_eq!(retries_column(u32::MAX), i32::MAX);
+        // Only a snapshot from before the bound holds these. They wrapped to i32::MIN
+        // and -1; a retry of that run gets the most a pipeline may now ask for.
+        let most = MAX_RETRIES as i32;
+        assert_eq!(retries_column(MAX_RETRIES + 1), most);
+        assert_eq!(retries_column(i32::MAX as u32), most);
+        assert_eq!(retries_column(i32::MAX as u32 + 1), most);
+        assert_eq!(retries_column(u32::MAX), most);
     }
 
     #[test]

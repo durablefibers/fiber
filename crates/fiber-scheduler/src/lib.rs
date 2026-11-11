@@ -1300,12 +1300,8 @@ impl Scheduler {
                 for (run_id, minutes) in runs {
                     warn!(run = %run_id, minutes, "run timed out");
                     let reason = format!("run timed out after {minutes} min");
-                    errs.record(
-                        "run_timeouts",
-                        self.cancel_run_with_reason(run_id, Some(&reason))
-                            .await
-                            .map(|_| ()),
-                    );
+                    let cancelled = self.cancel_run_with_reason(run_id, Some(&reason)).await;
+                    errs.record("run_timeouts", gone_is_done(cancelled.map(|_| ())));
                 }
             }
             Err(e) => errs.record("run_timeouts", Err(e)),
@@ -1331,6 +1327,25 @@ impl Scheduler {
         .await?;
         self.cancel_step_on_agent(agent_id, t.step_run_id).await;
         Ok(())
+    }
+}
+
+/// A sweep's action on a row it listed a moment ago: `NotFound` means retention or a
+/// project delete removed the row in between, and there is nothing left to act on.
+/// That is the sweep's work done for it, not a stage that failed. Judged on the typed
+/// [`fiber_core::StoreError`], never on the message.
+fn gone_is_done(result: Result<()>) -> Result<()> {
+    match result {
+        Err(e)
+            if matches!(
+                e.downcast_ref::<fiber_core::StoreError>(),
+                Some(fiber_core::StoreError::NotFound(_))
+            ) =>
+        {
+            debug!(error = %e, "swept row no longer exists");
+            Ok(())
+        }
+        other => other,
     }
 }
 
@@ -1871,6 +1886,53 @@ mod tests {
         assert!(!nothing_in_flight([Succeeded, Queued, Pending]));
         assert!(!nothing_in_flight([Succeeded, Running, Pending]));
         assert!(!nothing_in_flight([Queued]));
+    }
+
+    #[test]
+    fn no_stage_of_a_reclaim_tick_can_end_it_early() {
+        // `StageErrors` only helps if every stage goes through it. A `?` in
+        // `reclaim_once` is how one failed stage used to end the tick for the rest;
+        // nothing but the source can say there is none, so read it.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("    async fn reclaim_once(&self) -> Result<()> {")
+            .expect("reclaim_once");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("end of reclaim_once")];
+        assert!(
+            body.contains("errs.finish()"),
+            "not the function expected:\n{body}"
+        );
+        assert!(
+            body.matches(".await").count() >= 4,
+            "expected the tick's stages here:\n{body}"
+        );
+        assert!(
+            !body.contains('?'),
+            "a `?` in reclaim_once lets one stage end the tick:\n{body}"
+        );
+        assert!(
+            !body.contains("return"),
+            "an early return in reclaim_once:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_swept_row_that_was_deleted_meanwhile_is_not_a_failed_stage() {
+        let gone: Result<()> = Err(fiber_core::StoreError::not_found("run").into());
+        assert!(gone_is_done(gone).is_ok());
+        // With context added on the way up, it is still the same typed error.
+        let gone: Result<()> = Err(
+            anyhow::Error::from(fiber_core::StoreError::not_found("run"))
+                .context("cancelling a timed-out run"),
+        );
+        assert!(gone_is_done(gone).is_ok());
+        // Anything else is a failure — including one that merely says "not found".
+        let lookalike: Result<()> = Err(anyhow::anyhow!("run not found"));
+        assert!(gone_is_done(lookalike).is_err());
+        let other: Result<()> = Err(fiber_core::StoreError::Validation("no".into()).into());
+        assert!(gone_is_done(other).is_err());
+        assert!(gone_is_done(Ok(())).is_ok());
     }
 
     #[test]

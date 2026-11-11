@@ -245,6 +245,45 @@ struct ExpandedCell<'a> {
     template: &'a StepDefinition,
 }
 
+/// A `timeout_minutes` as a run's stored snapshot holds it, for whoever enforces it.
+///
+/// Compile only lets `1..=MAX_TIMEOUT_MINUTES` through, but a snapshot is a stored
+/// document and immutable, so one written before that bound — or edited by hand — can
+/// hold anything. Two places enforce the value, the offer an agent is sent and the
+/// server's timeout sweep, and they have to agree or the agent and the backstop work to
+/// different deadlines. The rule, here for the offer and restated in SQL for the sweep
+/// (`LIST_TIMED_OUT_STEPS_SQL` / `LIST_TIMED_OUT_RUNS_SQL` in `store.rs`):
+///
+/// - a whole number of at least 1 is a timeout, **clamped** to [`MAX_TIMEOUT_MINUTES`]
+///   however large it is (`5000000000`, `1e20`);
+/// - anything else — absent, `null`, a string, a fraction, zero, a negative — is no
+///   timeout at all: `None`, and the caller's default applies.
+///
+/// `5.0` is a whole number: Postgres keeps the `.0` in `jsonb` and `serde_json` reads
+/// it back as a float, and the SQL side compares against `trunc`, so both take it as 5.
+pub fn stored_timeout_minutes(value: Option<&serde_json::Value>) -> Option<u32> {
+    let serde_json::Value::Number(n) = value? else {
+        return None;
+    };
+    if let Some(m) = n.as_u64() {
+        let clamped = u32::try_from(m)
+            .unwrap_or(u32::MAX)
+            .min(MAX_TIMEOUT_MINUTES);
+        return (m >= 1).then_some(clamped);
+    }
+    // Not a u64: negative, fractional, or too large for one (`jsonb` holds `1e20` as
+    // 21 digits, which comes back as a float).
+    let f = n.as_f64()?;
+    if !f.is_finite() || f < 1.0 || f.fract() != 0.0 {
+        return None;
+    }
+    Some(if f >= f64::from(MAX_TIMEOUT_MINUTES) {
+        MAX_TIMEOUT_MINUTES
+    } else {
+        f as u32
+    })
+}
+
 /// A `timeout_minutes` is absent or within `1..=MAX_TIMEOUT_MINUTES`. `what` names the
 /// pipeline or the step in the error and is only built when there is one.
 fn check_timeout(minutes: Option<u32>, what: impl FnOnce() -> String) -> Result<(), DagError> {
@@ -1872,6 +1911,45 @@ mod tests {
             .expect("a year is allowed");
         assert_eq!(dag.timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
         assert_eq!(dag.steps[0].timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
+    }
+
+    #[test]
+    fn a_stored_timeout_is_clamped_or_absent_never_wrapped() {
+        use serde_json::json;
+        let read = |v: serde_json::Value| stored_timeout_minutes(Some(&v));
+        // In range: itself.
+        assert_eq!(read(json!(1)), Some(1));
+        assert_eq!(read(json!(90)), Some(90));
+        assert_eq!(read(json!(MAX_TIMEOUT_MINUTES)), Some(MAX_TIMEOUT_MINUTES));
+        // Whole, as Postgres hands back a `5.0` it stored.
+        assert_eq!(read(json!(5.0)), Some(5));
+        // Too large: a year, whatever the size. 3e9 fits a u32, 5e9 a u64, 1e20 neither.
+        for huge in [
+            json!(MAX_TIMEOUT_MINUTES + 1),
+            json!(3_000_000_000u64),
+            json!(5_000_000_000u64),
+            json!(u64::MAX),
+            json!(1e20),
+            serde_json::from_str("100000000000000000000").unwrap(),
+        ] {
+            assert_eq!(read(huge.clone()), Some(MAX_TIMEOUT_MINUTES), "{huge}");
+        }
+        // Not a timeout: the default applies.
+        for absent in [
+            json!(null),
+            json!("30"),
+            json!("abc"),
+            json!(1.5),
+            json!(0.5),
+            json!(0),
+            json!(-5),
+            json!(-1e20),
+            json!(true),
+            json!([30]),
+        ] {
+            assert_eq!(read(absent.clone()), None, "{absent}");
+        }
+        assert_eq!(stored_timeout_minutes(None), None);
     }
 
     #[test]
