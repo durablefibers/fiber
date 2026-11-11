@@ -2882,7 +2882,7 @@ impl StepRows {
         self.commands.push(step.run.clone());
         self.labels.push(json!(step.labels));
         self.needs.push(json!(step.needs));
-        self.retries.push(step.retries as i32);
+        self.retries.push(retries_column(step.retries));
         self.errors.push(match status {
             StepStatus::Skipped => Some("if: condition false".to_string()),
             _ => None,
@@ -3325,6 +3325,16 @@ fn run_status_terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "skipped")
 }
 
+/// A compiled step's `retries` as the `step_runs.retries` column (`int4`).
+///
+/// Compile bounds it at [`crate::dag::MAX_RETRIES`], but `retry_run` builds rows from a
+/// stored snapshot without recompiling, and one from before the bound can hold any
+/// `u32`. `as i32` wrapped the top half of that range negative — `4294967295` became
+/// `-1`, a step that never retries — so an out-of-range value saturates instead.
+fn retries_column(retries: u32) -> i32 {
+    i32::try_from(retries).unwrap_or(i32::MAX)
+}
+
 /// What a reclaim (expired lease, agent disconnect) did to the steps it found running.
 #[derive(Debug, Default)]
 pub struct Reclaimed {
@@ -3349,8 +3359,12 @@ enum RequeueOutcome {
 /// allows `retries + 1`. The extra one is for a rolling agent restart or a network
 /// blip, which a `retries: 0` step must survive once — while a step that kills its
 /// agent every time still stops after two leases instead of being re-leased forever.
+///
+/// Total for any stored `retries`: `saturating_add`, because a row written before
+/// `retries` was bounded can hold `i32::MAX`, and this runs inside the reclaim
+/// transaction — an overflow there panicked the tick in a debug build, every tick.
 fn requeue_outcome(attempt: i32, retries: i32) -> RequeueOutcome {
-    if attempt > retries + 1 {
+    if attempt > retries.saturating_add(1) {
         RequeueOutcome::Fail
     } else {
         RequeueOutcome::Requeue
@@ -4200,6 +4214,35 @@ mod transition_tests {
         assert_eq!(requeue_outcome(3, 2), RequeueOutcome::Requeue);
         assert_eq!(requeue_outcome(4, 2), RequeueOutcome::Fail);
         assert_eq!(requeue_outcome(5, 2), RequeueOutcome::Fail);
+    }
+
+    #[test]
+    fn a_lost_lease_is_decided_for_any_stored_retries() {
+        // `retries + 1` overflowed here, inside the reclaim transaction.
+        assert_eq!(requeue_outcome(1, i32::MAX), RequeueOutcome::Requeue);
+        assert_eq!(requeue_outcome(i32::MAX, i32::MAX), RequeueOutcome::Requeue);
+        assert_eq!(
+            requeue_outcome(i32::MAX, i32::MAX - 1),
+            RequeueOutcome::Requeue
+        );
+        assert_eq!(
+            requeue_outcome(i32::MAX, i32::MAX - 2),
+            RequeueOutcome::Fail
+        );
+        // Rows written by the old wrapping cast hold -1: one lease, as before.
+        assert_eq!(requeue_outcome(1, -1), RequeueOutcome::Fail);
+        assert_eq!(requeue_outcome(1, i32::MIN), RequeueOutcome::Fail);
+    }
+
+    #[test]
+    fn retries_reach_the_column_without_wrapping() {
+        for n in [0, 1, 3, 100] {
+            assert_eq!(retries_column(n), n as i32);
+        }
+        assert_eq!(retries_column(i32::MAX as u32), i32::MAX);
+        // These wrapped to i32::MIN and -1.
+        assert_eq!(retries_column(i32::MAX as u32 + 1), i32::MAX);
+        assert_eq!(retries_column(u32::MAX), i32::MAX);
     }
 
     #[test]

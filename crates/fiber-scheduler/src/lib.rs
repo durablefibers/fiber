@@ -1460,11 +1460,17 @@ fn slots_available(concurrency: u32, db_running: i64, reserved: u32) -> bool {
 /// Only a failure retries — a cancel is a person's decision and a success is done. The
 /// backoff doubles per attempt and is capped, and lands on the row as `not_before` so it
 /// survives a restart and is honoured by every instance.
+///
+/// `saturating_pow`, because `attempt` is only bounded by `retries`, and a row written
+/// before `retries` was bounded can carry one past 63 — where `2u64.pow` panics in a
+/// debug build and wraps to 0, a retry with no backoff at all, in release. Saturated, it
+/// lands on the cap like every other attempt from the sixth on.
 fn retry_plan(status: StepStatus, attempt: i32, retries: i32) -> Option<u64> {
     if status != StepStatus::Failed || attempt > retries {
         return None;
     }
-    Some(2u64.pow(attempt.max(1) as u32).min(MAX_RETRY_BACKOFF_SECS))
+    let exponent = attempt.max(1).unsigned_abs();
+    Some(2u64.saturating_pow(exponent).min(MAX_RETRY_BACKOFF_SECS))
 }
 
 /// Read a positive minute count, falling back to `default` for absent, unparseable, or
@@ -1854,6 +1860,51 @@ mod tests {
             retry_plan(StepStatus::Failed, 40, 99),
             Some(MAX_RETRY_BACKOFF_SECS)
         );
+    }
+
+    #[test]
+    fn the_backoff_is_what_it_was_for_every_attempt_that_used_to_fit() {
+        // Pinned by value, then against the old expression across its whole safe range.
+        let pinned = [
+            (1, 2),
+            (2, 4),
+            (3, 8),
+            (4, 16),
+            (5, 32),
+            (6, 60),
+            (7, 60),
+            (63, 60),
+        ];
+        for (attempt, secs) in pinned {
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(secs),
+                "attempt {attempt}"
+            );
+        }
+        for attempt in 0..=63 {
+            let before = 2u64.pow(attempt.max(1) as u32).min(MAX_RETRY_BACKOFF_SECS);
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(before),
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backoff_is_capped_where_two_to_the_attempt_no_longer_fits() {
+        // 2^64 does not fit a u64: `pow` panicked here in debug and wrapped to 0 in
+        // release.
+        for attempt in [64, 65, 1_000, i32::MAX] {
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(MAX_RETRY_BACKOFF_SECS),
+                "attempt {attempt}"
+            );
+        }
+        // A negative attempt is not a thing, and is still an answer.
+        assert_eq!(retry_plan(StepStatus::Failed, i32::MIN, 3), Some(2));
     }
 
     #[test]

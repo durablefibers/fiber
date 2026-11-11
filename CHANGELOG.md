@@ -7,8 +7,8 @@ minor versions may carry breaking changes.
 ## [Unreleased]
 
 A stored pipeline with a `timeout_minutes` above `525600` (one year), on the pipeline or on
-a step, now fails to compile. The boot scan names each one, and a push or schedule against
-it leaves a failed run saying why. Runs already started keep their snapshot and are
+a step, or a step with `retries` above `100`, now fails to compile. The boot scan names
+each one, and a push or schedule against it leaves a failed run saying why. Runs already started keep their snapshot and are
 unaffected: the timeout sweep reads an out-of-range value in one as a year.
 
 ### Security
@@ -37,6 +37,23 @@ unaffected: the timeout sweep reads an out-of-range value in one as a year.
     within the last four one step or run that errors does not shield the rest. Each
     failure is logged at `error` with its stage, and the tick still reports
     `lease reclaim failed`, naming the stages.
+
+### Fixed
+
+- **An unbounded `retries` overflowed in three places.** The field is a `u32` with no
+  upper limit, and the column it lands in is an `int4`.
+  - `retries: 4294967295` was stored as `-1`, so the step never retried at all.
+  - `retries: 2147483647` made `retries + 1` overflow where an expired lease decides
+    whether the step gets another attempt — inside the reclaim transaction, so a debug
+    build panicked there on every tick.
+  - The backoff is `2^attempt` seconds, and from attempt 64 that does not fit: a panic in
+    a debug build, and in release a wrap to `0`, a retry with no backoff.
+
+  `retries` above `100` is now rejected when the pipeline compiles, and each of the three
+  is total for whatever a row or a snapshot from an earlier version holds: the column
+  saturates, the lease decision saturates, and the backoff stays at its 60 s cap. The
+  backoff for every attempt that used to fit is unchanged.
+  [pipeline-yaml](docs/pipeline-yaml.md).
 
 ### Changed
 

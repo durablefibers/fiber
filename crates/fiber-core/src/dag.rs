@@ -45,6 +45,17 @@ const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
 /// one stored before this check existed can still carry anything.
 pub const MAX_TIMEOUT_MINUTES: u32 = 525_600;
 
+/// The most `retries` a step may ask for.
+///
+/// Each retry is another lease of an agent slot, and the backoff between them is capped
+/// at a minute, so a hundred is already most of two hours of waiting on a step that
+/// fails instantly. The field is a `u32` and the column an `int4`: without a bound,
+/// `4294967295` was stored as `-1` (a step that never retries) and `2147483647` made
+/// `retries + 1` overflow in the reclaim transaction. The readers are total on their own
+/// — a run retried from an old snapshot can still carry anything — so this is what makes
+/// the value mean something, not what keeps the arithmetic safe.
+pub const MAX_RETRIES: u32 = 100;
+
 /// The cap in force, from `FIBER_MAX_STEPS` (read once).
 ///
 /// 500 is justified on cost, not on correctness, and a generated monorepo fan-out can
@@ -133,6 +144,8 @@ pub enum DagError {
     InvalidTimeout(String),
     #[error("`{0}`: timeout_minutes must be at most {MAX_TIMEOUT_MINUTES} (one year)")]
     TimeoutTooLong(String),
+    #[error("step `{step}` retries is {retries}; it must be at most {MAX_RETRIES}")]
+    TooManyRetries { step: String, retries: u32 },
     #[error(
         "step `{step}` image `{image}` is not a docker image reference (`name[:tag][@digest]`, optionally registry-qualified)"
     )]
@@ -263,6 +276,12 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
     }
     for step in &def.steps {
         check_timeout(step.timeout_minutes, || format!("step {}", step.id))?;
+        if step.retries > MAX_RETRIES {
+            return Err(DagError::TooManyRetries {
+                step: step.id.clone(),
+                retries: step.retries,
+            });
+        }
     }
 
     let mut seen = HashSet::new();
@@ -1853,6 +1872,37 @@ mod tests {
             .expect("a year is allowed");
         assert_eq!(dag.timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
         assert_eq!(dag.steps[0].timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
+    }
+
+    #[test]
+    fn retries_above_the_bound_are_rejected() {
+        let def = |retries: u32| {
+            let mut s = step("flaky", &[], "true");
+            s.retries = retries;
+            PipelineDefinition {
+                name: "t".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![s],
+                timeout_minutes: None,
+            }
+        };
+        // i32::MAX overflowed `retries + 1`; u32::MAX was stored as -1.
+        for too_many in [MAX_RETRIES + 1, i32::MAX as u32, u32::MAX] {
+            let e = compile_definition(&def(too_many)).expect_err("rejected");
+            assert!(
+                matches!(&e, DagError::TooManyRetries { step, retries }
+                    if step == "flaky" && *retries == too_many),
+                "{e}"
+            );
+            assert!(e.to_string().contains("at most 100"), "{e}");
+        }
+        for fine in [0, 3, MAX_RETRIES] {
+            let dag = compile_definition(&def(fine)).expect("in range");
+            assert_eq!(dag.steps[0].retries, fine);
+        }
     }
 
     #[test]
