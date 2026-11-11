@@ -1,4 +1,6 @@
-use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml_lenient};
+use crate::dag::{
+    CompiledDag, MAX_TIMEOUT_MINUTES, compile_definition, parse_pipeline_yaml_lenient,
+};
 use crate::models::*;
 // sqlx 0.9 refuses a runtime-built query string unless it is asserted safe. Every
 // interpolation in this file splices a column-list `const` — PIPELINE_COLS, AGENT_COLS,
@@ -1522,43 +1524,37 @@ impl Store {
     /// Running steps whose current attempt has exceeded its timeout plus a grace
     /// period (the agent is expected to fail the step itself first). The timeout comes
     /// from the run's definition snapshot, falling back to `default_minutes`.
+    ///
+    /// The query is total over whatever a snapshot holds, because it runs for every
+    /// project at once and one row that made it raise would stop the sweep for all of
+    /// them. A snapshot is immutable, so a run stored before the compile-time bound can
+    /// still carry a `timeout_minutes` past what `make_interval` takes as an `int`:
+    /// each operand is clamped to [`MAX_TIMEOUT_MINUTES`] while still a `bigint`, and
+    /// only then cast. A value that is not a non-negative whole JSON number is read as
+    /// absent — the default applies — which is what the offer does with it
+    /// (`as_u64`, in `fiber-api`'s `offer_for_step`).
     pub async fn list_timed_out_steps(
         &self,
         default_minutes: i64,
         grace_minutes: i64,
     ) -> Result<Vec<TimedOutStep>> {
-        Ok(sqlx::query_as::<_, TimedOutStep>(
-            "SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
-                    COALESCE(js.t, $1)::bigint AS timeout_minutes
-             FROM step_runs s
-             JOIN runs r ON r.id = s.run_id
-             JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
-                                 AND a.finished_at IS NULL
-             LEFT JOIN LATERAL (
-                 SELECT (e->>'timeout_minutes')::bigint AS t
-                 FROM jsonb_array_elements(r.definition_snapshot->'steps') e
-                 WHERE e->>'id' = s.step_id
-                 LIMIT 1) js ON TRUE
-             WHERE s.status = 'running'
-               AND a.started_at < NOW() - make_interval(mins => (COALESCE(js.t, $1) + $2)::int)",
-        )
-        .bind(default_minutes)
-        .bind(grace_minutes)
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, TimedOutStep>(LIST_TIMED_OUT_STEPS_SQL)
+            .bind(default_minutes)
+            .bind(grace_minutes)
+            .bind(i64::from(MAX_TIMEOUT_MINUTES))
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Running runs whose snapshot carries a whole-run `timeout_minutes` that has elapsed.
+    ///
+    /// Total in the same way as [`Self::list_timed_out_steps`]: clamped before the cast,
+    /// and a value that is not a non-negative whole number means the run has no limit.
     pub async fn list_timed_out_runs(&self) -> Result<Vec<(Uuid, i64)>> {
-        Ok(sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT id, (definition_snapshot->>'timeout_minutes')::bigint
-             FROM runs
-             WHERE status = 'running'
-               AND (definition_snapshot->>'timeout_minutes') IS NOT NULL
-               AND started_at < NOW() - make_interval(mins => (definition_snapshot->>'timeout_minutes')::int)",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, (Uuid, i64)>(LIST_TIMED_OUT_RUNS_SQL)
+            .bind(i64::from(MAX_TIMEOUT_MINUTES))
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Reclaim running steps whose lease ran out. See [`Reclaimed`] for what comes back.
@@ -2965,6 +2961,44 @@ pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {
     }
     Ok(serde_json::from_value(value.clone())?)
 }
+
+/// `$1` default minutes, `$2` grace minutes, `$3` the clamp ([`MAX_TIMEOUT_MINUTES`]).
+///
+/// The `CASE` is what keeps the `::bigint` cast off text that is not a short run of
+/// digits; 18 of them always fit. `LEAST` on each operand bounds the sum at twice the
+/// clamp, so neither the addition nor the `::int` can overflow whatever the snapshot or
+/// the environment supplied.
+const LIST_TIMED_OUT_STEPS_SQL: &str = "\
+SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
+       LEAST(COALESCE(js.t, $1), $3)::bigint AS timeout_minutes
+FROM step_runs s
+JOIN runs r ON r.id = s.run_id
+JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
+                    AND a.finished_at IS NULL
+LEFT JOIN LATERAL (
+    SELECT CASE WHEN jsonb_typeof(e->'timeout_minutes') = 'number'
+                 AND e->>'timeout_minutes' ~ '^[0-9]{1,18}$'
+                THEN (e->>'timeout_minutes')::bigint END AS t
+    FROM jsonb_array_elements(r.definition_snapshot->'steps') e
+    WHERE e->>'id' = s.step_id
+    LIMIT 1) js ON TRUE
+WHERE s.status = 'running'
+  AND a.started_at < NOW() - make_interval(
+        mins => (LEAST(COALESCE(js.t, $1), $3) + LEAST($2, $3))::int)";
+
+/// `$1` the clamp ([`MAX_TIMEOUT_MINUTES`]). See [`LIST_TIMED_OUT_STEPS_SQL`].
+const LIST_TIMED_OUT_RUNS_SQL: &str = "\
+SELECT t.id, t.minutes
+FROM (
+    SELECT id, started_at,
+           CASE WHEN jsonb_typeof(definition_snapshot->'timeout_minutes') = 'number'
+                 AND definition_snapshot->>'timeout_minutes' ~ '^[0-9]{1,18}$'
+                THEN LEAST((definition_snapshot->>'timeout_minutes')::bigint, $1) END
+             AS minutes
+    FROM runs
+    WHERE status = 'running') t
+WHERE t.minutes IS NOT NULL
+  AND t.started_at < NOW() - make_interval(mins => t.minutes::int)";
 
 /// The run's definition snapshot, keyed by step id.
 ///

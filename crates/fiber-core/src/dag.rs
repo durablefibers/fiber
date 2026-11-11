@@ -34,6 +34,17 @@ pub const DEFAULT_MAX_STEPS: usize = 500;
 /// bounds a cost nobody chooses on purpose.
 const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
 
+/// The longest `timeout_minutes` a pipeline or a step may ask for: one year.
+///
+/// The field is a `u32`, and the timeout sweep turns it into a Postgres interval through
+/// an `int`. A value past 2^31-1 fits the field and overflowed that cast, which failed
+/// the sweep's query — for every project, on every tick, for as long as the run that
+/// carried it stayed `running`. Nothing legitimately waits a year for a build, so the
+/// bound costs nobody anything; the sweep clamps to it as well
+/// ([`crate::Store::list_timed_out_steps`]), because a run's snapshot is immutable and
+/// one stored before this check existed can still carry anything.
+pub const MAX_TIMEOUT_MINUTES: u32 = 525_600;
+
 /// The cap in force, from `FIBER_MAX_STEPS` (read once).
 ///
 /// 500 is justified on cost, not on correctness, and a generated monorepo fan-out can
@@ -120,6 +131,8 @@ pub enum DagError {
     BadArtifactPath { step: String, path: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
+    #[error("`{0}`: timeout_minutes must be at most {MAX_TIMEOUT_MINUTES} (one year)")]
+    TimeoutTooLong(String),
     #[error(
         "step `{step}` image `{image}` is not a docker image reference (`name[:tag][@digest]`, optionally registry-qualified)"
     )]
@@ -219,13 +232,21 @@ struct ExpandedCell<'a> {
     template: &'a StepDefinition,
 }
 
+/// A `timeout_minutes` is absent or within `1..=MAX_TIMEOUT_MINUTES`. `what` names the
+/// pipeline or the step in the error and is only built when there is one.
+fn check_timeout(minutes: Option<u32>, what: impl FnOnce() -> String) -> Result<(), DagError> {
+    match minutes {
+        Some(0) => Err(DagError::InvalidTimeout(what())),
+        Some(m) if m > MAX_TIMEOUT_MINUTES => Err(DagError::TimeoutTooLong(what())),
+        _ => Ok(()),
+    }
+}
+
 pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagError> {
     if def.steps.is_empty() {
         return Err(DagError::Empty);
     }
-    if def.timeout_minutes == Some(0) {
-        return Err(DagError::InvalidTimeout("pipeline".into()));
-    }
+    check_timeout(def.timeout_minutes, || "pipeline".into())?;
     // The repo lands on a `git remote add` command line on the agent host, before any
     // container exists; git's `ext::` transport would run it as a command.
     if let Some(ws) = &def.workspace
@@ -241,9 +262,7 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         return Err(DagError::BadRef(r.to_string()));
     }
     for step in &def.steps {
-        if step.timeout_minutes == Some(0) {
-            return Err(DagError::InvalidTimeout(format!("step {}", step.id)));
-        }
+        check_timeout(step.timeout_minutes, || format!("step {}", step.id))?;
     }
 
     let mut seen = HashSet::new();
@@ -1803,6 +1822,37 @@ mod tests {
         // The step timeout survives the JSON snapshot round-trip.
         let v = serde_json::to_value(&dag).unwrap();
         assert_eq!(v["steps"][0]["timeout_minutes"], 5);
+    }
+
+    #[test]
+    fn a_timeout_longer_than_a_year_is_rejected_on_the_pipeline_and_on_a_step() {
+        let def = |pipeline: Option<u32>, on_step: Option<u32>| {
+            let mut s = step("a", &[], "true");
+            s.timeout_minutes = on_step;
+            PipelineDefinition {
+                name: "t".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![s],
+                timeout_minutes: pipeline,
+            }
+        };
+        // 3_000_000_000 fits the u32 and is past what Postgres takes as an `int`: the
+        // value that stalled the timeout sweep.
+        for too_long in [MAX_TIMEOUT_MINUTES + 1, 3_000_000_000, u32::MAX] {
+            let e = compile_definition(&def(Some(too_long), None)).expect_err("pipeline");
+            assert!(matches!(&e, DagError::TimeoutTooLong(w) if w == "pipeline"));
+            let e = compile_definition(&def(None, Some(too_long))).expect_err("step");
+            assert!(matches!(&e, DagError::TimeoutTooLong(w) if w == "step a"));
+            assert!(e.to_string().contains("at most 525600"), "{e}");
+        }
+        // The bound itself is allowed, on both.
+        let dag = compile_definition(&def(Some(MAX_TIMEOUT_MINUTES), Some(MAX_TIMEOUT_MINUTES)))
+            .expect("a year is allowed");
+        assert_eq!(dag.timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
+        assert_eq!(dag.steps[0].timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
     }
 
     #[test]

@@ -6,6 +6,11 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+A stored pipeline with a `timeout_minutes` above `525600` (one year), on the pipeline or on
+a step, now fails to compile. The boot scan names each one, and a push or schedule against
+it leaves a failed run saying why. Runs already started keep their snapshot and are
+unaffected: the timeout sweep reads an out-of-range value in one as a year.
+
 ### Security
 
 - **Seven RustSec advisories in the lockfile, all fixed by upgrades.** `rustls` 0.23.46
@@ -13,6 +18,25 @@ minor versions may carry breaking changes.
   verification could accept a distrusted intermediate), `tokio` 1.54.1 (RUSTSEC-2026-0386)
   and `ctutils` 0.4.8 (RUSTSEC-2026-0385). TLS is on every path that carries an agent
   token or a session, so the 0.6.7 agent, CLI and images are affected; upgrade all three.
+- **One pipeline could stop lease reclaim for the whole instance.** `timeout_minutes` is a
+  `u32`, and only `0` was rejected. The timeout sweep turns it into an interval through a
+  Postgres `int`, so a value above 2 147 483 647 — `timeout_minutes: 3000000000` fits the
+  field — made that query raise `integer out of range` for as long as the run carrying it
+  stayed `running`. The sweep was the second of the reclaim tick's stages and they were
+  chained, so every tick on every replica ended there: no expired lease reclaimed, no
+  step or run timed out, no orphaned run finalised, in any project. `/ready` stayed `ok`,
+  because a failed tick is a logged error and not a dead loop. Any project `writer` could
+  do it with one saved pipeline and one run. Three changes, each sufficient alone:
+  - `timeout_minutes` above `525600` is rejected when the pipeline compiles, on the
+    pipeline and on a step. [pipeline-yaml](docs/pipeline-yaml.md).
+  - Both sweep queries clamp to that bound before the cast, so a snapshot stored by an
+    earlier version cannot raise. A `timeout_minutes` in a snapshot that is not a
+    non-negative whole number is read as absent, as the offer already reads it.
+  - A reclaim stage that fails no longer ends the tick. Stale agents, step timeouts, run
+    timeouts, expired leases and orphaned runs each run regardless of the others, and
+    within the last four one step or run that errors does not shield the rest. Each
+    failure is logged at `error` with its stage, and the tick still reports
+    `lease reclaim failed`, naming the stages.
 
 ### Changed
 
