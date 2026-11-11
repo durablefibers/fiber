@@ -1608,24 +1608,45 @@ impl Store {
         Ok(reclaimed)
     }
 
-    /// Running runs with no step left to run: every step is terminal, yet the run was
-    /// never finalised. That is the window between a reclaim committing a step as
-    /// `failed` and `propagate_after_step` running on it — a process that dies in
-    /// between leaves the run `running` with nothing that would ever revisit it, since
-    /// every other sweep looks for open steps. The reclaim loop feeds these back into
-    /// propagation. Bounded so one tick cannot stall behind a pathological backlog.
+    /// Running runs with nothing in flight: no step is `queued` or `running`, so no
+    /// agent will ever report on the run and nothing else will revisit it. Whatever is
+    /// left is terminal or `pending`, and only propagation moves those — the reclaim
+    /// loop feeds these runs back into it.
     ///
-    /// A run holding a step whose status is outside the vocabulary (a legacy row the
-    /// NOT VALID check tolerates) is left out: propagation reads it as `Pending`, so it
-    /// could never finalise and would be re-selected every tick, crowding out real
-    /// orphans past the limit. Such rows are the operator's to fix.
-    pub async fn runs_with_no_open_steps(&self) -> Result<Vec<Uuid>> {
+    /// A run gets here because a step's outcome and the propagation that follows it are
+    /// two transactions. A process that dies, or a pool that times out, between them
+    /// leaves the outcome committed and its consequences unapplied: dependents still
+    /// `pending`, or every step terminal and the run never finalised. The agent does not
+    /// resend a completion and a resend would be dropped as stale. `start_run` and
+    /// `retry_run` have the same gap when every root is skipped or carried over.
+    ///
+    /// `pending` is deliberately not treated as in flight (it was, and that hid the
+    /// first case). Nothing parks a step there to wait: a retry backoff, an offer that
+    /// was backed out, and a step no connected agent has the labels for are all
+    /// `queued` (the first two with `not_before`); `if:` is decided at the moment a step
+    /// would be queued; a concurrency group cancels the older run, it never holds the
+    /// newer one. So a `pending` step is only ever waiting on a dependency, and when no
+    /// step is in flight the earliest one in the DAG has every dependency terminal —
+    /// propagation queues or skips it. Selecting a run that another caller is about to
+    /// propagate is harmless: `propagate_after_step` locks the run row, guards each
+    /// write on the status it read, and hands each transition to exactly one caller.
+    ///
+    /// Bounded so one tick cannot stall behind a pathological backlog, oldest first.
+    /// That only works while every selected run leaves the set, so a run propagation
+    /// cannot move must not be selected. One holding a step whose status is outside
+    /// the vocabulary (a legacy row the NOT VALID check tolerates) is left out for that
+    /// reason: propagation reads it as `Pending`, it could never finalise, and it would
+    /// be re-selected every tick, crowding out real ones past the limit. Such rows are
+    /// the operator's to fix. The same goes for a `pending` step whose `needs` names a
+    /// step the run does not have — compile rejects that, so it takes a hand-edited
+    /// row — which this query does not exclude; the caller warns about it every tick.
+    pub async fn runs_with_nothing_in_flight(&self) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar::<_, Uuid>(
             "SELECT r.id FROM runs r
              WHERE r.status = 'running'
                AND NOT EXISTS (
                    SELECT 1 FROM step_runs s
-                   WHERE s.run_id = r.id AND s.status IN ('pending', 'queued', 'running'))
+                   WHERE s.run_id = r.id AND s.status IN ('queued', 'running'))
                AND NOT EXISTS (
                    SELECT 1 FROM step_runs s
                    WHERE s.run_id = r.id
@@ -3626,6 +3647,109 @@ mod propagate_tests {
         assert_eq!(plan, vec![(1, Transition::Queue)]);
         apply(&mut steps, &plan);
         assert!(plan_transitions(&steps, &json!([])).is_empty());
+    }
+
+    // --- what the stalled-run sweep relies on ------------------------------------------
+    //
+    // `runs_with_nothing_in_flight` selects running runs with no queued or running step
+    // and re-propagates them. That is only right if propagation always moves such a run.
+
+    #[test]
+    fn a_run_whose_dependents_were_never_unlocked_plans_a_transition() {
+        // `a` completed and committed; the process died before propagating. Nothing is
+        // queued or running, so nothing but a re-propagation will ever touch the run.
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["a"]),
+        ];
+        let plan = plan_transitions(&steps, &json!([]));
+        assert_eq!(plan, vec![(1, Transition::Queue), (2, Transition::Queue)]);
+        apply(&mut steps, &plan);
+        // Now something is queued: the run is back in the scheduler's hands.
+        assert!(steps.iter().any(|s| s.status == "queued"));
+    }
+
+    #[test]
+    fn a_pending_chain_rooted_in_a_terminal_step_resolves() {
+        // Every root skipped by its `if:` at start, and the propagation after the
+        // insert never ran: the whole chain is pending behind a terminal step.
+        let mut steps = vec![
+            step("a", StepStatus::Skipped, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+            step("d", StepStatus::Pending, &["c"]),
+        ];
+        assert!(run_to_fixpoint(&mut steps, &json!([])) >= 1);
+        assert!(
+            steps.iter().all(|s| s.status_enum().is_terminal()),
+            "{steps:?}"
+        );
+
+        // Rooted in a success instead, the head of the chain is queued and the rest
+        // wait on it — pending, legitimately, because a step is now in flight.
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+        ];
+        assert_eq!(run_to_fixpoint(&mut steps, &json!([])), 1);
+        assert_eq!(steps[1].status, "queued");
+        assert_eq!(steps[2].status, "pending");
+    }
+
+    #[test]
+    fn no_run_with_nothing_in_flight_is_a_resting_state() {
+        // Every assignment of {pending, terminal} statuses to a diamond, queued and
+        // running excluded — the set the sweep selects from. Whenever a step is still
+        // pending, one pass must plan something, with and without an `always()` step:
+        // if any of these planned nothing, the sweep would re-select that run forever.
+        let statuses = [
+            StepStatus::Pending,
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ];
+        let snaps = [
+            json!([]),
+            json!([{"id": "d", "if": "always()"}]),
+            json!([{"id": "a", "continue_on_error": true}, {"id": "c", "if": "always()"}]),
+        ];
+        let mut checked = 0;
+        for a in statuses {
+            for b in statuses {
+                for c in statuses {
+                    for d in statuses {
+                        let steps = vec![
+                            step("a", a, &[]),
+                            step("b", b, &["a"]),
+                            step("c", c, &["a"]),
+                            step("d", d, &["b", "c"]),
+                        ];
+                        if !steps.iter().any(|s| s.status == "pending") {
+                            continue;
+                        }
+                        for snap in &snaps {
+                            let mut steps = steps.clone();
+                            assert!(
+                                !plan_transitions(&steps, snap).is_empty(),
+                                "nothing planned for {a:?} {b:?} {c:?} {d:?} under {snap}"
+                            );
+                            // And it keeps moving until a step is in flight or all are done.
+                            run_to_fixpoint(&mut steps, snap);
+                            assert!(
+                                steps.iter().any(|s| s.status == "queued")
+                                    || steps.iter().all(|s| s.status_enum().is_terminal()),
+                                "{steps:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, (5usize.pow(4) - 4usize.pow(4)) * snaps.len());
     }
 
     #[test]

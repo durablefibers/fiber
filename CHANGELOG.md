@@ -33,13 +33,26 @@ unaffected: the timeout sweep reads an out-of-range value in one as a year.
     earlier version cannot raise. A `timeout_minutes` in a snapshot that is not a
     non-negative whole number is read as absent, as the offer already reads it.
   - A reclaim stage that fails no longer ends the tick. Stale agents, step timeouts, run
-    timeouts, expired leases and orphaned runs each run regardless of the others, and
+    timeouts, expired leases and stalled runs each run regardless of the others, and
     within the last four one step or run that errors does not shield the rest. Each
     failure is logged at `error` with its stage, and the tick still reports
     `lease reclaim failed`, naming the stages.
 
 ### Fixed
 
+- **A run could stay `running` forever with every remaining step `pending`.** A step's
+  outcome is committed in one transaction and its consequences — unlocking dependents,
+  finalising the run — in the next. If the process died or the pool timed out between
+  them, the dependents were never queued; nothing was `queued` or `running`, so no agent
+  would ever report on the run again, and the agent's completion is not resent. The same
+  gap follows `start` and `retry` when every root step is skipped or carried over. The
+  reclaim loop has a sweep for exactly this, but it only picked up runs with no `pending`
+  step either, which is the case where every step had already finished. It now picks up
+  every `running` run with no step `queued` or `running` and re-propagates it, on the
+  next tick (15 s). A `pending` step is only ever waiting on a dependency — a retry
+  backoff, a backed-out offer and a step waiting for a matching agent are all `queued` —
+  so such a run can always be moved. The sweep also no longer warns about a run it
+  picked in the instant before that run's own propagation ran.
 - **An unbounded `retries` overflowed in three places.** The field is a `u32` with no
   upper limit, and the column it lands in is an `int4`.
   - `retries: 4294967295` was stored as `-1`, so the step never retried at all.

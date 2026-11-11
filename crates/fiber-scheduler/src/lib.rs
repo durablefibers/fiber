@@ -584,25 +584,25 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Finalise runs whose every step is terminal but which are still `running`: the
-    /// crash window between a reclaim committing a failure and propagating it. Nothing
-    /// else revisits such a run, so the reclaim tick does.
+    /// Re-propagate runs that are `running` with no step queued or running: a step's
+    /// outcome was committed and the propagation after it never ran (a crash or a pool
+    /// timeout between the two transactions), so dependents were never unlocked or the
+    /// run never finalised. Nothing else revisits such a run, so the reclaim tick does.
     ///
     /// Each run is recorded on its own: one whose propagation fails must not keep the
     /// runs selected after it from being looked at, this tick and every tick after.
-    async fn finalise_orphaned_runs(&self, errs: &mut StageErrors) {
-        match self.store.runs_with_no_open_steps().await {
+    async fn advance_stalled_runs(&self, errs: &mut StageErrors) {
+        match self.store.runs_with_nothing_in_flight().await {
             Ok(runs) => {
                 for run_id in runs {
-                    errs.record("orphaned_runs", self.finalise_orphaned_run(run_id).await);
+                    errs.record("stalled_runs", self.advance_stalled_run(run_id).await);
                 }
             }
-            Err(e) => errs.record("orphaned_runs", Err(e)),
+            Err(e) => errs.record("stalled_runs", Err(e)),
         }
     }
 
-    async fn finalise_orphaned_run(&self, run_id: Uuid) -> Result<()> {
-        info!(%run_id, "finalising run left running with no open steps");
+    async fn advance_stalled_run(&self, run_id: Uuid) -> Result<()> {
         let changed = self.store.propagate_after_step(run_id).await?;
         for s in &changed {
             if s.status_enum() == StepStatus::Queued {
@@ -622,19 +622,30 @@ impl Scheduler {
             return Ok(());
         };
         if changed.is_empty() && !run.status_enum().is_terminal() {
-            // The query excludes unknown step statuses, so this is something new:
-            // say what the steps look like rather than publish a non-terminal
-            // RunUpdated every tick.
-            let statuses: Vec<String> = self
-                .store
-                .list_step_runs(run_id)
-                .await?
+            let steps = self.store.list_step_runs(run_id).await?;
+            if !nothing_in_flight(steps.iter().map(|s| s.status_enum())) {
+                // Selected in the moment between a step's completion and its own
+                // propagation, which has since run: the run was never stalled.
+                debug!(%run_id, "run advanced by its own propagation before the sweep got to it");
+                return Ok(());
+            }
+            // Propagation always moves a well-formed run with nothing in flight, and
+            // the query excludes unknown step statuses, so this is something else — a
+            // `needs` naming a step the run does not have, say. Show the steps rather
+            // than publish a non-terminal RunUpdated every tick.
+            let statuses: Vec<String> = steps
                 .into_iter()
                 .map(|s| format!("{}={}", s.step_id, s.status))
                 .collect();
-            warn!(%run_id, ?statuses, "run has no open steps but did not finalise");
+            warn!(%run_id, ?statuses, "run has nothing in flight and propagation cannot advance it");
             return Ok(());
         }
+        info!(
+            %run_id,
+            steps_changed = changed.len(),
+            status = %run.status,
+            "advanced a run left running with nothing in flight"
+        );
         let ev = RunEvent::RunUpdated {
             run_id: run.id,
             status: run.status_enum(),
@@ -1228,7 +1239,7 @@ impl Scheduler {
         errs.record("stale_agents", self.mark_stale_agents().await);
         self.enforce_timeouts(&mut errs).await;
         errs.record("expired_leases", self.reclaim_expired_leases().await);
-        self.finalise_orphaned_runs(&mut errs).await;
+        self.advance_stalled_runs(&mut errs).await;
         errs.finish()
     }
 
@@ -1441,6 +1452,18 @@ fn completion_is_current(
     current == StepStatus::Running
         && row_agent == Some(reporting_agent)
         && attempt_is_current(reported_attempt, row_attempt)
+}
+
+/// Whether none of a run's steps is queued or running — what the stalled-run sweep
+/// selects on (`Store::runs_with_nothing_in_flight`), asked again after propagation
+/// changed nothing. The sweep reads its list before it takes any run's lock, so a run
+/// can be picked in the moment between a step completing and that completion's own
+/// propagation; by the time the sweep propagates there is nothing left to do, and that
+/// is a healthy run, not one to warn about every time the race is lost.
+fn nothing_in_flight(steps: impl IntoIterator<Item = StepStatus>) -> bool {
+    !steps
+        .into_iter()
+        .any(|s| matches!(s, StepStatus::Queued | StepStatus::Running))
 }
 
 /// Whether one more lease fits under `concurrency`.
@@ -1825,19 +1848,29 @@ mod tests {
         );
         // The stages after the failure are still recorded — and one of them fails too.
         errs.record("expired_leases", Ok(()));
-        errs.record("orphaned_runs", Err(anyhow::anyhow!("pool timed out")));
-        errs.record(
-            "orphaned_runs",
-            Err(anyhow::anyhow!("pool timed out again")),
-        );
-        assert_eq!(errs.failed, ["step_timeouts", "orphaned_runs"]);
+        errs.record("stalled_runs", Err(anyhow::anyhow!("pool timed out")));
+        errs.record("stalled_runs", Err(anyhow::anyhow!("pool timed out again")));
+        assert_eq!(errs.failed, ["step_timeouts", "stalled_runs"]);
         // The tick fails, with the first cause and every stage that failed named.
         let e = errs.finish().expect_err("a failed stage fails the tick");
         assert_eq!(e.root_cause().to_string(), "integer out of range");
         assert_eq!(
             e.to_string(),
-            "reclaim stages failed: step_timeouts, orphaned_runs"
+            "reclaim stages failed: step_timeouts, stalled_runs"
         );
+    }
+
+    #[test]
+    fn a_run_is_stalled_only_while_no_step_is_queued_or_running() {
+        use StepStatus::*;
+        // Pending and terminal steps are not in flight, in any mix — including none.
+        assert!(nothing_in_flight([]));
+        assert!(nothing_in_flight([Succeeded, Pending, Pending]));
+        assert!(nothing_in_flight([Succeeded, Failed, Cancelled, Skipped]));
+        // One queued or running step and the run is the scheduler's or an agent's.
+        assert!(!nothing_in_flight([Succeeded, Queued, Pending]));
+        assert!(!nothing_in_flight([Succeeded, Running, Pending]));
+        assert!(!nothing_in_flight([Queued]));
     }
 
     #[test]
