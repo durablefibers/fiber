@@ -201,12 +201,61 @@ def check_hooks() -> None:
             warnings.append(f"hooks/{script.name} exists but is not registered in settings.json")
 
 
+# A brief that names a file which no longer exists sends an agent looking for it, and
+# then reporting on a layout the repository does not have. `fiber-devops` named
+# `deploy/Dockerfile.api` and `deploy/nginx.conf` for two months after they were gone.
+REPO = ROOT.parent
+PATH_ROOTS = ("deploy/", "scripts/", "crates/", "apps/", "docs/", ".github/", ".claude/", "examples/")
+# Build output: named in briefs as something not to edit, absent from a clean checkout.
+GENERATED = {"apps/ui/dist/"}
+PATH_RE = re.compile(r"`([A-Za-z0-9_.$/-]+)`")
+
+
+def check_paths(md: Path) -> None:
+    """Every backticked repository path in a brief must exist."""
+    rel = md.relative_to(ROOT)
+    for token in sorted(set(PATH_RE.findall(md.read_text()))):
+        if not token.startswith(PATH_ROOTS):
+            continue
+        # Only whole paths: something with a file extension, or a directory written
+        # with its trailing slash. `crates/fiber-api` style prose mentions are skipped.
+        if not (token.endswith("/") or re.search(r"\.[A-Za-z0-9]+$", token)):
+            continue
+        if token in GENERATED:
+            continue
+        if not (REPO / token).exists():
+            errors.append(f"{rel}: names `{token}`, which does not exist")
+
+
+def check_readme_counts() -> None:
+    """README.md states how many skills, agents and hooks there are; keep it true."""
+    readme = (ROOT / "README.md").read_text()
+    actual = {
+        "skills": len(list((ROOT / "skills").glob("*/SKILL.md"))),
+        "subagents": len(list((ROOT / "agents").glob("*.md"))),
+        "hooks": len([p for p in (ROOT / "hooks").glob("*.sh") if p.name != "selftest.sh"]),
+    }
+    for noun, n in actual.items():
+        m = re.search(rf"(\d+)\s+{noun}\b", readme)
+        if m and int(m.group(1)) != n:
+            errors.append(f"README.md says {m.group(1)} {noun}; there are {n}")
+    m = re.search(r"(\d+) deny/allow cases", readme)
+    if m:
+        selftest = (ROOT / "hooks" / "selftest.sh").read_text()
+        cases = len(re.findall(r"^expect (?:deny|allow) ", selftest, flags=re.M))
+        if int(m.group(1)) != cases:
+            errors.append(f"README.md says {m.group(1)} deny/allow cases; selftest.sh has {cases}")
+
+
 def main() -> int:
     for skill_md in sorted((ROOT / "skills").glob("*/SKILL.md")):
         check_skill(skill_md)
     for agent in sorted((ROOT / "agents").glob("*.md")):
         check_agent(agent)
     check_hooks()
+    for md in sorted([*(ROOT / "skills").rglob("*.md"), *(ROOT / "agents").glob("*.md")]):
+        check_paths(md)
+    check_readme_counts()
 
     for w in warnings:
         print(f"  warn  {w}")

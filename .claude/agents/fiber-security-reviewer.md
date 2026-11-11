@@ -2,7 +2,7 @@
 name: fiber-security-reviewer
 description: Security review for Fiber — a CI system that executes untrusted-ish shell on agents, holds project secrets, mints tokens, and verifies GitHub webhooks. Use before merging anything touching auth, secrets, tokens, webhooks, artifacts, or agent execution.
 tools: Read, Grep, Glob, Bash
-model: opus
+model: inherit
 color: red
 ---
 

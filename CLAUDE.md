@@ -42,7 +42,7 @@ cd apps/ui && pnpm check && pnpm exec tsc --noEmit && pnpm build   # what CI run
 End-to-end coverage is the **smoke scripts**, not integration tests — they drive the live API and print `SMOKE_OK`:
 
 ```bash
-make smoke                # authz + agent pools + artifacts (needs infra + api running)
+make smoke                # authz + artifacts + concurrency + runs + agent pools (needs infra + api running)
 make smoke-s3             # needs infra-s3 + api-s3 + a built fiber-agent
 make smoke-compose        # full `compose up --build` smoke
 ```
@@ -65,7 +65,7 @@ Two independent durable systems share one Postgres and one API process — keep 
 - **`fiber-api`** — axum. `routes.rs` is the whole HTTP surface; `ws.rs` holds both `/ws/agent` (agent protocol) and `/ws/runs/{id}` (UI event stream); `access.rs` is the role-gate helper layer; `auth.rs` has the `AuthUser` (bearer session) and `AuthAgent` (agent token) extractors; also `artifacts.rs` (local FS or S3 presign backend), `retention.rs`, `github.rs`, `otel.rs`.
 - **`fiber-scheduler`** — lease queue, agent registry/connections, offers, lease renewal, expired-lease reclaim, schedule loop, Redis `fiber:events` fan-out.
 - **`fiber-agent`** — single-binary worker: connects out over WS, claims offers, prepares git workspace, restores artifacts, runs shell or Docker, streams `LogChunk`, uploads artifacts.
-- **`fiber-durable`** — separate memoturn-style runtime: `engine.rs` (run/resume one fiber), `context.rs` (`FiberSuspended`), `store.rs`, `scheduler.rs` (poller + stale-heartbeat reclaim), `registry.rs`, `tasks.rs` (built-ins `ping`, `sleep_demo`, `interval_task`).
+- **`fiber-durable`** — separate memoturn-style runtime: `engine.rs` (run/resume one fiber), `context.rs` (`FiberSuspended`), `store.rs`, `scheduler.rs` (poller + stale-heartbeat reclaim), `registry.rs`, `tasks.rs` (built-ins `ping`, `sleep_demo`, `interval_task`), `http_task.rs` (`http_request`).
 - **`fiber-proto`** — wire + YAML-facing types shared by API, agent, and CLI (`AgentMessage`, `ServerMessage`, `RunEvent`, `PipelineDefinition`, `StepDefinition`).
 - **`fiber-cli`** — the `fiber` binary: `validate`, `login`, run, members, secrets, agents, fibers, and spawning an agent.
 

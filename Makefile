@@ -1,4 +1,4 @@
-.PHONY: help infra infra-s3 infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny test test-rust test-ui \
+.PHONY: help infra infra-s3 infra-minio down api api-s3 agent ui cli build images check fmt fmt-check clippy deny toolkit test test-rust test-ui \
 	smoke smoke-authz smoke-pools smoke-artifacts smoke-concurrency smoke-runs smoke-s3 smoke-compose \
 	login validate ready
 
@@ -41,6 +41,7 @@ help:
 	@echo "  build         cargo build workspace + fiber-cli"
 	@echo "  check         THE gate: fmt --check + clippy --workspace --all-targets --locked -D warnings"
 	@echo "  deny          cargo deny check (advisories, licences, sources) — needs cargo-deny"
+	@echo "  toolkit       Check .claude/: validate.py, the hook selftest, shellcheck on the hooks"
 	@echo "  test          cargo test --workspace --locked + ui vitest"
 	@echo "  test-rust     cargo test --workspace --locked"
 	@echo "  test-ui       apps/ui vitest"
@@ -55,7 +56,7 @@ help:
 	@echo "  login         fiber-cli login (writes ~/.fiber/token)"
 	@echo "  validate      Validate examples/fiber.yml"
 	@echo "  ready         curl /ready"
-	@echo "  smoke         authz + artifacts + concurrency + pools (needs an agent; pools kills them last)"
+	@echo "  smoke         authz + artifacts + concurrency + runs + pools (needs an agent; pools kills them last)"
 	@echo "  smoke-authz / smoke-artifacts / smoke-concurrency / smoke-runs / smoke-pools   one scenario each"
 	@echo "  smoke-s3      S3 presign path (needs infra-s3 + api-s3)"
 	@echo "  smoke-compose Full Compose stack + a pipeline on the containerised agent"
@@ -97,6 +98,14 @@ check: fmt-check clippy
 deny:
 	@command -v cargo-deny >/dev/null || { echo "cargo install cargo-deny --locked"; exit 1; }
 	cargo deny check
+
+# The Claude Code toolkit under .claude/ is code too: briefs that name files which no
+# longer exist, and guards that stopped guarding, were both found by hand in the
+# November 2026 audit. Needs python3 with PyYAML, jq and shellcheck. CI runs this in `check`.
+toolkit:
+	python3 .claude/validate.py
+	bash .claude/hooks/selftest.sh
+	shellcheck -S warning .claude/hooks/*.sh
 
 test: test-rust test-ui
 

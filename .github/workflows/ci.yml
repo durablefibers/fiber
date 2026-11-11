@@ -58,6 +58,14 @@ jobs:
       - name: shellcheck
         run: shellcheck scripts/*.sh
 
+      # The .claude/ toolkit: briefs must not name files that are gone, and each guard
+      # hook must still deny what it says it denies. PyYAML ships with the runner's
+      # system Python; the install is a no-op there and keeps this honest if it stops.
+      - name: toolkit (validate.py, hook selftest)
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y --no-install-recommends python3-yaml
+          make toolkit
+
       # actionlint also runs shellcheck over every `run:` block. Pinned by version and
       # checked against the published checksum rather than taken from a mutable action
       # tag or Docker Hub tag; `actionlint_*_checksums.txt` on the release carries it.
@@ -87,6 +95,7 @@ jobs:
       - name: Cargo.lock is unchanged
         run: git diff --exit-code Cargo.lock
 
+  # ⚠ `deny` is pinned as a required status check by the `main` ruleset — see `check`.
   # Supply chain: RUSTSEC advisories, the licence allowlist, and "every crate came from
   # crates.io". Config and rationale live in deny.toml; run `cargo deny check` locally
   # after `cargo install cargo-deny --locked`. Not part of `make check`, which has to

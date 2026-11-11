@@ -32,6 +32,7 @@ make login         # session → ~/.fiber/token
 make validate      # examples/fiber.yml
 make check         # THE gate: fmt --check + clippy --workspace --all-targets --locked -D warnings
 make deny          # cargo deny check (advisories, licences, crates.io-only sources)
+make toolkit       # .claude/: validate.py, the hook selftest, shellcheck on the hooks
 make images        # build the fiber-api / fiber-agent container images
 make test          # cargo test --workspace --locked + apps/ui vitest
 make smoke           # authz + artifacts + concurrency + runs + pools (pools last: it kills every agent)
