@@ -22,10 +22,15 @@ pub mod validate;
 /// - `3` — the agent reads `untrusted` on [`ServerMessage::Offer`] and never runs such a
 ///   step on its host shell: it runs in a container or fails the step. It also refuses a
 ///   step with no `image` when it is a Docker agent, unless its operator set
-///   `FIBER_AGENT_ALLOW_HOST_SHELL=true`. Nothing gates on this yet either; it is here so
-///   a server can tell an agent that enforces this from one that would run a fork's
-///   pull request on the host.
+///   `FIBER_AGENT_ALLOW_HOST_SHELL=true`. The server gates on this one: see
+///   [`UNTRUSTED_OFFER_PROTOCOL`].
 pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The revision from which an agent honours `untrusted` on [`ServerMessage::Offer`]. The
+/// server offers a step of an untrusted run only to an agent whose `Hello` declared this
+/// or later: an older one would ignore the flag and run a fork's pull request on its
+/// host, so for it the step stays queued until an agent that qualifies is online.
+pub const UNTRUSTED_OFFER_PROTOCOL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -414,8 +419,9 @@ pub enum ServerMessage {
         /// agent that reads this never runs such a step on its host shell, whatever
         /// `FIBER_AGENT_ALLOW_HOST_SHELL` says: it runs in a container or fails. Absent
         /// from older servers, which the agent reads as the old contract — a trusted
-        /// run. An agent below revision 3 ignores it and runs the step as before, so the
-        /// server may rely on it only for an agent whose `Hello` said 3 or later.
+        /// run. An agent below [`UNTRUSTED_OFFER_PROTOCOL`] would ignore it and run the
+        /// step as before, so the server never sends such an agent an offer with this
+        /// set: the step waits in the queue for one that declared that revision.
         #[serde(default)]
         untrusted: bool,
     },

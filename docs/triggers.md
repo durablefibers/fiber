@@ -92,8 +92,9 @@ and its secrets belong to the base repository. Fiber marks such a run **untruste
    Provenance that cannot be determined from the payload counts as untrusted, and a retry
    of an untrusted run stays untrusted.
 2. **Project-dedicated agents only.** Untrusted steps are never offered to the global
-   pool — only to an agent bound to that project. If the project has no such agent, the
-   steps stay queued.
+   pool — only to an agent bound to that project, and only to one new enough to apply
+   the third control (0.6.8 or later). If the project has no such agent, the steps stay
+   queued.
 3. **Containers only.** The offer tells the agent the run is untrusted, and the agent
    never runs such a step on its host shell: a step with an `image:`, on an agent with
    Docker on, runs in its container; anything else **fails** before a line of the fork's
@@ -112,9 +113,13 @@ the first fork PR arrives:
 - A step without `image:` fails the same way on a Docker agent, even one that allows host
   shell for the project's own runs.
 
-The third control is the agent's, so it holds only on agents that have it: an agent older
-than protocol revision 3 ignores the flag and runs the step as before. Upgrade the agents
-that serve projects with fork pull requests.
+The third control is carried out by the agent, and an agent older than 0.6.8 (protocol
+revision below 3) does not know the flag — it would run the step on its host. So the
+server does not offer it one: **a fork pull request's steps wait in `queued` until an
+agent at 0.6.8 or later is online in the project's pool.** Nothing fails and nothing is
+leased in the meantime; an older agent in the same pool keeps taking the project's own
+runs, and the server logs one warning when such an agent connects. If a fork's pull
+request sits queued with a project agent online, check that agent's version.
 
 **These reduce the blast radius; they do not sandbox the code.** A container shares the
 host's kernel, has the network unless `FIBER_AGENT_DOCKER_NETWORK=none`, and writes to a

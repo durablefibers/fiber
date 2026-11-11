@@ -109,6 +109,9 @@ pub struct AgentPresence {
     pub reserved: u32,
     /// `None` = global pool.
     pub project_id: Option<Uuid>,
+    /// `Hello.protocol_version`; `0` from an agent older than the field. Decides
+    /// whether the agent is offered untrusted steps ([`takes_untrusted_steps`]).
+    pub protocol_version: u32,
 }
 
 impl AgentPresence {
@@ -358,6 +361,7 @@ impl Scheduler {
         labels: Vec<String>,
         concurrency: u32,
         project_id: Option<Uuid>,
+        protocol_version: u32,
     ) {
         // Nothing about the agent's running steps is kept here: a lease outlives the
         // session that took it, so every offer counts the rows the database shows
@@ -376,6 +380,7 @@ impl Scheduler {
                 concurrency: concurrency.max(1),
                 reserved,
                 project_id,
+                protocol_version,
             },
         );
     }
@@ -803,7 +808,7 @@ impl Scheduler {
     ) -> Result<Option<fiber_core::StepRun>> {
         // Fail closed without presence: a socket that never sent Hello (or whose
         // presence was reclaimed) gets nothing rather than the global pool.
-        let (agent_labels, concurrency, others_reserved) = {
+        let (agent_labels, concurrency, others_reserved, protocol) = {
             let mut agents = self.agents.write().await;
             match agents.get_mut(&agent_id) {
                 Some(a) => {
@@ -811,7 +816,7 @@ impl Scheduler {
                     if !a.try_reserve_slot() {
                         return Ok(None);
                     }
-                    (a.labels.clone(), a.concurrency, others)
+                    (a.labels.clone(), a.concurrency, others, a.protocol_version)
                 }
                 None => {
                     debug!(%agent_id, "no presence for agent; not offering");
@@ -820,7 +825,14 @@ impl Scheduler {
             }
         };
         let leased = self
-            .lease_within_slots(agent_id, agent_labels, concurrency, others_reserved, skip)
+            .lease_within_slots(
+                agent_id,
+                agent_labels,
+                concurrency,
+                others_reserved,
+                protocol,
+                skip,
+            )
             .await;
         // Leased or not, the reservation is done: a leased step is now `running` in
         // the database and counted from there.
@@ -837,19 +849,22 @@ impl Scheduler {
         agent_labels: Vec<String>,
         concurrency: u32,
         others_reserved: u32,
+        protocol: u32,
         skip: &[Uuid],
     ) -> Result<Option<fiber_core::StepRun>> {
         let db_running = self.store.count_running_steps_for_agent(agent_id).await?;
         if !slots_available(concurrency, db_running, others_reserved) {
             return Ok(None);
         }
-        self.try_lease_for(agent_id, agent_labels, skip).await
+        self.try_lease_for(agent_id, agent_labels, protocol, skip)
+            .await
     }
 
     async fn try_lease_for(
         &self,
         agent_id: Uuid,
         agent_labels: Vec<String>,
+        protocol: u32,
         skip: &[Uuid],
     ) -> Result<Option<fiber_core::StepRun>> {
         // Pool scope is authoritative from the DB row, never from in-memory state.
@@ -858,9 +873,20 @@ impl Scheduler {
             None => return Ok(None),
         };
 
+        // Decided before the candidates are read, so an untrusted step this agent may
+        // not take is never leased, and never occupies a place in the scan window.
+        let include_untrusted = takes_untrusted_steps(agent_project_id, protocol);
+        if agent_project_id.is_some() && !include_untrusted {
+            // Debug: this is every fill of every such agent. The line an operator sees
+            // is the warning the session logs once, at `Hello`.
+            debug!(
+                %agent_id, protocol,
+                "agent predates the untrusted-offer protocol; fork pull request steps stay queued for another agent"
+            );
+        }
         let queued = self
             .store
-            .list_queued_steps_for_pool(agent_project_id, &agent_labels)
+            .list_queued_steps_for_pool(agent_project_id, &agent_labels, include_untrusted)
             .await?;
         for step in queued {
             if skip.contains(&step.id) {
@@ -1335,6 +1361,20 @@ pub fn disconnect_policy(hello: Option<u32>, goodbye: bool) -> DisconnectPolicy 
     }
 }
 
+/// Whether an agent may be offered steps of an untrusted run (a fork's pull request).
+///
+/// Two conditions, both required. The agent is bound to a project — the query scopes it
+/// to that project's runs, and the global pool never sees an untrusted step. And its
+/// `Hello` declared [`fiber_proto::UNTRUSTED_OFFER_PROTOCOL`] or later (`hello` is `0`
+/// from an agent older than the field): an agent below it ignores `untrusted` on the
+/// offer and would run the fork's step on its host shell.
+///
+/// False means ineligible, not failed: the step stays queued for an agent that
+/// qualifies, which matters when an old and a new agent serve the same project.
+pub fn takes_untrusted_steps(agent_project_id: Option<Uuid>, hello: u32) -> bool {
+    agent_project_id.is_some() && hello >= fiber_proto::UNTRUSTED_OFFER_PROTOCOL
+}
+
 /// Whether a message's `attempt` (echoed from the offer; `None` from older agents)
 /// refers to the attempt the row is on. A `step_run_id` is stable across attempts, so
 /// this is what keeps a line, artifact or completion that an agent held through a
@@ -1420,6 +1460,7 @@ mod tests {
             concurrency,
             reserved,
             project_id: None,
+            protocol_version: fiber_proto::PROTOCOL_VERSION,
         }
     }
 
@@ -1681,6 +1722,27 @@ mod tests {
                 reason: "agent disconnected"
             }
         );
+    }
+
+    #[test]
+    fn only_a_current_project_agent_is_offered_untrusted_steps() {
+        let project = Some(Uuid::nil());
+        let gate = fiber_proto::UNTRUSTED_OFFER_PROTOCOL;
+        // A project agent that honours `untrusted` on the offer.
+        assert!(takes_untrusted_steps(project, gate));
+        assert!(takes_untrusted_steps(project, gate + 1));
+        assert!(takes_untrusted_steps(
+            project,
+            fiber_proto::PROTOCOL_VERSION
+        ));
+        // One revision short, and an agent older than `protocol_version` itself (0):
+        // both would run a fork's step on the host, so neither is offered one.
+        assert!(!takes_untrusted_steps(project, gate - 1));
+        assert!(!takes_untrusted_steps(project, 0));
+        // The global pool never is, however new the agent.
+        assert!(!takes_untrusted_steps(None, gate));
+        assert!(!takes_untrusted_steps(None, u32::MAX));
+        assert!(!takes_untrusted_steps(None, 0));
     }
 
     #[test]

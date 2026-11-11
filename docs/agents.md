@@ -6,7 +6,7 @@ An agent's identity is the token it connected with. The server binds `agent_id` 
 
 A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
-`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **3**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path). Revision 3 means the agent reads `untrusted` on an `Offer` and never runs a fork pull request's step on its host shell, and that a Docker agent refuses a step without `image:` unless told otherwise; see [Executor](#executor). `untrusted` is absent from an older server, which the agent reads as a trusted run, and an older agent ignores it — nothing gates on the revision yet.
+`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **3**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path). Revision 3 means the agent reads `untrusted` on an `Offer` and never runs a fork pull request's step on its host shell, and that a Docker agent refuses a step without `image:` unless told otherwise; see [Executor](#executor). `untrusted` is absent from an older server, which the agent reads as a trusted run. An older agent would ignore it, so the server gates on the revision (`fiber_proto::UNTRUSTED_OFFER_PROTOCOL`): a step of an untrusted run is offered only to a project agent whose `Hello` declared 3 or later, and otherwise stays `queued` — it is not leased and does not fail — until such an agent (0.6.8+) is online in the project's pool. The server warns once per session when a project agent below that revision connects.
 
 ## Pools
 
@@ -281,8 +281,19 @@ published agent plus the Docker CLI locally (`deploy/agent-docker.Dockerfile`), 
 engine's socket, and runs as root, because the socket is root on the host anyway. For
 that reason it runs steps **in containers only**: `FIBER_AGENT_ALLOW_HOST_SHELL` is pinned
 to `false` in the Compose file, so a step without `image:` is refused rather than run as
-root inside the agent's container, next to the socket. It registers with the labels of
-the plain agent plus `docker=true`, so a step can ask for it with `labels: [docker=true]`:
+root inside the agent's container, next to the socket.
+
+**The pin only works on an agent that knows the variable.** The profile's image is built
+`FROM` the published `fiber-agent:${FIBER_VERSION}`, and a 0.6.7 or older binary ignores
+`FIBER_AGENT_ALLOW_HOST_SHELL` without a word and runs imageless steps on its host as
+before. Set `FIBER_VERSION` to this release or later, rebuild the service, and confirm it
+took effect: the agent's startup log (`docker compose … logs fiber-agent-docker`) has a
+line beginning `steps run in containers only`. No such line means the old binary.
+
+It registers with `FIBER_AGENT_LABELS` plus `docker=true`, and the plain `agent` profile
+with `FIBER_AGENT_LABELS` plus `executor=shell`. See
+[Steps that would run on the host](#steps-that-would-run-on-the-host) for what those two
+labels do and do not route.
 
 ```bash
 echo "FIBER_AGENT_DOCKER_WORKSPACE=/var/lib/fiber/workspaces" >> deploy/.env
@@ -457,11 +468,16 @@ could then run nothing.
 
 A fork's pull request is never run on the host shell, and the setting does not change
 that: its author is not someone the operator vouched for. Its steps need an `image:` and a
-project agent with Docker on. On a shell agent they fail, by design — see
+project agent with Docker on. On a shell agent they fail, by design. The server offers
+them only to a project agent at 0.6.8 or later (protocol revision 3), since an older one
+would not know to refuse; until one is online they wait in `queued` — see
 [triggers](./triggers.md#pull-requests-from-forks).
 
-A refused step fails, and a retry will fail the same way. Its log and its `error` say
-which case it was and what to change; nothing is cloned or restored first:
+A refused step fails, and a retry on the same agent fails the same way. With `retries: N`
+a refused step is leased again up to N times, each to whichever matching agent has a free
+slot — so in a pool that mixes agents it may be refused N more times, or land on an agent
+that accepts it and pass. Its log and its `error` say which case it was and what to
+change; nothing is cloned or restored first:
 
 ```text
 this agent runs steps in containers only: add `image:` to the step, or set FIBER_AGENT_ALLOW_HOST_SHELL=true on the agent
@@ -469,9 +485,27 @@ fork pull request steps only run in containers: this run builds code from outsid
 fork pull request steps only run in containers, and this is a shell agent (FIBER_AGENT_USE_DOCKER=false) …
 ```
 
-To keep steps without `image:` away from a Docker agent in the first place, give the two
-kinds of agent different labels and ask for one in the step's `labels:` — the Compose
-`agent-docker` profile adds `docker=true` for this.
+Labels decide which agent a step reaches, and a step matches an agent that has **every**
+label the step asks for — extra labels on the agent do not exclude it. So a label that
+only the Docker agent carries (`docker=true`, which the Compose `agent-docker` profile
+adds) lets an `image:` step opt **in** to it; it does not keep a step without `image:`
+away, because that step asks for nothing the Docker agent lacks. To keep it away, the
+shell agent needs a label of its own that the Docker agent does not have, and the step
+has to ask for it. The Compose `agent` profile adds `executor=shell` for this:
+
+```yaml
+steps:
+  build:
+    image: rust:1-bookworm
+    labels: [os=linux, docker=true]     # only a Docker agent
+  notify:
+    run: ./scripts/notify.sh
+    labels: [os=linux, executor=shell]  # only a shell agent
+```
+
+A step that asks for neither can be leased by either kind of agent, and fails if the
+Docker agent gets it first. Agents you start yourself carry only the labels you give them
+in `FIBER_AGENT_LABELS`.
 
 Releases up to 0.6.7 ran a step without `image:` on a Docker agent's host without being
 asked, and ran a fork's pull request on the host shell like any other run.

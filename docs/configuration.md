@@ -94,7 +94,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_METRICS_TOKEN` | empty | Bearer token for `/metrics`; empty = off |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | OTLP collector base URL. Use this name in Compose, not `FIBER_OTEL_ENDPOINT`: the API reads the alias only when this one is *absent*, and Compose always defines what it passes |
 | `RUST_LOG` | `info,fiber_api=info` | API log filter |
-| `FIBER_AGENT_TOKEN` / `_NAME` / `_LABELS` / `_CONCURRENCY` | — / `compose` / `os=linux` / `2` | The optional `agent` profile |
+| `FIBER_AGENT_TOKEN` / `_NAME` / `_LABELS` / `_CONCURRENCY` | — / `compose` / `os=linux` / `2` | The optional `agent` profile. Compose appends `executor=shell` to the labels there, and `docker=true` on the `agent-docker` profile |
 
 ## fiber-agent
 
@@ -121,7 +121,7 @@ Installed by `scripts/install-agent.sh` into `/etc/fiber/agent.env` (root-owned,
 in Compose they come from `deploy/.env` (`FIBER_AGENT_TOKEN`, `FIBER_AGENT_NAME`,
 `FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`, `FIBER_AGENT_USE_DOCKER`). The Compose
 `agent-docker` profile pins `FIBER_AGENT_ALLOW_HOST_SHELL=false` and appends `docker=true`
-to the labels; the installer writes `FIBER_AGENT_ALLOW_HOST_SHELL` only to carry over a
+to the labels, and the `agent` profile appends `executor=shell`; the installer writes `FIBER_AGENT_ALLOW_HOST_SHELL` only to carry over a
 line already in `agent.env`. The installer also writes
 `FIBER_AGENT_INSTALLED_VERSION` and `FIBER_AGENT_INSTALLED_SHA256` there so a re-run can say
 what it is replacing; no crate reads them, and they are not deployment configuration.

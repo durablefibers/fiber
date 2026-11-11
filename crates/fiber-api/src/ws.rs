@@ -991,9 +991,22 @@ async fn handle_agent(
                     break;
                 };
                 let project_id = agent_row.project_id;
+                // Once per session, where an operator will see it; the scheduler's own
+                // note about each fill is at debug.
+                if project_id.is_some()
+                    && !fiber_scheduler::takes_untrusted_steps(project_id, protocol_version)
+                {
+                    warn!(
+                        %agent_id, %name, protocol_version,
+                        required = fiber_proto::UNTRUSTED_OFFER_PROTOCOL,
+                        "this project agent predates the untrusted-offer protocol and would run \
+                         a fork's pull request on its host; it will not be offered those steps, \
+                         which stay queued until an upgraded agent is online in the project's pool"
+                    );
+                }
                 state
                     .scheduler
-                    .register_agent(agent_id, labels, concurrency, project_id)
+                    .register_agent(agent_id, labels, concurrency, project_id, protocol_version)
                     .await;
                 // Re-bind connection under confirmed agent_id (same as token)
                 state
