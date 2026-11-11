@@ -1,4 +1,6 @@
-use crate::dag::{CompiledDag, compile_definition, parse_pipeline_yaml_lenient};
+use crate::dag::{
+    CompiledDag, MAX_RETRIES, MAX_TIMEOUT_MINUTES, compile_definition, parse_pipeline_yaml_lenient,
+};
 use crate::models::*;
 // sqlx 0.9 refuses a runtime-built query string unless it is asserted safe. Every
 // interpolation in this file splices a column-list `const` — PIPELINE_COLS, AGENT_COLS,
@@ -1522,43 +1524,36 @@ impl Store {
     /// Running steps whose current attempt has exceeded its timeout plus a grace
     /// period (the agent is expected to fail the step itself first). The timeout comes
     /// from the run's definition snapshot, falling back to `default_minutes`.
+    ///
+    /// The query is total over whatever a snapshot holds, because it runs for every
+    /// project at once and one row that made it raise would stop the sweep for all of
+    /// them. A snapshot is immutable, so a run stored before the compile-time bound can
+    /// still carry a `timeout_minutes` past what `make_interval` takes as an `int`. The
+    /// SQL restates [`crate::dag::stored_timeout_minutes`], which the offer uses, so the
+    /// agent and this backstop read one value: a whole number of at least 1 is clamped
+    /// to [`MAX_TIMEOUT_MINUTES`], and anything else is absent and the default applies.
     pub async fn list_timed_out_steps(
         &self,
         default_minutes: i64,
         grace_minutes: i64,
     ) -> Result<Vec<TimedOutStep>> {
-        Ok(sqlx::query_as::<_, TimedOutStep>(
-            "SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
-                    COALESCE(js.t, $1)::bigint AS timeout_minutes
-             FROM step_runs s
-             JOIN runs r ON r.id = s.run_id
-             JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
-                                 AND a.finished_at IS NULL
-             LEFT JOIN LATERAL (
-                 SELECT (e->>'timeout_minutes')::bigint AS t
-                 FROM jsonb_array_elements(r.definition_snapshot->'steps') e
-                 WHERE e->>'id' = s.step_id
-                 LIMIT 1) js ON TRUE
-             WHERE s.status = 'running'
-               AND a.started_at < NOW() - make_interval(mins => (COALESCE(js.t, $1) + $2)::int)",
-        )
-        .bind(default_minutes)
-        .bind(grace_minutes)
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, TimedOutStep>(LIST_TIMED_OUT_STEPS_SQL)
+            .bind(default_minutes)
+            .bind(grace_minutes)
+            .bind(i64::from(MAX_TIMEOUT_MINUTES))
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Running runs whose snapshot carries a whole-run `timeout_minutes` that has elapsed.
+    ///
+    /// Total in the same way as [`Self::list_timed_out_steps`], by the same rule: too
+    /// large is a year, and a value that is not a timeout means the run has no limit.
     pub async fn list_timed_out_runs(&self) -> Result<Vec<(Uuid, i64)>> {
-        Ok(sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT id, (definition_snapshot->>'timeout_minutes')::bigint
-             FROM runs
-             WHERE status = 'running'
-               AND (definition_snapshot->>'timeout_minutes') IS NOT NULL
-               AND started_at < NOW() - make_interval(mins => (definition_snapshot->>'timeout_minutes')::int)",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, (Uuid, i64)>(LIST_TIMED_OUT_RUNS_SQL)
+            .bind(i64::from(MAX_TIMEOUT_MINUTES))
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Reclaim running steps whose lease ran out. See [`Reclaimed`] for what comes back.
@@ -1612,24 +1607,45 @@ impl Store {
         Ok(reclaimed)
     }
 
-    /// Running runs with no step left to run: every step is terminal, yet the run was
-    /// never finalised. That is the window between a reclaim committing a step as
-    /// `failed` and `propagate_after_step` running on it — a process that dies in
-    /// between leaves the run `running` with nothing that would ever revisit it, since
-    /// every other sweep looks for open steps. The reclaim loop feeds these back into
-    /// propagation. Bounded so one tick cannot stall behind a pathological backlog.
+    /// Running runs with nothing in flight: no step is `queued` or `running`, so no
+    /// agent will ever report on the run and nothing else will revisit it. Whatever is
+    /// left is terminal or `pending`, and only propagation moves those — the reclaim
+    /// loop feeds these runs back into it.
     ///
-    /// A run holding a step whose status is outside the vocabulary (a legacy row the
-    /// NOT VALID check tolerates) is left out: propagation reads it as `Pending`, so it
-    /// could never finalise and would be re-selected every tick, crowding out real
-    /// orphans past the limit. Such rows are the operator's to fix.
-    pub async fn runs_with_no_open_steps(&self) -> Result<Vec<Uuid>> {
+    /// A run gets here because a step's outcome and the propagation that follows it are
+    /// two transactions. A process that dies, or a pool that times out, between them
+    /// leaves the outcome committed and its consequences unapplied: dependents still
+    /// `pending`, or every step terminal and the run never finalised. The agent does not
+    /// resend a completion and a resend would be dropped as stale. `start_run` and
+    /// `retry_run` have the same gap when every root is skipped or carried over.
+    ///
+    /// `pending` is deliberately not treated as in flight (it was, and that hid the
+    /// first case). Nothing parks a step there to wait: a retry backoff, an offer that
+    /// was backed out, and a step no connected agent has the labels for are all
+    /// `queued` (the first two with `not_before`); `if:` is decided at the moment a step
+    /// would be queued; a concurrency group cancels the older run, it never holds the
+    /// newer one. So a `pending` step is only ever waiting on a dependency, and when no
+    /// step is in flight the earliest one in the DAG has every dependency terminal —
+    /// propagation queues or skips it. Selecting a run that another caller is about to
+    /// propagate is harmless: `propagate_after_step` locks the run row, guards each
+    /// write on the status it read, and hands each transition to exactly one caller.
+    ///
+    /// Bounded so one tick cannot stall behind a pathological backlog, oldest first.
+    /// That only works while every selected run leaves the set, so a run propagation
+    /// cannot move must not be selected. One holding a step whose status is outside
+    /// the vocabulary (a legacy row the NOT VALID check tolerates) is left out for that
+    /// reason: propagation reads it as `Pending`, it could never finalise, and it would
+    /// be re-selected every tick, crowding out real ones past the limit. Such rows are
+    /// the operator's to fix. The same goes for a `pending` step whose `needs` names a
+    /// step the run does not have — compile rejects that, so it takes a hand-edited
+    /// row — which this query does not exclude; the caller warns about it every tick.
+    pub async fn runs_with_nothing_in_flight(&self) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar::<_, Uuid>(
             "SELECT r.id FROM runs r
              WHERE r.status = 'running'
                AND NOT EXISTS (
                    SELECT 1 FROM step_runs s
-                   WHERE s.run_id = r.id AND s.status IN ('pending', 'queued', 'running'))
+                   WHERE s.run_id = r.id AND s.status IN ('queued', 'running'))
                AND NOT EXISTS (
                    SELECT 1 FROM step_runs s
                    WHERE s.run_id = r.id
@@ -1762,7 +1778,7 @@ impl Store {
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| anyhow!("run not found"))?;
+        .ok_or_else(|| crate::StoreError::not_found("run"))?;
         // Locking the open steps blocks a concurrent lease until this commits; after
         // that the lease's `status = 'queued'` guard fails on its own. `ORDER BY id` is
         // the lock order every multi-row step lock in this file uses (see the reclaims),
@@ -2886,7 +2902,7 @@ impl StepRows {
         self.commands.push(step.run.clone());
         self.labels.push(json!(step.labels));
         self.needs.push(json!(step.needs));
-        self.retries.push(step.retries as i32);
+        self.retries.push(retries_column(step.retries));
         self.errors.push(match status {
             StepStatus::Skipped => Some("if: condition false".to_string()),
             _ => None,
@@ -2965,6 +2981,55 @@ pub fn value_to_definition(value: &Value) -> Result<PipelineDefinition> {
     }
     Ok(serde_json::from_value(value.clone())?)
 }
+
+/// `$1` default minutes, `$2` grace minutes, `$3` the clamp ([`MAX_TIMEOUT_MINUTES`]).
+///
+/// The snapshot value is read by the rule in [`crate::dag::stored_timeout_minutes`]. It
+/// goes through `numeric`, which holds any JSON number, and is clamped there; only the
+/// clamped value is ever cast to an integer type. The outer `CASE` keeps the `::numeric`
+/// cast off anything that is not a JSON number — a `CASE` evaluates only the branch it
+/// takes, where the operands of an `AND` may be evaluated in either order. `LEAST` on
+/// each operand of the sum bounds it at twice the clamp, so neither the addition nor
+/// the `::int` can overflow whatever the snapshot or the environment supplied.
+///
+/// `store::timeout_sql_tests` pins these properties against the text.
+const LIST_TIMED_OUT_STEPS_SQL: &str = "\
+SELECT s.id AS step_run_id, s.run_id, s.step_id, s.agent_id,
+       LEAST(COALESCE(js.t, $1), $3)::bigint AS timeout_minutes
+FROM step_runs s
+JOIN runs r ON r.id = s.run_id
+JOIN step_attempts a ON a.step_run_id = s.id AND a.attempt = s.attempt
+                    AND a.finished_at IS NULL
+LEFT JOIN LATERAL (
+    SELECT CASE WHEN jsonb_typeof(e->'timeout_minutes') = 'number' THEN
+                CASE WHEN (e->>'timeout_minutes')::numeric >= 1
+                      AND (e->>'timeout_minutes')::numeric
+                          = trunc((e->>'timeout_minutes')::numeric)
+                     THEN LEAST((e->>'timeout_minutes')::numeric, $3)::bigint END
+           END AS t
+    FROM jsonb_array_elements(r.definition_snapshot->'steps') e
+    WHERE e->>'id' = s.step_id
+    LIMIT 1) js ON TRUE
+WHERE s.status = 'running'
+  AND a.started_at < NOW() - make_interval(
+        mins => (LEAST(COALESCE(js.t, $1), $3) + LEAST($2, $3))::int)";
+
+/// `$1` the clamp ([`MAX_TIMEOUT_MINUTES`]). See [`LIST_TIMED_OUT_STEPS_SQL`].
+const LIST_TIMED_OUT_RUNS_SQL: &str = "\
+SELECT t.id, t.minutes
+FROM (
+    SELECT id, started_at,
+           CASE WHEN jsonb_typeof(definition_snapshot->'timeout_minutes') = 'number' THEN
+                CASE WHEN (definition_snapshot->>'timeout_minutes')::numeric >= 1
+                      AND (definition_snapshot->>'timeout_minutes')::numeric
+                          = trunc((definition_snapshot->>'timeout_minutes')::numeric)
+                     THEN LEAST((definition_snapshot->>'timeout_minutes')::numeric, $1)::bigint
+                END
+           END AS minutes
+    FROM runs
+    WHERE status = 'running') t
+WHERE t.minutes IS NOT NULL
+  AND t.started_at < NOW() - make_interval(mins => LEAST(t.minutes, $1)::int)";
 
 /// The run's definition snapshot, keyed by step id.
 ///
@@ -3291,6 +3356,17 @@ fn run_status_terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "skipped")
 }
 
+/// A compiled step's `retries` as the `step_runs.retries` column (`int4`).
+///
+/// Compile bounds it at [`MAX_RETRIES`], but `retry_run` builds rows from a stored
+/// snapshot without recompiling, and one from before the bound can hold any `u32`.
+/// `as i32` wrapped the top half of that range negative — `4294967295` became `-1`, a
+/// step that never retries. Clamped to the bound rather than saturated to `i32::MAX`:
+/// re-running such a run must not turn "never retries" into "retries for ever".
+fn retries_column(retries: u32) -> i32 {
+    i32::try_from(retries.min(MAX_RETRIES)).unwrap_or(i32::MAX)
+}
+
 /// What a reclaim (expired lease, agent disconnect) did to the steps it found running.
 #[derive(Debug, Default)]
 pub struct Reclaimed {
@@ -3315,8 +3391,12 @@ enum RequeueOutcome {
 /// allows `retries + 1`. The extra one is for a rolling agent restart or a network
 /// blip, which a `retries: 0` step must survive once — while a step that kills its
 /// agent every time still stops after two leases instead of being re-leased forever.
+///
+/// Total for any stored `retries`: `saturating_add`, because a row written before
+/// `retries` was bounded can hold `i32::MAX`, and this runs inside the reclaim
+/// transaction — an overflow there panicked the tick in a debug build, every tick.
 fn requeue_outcome(attempt: i32, retries: i32) -> RequeueOutcome {
-    if attempt > retries + 1 {
+    if attempt > retries.saturating_add(1) {
         RequeueOutcome::Fail
     } else {
         RequeueOutcome::Requeue
@@ -3522,6 +3602,97 @@ fn plan_transitions_indexed(
 }
 
 #[cfg(test)]
+mod timeout_sql_tests {
+    //! The timeout sweep's two queries run for every project on every reclaim tick, so
+    //! one that can raise on a stored value stops the sweep for the whole instance.
+    //! Postgres is not available to a unit test; what can be pinned is the text — the
+    //! properties that make the queries total, so an edit that drops one goes red here.
+    use super::*;
+
+    const BOTH: [(&str, &str); 2] = [
+        ("steps", LIST_TIMED_OUT_STEPS_SQL),
+        ("runs", LIST_TIMED_OUT_RUNS_SQL),
+    ];
+
+    /// Every place the raw snapshot value is cast, as `(cast type, text before it)`.
+    fn raw_casts(sql: &str) -> Vec<&str> {
+        sql.match_indices("'timeout_minutes')::")
+            .map(|(i, m)| {
+                let rest = &sql[i + m.len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_raw_snapshot_value_is_only_ever_cast_to_numeric() {
+        // `::int` overflowed past 2^31-1 and `::bigint` raises on `1.5`, `1e20` and
+        // text; `numeric` holds any JSON number.
+        for (name, sql) in BOTH {
+            let casts = raw_casts(sql);
+            assert!(!casts.is_empty(), "{name}: the snapshot value is not read");
+            assert!(
+                casts.iter().all(|c| *c == "numeric"),
+                "{name}: raw snapshot value cast to {casts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_numeric_cast_is_guarded_by_the_json_type() {
+        // The guard is its own CASE, opened before the first cast: an `AND` beside the
+        // cast would not promise the order.
+        for (name, sql) in BOTH {
+            let guard = sql
+                .find("jsonb_typeof(")
+                .unwrap_or_else(|| panic!("{name}: no jsonb_typeof guard"));
+            let then = guard
+                + sql[guard..]
+                    .find("= 'number' THEN")
+                    .expect("guard is a CASE arm");
+            let first_cast = sql.find("'timeout_minutes')::").expect("a cast");
+            assert!(then < first_cast, "{name}: a cast precedes the type guard");
+        }
+    }
+
+    #[test]
+    fn every_integer_cast_is_of_a_clamped_value() {
+        for (name, sql) in BOTH {
+            // The value leaves `numeric` only through LEAST(.., clamp).
+            // So every `::bigint` closes a parenthesis on a line that opened a LEAST —
+            // `x::numeric::bigint`, the unclamped form, closes nothing.
+            let to_bigint: Vec<_> = sql.match_indices("::bigint").collect();
+            assert!(!to_bigint.is_empty(), "{name}");
+            for (i, _) in to_bigint {
+                let line_start = sql[..i].rfind('\n').map_or(0, |n| n + 1);
+                assert!(
+                    sql[line_start..i].ends_with(')') && sql[line_start..i].contains("LEAST("),
+                    "{name}: `::bigint` of something not clamped: {}",
+                    &sql[line_start..i]
+                );
+            }
+            // And reaches `make_interval`'s int exactly once, clamped there too.
+            let to_int: Vec<_> = sql
+                .match_indices("::int")
+                .filter(|(i, _)| !sql[i + 5..].starts_with(|c: char| c.is_ascii_alphanumeric()))
+                .collect();
+            assert_eq!(to_int.len(), 1, "{name}: {to_int:?}");
+            let (i, _) = to_int[0];
+            let interval = sql.rfind("make_interval(").expect("make_interval");
+            assert!(interval < i, "{name}: `::int` outside make_interval");
+            assert!(
+                sql[interval..i].contains("LEAST("),
+                "{name}: make_interval takes an unclamped value: {}",
+                &sql[interval..i]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod propagate_tests {
     use super::*;
 
@@ -3578,6 +3749,109 @@ mod propagate_tests {
         assert_eq!(plan, vec![(1, Transition::Queue)]);
         apply(&mut steps, &plan);
         assert!(plan_transitions(&steps, &json!([])).is_empty());
+    }
+
+    // --- what the stalled-run sweep relies on ------------------------------------------
+    //
+    // `runs_with_nothing_in_flight` selects running runs with no queued or running step
+    // and re-propagates them. That is only right if propagation always moves such a run.
+
+    #[test]
+    fn a_run_whose_dependents_were_never_unlocked_plans_a_transition() {
+        // `a` completed and committed; the process died before propagating. Nothing is
+        // queued or running, so nothing but a re-propagation will ever touch the run.
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["a"]),
+        ];
+        let plan = plan_transitions(&steps, &json!([]));
+        assert_eq!(plan, vec![(1, Transition::Queue), (2, Transition::Queue)]);
+        apply(&mut steps, &plan);
+        // Now something is queued: the run is back in the scheduler's hands.
+        assert!(steps.iter().any(|s| s.status == "queued"));
+    }
+
+    #[test]
+    fn a_pending_chain_rooted_in_a_terminal_step_resolves() {
+        // Every root skipped by its `if:` at start, and the propagation after the
+        // insert never ran: the whole chain is pending behind a terminal step.
+        let mut steps = vec![
+            step("a", StepStatus::Skipped, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+            step("d", StepStatus::Pending, &["c"]),
+        ];
+        assert!(run_to_fixpoint(&mut steps, &json!([])) >= 1);
+        assert!(
+            steps.iter().all(|s| s.status_enum().is_terminal()),
+            "{steps:?}"
+        );
+
+        // Rooted in a success instead, the head of the chain is queued and the rest
+        // wait on it — pending, legitimately, because a step is now in flight.
+        let mut steps = vec![
+            step("a", StepStatus::Succeeded, &[]),
+            step("b", StepStatus::Pending, &["a"]),
+            step("c", StepStatus::Pending, &["b"]),
+        ];
+        assert_eq!(run_to_fixpoint(&mut steps, &json!([])), 1);
+        assert_eq!(steps[1].status, "queued");
+        assert_eq!(steps[2].status, "pending");
+    }
+
+    #[test]
+    fn no_run_with_nothing_in_flight_is_a_resting_state() {
+        // Every assignment of {pending, terminal} statuses to a diamond, queued and
+        // running excluded — the set the sweep selects from. Whenever a step is still
+        // pending, one pass must plan something, with and without an `always()` step:
+        // if any of these planned nothing, the sweep would re-select that run forever.
+        let statuses = [
+            StepStatus::Pending,
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ];
+        let snaps = [
+            json!([]),
+            json!([{"id": "d", "if": "always()"}]),
+            json!([{"id": "a", "continue_on_error": true}, {"id": "c", "if": "always()"}]),
+        ];
+        let mut checked = 0;
+        for a in statuses {
+            for b in statuses {
+                for c in statuses {
+                    for d in statuses {
+                        let steps = vec![
+                            step("a", a, &[]),
+                            step("b", b, &["a"]),
+                            step("c", c, &["a"]),
+                            step("d", d, &["b", "c"]),
+                        ];
+                        if !steps.iter().any(|s| s.status == "pending") {
+                            continue;
+                        }
+                        for snap in &snaps {
+                            let mut steps = steps.clone();
+                            assert!(
+                                !plan_transitions(&steps, snap).is_empty(),
+                                "nothing planned for {a:?} {b:?} {c:?} {d:?} under {snap}"
+                            );
+                            // And it keeps moving until a step is in flight or all are done.
+                            run_to_fixpoint(&mut steps, snap);
+                            assert!(
+                                steps.iter().any(|s| s.status == "queued")
+                                    || steps.iter().all(|s| s.status_enum().is_terminal()),
+                                "{steps:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, (5usize.pow(4) - 4usize.pow(4)) * snaps.len());
     }
 
     #[test]
@@ -4166,6 +4440,38 @@ mod transition_tests {
         assert_eq!(requeue_outcome(3, 2), RequeueOutcome::Requeue);
         assert_eq!(requeue_outcome(4, 2), RequeueOutcome::Fail);
         assert_eq!(requeue_outcome(5, 2), RequeueOutcome::Fail);
+    }
+
+    #[test]
+    fn a_lost_lease_is_decided_for_any_stored_retries() {
+        // `retries + 1` overflowed here, inside the reclaim transaction.
+        assert_eq!(requeue_outcome(1, i32::MAX), RequeueOutcome::Requeue);
+        assert_eq!(requeue_outcome(i32::MAX, i32::MAX), RequeueOutcome::Requeue);
+        assert_eq!(
+            requeue_outcome(i32::MAX, i32::MAX - 1),
+            RequeueOutcome::Requeue
+        );
+        assert_eq!(
+            requeue_outcome(i32::MAX, i32::MAX - 2),
+            RequeueOutcome::Fail
+        );
+        // Rows written by the old wrapping cast hold -1: one lease, as before.
+        assert_eq!(requeue_outcome(1, -1), RequeueOutcome::Fail);
+        assert_eq!(requeue_outcome(1, i32::MIN), RequeueOutcome::Fail);
+    }
+
+    #[test]
+    fn retries_reach_the_column_clamped_never_wrapped() {
+        for n in [0, 1, 3, MAX_RETRIES] {
+            assert_eq!(retries_column(n), n as i32);
+        }
+        // Only a snapshot from before the bound holds these. They wrapped to i32::MIN
+        // and -1; a retry of that run gets the most a pipeline may now ask for.
+        let most = MAX_RETRIES as i32;
+        assert_eq!(retries_column(MAX_RETRIES + 1), most);
+        assert_eq!(retries_column(i32::MAX as u32), most);
+        assert_eq!(retries_column(i32::MAX as u32 + 1), most);
+        assert_eq!(retries_column(u32::MAX), most);
     }
 
     #[test]

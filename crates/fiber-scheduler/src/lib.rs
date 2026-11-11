@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const EVENTS_CHANNEL: &str = "fiber:events";
@@ -584,51 +584,74 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Finalise runs whose every step is terminal but which are still `running`: the
-    /// crash window between a reclaim committing a failure and propagating it. Nothing
-    /// else revisits such a run, so the reclaim tick does.
-    async fn finalise_orphaned_runs(&self) -> Result<()> {
-        for run_id in self.store.runs_with_no_open_steps().await? {
-            info!(%run_id, "finalising run left running with no open steps");
-            let changed = self.store.propagate_after_step(run_id).await?;
-            for s in &changed {
-                if s.status_enum() == StepStatus::Queued {
-                    self.enqueue_step(s.id, s.labels_vec()).await?;
-                }
-                let ev = RunEvent::StepUpdated {
-                    run_id: s.run_id,
-                    step_run_id: s.id,
-                    step_id: s.step_id.clone(),
-                    status: s.status_enum(),
-                };
-                if let Ok(payload) = serde_json::to_string(&ev) {
-                    self.publish_event(&payload).await;
+    /// Re-propagate runs that are `running` with no step queued or running: a step's
+    /// outcome was committed and the propagation after it never ran (a crash or a pool
+    /// timeout between the two transactions), so dependents were never unlocked or the
+    /// run never finalised. Nothing else revisits such a run, so the reclaim tick does.
+    ///
+    /// Each run is recorded on its own: one whose propagation fails must not keep the
+    /// runs selected after it from being looked at, this tick and every tick after.
+    async fn advance_stalled_runs(&self, errs: &mut StageErrors) {
+        match self.store.runs_with_nothing_in_flight().await {
+            Ok(runs) => {
+                for run_id in runs {
+                    errs.record("stalled_runs", self.advance_stalled_run(run_id).await);
                 }
             }
-            let Some(run) = self.store.get_run(run_id).await? else {
-                continue;
-            };
-            if changed.is_empty() && !run.status_enum().is_terminal() {
-                // The query excludes unknown step statuses, so this is something new:
-                // say what the steps look like rather than publish a non-terminal
-                // RunUpdated every tick.
-                let statuses: Vec<String> = self
-                    .store
-                    .list_step_runs(run_id)
-                    .await?
-                    .into_iter()
-                    .map(|s| format!("{}={}", s.step_id, s.status))
-                    .collect();
-                warn!(%run_id, ?statuses, "run has no open steps but did not finalise");
-                continue;
+            Err(e) => errs.record("stalled_runs", Err(e)),
+        }
+    }
+
+    async fn advance_stalled_run(&self, run_id: Uuid) -> Result<()> {
+        let changed = self.store.propagate_after_step(run_id).await?;
+        for s in &changed {
+            if s.status_enum() == StepStatus::Queued {
+                self.enqueue_step(s.id, s.labels_vec()).await?;
             }
-            let ev = RunEvent::RunUpdated {
-                run_id: run.id,
-                status: run.status_enum(),
+            let ev = RunEvent::StepUpdated {
+                run_id: s.run_id,
+                step_run_id: s.id,
+                step_id: s.step_id.clone(),
+                status: s.status_enum(),
             };
             if let Ok(payload) = serde_json::to_string(&ev) {
                 self.publish_event(&payload).await;
             }
+        }
+        let Some(run) = self.store.get_run(run_id).await? else {
+            return Ok(());
+        };
+        if changed.is_empty() && !run.status_enum().is_terminal() {
+            let steps = self.store.list_step_runs(run_id).await?;
+            if !nothing_in_flight(steps.iter().map(|s| s.status_enum())) {
+                // Selected in the moment between a step's completion and its own
+                // propagation, which has since run: the run was never stalled.
+                debug!(%run_id, "run advanced by its own propagation before the sweep got to it");
+                return Ok(());
+            }
+            // Propagation always moves a well-formed run with nothing in flight, and
+            // the query excludes unknown step statuses, so this is something else — a
+            // `needs` naming a step the run does not have, say. Show the steps rather
+            // than publish a non-terminal RunUpdated every tick.
+            let statuses: Vec<String> = steps
+                .into_iter()
+                .map(|s| format!("{}={}", s.step_id, s.status))
+                .collect();
+            warn!(%run_id, ?statuses, "run has nothing in flight and propagation cannot advance it");
+            return Ok(());
+        }
+        info!(
+            %run_id,
+            steps_changed = changed.len(),
+            status = %run.status,
+            "advanced a run left running with nothing in flight"
+        );
+        let ev = RunEvent::RunUpdated {
+            run_id: run.id,
+            status: run.status_enum(),
+        };
+        if let Ok(payload) = serde_json::to_string(&ev) {
+            self.publish_event(&payload).await;
         }
         Ok(())
     }
@@ -1204,7 +1227,23 @@ impl Scheduler {
         }
     }
 
+    /// One reclaim tick: its stages, each run whatever happened to the ones before it.
+    ///
+    /// They used to be chained with `?`, so the first to fail ended the tick. One run
+    /// whose snapshot made the timeout query raise therefore also stopped expired
+    /// leases being reclaimed and stalled runs being advanced — for every project, on
+    /// every tick. The stages share nothing but the clock, so each failure is logged
+    /// where it happens and the tick still returns an error for `reclaim_loop` to report.
     async fn reclaim_once(&self) -> Result<()> {
+        let mut errs = StageErrors::default();
+        errs.record("stale_agents", self.mark_stale_agents().await);
+        self.enforce_timeouts(&mut errs).await;
+        errs.record("expired_leases", self.reclaim_expired_leases().await);
+        self.advance_stalled_runs(&mut errs).await;
+        errs.finish()
+    }
+
+    async fn mark_stale_agents(&self) -> Result<()> {
         let stale_secs: i64 = std::env::var("FIBER_AGENT_STALE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1216,13 +1255,14 @@ impl Scheduler {
             // stopped heartbeating; drop it so the agent reconnects. Its leases are not
             // touched: `stale_secs` is well inside a lease, and an agent this far behind
             // is as likely to be waiting out a reconnect as gone. If it is gone, the
-            // leases expire below on a later tick.
+            // leases expire on a later tick.
             self.drop_agent_session(agent_id, "stale heartbeat — reconnect")
                 .await;
         }
+        Ok(())
+    }
 
-        self.enforce_timeouts().await?;
-
+    async fn reclaim_expired_leases(&self) -> Result<()> {
         let reclaimed = self.store.requeue_expired_leases().await?;
         if !reclaimed.requeued.is_empty() || !reclaimed.failed.is_empty() {
             info!(
@@ -1231,46 +1271,114 @@ impl Scheduler {
                 "reclaimed expired leases"
             );
         }
-        self.publish_reclaimed(reclaimed).await?;
-
-        self.finalise_orphaned_runs().await
+        self.publish_reclaimed(reclaimed).await
     }
 }
 
 impl Scheduler {
     /// Server-side backstop for step and run timeouts. Agents enforce the step limit
     /// themselves; this catches agents that are old, hung, or gone, after a grace period.
-    async fn enforce_timeouts(&self) -> Result<()> {
+    ///
+    /// Step timeouts and run timeouts are separate stages, and so is each step and each
+    /// run within them: one that cannot be failed or cancelled must not shield the rest.
+    async fn enforce_timeouts(&self, errs: &mut StageErrors) {
         let cfg = TimeoutConfig::from_env();
-        for t in self
+        match self
             .store
             .list_timed_out_steps(cfg.default_minutes, cfg.grace_minutes)
-            .await?
+            .await
         {
-            let Some(agent_id) = t.agent_id else {
-                continue;
-            };
-            warn!(step = %t.step_id, run = %t.run_id, minutes = t.timeout_minutes, "step timed out (server backstop)");
-            let error = format!("timed out after {} min", t.timeout_minutes);
-            // Fails the attempt (honouring retries), propagates, publishes — then asks the
-            // agent to kill whatever is still running for it.
-            self.on_step_complete(
-                agent_id,
-                t.step_run_id,
-                None,
-                StepStatus::Failed,
-                None,
-                Some(error),
-            )
-            .await?;
-            self.cancel_step_on_agent(agent_id, t.step_run_id).await;
+            Ok(steps) => {
+                for t in steps {
+                    errs.record("step_timeouts", self.fail_timed_out_step(t).await);
+                }
+            }
+            Err(e) => errs.record("step_timeouts", Err(e)),
         }
-        for (run_id, minutes) in self.store.list_timed_out_runs().await? {
-            warn!(run = %run_id, minutes, "run timed out");
-            let reason = format!("run timed out after {minutes} min");
-            self.cancel_run_with_reason(run_id, Some(&reason)).await?;
+        match self.store.list_timed_out_runs().await {
+            Ok(runs) => {
+                for (run_id, minutes) in runs {
+                    warn!(run = %run_id, minutes, "run timed out");
+                    let reason = format!("run timed out after {minutes} min");
+                    let cancelled = self.cancel_run_with_reason(run_id, Some(&reason)).await;
+                    errs.record("run_timeouts", gone_is_done(cancelled.map(|_| ())));
+                }
+            }
+            Err(e) => errs.record("run_timeouts", Err(e)),
         }
+    }
+
+    async fn fail_timed_out_step(&self, t: fiber_core::TimedOutStep) -> Result<()> {
+        let Some(agent_id) = t.agent_id else {
+            return Ok(());
+        };
+        warn!(step = %t.step_id, run = %t.run_id, minutes = t.timeout_minutes, "step timed out (server backstop)");
+        let error = format!("timed out after {} min", t.timeout_minutes);
+        // Fails the attempt (honouring retries), propagates, publishes — then asks the
+        // agent to kill whatever is still running for it.
+        self.on_step_complete(
+            agent_id,
+            t.step_run_id,
+            None,
+            StepStatus::Failed,
+            None,
+            Some(error),
+        )
+        .await?;
+        self.cancel_step_on_agent(agent_id, t.step_run_id).await;
         Ok(())
+    }
+}
+
+/// A sweep's action on a row it listed a moment ago: `NotFound` means retention or a
+/// project delete removed the row in between, and there is nothing left to act on.
+/// That is the sweep's work done for it, not a stage that failed. Judged on the typed
+/// [`fiber_core::StoreError`], never on the message.
+fn gone_is_done(result: Result<()>) -> Result<()> {
+    match result {
+        Err(e)
+            if matches!(
+                e.downcast_ref::<fiber_core::StoreError>(),
+                Some(fiber_core::StoreError::NotFound(_))
+            ) =>
+        {
+            debug!(error = %e, "swept row no longer exists");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// What went wrong in one reclaim tick, kept so the stages after a failure still run.
+///
+/// `record` logs the failure where it happened and remembers it; `finish` hands the
+/// first one back, naming every stage that failed, so the tick reports an error exactly
+/// when one of its stages did. Nothing here touches the store, which is what lets the
+/// "a failure does not end the tick" rule be tested without one.
+#[derive(Debug, Default)]
+struct StageErrors {
+    first: Option<anyhow::Error>,
+    /// Stage names in the order they failed, each once.
+    failed: Vec<&'static str>,
+}
+
+impl StageErrors {
+    fn record(&mut self, stage: &'static str, result: Result<()>) {
+        let Err(e) = result else {
+            return;
+        };
+        error!(stage, error = %e, "reclaim stage failed; continuing with the rest of the tick");
+        if !self.failed.contains(&stage) {
+            self.failed.push(stage);
+        }
+        self.first.get_or_insert(e);
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.first {
+            None => Ok(()),
+            Some(e) => Err(e.context(format!("reclaim stages failed: {}", self.failed.join(", ")))),
+        }
     }
 }
 
@@ -1361,6 +1469,18 @@ fn completion_is_current(
         && attempt_is_current(reported_attempt, row_attempt)
 }
 
+/// Whether none of a run's steps is queued or running — what the stalled-run sweep
+/// selects on (`Store::runs_with_nothing_in_flight`), asked again after propagation
+/// changed nothing. The sweep reads its list before it takes any run's lock, so a run
+/// can be picked in the moment between a step completing and that completion's own
+/// propagation; by the time the sweep propagates there is nothing left to do, and that
+/// is a healthy run, not one to warn about every time the race is lost.
+fn nothing_in_flight(steps: impl IntoIterator<Item = StepStatus>) -> bool {
+    !steps
+        .into_iter()
+        .any(|s| matches!(s, StepStatus::Queued | StepStatus::Running))
+}
+
 /// Whether one more lease fits under `concurrency`.
 ///
 /// `db_running` is what the database shows running on the agent — the authoritative
@@ -1378,11 +1498,17 @@ fn slots_available(concurrency: u32, db_running: i64, reserved: u32) -> bool {
 /// Only a failure retries — a cancel is a person's decision and a success is done. The
 /// backoff doubles per attempt and is capped, and lands on the row as `not_before` so it
 /// survives a restart and is honoured by every instance.
+///
+/// `saturating_pow`, because `attempt` is only bounded by `retries`, and a row written
+/// before `retries` was bounded can carry one past 63 — where `2u64.pow` panics in a
+/// debug build and wraps to 0, a retry with no backoff at all, in release. Saturated, it
+/// lands on the cap like every other attempt from the sixth on.
 fn retry_plan(status: StepStatus, attempt: i32, retries: i32) -> Option<u64> {
     if status != StepStatus::Failed || attempt > retries {
         return None;
     }
-    Some(2u64.pow(attempt.max(1) as u32).min(MAX_RETRY_BACKOFF_SECS))
+    let exponent = attempt.max(1).unsigned_abs();
+    Some(2u64.saturating_pow(exponent).min(MAX_RETRY_BACKOFF_SECS))
 }
 
 /// Read a positive minute count, falling back to `default` for absent, unparseable, or
@@ -1728,6 +1854,97 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reclaim_stage_does_not_hide_the_stages_after_it() {
+        let mut errs = StageErrors::default();
+        errs.record("stale_agents", Ok(()));
+        errs.record(
+            "step_timeouts",
+            Err(anyhow::anyhow!("integer out of range")),
+        );
+        // The stages after the failure are still recorded — and one of them fails too.
+        errs.record("expired_leases", Ok(()));
+        errs.record("stalled_runs", Err(anyhow::anyhow!("pool timed out")));
+        errs.record("stalled_runs", Err(anyhow::anyhow!("pool timed out again")));
+        assert_eq!(errs.failed, ["step_timeouts", "stalled_runs"]);
+        // The tick fails, with the first cause and every stage that failed named.
+        let e = errs.finish().expect_err("a failed stage fails the tick");
+        assert_eq!(e.root_cause().to_string(), "integer out of range");
+        assert_eq!(
+            e.to_string(),
+            "reclaim stages failed: step_timeouts, stalled_runs"
+        );
+    }
+
+    #[test]
+    fn a_run_is_stalled_only_while_no_step_is_queued_or_running() {
+        use StepStatus::*;
+        // Pending and terminal steps are not in flight, in any mix — including none.
+        assert!(nothing_in_flight([]));
+        assert!(nothing_in_flight([Succeeded, Pending, Pending]));
+        assert!(nothing_in_flight([Succeeded, Failed, Cancelled, Skipped]));
+        // One queued or running step and the run is the scheduler's or an agent's.
+        assert!(!nothing_in_flight([Succeeded, Queued, Pending]));
+        assert!(!nothing_in_flight([Succeeded, Running, Pending]));
+        assert!(!nothing_in_flight([Queued]));
+    }
+
+    #[test]
+    fn no_stage_of_a_reclaim_tick_can_end_it_early() {
+        // `StageErrors` only helps if every stage goes through it. A `?` in
+        // `reclaim_once` is how one failed stage used to end the tick for the rest;
+        // nothing but the source can say there is none, so read it.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("    async fn reclaim_once(&self) -> Result<()> {")
+            .expect("reclaim_once");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("end of reclaim_once")];
+        assert!(
+            body.contains("errs.finish()"),
+            "not the function expected:\n{body}"
+        );
+        assert!(
+            body.matches(".await").count() >= 4,
+            "expected the tick's stages here:\n{body}"
+        );
+        assert!(
+            !body.contains('?'),
+            "a `?` in reclaim_once lets one stage end the tick:\n{body}"
+        );
+        assert!(
+            !body.contains("return"),
+            "an early return in reclaim_once:\n{body}"
+        );
+    }
+
+    #[test]
+    fn a_swept_row_that_was_deleted_meanwhile_is_not_a_failed_stage() {
+        let gone: Result<()> = Err(fiber_core::StoreError::not_found("run").into());
+        assert!(gone_is_done(gone).is_ok());
+        // With context added on the way up, it is still the same typed error.
+        let gone: Result<()> = Err(
+            anyhow::Error::from(fiber_core::StoreError::not_found("run"))
+                .context("cancelling a timed-out run"),
+        );
+        assert!(gone_is_done(gone).is_ok());
+        // Anything else is a failure — including one that merely says "not found".
+        let lookalike: Result<()> = Err(anyhow::anyhow!("run not found"));
+        assert!(gone_is_done(lookalike).is_err());
+        let other: Result<()> = Err(fiber_core::StoreError::Validation("no".into()).into());
+        assert!(gone_is_done(other).is_err());
+        assert!(gone_is_done(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_reclaim_tick_with_no_failed_stage_succeeds() {
+        let mut errs = StageErrors::default();
+        for stage in ["stale_agents", "step_timeouts", "expired_leases"] {
+            errs.record(stage, Ok(()));
+        }
+        assert!(errs.finish().is_ok());
+    }
+
+    #[test]
     fn the_backoff_doubles_per_attempt_and_is_capped() {
         assert_eq!(retry_plan(StepStatus::Failed, 1, 99), Some(2));
         assert_eq!(retry_plan(StepStatus::Failed, 2, 99), Some(4));
@@ -1738,6 +1955,51 @@ mod tests {
             retry_plan(StepStatus::Failed, 40, 99),
             Some(MAX_RETRY_BACKOFF_SECS)
         );
+    }
+
+    #[test]
+    fn the_backoff_is_what_it_was_for_every_attempt_that_used_to_fit() {
+        // Pinned by value, then against the old expression across its whole safe range.
+        let pinned = [
+            (1, 2),
+            (2, 4),
+            (3, 8),
+            (4, 16),
+            (5, 32),
+            (6, 60),
+            (7, 60),
+            (63, 60),
+        ];
+        for (attempt, secs) in pinned {
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(secs),
+                "attempt {attempt}"
+            );
+        }
+        for attempt in 0..=63 {
+            let before = 2u64.pow(attempt.max(1) as u32).min(MAX_RETRY_BACKOFF_SECS);
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(before),
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_backoff_is_capped_where_two_to_the_attempt_no_longer_fits() {
+        // 2^64 does not fit a u64: `pow` panicked here in debug and wrapped to 0 in
+        // release.
+        for attempt in [64, 65, 1_000, i32::MAX] {
+            assert_eq!(
+                retry_plan(StepStatus::Failed, attempt, i32::MAX),
+                Some(MAX_RETRY_BACKOFF_SECS),
+                "attempt {attempt}"
+            );
+        }
+        // A negative attempt is not a thing, and is still an answer.
+        assert_eq!(retry_plan(StepStatus::Failed, i32::MIN, 3), Some(2));
     }
 
     #[test]

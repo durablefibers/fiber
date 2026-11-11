@@ -31,7 +31,7 @@ steps:
 | `workspace` | no | Git clone into the step workspace. `repo` must be an `http(s)://`, `ssh://`, `git://`, or `file://` URL, an scp-like `user@host:path`, or a path — rejected when the pipeline compiles otherwise, and again by the agent, which also pins `GIT_ALLOW_PROTOCOL`. Git's `ext::` transport runs a command, and the repo is added on the agent host before any container exists. `ref` must be one branch, tag, ref or SHA: no leading `-`, `..`, spaces, or `~ ^ : ?` |
 | `on` | no | Push / PR / cron / interval |
 | `steps` | yes | Map of step id → step (YAML) or list in JSON API |
-| `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out` |
+| `timeout_minutes` | no | Whole-run wall-clock limit from run start; the run is cancelled with reason `run timed out`. `1` to `525600` (one year); anything else is rejected when the pipeline compiles |
 | `concurrency` | no | Keep one run per group in flight; see below |
 
 In YAML, steps are usually a **map** keyed by id; the compiler fills `id` / `name` from the key when omitted. Give a map-form step its own `id:` and it is rejected — the key *is* the id, and two answers to the question is one of them going unread.
@@ -105,8 +105,8 @@ API replicas still leave exactly one run in flight.
 | `needs` | `[]` | Upstream step ids (DAG edges) |
 | `labels` | `[]` | Matched against agent labels (all required labels must be present) |
 | `image` | — | Optional Docker image; agent runs in container when Docker enabled. A docker image reference only (`name[:tag][@digest]`, optionally registry-qualified): the value becomes a `docker run` argument, so anything docker could read as a flag (`-v/:/host`, `--privileged`) is rejected when the pipeline compiles and again by the agent, which also passes it after `--` |
-| `retries` | `0` | Extra attempts after failure (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts, and gets one extra try: a step is failed once it has lost more than `retries + 1` leases |
-| `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not |
+| `retries` | `0` | Extra attempts after failure, `0` to `100` — more is rejected when the pipeline compiles (exponential backoff `2^attempt` s, max 60 s, persisted on the row). An attempt lost to an agent disconnect or lease expiry also counts, and gets one extra try: a step is failed once it has lost more than `retries + 1` leases |
+| `timeout_minutes` | server default (60) | Per-attempt wall-clock limit incl. workspace prep and restores. The agent kills the step and fails the attempt (retries still apply); the server independently fails it `FIBER_STEP_TIMEOUT_GRACE_MINUTES` later if the agent did not. `1` to `525600` (one year); anything else is rejected when the pipeline compiles |
 | `secrets` | all | Project secrets to inject, by name. Omit for every secret (the default); `secrets: []` for none. Naming them keeps credentials out of steps that have no use for them, which matters most for a step running a third-party `image:` |
 | `env` | `{}` | Environment for this step; overrides the pipeline's for the same name |
 | `working_directory` | workspace root | Run in this subdirectory. Must stay inside the workspace — absolute paths and `..` are rejected when the pipeline compiles. **`artifacts` paths stay relative to the workspace root**, so moving a step's `working_directory` does not silently change what it publishes |

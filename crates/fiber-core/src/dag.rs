@@ -34,6 +34,28 @@ pub const DEFAULT_MAX_STEPS: usize = 500;
 /// bounds a cost nobody chooses on purpose.
 const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
 
+/// The longest `timeout_minutes` a pipeline or a step may ask for: one year.
+///
+/// The field is a `u32`, and the timeout sweep turns it into a Postgres interval through
+/// an `int`. A value past 2^31-1 fits the field and overflowed that cast, which failed
+/// the sweep's query — for every project, on every tick, for as long as the run that
+/// carried it stayed `running`. Nothing legitimately waits a year for a build, so the
+/// bound costs nobody anything; the sweep clamps to it as well
+/// ([`crate::Store::list_timed_out_steps`]), because a run's snapshot is immutable and
+/// one stored before this check existed can still carry anything.
+pub const MAX_TIMEOUT_MINUTES: u32 = 525_600;
+
+/// The most `retries` a step may ask for.
+///
+/// Each retry is another lease of an agent slot, and the backoff between them is capped
+/// at a minute, so a hundred is already most of two hours of waiting on a step that
+/// fails instantly. The field is a `u32` and the column an `int4`: without a bound,
+/// `4294967295` was stored as `-1` (a step that never retries) and `2147483647` made
+/// `retries + 1` overflow in the reclaim transaction. The readers are total on their own
+/// — a run retried from an old snapshot can still carry anything — so this is what makes
+/// the value mean something, not what keeps the arithmetic safe.
+pub const MAX_RETRIES: u32 = 100;
+
 /// The cap in force, from `FIBER_MAX_STEPS` (read once).
 ///
 /// 500 is justified on cost, not on correctness, and a generated monorepo fan-out can
@@ -120,6 +142,10 @@ pub enum DagError {
     BadArtifactPath { step: String, path: String },
     #[error("`{0}`: timeout_minutes must be at least 1")]
     InvalidTimeout(String),
+    #[error("`{0}`: timeout_minutes must be at most {MAX_TIMEOUT_MINUTES} (one year)")]
+    TimeoutTooLong(String),
+    #[error("step `{step}` retries is {retries}; it must be at most {MAX_RETRIES}")]
+    TooManyRetries { step: String, retries: u32 },
     #[error(
         "step `{step}` image `{image}` is not a docker image reference (`name[:tag][@digest]`, optionally registry-qualified)"
     )]
@@ -219,13 +245,60 @@ struct ExpandedCell<'a> {
     template: &'a StepDefinition,
 }
 
+/// A `timeout_minutes` as a run's stored snapshot holds it, for whoever enforces it.
+///
+/// Compile only lets `1..=MAX_TIMEOUT_MINUTES` through, but a snapshot is a stored
+/// document and immutable, so one written before that bound — or edited by hand — can
+/// hold anything. Two places enforce the value, the offer an agent is sent and the
+/// server's timeout sweep, and they have to agree or the agent and the backstop work to
+/// different deadlines. The rule, here for the offer and restated in SQL for the sweep
+/// (`LIST_TIMED_OUT_STEPS_SQL` / `LIST_TIMED_OUT_RUNS_SQL` in `store.rs`):
+///
+/// - a whole number of at least 1 is a timeout, **clamped** to [`MAX_TIMEOUT_MINUTES`]
+///   however large it is (`5000000000`, `1e20`);
+/// - anything else — absent, `null`, a string, a fraction, zero, a negative — is no
+///   timeout at all: `None`, and the caller's default applies.
+///
+/// `5.0` is a whole number: Postgres keeps the `.0` in `jsonb` and `serde_json` reads
+/// it back as a float, and the SQL side compares against `trunc`, so both take it as 5.
+pub fn stored_timeout_minutes(value: Option<&serde_json::Value>) -> Option<u32> {
+    let serde_json::Value::Number(n) = value? else {
+        return None;
+    };
+    if let Some(m) = n.as_u64() {
+        let clamped = u32::try_from(m)
+            .unwrap_or(u32::MAX)
+            .min(MAX_TIMEOUT_MINUTES);
+        return (m >= 1).then_some(clamped);
+    }
+    // Not a u64: negative, fractional, or too large for one (`jsonb` holds `1e20` as
+    // 21 digits, which comes back as a float).
+    let f = n.as_f64()?;
+    if !f.is_finite() || f < 1.0 || f.fract() != 0.0 {
+        return None;
+    }
+    Some(if f >= f64::from(MAX_TIMEOUT_MINUTES) {
+        MAX_TIMEOUT_MINUTES
+    } else {
+        f as u32
+    })
+}
+
+/// A `timeout_minutes` is absent or within `1..=MAX_TIMEOUT_MINUTES`. `what` names the
+/// pipeline or the step in the error and is only built when there is one.
+fn check_timeout(minutes: Option<u32>, what: impl FnOnce() -> String) -> Result<(), DagError> {
+    match minutes {
+        Some(0) => Err(DagError::InvalidTimeout(what())),
+        Some(m) if m > MAX_TIMEOUT_MINUTES => Err(DagError::TimeoutTooLong(what())),
+        _ => Ok(()),
+    }
+}
+
 pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagError> {
     if def.steps.is_empty() {
         return Err(DagError::Empty);
     }
-    if def.timeout_minutes == Some(0) {
-        return Err(DagError::InvalidTimeout("pipeline".into()));
-    }
+    check_timeout(def.timeout_minutes, || "pipeline".into())?;
     // The repo lands on a `git remote add` command line on the agent host, before any
     // container exists; git's `ext::` transport would run it as a command.
     if let Some(ws) = &def.workspace
@@ -241,8 +314,12 @@ pub fn compile_definition(def: &PipelineDefinition) -> Result<CompiledDag, DagEr
         return Err(DagError::BadRef(r.to_string()));
     }
     for step in &def.steps {
-        if step.timeout_minutes == Some(0) {
-            return Err(DagError::InvalidTimeout(format!("step {}", step.id)));
+        check_timeout(step.timeout_minutes, || format!("step {}", step.id))?;
+        if step.retries > MAX_RETRIES {
+            return Err(DagError::TooManyRetries {
+                step: step.id.clone(),
+                retries: step.retries,
+            });
         }
     }
 
@@ -1803,6 +1880,107 @@ mod tests {
         // The step timeout survives the JSON snapshot round-trip.
         let v = serde_json::to_value(&dag).unwrap();
         assert_eq!(v["steps"][0]["timeout_minutes"], 5);
+    }
+
+    #[test]
+    fn a_timeout_longer_than_a_year_is_rejected_on_the_pipeline_and_on_a_step() {
+        let def = |pipeline: Option<u32>, on_step: Option<u32>| {
+            let mut s = step("a", &[], "true");
+            s.timeout_minutes = on_step;
+            PipelineDefinition {
+                name: "t".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![s],
+                timeout_minutes: pipeline,
+            }
+        };
+        // 3_000_000_000 fits the u32 and is past what Postgres takes as an `int`: the
+        // value that stalled the timeout sweep.
+        for too_long in [MAX_TIMEOUT_MINUTES + 1, 3_000_000_000, u32::MAX] {
+            let e = compile_definition(&def(Some(too_long), None)).expect_err("pipeline");
+            assert!(matches!(&e, DagError::TimeoutTooLong(w) if w == "pipeline"));
+            let e = compile_definition(&def(None, Some(too_long))).expect_err("step");
+            assert!(matches!(&e, DagError::TimeoutTooLong(w) if w == "step a"));
+            assert!(e.to_string().contains("at most 525600"), "{e}");
+        }
+        // The bound itself is allowed, on both.
+        let dag = compile_definition(&def(Some(MAX_TIMEOUT_MINUTES), Some(MAX_TIMEOUT_MINUTES)))
+            .expect("a year is allowed");
+        assert_eq!(dag.timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
+        assert_eq!(dag.steps[0].timeout_minutes, Some(MAX_TIMEOUT_MINUTES));
+    }
+
+    #[test]
+    fn a_stored_timeout_is_clamped_or_absent_never_wrapped() {
+        use serde_json::json;
+        let read = |v: serde_json::Value| stored_timeout_minutes(Some(&v));
+        // In range: itself.
+        assert_eq!(read(json!(1)), Some(1));
+        assert_eq!(read(json!(90)), Some(90));
+        assert_eq!(read(json!(MAX_TIMEOUT_MINUTES)), Some(MAX_TIMEOUT_MINUTES));
+        // Whole, as Postgres hands back a `5.0` it stored.
+        assert_eq!(read(json!(5.0)), Some(5));
+        // Too large: a year, whatever the size. 3e9 fits a u32, 5e9 a u64, 1e20 neither.
+        for huge in [
+            json!(MAX_TIMEOUT_MINUTES + 1),
+            json!(3_000_000_000u64),
+            json!(5_000_000_000u64),
+            json!(u64::MAX),
+            json!(1e20),
+            serde_json::from_str("100000000000000000000").unwrap(),
+        ] {
+            assert_eq!(read(huge.clone()), Some(MAX_TIMEOUT_MINUTES), "{huge}");
+        }
+        // Not a timeout: the default applies.
+        for absent in [
+            json!(null),
+            json!("30"),
+            json!("abc"),
+            json!(1.5),
+            json!(0.5),
+            json!(0),
+            json!(-5),
+            json!(-1e20),
+            json!(true),
+            json!([30]),
+        ] {
+            assert_eq!(read(absent.clone()), None, "{absent}");
+        }
+        assert_eq!(stored_timeout_minutes(None), None);
+    }
+
+    #[test]
+    fn retries_above_the_bound_are_rejected() {
+        let def = |retries: u32| {
+            let mut s = step("flaky", &[], "true");
+            s.retries = retries;
+            PipelineDefinition {
+                name: "t".into(),
+                env: Default::default(),
+                workspace: None,
+                concurrency: None,
+                on: None,
+                steps: vec![s],
+                timeout_minutes: None,
+            }
+        };
+        // i32::MAX overflowed `retries + 1`; u32::MAX was stored as -1.
+        for too_many in [MAX_RETRIES + 1, i32::MAX as u32, u32::MAX] {
+            let e = compile_definition(&def(too_many)).expect_err("rejected");
+            assert!(
+                matches!(&e, DagError::TooManyRetries { step, retries }
+                    if step == "flaky" && *retries == too_many),
+                "{e}"
+            );
+            assert!(e.to_string().contains("at most 100"), "{e}");
+        }
+        for fine in [0, 3, MAX_RETRIES] {
+            let dag = compile_definition(&def(fine)).expect("in range");
+            assert_eq!(dag.steps[0].retries, fine);
+        }
     }
 
     #[test]
