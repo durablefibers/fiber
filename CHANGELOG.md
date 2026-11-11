@@ -41,6 +41,18 @@ minor versions may carry breaking changes.
   that it also claims, and the smaller of the two concurrencies. Asking for more is logged
   with the agent id. See *Changed* for what this does to an existing agent.
   [agents](docs/agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
+- **The instance's GitHub token could be aimed at any repository by a project admin.**
+  Listing a pull request's files (for `paths` filters) fell back from the project's
+  `GITHUB_TOKEN` secret to `FIBER_GITHUB_TOKEN` / `GITHUB_TOKEN` in `fiber-api`'s
+  environment, and the repository came from the webhook payload. The payload's signature
+  proves only that the sender holds the project's webhook secret, which a project admin
+  sets — and any user can create a project. So a user could sign a `pull_request` payload
+  naming a private repository and read from the response (`files_source`,
+  `changed_files`, which path-filtered pipelines started) what the instance's token can
+  see there. The fallback is gone: both GitHub calls now use the project's secret only,
+  as commit statuses already did. Checking the payload's repository against the
+  project's pipelines would not have closed it, since the same user writes the pipeline.
+  See *Changed*. [triggers](docs/triggers.md#pull-request).
 
 ### Changed
 
@@ -60,6 +72,14 @@ minor versions may carry breaking changes.
   `"labels": []` is not stripped. The API logs
   `agent hello asked for more than its registration allows` with the agent id for every
   agent this affects, each time it connects.
+- **If you rely on `FIBER_GITHUB_TOKEN` in `fiber-api`'s environment, add a project secret
+  before upgrading.** It is no longer read. A project with `pull_request` `paths` /
+  `paths_ignore` filters and no `GITHUB_TOKEN` secret of its own will stop starting those
+  pipelines on pull requests (they skip, as they always have without a token). Add the
+  token to each such project: `fiber secrets set <project-id> GITHUB_TOKEN --value-stdin`.
+  `fiber-api` logs one warning the first time a project needed the environment's token.
+  The docs also said the environment variable was a fallback for commit statuses; it has
+  not been since statuses moved to the project's secret, and they now say so.
 
 ### Changed
 

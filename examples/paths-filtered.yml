@@ -1,6 +1,6 @@
 name: paths-filtered
 # Fires on push/PR to main only when Rust/Cargo files change; ignores docs.
-# For PR path filters, set project secret GITHUB_TOKEN (or FIBER_GITHUB_TOKEN env)
+# For PR path filters, set project secret GITHUB_TOKEN
 # so Fiber can list changed files via the GitHub API.
 workspace:
   repo: https://github.com/octocat/Hello-World.git

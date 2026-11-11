@@ -29,7 +29,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_AGENT_STALE_SECS` | `45` | Offline threshold for heartbeats |
 | `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` | `60` | Per-attempt limit for steps without `timeout_minutes` |
 | `FIBER_STEP_TIMEOUT_GRACE_MINUTES` | `5` | Extra minutes the server waits past a step's limit before failing it itself (backstop for hung/old agents) |
-| `FIBER_GITHUB_TOKEN` | unset | Fallback for the PR file API and commit statuses (needs `repo:status`) |
+| `FIBER_GITHUB_TOKEN` | unset | **No longer used.** Was an instance-wide fallback for the PR file API; set a project secret `GITHUB_TOKEN` instead ([triggers](./triggers.md)). A warning is logged once if it is set and a project needed it |
 | `FIBER_PUBLIC_URL` | unset | Public base URL of this Fiber; used to link commit statuses to the run page |
 | `FIBER_GITHUB_API_URL` | `https://api.github.com` | GitHub / GHE API base |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Collector **base** URL; `/v1/traces` and `/v1/metrics` are appended |
@@ -80,7 +80,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_API_BIND` / `FIBER_UI_BIND` | `127.0.0.1` | Host interface for `18080` / `3100`; set `0.0.0.0` only without a reverse proxy |
 | `VITE_FIBER_API_URL` | `http://localhost:18080` | Baked into the UI bundle |
 | `FIBER_PUBLIC_URL` | empty | Public base URL; commit statuses link back to it |
-| `FIBER_GITHUB_TOKEN` | empty | Instance-wide fallback for the PR file API and commit statuses |
+| `FIBER_GITHUB_TOKEN` | empty | No longer used; set a project secret `GITHUB_TOKEN` instead |
 | `FIBER_GITHUB_API_URL` | empty (`https://api.github.com`) | GitHub Enterprise API base |
 | `FIBER_RETENTION_DAYS` / `_KEEP_RUNS` / `_BATCH` / `_INTERVAL_SECS` | empty (`30` / `20` / `100` / `3600`) | Run GC; see the API table |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Durable-fiber GC |

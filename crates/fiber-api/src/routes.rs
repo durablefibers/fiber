@@ -2037,7 +2037,7 @@ async fn github_webhook(
                     .await
                     .unwrap_or(true)
             {
-                match crate::github::resolve_token(&state.store, id).await {
+                match crate::github::resolve_project_token(&state.store, id).await {
                     Ok(Some(token)) => {
                         if let Some((owner, repo)) = crate::github::repo_full_name(&payload) {
                             match crate::github::list_pull_request_files(
@@ -2060,7 +2060,7 @@ async fn github_webhook(
                     }
                     Ok(None) => {
                         tracing::debug!(
-                            "no GITHUB_TOKEN; PR path filters need API file list or payload.changed_files"
+                            "no GITHUB_TOKEN project secret; PR path filters need API file list or payload.changed_files"
                         );
                     }
                     Err(e) => {

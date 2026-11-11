@@ -194,8 +194,8 @@ services:
       FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
       # Public base URL of this instance; commit statuses link back to it.
       FIBER_PUBLIC_URL: ${FIBER_PUBLIC_URL:-}
-      # Instance-wide fallback for the PR file API and commit statuses. A project secret
-      # of the same name wins over it.
+      # No longer used: GitHub tokens are per-project secrets now. Still passed through so
+      # fiber-api can warn when one is set here and a project needed it.
       FIBER_GITHUB_TOKEN: ${FIBER_GITHUB_TOKEN:-}
       FIBER_GITHUB_API_URL: ${FIBER_GITHUB_API_URL:-}
       # Retention. Empty falls back to the documented default (30 / 20 / 100 / 3600).
