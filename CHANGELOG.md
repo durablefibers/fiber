@@ -6,6 +6,24 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **Seven RustSec advisories in the lockfile, all fixed by upgrades.** `rustls` 0.23.46
+  (RUSTSEC-2026-0346 to -0349), `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382: certificate
+  verification could accept a distrusted intermediate), `tokio` 1.54.1 (RUSTSEC-2026-0386)
+  and `ctutils` 0.4.8 (RUSTSEC-2026-0385). TLS is on every path that carries an agent
+  token or a session, so the 0.6.7 agent, CLI and images are affected; upgrade all three.
+
+### Changed
+
+- **The advisory gate can no longer go red unseen.** `deny` only ran on a push or pull
+  request, was not a required check, and was not run on a release tag — so with no
+  pushes to `main` since early October, the advisories above went unreported. A daily
+  `advisories` workflow now checks `main`, `deny` is a required check, and the release
+  workflow runs `cargo deny check` before it builds anything.
+- The release workflow passes the tag to its version check through the environment
+  rather than interpolating it into the script.
+
 ## [0.6.7] — 2026-10-01
 
 **The `fiber-ui` image now serves Fiber.** Every earlier build of it served nginx's welcome
