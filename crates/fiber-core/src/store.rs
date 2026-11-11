@@ -288,7 +288,7 @@ impl Store {
 
     pub async fn create_user(&self, username: &str, password: &str) -> Result<PublicUser> {
         let id = Uuid::new_v4();
-        let hash = crate::tokens::hash_password(password);
+        let hash = crate::tokens::hash_password_blocking(password).await?;
         Ok(sqlx::query_as::<_, PublicUser>(
             "INSERT INTO users (id, username, password_hash) VALUES ($1, $2, $3)
              RETURNING id, username, is_admin",
@@ -2587,15 +2587,18 @@ impl Store {
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
+        // An unknown username still pays for a verify (against a dummy hash), so the
+        // response time does not say whether the account exists.
+        let stored = user.as_ref().map(|u| u.password_hash.as_str());
+        if !crate::tokens::verify_password_blocking(password, stored).await? {
+            return Ok(None);
+        }
         let Some(user) = user else {
             return Ok(None);
         };
-        if !crate::tokens::verify_password(password, &user.password_hash) {
-            return Ok(None);
-        }
         // Upgrade legacy SHA-256 password hashes to argon2id on successful login.
         if crate::tokens::password_needs_rehash(&user.password_hash) {
-            let new_hash = crate::tokens::hash_password(password);
+            let new_hash = crate::tokens::hash_password_blocking(password).await?;
             let _ = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
                 .bind(user.id)
                 .bind(&new_hash)
@@ -2625,6 +2628,20 @@ impl Store {
             },
             expires_at,
         }))
+    }
+
+    /// Whether `username` exists and `password` is its password. Creates no session.
+    ///
+    /// For the boot check that refuses to serve a known login on a public address; it
+    /// asks the database rather than the configuration, because the configured admin
+    /// password is applied only on the first boot of an empty database.
+    pub async fn password_is(&self, username: &str, password: &str) -> Result<bool> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?;
+        crate::tokens::verify_password_blocking(password, stored.as_deref()).await
     }
 
     pub async fn user_by_session_token(&self, token: &str) -> Result<Option<PublicUser>> {
@@ -2661,10 +2678,10 @@ impl Store {
         let Some(stored) = stored else {
             return Ok(false);
         };
-        if !crate::tokens::verify_password(current, &stored) {
+        if !crate::tokens::verify_password_blocking(current, Some(&stored)).await? {
             return Ok(false);
         }
-        let hash = crate::tokens::hash_password(new_password);
+        let hash = crate::tokens::hash_password_blocking(new_password).await?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
             .bind(user_id)

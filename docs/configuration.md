@@ -8,14 +8,15 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 |---|---|---|
 | `FIBER_DATABASE_URL` | `postgres://fiber:fiber@localhost:15432/fiber` | Postgres |
 | `FIBER_REDIS_URL` | `redis://localhost:16379` | Redis (events + coordination). The Compose Redis requires a password (`FIBER_REDIS_PASSWORD`, no default — `make infra` passes `fiber` on a dev box): `redis://:fiber@127.0.0.1:16379`, which is what `scripts/dev-env.sh` builds |
-| `FIBER_LISTEN` | `0.0.0.0:18080` | Bind address |
+| `FIBER_LISTEN` | `127.0.0.1:18080` | Bind address. Loopback by default, so a bare `fiber-api` with its bootstrap login is reachable only from the same machine; the image sets `0.0.0.0:8080`. Set it explicitly to serve other hosts (an agent on another machine, a reverse proxy in another container) |
 | `FIBER_ARTIFACTS_DIR` | `./data/artifacts` | Local artifact root |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
-| `FIBER_ADMIN_PASSWORD` | `fiber` | Bootstrap admin password (API warns at boot while it is the default) |
+| `FIBER_ADMIN_PASSWORD` | `fiber` | Bootstrap admin password, applied only on the first boot of an empty database. While the bootstrap admin can log in with `fiber`, the API warns at boot on a loopback `FIBER_LISTEN` and **refuses to start** on any other address. Both `FIBER_ADMIN_USER` and the literal `admin` are checked, so renaming the variable does not hide an old `admin` / `fiber` account |
+| `FIBER_ALLOW_DEFAULT_ADMIN` | unset | `1` (or `true`) starts on a non-loopback `FIBER_LISTEN` even though the bootstrap admin still has the default password. For a throwaway stack such as the Compose smoke; the fix for a real one is to change the password (`fiber-api reset-password admin`) |
 | `FIBER_MAX_STEPS` | `500` | Most expanded steps (matrix cells included) one pipeline may compile to; past it the definition is rejected with `TooManySteps`. Raise it for a generated fan-out. It bounds the **number** of cells only — a cell is not a fixed size, so a separate, non-configurable 8 MiB budget bounds the bytes a definition expands to, and the three routes that accept a definition cap the request body at 256 KiB. `0` or a non-number fails the boot. **`fiber validate` reads it too**, from the developer's shell: a server raised to 2000 and a developer left unset means a pipeline that fails locally and is accepted on push |
 | `FIBER_SEED_SHOWCASE` | `auto` | Seed the **Showcase** demo project and its pipelines. `auto` = only when the users table was empty at boot (a fresh instance), so a demo project you delete stays deleted; `1` = seed on this boot (restores it, and picks up pipelines a newer version added); `0` = never. Any other value fails the boot |
 | `FIBER_CORS_ORIGINS` | `http://127.0.0.1:3100,http://localhost:3100` | Comma-separated browser origins allowed to call the API; `*` = any origin |
-| `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project **and webhook** secrets at rest |
+| `FIBER_SECRETS_KEY` | unset | 64 hex chars → encrypt project **and webhook** secrets at rest. Unset (or empty) = plaintext, with a warning at boot. Set to anything that is not 64 hex characters = **the API refuses to start** and says why — it does not fall back to plaintext |
 | `FIBER_S3_BUCKET` | unset | If set, use the S3 backend |
 | `FIBER_S3_ENDPOINT` | `http://127.0.0.1:19000` | S3 API endpoint |
 | `FIBER_S3_PUBLIC_ENDPOINT` | = endpoint | Presign host agents can reach |
@@ -29,7 +30,7 @@ All product env vars use the `FIBER_*` prefix (plus standard OTEL names).
 | `FIBER_AGENT_STALE_SECS` | `45` | Offline threshold for heartbeats |
 | `FIBER_STEP_TIMEOUT_DEFAULT_MINUTES` | `60` | Per-attempt limit for steps without `timeout_minutes` |
 | `FIBER_STEP_TIMEOUT_GRACE_MINUTES` | `5` | Extra minutes the server waits past a step's limit before failing it itself (backstop for hung/old agents) |
-| `FIBER_GITHUB_TOKEN` | unset | Fallback for the PR file API and commit statuses (needs `repo:status`) |
+| `FIBER_GITHUB_TOKEN` | unset | **No longer used.** Was an instance-wide fallback for the PR file API; set a project secret `GITHUB_TOKEN` instead ([triggers](./triggers.md)). A warning is logged once if it is set and a project needed it |
 | `FIBER_PUBLIC_URL` | unset | Public base URL of this Fiber; used to link commit statuses to the run page |
 | `FIBER_GITHUB_API_URL` | `https://api.github.com` | GitHub / GHE API base |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Collector **base** URL; `/v1/traces` and `/v1/metrics` are appended |
@@ -61,14 +62,15 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_POSTGRES_PASSWORD` | Postgres password (loopback-bound port `15432`); applied when the volume is first initialised, so changing it later also needs `ALTER ROLE` |
 | `FIBER_REDIS_PASSWORD` | Redis `requirepass` (loopback-bound port `16379`), delivered through a Compose `configs:` file, not argv |
 | `FIBER_S3_ACCESS_KEY` / `FIBER_S3_SECRET_KEY` | Root credentials of the bundled S3 store (RustFS) and what `fiber-api` signs S3 requests with. Required even with the `s3` profile off: Compose interpolates the whole file before it filters by profile. Any placeholder does when `FIBER_S3_BUCKET` is empty |
-| `FIBER_ADMIN_PASSWORD` | Bootstrap admin password — applied only on the first boot of an empty database; rotate an existing admin through the API/UI |
+| `FIBER_ADMIN_PASSWORD` | Bootstrap admin password — applied only on the first boot of an empty database; rotate an existing admin through the API/UI. `fiber` is refused at boot (see `FIBER_ALLOW_DEFAULT_ADMIN`) |
+| `FIBER_SECRETS_KEY` | Encrypts project and webhook secrets at rest: `openssl rand -hex 32`. Keep a backup — there is no recovery path |
 
 **Optional.**
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `FIBER_VERSION` | `latest` | Tag for the `ghcr.io/durablefibers/fiber-api` and `fiber-agent` images |
-| `FIBER_SECRETS_KEY` | empty (plaintext, warned) | Passed through to `fiber-api` |
+| `FIBER_ALLOW_DEFAULT_ADMIN` | empty | `1` lets `fiber-api` start while the admin can still log in with `fiber`. See the API table |
 | `FIBER_ADMIN_USER` | `admin` | Bootstrap admin username |
 | `FIBER_MAX_STEPS` | `500` | See above. Set it for the CLI as well as the server, or the two disagree |
 | `FIBER_SEED_SHOWCASE` | `auto` | See above; `auto` seeds the demo project only on the first boot of an empty database |
@@ -80,7 +82,7 @@ file passes the variable through as an empty string and each reader falls back.
 | `FIBER_API_BIND` / `FIBER_UI_BIND` | `127.0.0.1` | Host interface for `18080` / `3100`; set `0.0.0.0` only without a reverse proxy |
 | `VITE_FIBER_API_URL` | `http://localhost:18080` | Baked into the UI bundle |
 | `FIBER_PUBLIC_URL` | empty | Public base URL; commit statuses link back to it |
-| `FIBER_GITHUB_TOKEN` | empty | Instance-wide fallback for the PR file API and commit statuses |
+| `FIBER_GITHUB_TOKEN` | empty | No longer used; set a project secret `GITHUB_TOKEN` instead |
 | `FIBER_GITHUB_API_URL` | empty (`https://api.github.com`) | GitHub Enterprise API base |
 | `FIBER_RETENTION_DAYS` / `_KEEP_RUNS` / `_BATCH` / `_INTERVAL_SECS` | empty (`30` / `20` / `100` / `3600`) | Run GC; see the API table |
 | `FIBER_RETENTION_FIBER_DAYS` | `7` | Durable-fiber GC |

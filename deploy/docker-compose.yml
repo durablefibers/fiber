@@ -2,11 +2,12 @@ name: fiber
 # Backing services bind to loopback only; put fiber-api / fiber-ui behind TLS
 # (docs/operations.md#deployment). Settings come from deploy/.env — see deploy/.env.example.
 #
-# Four credentials are required, not defaulted: FIBER_POSTGRES_PASSWORD,
-# FIBER_REDIS_PASSWORD, FIBER_S3_ACCESS_KEY/FIBER_S3_SECRET_KEY and
-# FIBER_ADMIN_PASSWORD. `docker compose config` fails until deploy/.env sets them. A
-# default that works is a default nobody changes, and FIBER_API_BIND=0.0.0.0 plus a
-# published admin password is a public instance with a known login.
+# Four credentials and the secrets key are required, not defaulted:
+# FIBER_POSTGRES_PASSWORD, FIBER_REDIS_PASSWORD, FIBER_S3_ACCESS_KEY/FIBER_S3_SECRET_KEY,
+# FIBER_ADMIN_PASSWORD and FIBER_SECRETS_KEY. `docker compose config` fails until
+# deploy/.env sets them. A default that works is a default nobody changes, and
+# FIBER_API_BIND=0.0.0.0 plus a published admin password is a public instance with a
+# known login; an empty secrets key is every project secret in plaintext.
 #
 # Networks: everything shares `backend`, except the agent, which sits alone with the API
 # on `agentnet`. Pipeline steps are repo-supplied shell, so an agent that could reach
@@ -183,19 +184,23 @@ services:
       # Applied only on the first boot of an empty database; change it later through the
       # UI or the API.
       FIBER_ADMIN_PASSWORD: ${FIBER_ADMIN_PASSWORD:?set it in deploy/.env (cp deploy/.env.example deploy/.env)}
+      # fiber-api listens on 0.0.0.0 in here, so it refuses to start while the admin can
+      # still log in with the old default password `fiber`. 1 = start anyway.
+      FIBER_ALLOW_DEFAULT_ADMIN: ${FIBER_ALLOW_DEFAULT_ADMIN:-}
       # Showcase demo project: auto = only on the first boot of an empty database, so a
       # deleted demo project stays deleted. 1 = seed on this boot, 0 = never.
       FIBER_SEED_SHOWCASE: ${FIBER_SEED_SHOWCASE:-auto}
       # Most expanded steps (matrix cells included) one pipeline may compile to.
       FIBER_MAX_STEPS: ${FIBER_MAX_STEPS:-}
-      # Required for encrypted project/webhook secrets: openssl rand -hex 32 → deploy/.env.
-      # Empty = plaintext at rest (fiber-api warns at boot).
-      FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:-}
+      # Encrypts project and webhook secrets at rest. Required: a deployment does not get
+      # plaintext secrets by leaving a line empty. 64 hex characters; anything else set
+      # here stops fiber-api at boot.
+      FIBER_SECRETS_KEY: ${FIBER_SECRETS_KEY:?generate one with `openssl rand -hex 32` and set it in deploy/.env (keep a backup)}
       FIBER_CORS_ORIGINS: ${FIBER_CORS_ORIGINS:-http://localhost:3100,http://127.0.0.1:3100}
       # Public base URL of this instance; commit statuses link back to it.
       FIBER_PUBLIC_URL: ${FIBER_PUBLIC_URL:-}
-      # Instance-wide fallback for the PR file API and commit statuses. A project secret
-      # of the same name wins over it.
+      # No longer used: GitHub tokens are per-project secrets now. Still passed through so
+      # fiber-api can warn when one is set here and a project needed it.
       FIBER_GITHUB_TOKEN: ${FIBER_GITHUB_TOKEN:-}
       FIBER_GITHUB_API_URL: ${FIBER_GITHUB_API_URL:-}
       # Retention. Empty falls back to the documented default (30 / 20 / 100 / 3600).

@@ -917,6 +917,9 @@ async fn handle_agent(
     // is exiting on purpose. Not persisted — `agents` has no column for the revision
     // yet; the Hello log line carries it.
     let mut agent_protocol: Option<u32> = None;
+    // What this session's `Hello` claimed, kept so the registration can be recomputed
+    // against the agent's row whenever the row may have changed (every heartbeat).
+    let mut hello_claim: Option<(Vec<String>, u32)> = None;
     let mut goodbye = false;
     let mut shutdown = state.shutdown.clone();
     let mut liveness = tokio::time::Instant::now() + AGENT_LIVENESS_TIMEOUT;
@@ -974,8 +977,9 @@ async fn handle_agent(
                     break;
                 }
                 agent_protocol = Some(protocol_version);
-                info!(%agent_id, %name, ?labels, protocol_version, "agent hello");
-                // Reload from DB so pool scope is authoritative (not client-supplied).
+                info!(%agent_id, %name, ?labels, concurrency, protocol_version, "agent hello");
+                // Reload from DB so pool scope, labels and concurrency are authoritative
+                // (not client-supplied).
                 // A missing row ends the session rather than defaulting: `.flatten()`
                 // into `and_then(project_id)` made "agent deleted" indistinguishable from
                 // "global agent", so a deleted project-scoped agent would re-register
@@ -988,9 +992,35 @@ async fn handle_agent(
                     break;
                 };
                 let project_id = agent_row.project_id;
+                // `Hello` says what the agent can run; the row says what it may. Taking
+                // labels and concurrency from `Hello` let anyone holding an agent token
+                // reconnect claiming every label and `u32::MAX` slots, and lease steps —
+                // with their secrets — meant for other agents in the pool.
+                let (effective_labels, effective_concurrency, refused) = effective_registration(
+                    &agent_row.labels_vec(),
+                    agent_row.concurrency,
+                    &labels,
+                    concurrency,
+                );
+                hello_claim = Some((labels.clone(), concurrency));
+                if refused {
+                    warn!(
+                        %agent_id,
+                        hello_labels = ?labels,
+                        hello_concurrency = concurrency,
+                        ?effective_labels,
+                        effective_concurrency,
+                        "agent hello asked for more than its registration allows; registered with the allowed subset"
+                    );
+                }
                 state
                     .scheduler
-                    .register_agent(agent_id, labels, concurrency, project_id)
+                    .register_agent(
+                        agent_id,
+                        effective_labels,
+                        effective_concurrency,
+                        project_id,
+                    )
                     .await;
                 // Re-bind connection under confirmed agent_id (same as token)
                 state
@@ -1005,24 +1035,41 @@ async fn handle_agent(
                 warn_if_spoofed(agent_id, claimed, &mut spoof_logged);
                 // Revocation must not depend on Redis delivery: a rotated or deleted token
                 // ends the session on its next heartbeat, whichever replica holds it.
-                let still_valid = matches!(
-                    state.store.get_agent(agent_id).await,
-                    Ok(Some(a)) if a.token_hash == token_hash
-                );
-                if !still_valid {
-                    warn!(%agent_id, "agent token no longer valid; ending session");
-                    revoked = true;
-                    let _ = tx.send(ServerMessage::Error {
-                        message: "agent token revoked — reconnect with a valid token".into(),
-                    });
-                    break;
-                }
+                let agent_row = match state.store.get_agent(agent_id).await {
+                    Ok(Some(a)) if a.token_hash == token_hash => a,
+                    _ => {
+                        warn!(%agent_id, "agent token no longer valid; ending session");
+                        revoked = true;
+                        let _ = tx.send(ServerMessage::Error {
+                            message: "agent token revoked — reconnect with a valid token".into(),
+                        });
+                        break;
+                    }
+                };
                 // force_disconnect_agent drops the connection; the next heartbeat ends the session.
                 if !state.scheduler.has_connection(agent_id).await {
                     let _ = tx.send(ServerMessage::Error {
                         message: "session ended — reconnect".into(),
                     });
                     break;
+                }
+                // The row was just read, so apply it: an edit to the agent's labels or
+                // concurrency — made on this replica or another — reaches the live
+                // registration within one heartbeat, in both directions, and always as
+                // `row ∩ Hello`. (`PUT /api/agents/{id}` narrows at once on its own
+                // replica; widening waits for this, because only the session knows what
+                // `Hello` claimed.) Before any offer below is made.
+                if let Some((hello_labels, hello_concurrency)) = &hello_claim {
+                    let (labels, concurrency, _) = effective_registration(
+                        &agent_row.labels_vec(),
+                        agent_row.concurrency,
+                        hello_labels,
+                        *hello_concurrency,
+                    );
+                    state
+                        .scheduler
+                        .update_agent_presence(agent_id, labels, concurrency)
+                        .await;
                 }
                 let _ = state.store.touch_agent(agent_id).await;
                 let _ = state.scheduler.renew_leases(agent_id).await;
@@ -1507,9 +1554,125 @@ async fn handle_run_events(
     }
 }
 
+/// What an agent is registered with, given its database row and what its `Hello` claimed.
+///
+/// The row is a ceiling and `Hello` a declaration of capability, so the result is never
+/// more than either:
+///
+/// - **labels**: the row's labels that `Hello` also sent. An agent cannot add a label by
+///   claiming it, and is not offered work for a label it did not claim (a host started
+///   with `os=linux` under a row that says `os=linux,docker=true` cannot run `docker=true`
+///   steps, whatever the row says).
+/// - **concurrency**: the smaller of the two, at least 1. More than the row is not
+///   allowed; more than `Hello` would only park offers on the agent's local semaphore.
+///
+/// No exception for a row with **no** labels: it grants none, and the agent is offered
+/// only steps that require none (the queue match is `step.labels <@ agent.labels`).
+/// Treating an empty row as "unrestricted" would leave the original hole open for exactly
+/// those rows, and would turn an admin clearing an agent's labels to restrict it into
+/// the opposite.
+///
+/// The third value is `true` when `Hello` asked for something it did not get — a label
+/// outside the row, or more slots than the row has. That is a misconfiguration or a
+/// probe, and the caller logs it; an agent that claims *less* than its row is normal.
+fn effective_registration(
+    db_labels: &[String],
+    db_concurrency: i32,
+    hello_labels: &[String],
+    hello_concurrency: u32,
+) -> (Vec<String>, u32, bool) {
+    let allowed_slots = u32::try_from(db_concurrency).unwrap_or(0).max(1);
+    let wanted_slots = hello_concurrency.max(1);
+    let concurrency = wanted_slots.min(allowed_slots);
+    let mut refused = wanted_slots > allowed_slots;
+
+    refused |= hello_labels.iter().any(|l| !db_labels.contains(l));
+    let labels = db_labels
+        .iter()
+        .filter(|l| hello_labels.contains(l))
+        .cloned()
+        .collect();
+    (labels, concurrency, refused)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(csv: &str) -> Vec<String> {
+        csv.split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_hello_cannot_claim_labels_or_slots_its_row_does_not_have() {
+        // The attack: a token for a plain linux agent reconnects as everything, unbounded.
+        let (l, c, refused) = effective_registration(
+            &labels("os=linux"),
+            2,
+            &labels("os=linux,docker=true,pool=release,gpu=true"),
+            u32::MAX,
+        );
+        assert_eq!(l, labels("os=linux"));
+        assert_eq!(c, 2);
+        assert!(refused);
+        // Nothing in common leaves an agent that matches only label-less steps.
+        let (l, c, refused) =
+            effective_registration(&labels("os=linux"), 1, &labels("os=macos"), 1);
+        assert!(l.is_empty());
+        assert_eq!(c, 1);
+        assert!(refused);
+    }
+
+    #[test]
+    fn a_matching_hello_registers_unchanged_and_quietly() {
+        let (l, c, refused) = effective_registration(
+            &labels("os=linux,docker=true"),
+            4,
+            &labels("docker=true,os=linux"),
+            4,
+        );
+        assert_eq!(l, labels("os=linux,docker=true"));
+        assert_eq!(c, 4);
+        assert!(!refused);
+    }
+
+    #[test]
+    fn an_agent_may_claim_less_than_its_row_and_is_registered_with_what_it_claimed() {
+        // The UI's default labels against the installer's: this host cannot run docker
+        // steps and must not be offered them because its row could.
+        let (l, c, refused) =
+            effective_registration(&labels("os=linux,docker=true"), 4, &labels("os=linux"), 1);
+        assert_eq!(l, labels("os=linux"));
+        assert_eq!(c, 1);
+        assert!(!refused);
+    }
+
+    /// An empty row used to mean "whatever the agent says", which kept the hole open
+    /// for those rows and inverted an admin clearing labels to restrict an agent.
+    #[test]
+    fn a_row_without_labels_grants_none() {
+        let (l, c, refused) = effective_registration(&[], 2, &labels("os=linux,arch=arm64"), 9);
+        assert!(l.is_empty(), "{l:?}");
+        assert_eq!(c, 2);
+        assert!(refused);
+        // An agent that claims none either is simply a label-less agent.
+        let (l, _, refused) = effective_registration(&[], 2, &[], 2);
+        assert!(l.is_empty());
+        assert!(!refused);
+    }
+
+    #[test]
+    fn concurrency_is_never_below_one() {
+        for (db, hello) in [(0, 0), (-3, 5), (5, 0)] {
+            let (_, c, _) = effective_registration(&[], db, &[], hello);
+            assert_eq!(c, 1, "db {db}, hello {hello}");
+        }
+        // A zero in Hello is clamped, not reported: older agents send it.
+        assert!(!effective_registration(&[], 1, &[], 0).2);
+    }
     use serde_json::json;
 
     #[test]

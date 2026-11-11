@@ -43,7 +43,8 @@ boundaries are.
 - **Steps run without a container unless the step sets `image:`.** A host-shell step runs
   as the agent's user.
 - **Defaults are for a local trial, not the internet.** `admin` / `fiber`, no secrets
-  encryption key, everything on loopback. [docs/operations.md](docs/operations.md#deployment)
+  encryption key, everything on loopback — `fiber-api` included, which also refuses to
+  start on any other address while `admin` / `fiber` still works. [docs/operations.md](docs/operations.md#deployment)
   describes what to change before exposing an instance.
 
 ## Hardening a deployment

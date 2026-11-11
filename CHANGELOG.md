@@ -6,6 +6,12 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+**Three things to do before upgrading** (details under *Changed*): put a
+`FIBER_SECRETS_KEY` in `deploy/.env` — Compose now requires it; change the admin password
+if it is still `fiber` — the API no longer starts on a non-loopback address with it; and
+set `FIBER_LISTEN` for a host-run API that other machines connect to — the default is now
+loopback.
+
 ### Security
 
 - **Seven RustSec advisories in the lockfile, all fixed by upgrades.** `rustls` 0.23.46
@@ -13,9 +19,121 @@ minor versions may carry breaking changes.
   verification could accept a distrusted intermediate), `tokio` 1.54.1 (RUSTSEC-2026-0386)
   and `ctutils` 0.4.8 (RUSTSEC-2026-0385). TLS is on every path that carries an agent
   token or a session, so the 0.6.7 agent, CLI and images are affected; upgrade all three.
+- **The login lockout could be outrun by sending the guesses in parallel.** The handler
+  checked the lockout, verified the password, and only then recorded the failure, so every
+  request in a burst passed the check before any of them counted. The guess rate against a
+  known username was bounded by the server's CPU, not by "10 failures, then 60 s". An
+  attempt is now reserved before the verify and settled after it, and attempts still in
+  flight count against the same ten; a request that errors or is dropped gives its slot
+  back. Three things next to it:
+  - argon2id ran inline on the async workers, so the same burst stalled agent heartbeats
+    and lease renewals. Hashing and verifying now run on the blocking pool, at most four
+    at a time across the whole process (login, password change, user creation). A slot
+    is held until the hash finishes, not until the request that asked for it goes away,
+    so hanging up mid-login does not free it for more. A request that finds all four
+    busy waits its turn for up to 5 s and then gets a `503` that says nothing was
+    checked; it is not a lockout and does not count as a failed login.
+  - An unknown username returned before any hashing, a wrong password after it, so
+    response time said which usernames exist. Both now cost one argon2id verify, and so
+    does an account still on a legacy SHA-256 hash, which is also now compared in
+    constant time.
+  - Once the guard held 10 000 usernames it dropped every entry that was not locked out,
+    so a flood of made-up usernames reset a real account's failure count on demand. It
+    now evicts expired entries, then the fewest failures first.
+
+  The `429` body's `error` text changed from "too many failed logins" to "too many login
+  attempts", since it now also covers attempts refused while others for the same
+  username are being verified.
+  [authz](docs/authz.md#authentication).
+- **An agent token could claim any labels and any concurrency.** `Hello` carries the
+  agent's labels and concurrency, and the server registered the agent with them as sent —
+  it reloaded the agent's row for pool scope and ignored the labels and concurrency stored
+  beside it. Anyone holding one agent token could reconnect claiming every label and
+  `u32::MAX` slots, and be offered steps, with their secrets, meant for other agents in
+  the same pool. The row is now the ceiling: an agent is registered with the row's labels
+  that it also claims, and the smaller of the two concurrencies — at connect, and again
+  whenever the row is edited while the agent is connected. A row with no labels grants
+  none. Asking for more is logged with the agent id. See *Changed* for what this does to
+  an existing agent.
+  [agents](docs/agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
+- **The instance's GitHub token could be aimed at any repository by a project admin.**
+  Listing a pull request's files (for `paths` filters) fell back from the project's
+  `GITHUB_TOKEN` secret to `FIBER_GITHUB_TOKEN` / `GITHUB_TOKEN` in `fiber-api`'s
+  environment, and the repository came from the webhook payload. The payload's signature
+  proves only that the sender holds the project's webhook secret, which a project admin
+  sets — and any user can create a project. So a user could sign a `pull_request` payload
+  naming a private repository and read from the response (`files_source`,
+  `changed_files`, which path-filtered pipelines started) what the instance's token can
+  see there. The fallback is gone: both GitHub calls now use the project's secret only,
+  as commit statuses already did. Checking the payload's repository against the
+  project's pipelines would not have closed it, since the same user writes the pipeline.
+  See *Changed*. [triggers](docs/triggers.md#pull-request).
+- **A `FIBER_SECRETS_KEY` that was set but invalid meant plaintext secrets, silently.** A
+  key that was not hex, or not 64 characters — a truncated paste, a passphrase, a value
+  with quotes round it — was treated as no key: the boot log carried the ordinary "unset
+  (dev only)" line and every secret written afterwards was stored in plaintext, for an
+  operator who had configured encryption. It is now a boot error that says what is wrong
+  with the value (never the value), and encrypting or decrypting with such a key fails
+  rather than passing plaintext through. Unset is still allowed, and still warned about.
+- **A bare `fiber-api` listened on every interface with `admin` / `fiber`.** The default
+  `FIBER_LISTEN` was `0.0.0.0:18080`, while `SECURITY.md` said the defaults were all
+  loopback. It is now `127.0.0.1:18080`, and on any other address the API refuses to
+  start while the bootstrap admin can still log in with `fiber`. The check asks the
+  database, not the environment, so an instance whose password was changed in the UI is
+  not refused, and one where only the variable was changed (it applies to an empty
+  database only) is. It checks `FIBER_ADMIN_USER` and the literal `admin`.
 
 ### Changed
 
+- **Compose: set `FIBER_SECRETS_KEY` in `deploy/.env` before upgrading.**
+  `docker compose` now refuses to read the file without it, as it does for the four
+  credentials. Generate one with `openssl rand -hex 32` and keep a backup. If you ran
+  without a key until now, existing secrets stay readable — a stored value without the
+  `enc:v1:` prefix is read as plaintext — and each is encrypted the next time it is
+  written. If your key was set but not 64 hex characters, your secrets are in plaintext
+  today and the API will not start until the key is valid. `make infra` and
+  `scripts/smoke_compose.sh` supply a throwaway key themselves.
+- **Change the admin password if it is still `fiber`, or the API will not start in a
+  container.** Any `FIBER_LISTEN` other than loopback — which is every container, Compose
+  included — now refuses to boot while the bootstrap admin can log in with the default
+  password. `fiber-api reset-password admin` changes it without a running server
+  (`docker compose -f deploy/docker-compose.yml run --rm fiber-api fiber-api reset-password admin`).
+  `FIBER_ALLOW_DEFAULT_ADMIN=1` starts anyway; the Compose smoke uses it.
+- **A host-run `fiber-api` listens on `127.0.0.1:18080` by default, not `0.0.0.0`.** If
+  agents on other machines, or a reverse proxy in a container, connect to it, set
+  `FIBER_LISTEN=0.0.0.0:18080` (and a real admin password, per the item above). Compose
+  is unaffected: it sets `FIBER_LISTEN` itself. The `fiber-api` image now sets
+  `FIBER_LISTEN=0.0.0.0:8080`, matching its `EXPOSE` and `HEALTHCHECK`; a bare
+  `docker run` of it previously listened on 18080 and reported unhealthy.
+- **Check each agent's registered labels and concurrency against its flags before
+  upgrading.** Until now the agent's own `--labels` / `--concurrency` won at connect and
+  the values on its row (the UI's Agents page, `fiber agents list`) were only applied
+  after an edit. Now the row caps both, so an agent whose flags ask for more than its row
+  gets less than it did:
+  - *Concurrency.* `fiber agents create` and the UI default to **1**; `install-agent.sh`
+    and the Compose agent default to **2**. An agent registered and installed with those
+    defaults ran two steps at once and will now run one. Raise the row:
+    `fiber agents update <id> --concurrency 2`.
+  - *Labels.* A label passed to the agent but missing from its row no longer matches
+    steps. Add it to the row: `fiber agents update <id> --labels os=linux,docker=true`.
+
+  - *No labels on the row.* An agent whose row has no labels at all now receives only
+    steps that require no labels, whatever its own flags say. Find such rows with
+    `SELECT id, name FROM agents WHERE labels = '[]'::jsonb;` and give each the labels it
+    should have.
+
+  The API logs `agent hello asked for more than its registration allows` with the agent
+  id for every agent this affects, each time it connects. Editing a connected agent's row
+  no longer needs a reconnect to be applied correctly: narrowing takes effect at once,
+  widening on the agent's next heartbeat, and never beyond the agent's own flags.
+- **If you rely on `FIBER_GITHUB_TOKEN` in `fiber-api`'s environment, add a project secret
+  before upgrading.** It is no longer read. A project with `pull_request` `paths` /
+  `paths_ignore` filters and no `GITHUB_TOKEN` secret of its own will stop starting those
+  pipelines on pull requests (they skip, as they always have without a token). Add the
+  token to each such project: `fiber secrets set <project-id> GITHUB_TOKEN --value-stdin`.
+  `fiber-api` logs one warning the first time a project needed the environment's token.
+  The docs also said the environment variable was a fallback for commit statuses; it has
+  not been since statuses moved to the project's secret, and they now say so.
 - **The advisory gate can no longer go red unseen.** `deny` only ran on a push or pull
   request, was not a required check, and was not run on a release tag — so with no
   pushes to `main` since early October, the advisories above went unreported. A daily

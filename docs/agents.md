@@ -2,7 +2,7 @@
 
 Agents are outbound WebSocket workers that execute CI steps.
 
-An agent's identity is the token it connected with. The server binds `agent_id` from that token and ignores the `agent_id` carried in messages (a mismatch is logged). Log lines are accepted only for a step **last leased to that agent** (so the tail of a cancelled or reclaimed step is still recorded); artifacts and completions additionally require the lease to be **live** — anything after a reclaim or cancel is dropped, which is the at-least-once contract: the re-leased attempt reports its own result. Artifact restore downloads are limited to runs in which the agent holds a running step. A socket that never sends `Hello` is offered nothing, and pool scope always comes from the agent's database row, never from the connection.
+An agent's identity is the token it connected with. The server binds `agent_id` from that token and ignores the `agent_id` carried in messages (a mismatch is logged). Log lines are accepted only for a step **last leased to that agent** (so the tail of a cancelled or reclaimed step is still recorded); artifacts and completions additionally require the lease to be **live** — anything after a reclaim or cancel is dropped, which is the at-least-once contract: the re-leased attempt reports its own result. Artifact restore downloads are limited to runs in which the agent holds a running step. A socket that never sends `Hello` is offered nothing, and pool scope always comes from the agent's database row, never from the connection. Labels and concurrency are capped by the row too — see [Labels and concurrency](#labels-and-concurrency-the-registration-is-the-ceiling).
 
 A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
@@ -318,6 +318,35 @@ cargo run -p fiber-agent
 
 Connects to `/ws/agent?token=…`, sends `Hello`, then heartbeats every **10s**. Pool scope comes from the token's agent row (not from the client). A `concurrency` below 1 is treated as 1 — an agent that is online but can never be offered anything is a misconfiguration nobody would notice.
 
+### Labels and concurrency: the registration is the ceiling
+
+The agent's row (what you set at **Register**, or later with `PUT /api/agents/{id}` /
+`fiber agents update`) says what the agent **may** do. `--labels` / `--concurrency` on the
+agent (`FIBER_AGENT_LABELS`, `FIBER_AGENT_CONCURRENCY`) say what this host **can** do. The
+agent is registered with what both agree on:
+
+| | Registered with |
+|---|---|
+| Labels | The row's labels that the agent also sent. A label the agent claims but the row lacks is dropped |
+| Concurrency | The smaller of the row's and the agent's (at least 1) |
+
+So to give an agent a new label or more slots, change **both**: the row, and the agent's
+flags. Changing only the agent's flags does nothing, and the API logs a warning naming the
+agent id each time it connects asking for more than its row has
+(`agent hello asked for more than its registration allows`). An agent that claims *less*
+than its row is fine and is offered only what it claimed.
+
+A row with **no labels** (`"labels": []`, `--labels ""`) grants none: whatever the agent
+claims, it is offered only steps that require no labels. Clearing an agent's labels is
+therefore a way to restrict it, not to open it up.
+
+Editing the row of a connected agent takes effect without a reconnect. Removing a label
+or lowering concurrency applies at once on the API replica that handled the edit, and
+within one heartbeat (10 s) on any other. Adding a label or raising concurrency applies
+on the agent's next heartbeat, and only as far as the agent's own flags go.
+
+The UI and `GET /api/agents` show the row, not the effective registration.
+
 ## Label matching
 
 A step is offered only if:
@@ -355,7 +384,7 @@ The server counts an agent's in-flight steps **from the database** (`step_runs` 
 | Server shutdown | On SIGTERM the API sends Close 1012 ("server shutting down") to every agent and waits for the sessions to end (up to 20 s) before exiting; the agent reconnects with its usual backoff and its in-flight steps follow the Disconnect and Reconnect rows — they keep running |
 | Older agent | An agent whose `Hello` has no `protocol_version` cancels its steps on any close, so for it a close is still the end of the attempt: the server requeues its steps at once on disconnect, exactly as before |
 | Token rotate | `POST /api/agents/{id}/rotate-token` — new token once; force-disconnect; old session cannot keep leasing |
-| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged) |
+| Update | `PUT /api/agents/{id}` — name / labels / concurrency (pool unchanged). A connected agent is re-registered as *row ∩ its own flags*: narrowing at once, widening on its next heartbeat |
 | Delete | `DELETE /api/agents/{id}` — disconnect cleanup then delete |
 
 ## Log path

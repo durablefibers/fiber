@@ -127,6 +127,15 @@ impl AgentPresence {
     pub fn release_slot(&mut self) {
         self.reserved = self.reserved.saturating_sub(1);
     }
+
+    /// Cut the registration down to a new ceiling: keep only the labels in
+    /// `allowed_labels`, and no more than `max_concurrency` slots (at least 1). Never
+    /// adds a label or a slot — what is registered is what the agent claimed, capped by
+    /// its row, and this only knows the row.
+    pub fn narrow_to(&mut self, allowed_labels: &[String], max_concurrency: u32) {
+        self.labels.retain(|l| allowed_labels.contains(l));
+        self.concurrency = self.concurrency.min(max_concurrency.max(1));
+    }
 }
 
 /// Envelope on `fiber:agent_cmds`.
@@ -391,6 +400,19 @@ impl Scheduler {
         if let Some(a) = agents.get_mut(&agent_id) {
             a.labels = labels;
             a.concurrency = concurrency.max(1);
+        }
+    }
+
+    /// Apply an edited agent row to a live agent without widening it; see
+    /// [`AgentPresence::narrow_to`]. A no-op for an agent that is not connected here.
+    pub async fn narrow_agent_presence(
+        &self,
+        agent_id: Uuid,
+        allowed_labels: &[String],
+        max_concurrency: u32,
+    ) {
+        if let Some(a) = self.agents.write().await.get_mut(&agent_id) {
+            a.narrow_to(allowed_labels, max_concurrency);
         }
     }
 
@@ -1421,6 +1443,38 @@ mod tests {
             reserved,
             project_id: None,
         }
+    }
+
+    // --- editing a live agent -----------------------------------------------------------
+
+    /// `PUT /api/agents/{id}` used to install the row's labels and concurrency verbatim,
+    /// so widening a row gave a live agent labels it never claimed.
+    #[test]
+    fn an_edited_row_narrows_a_live_agent_and_never_widens_it() {
+        let l = |csv: &str| -> Vec<String> {
+            csv.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut a = presence(2, 1);
+        a.labels = l("os=linux,docker=true");
+
+        // Widened row: more labels, more slots. Nothing the agent did not claim appears.
+        a.narrow_to(&l("os=linux,docker=true,gpu=true,pool=release"), 16);
+        assert_eq!(a.labels, l("os=linux,docker=true"));
+        assert_eq!(a.concurrency, 2);
+
+        // Narrowed row: takes effect at once.
+        a.narrow_to(&l("os=linux"), 1);
+        assert_eq!(a.labels, l("os=linux"));
+        assert_eq!(a.concurrency, 1);
+        assert_eq!(a.reserved, 1, "reservations in flight are not dropped");
+
+        // Cleared labels restrict to label-less steps; a zero is still one slot.
+        a.narrow_to(&[], 0);
+        assert!(a.labels.is_empty());
+        assert_eq!(a.concurrency, 1);
     }
 
     // --- concurrency slots ------------------------------------------------------------
