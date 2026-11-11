@@ -81,7 +81,7 @@ loopback.
   start while the bootstrap admin can still log in with `fiber`. The check asks the
   database, not the environment, so an instance whose password was changed in the UI is
   not refused, and one where only the variable was changed (it applies to an empty
-  database only) is.
+  database only) is. It checks `FIBER_ADMIN_USER` and the literal `admin`.
 
 ### Changed
 

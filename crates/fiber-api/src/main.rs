@@ -47,6 +47,8 @@ const REDIS_BOOT_PROBE: Duration = Duration::from_secs(5);
 /// README, so the address it answers on by default must not be one a network can reach.
 /// A deployment sets `FIBER_LISTEN` (Compose and the image do).
 const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
+/// The bootstrap admin's name when `FIBER_ADMIN_USER` is not set.
+const DEFAULT_ADMIN_USER: &str = "admin";
 /// The bootstrap admin's password when `FIBER_ADMIN_PASSWORD` is not set.
 const DEFAULT_ADMIN_PASSWORD: &str = "fiber";
 
@@ -73,7 +75,7 @@ struct Args {
     #[arg(long, env = "FIBER_ARTIFACTS_DIR", default_value = "./data/artifacts")]
     artifacts_dir: String,
 
-    #[arg(long, env = "FIBER_ADMIN_USER", default_value = "admin")]
+    #[arg(long, env = "FIBER_ADMIN_USER", default_value = DEFAULT_ADMIN_USER)]
     admin_user: String,
 
     #[arg(long, env = "FIBER_ADMIN_PASSWORD", default_value = DEFAULT_ADMIN_PASSWORD)]
@@ -134,6 +136,18 @@ fn default_admin_exposure(
     } else {
         DefaultAdmin::Refuse
     }
+}
+
+/// The accounts that may still hold the published login: the configured bootstrap admin,
+/// and the literal `admin` when the configuration names someone else. An instance
+/// bootstrapped as `admin` / `fiber` whose `FIBER_ADMIN_USER` was later pointed at another
+/// account still has `admin` / `fiber` in its users table.
+fn default_admin_candidates(configured: &str) -> Vec<&str> {
+    let mut names = vec![configured];
+    if configured != DEFAULT_ADMIN_USER {
+        names.push(DEFAULT_ADMIN_USER);
+    }
+    names
 }
 
 /// `FIBER_ALLOW_DEFAULT_ADMIN`: on for `1` or `true`. Compose passes an empty string for
@@ -234,29 +248,34 @@ async fn main() -> Result<()> {
     // Decided before the admin is created, not after: `FIBER_ADMIN_PASSWORD` is applied
     // only to an empty database, so refusing *after* creating `admin` / `fiber` would
     // leave an instance that setting the variable could no longer fix.
-    let default_login_works = if users_existed {
-        store
-            .password_is(&args.admin_user, DEFAULT_ADMIN_PASSWORD)
-            .await?
-    } else {
-        args.admin_password == DEFAULT_ADMIN_PASSWORD
-    };
+    // Which account, if any, the published login opens.
+    let mut default_login: Option<&str> = None;
+    if users_existed {
+        for name in default_admin_candidates(&args.admin_user) {
+            if store.password_is(name, DEFAULT_ADMIN_PASSWORD).await? {
+                default_login = Some(name);
+                break;
+            }
+        }
+    } else if args.admin_password == DEFAULT_ADMIN_PASSWORD {
+        default_login = Some(&args.admin_user);
+    }
     match default_admin_exposure(
         args.listen.ip(),
-        default_login_works,
+        default_login.is_some(),
         flag_is_on(args.allow_default_admin.as_deref()),
     ) {
         DefaultAdmin::Absent => {}
         DefaultAdmin::Warn => tracing::warn!(
-            user = %args.admin_user,
-            "the bootstrap admin can log in with the default password (`fiber`) — change it before exposing this instance"
+            user = default_login.unwrap_or_default(),
+            "this account can log in with the default password (`fiber`) — change it before exposing this instance"
         ),
         DefaultAdmin::Refuse if users_existed => anyhow::bail!(
             "refusing to listen on {}: `{user}` can still log in with the default password `fiber`. \
              Change it (`fiber-api reset-password {user}` works without the server), \
              or listen on a loopback address, or set FIBER_ALLOW_DEFAULT_ADMIN=1 to start anyway",
             args.listen,
-            user = args.admin_user,
+            user = default_login.unwrap_or_default(),
         ),
         DefaultAdmin::Refuse => anyhow::bail!(
             "refusing to listen on {} with the default admin password `fiber`. \
@@ -570,6 +589,15 @@ mod tests {
                 DefaultAdmin::Absent
             );
         }
+    }
+
+    /// Checking only `FIBER_ADMIN_USER` let an instance bootstrapped as `admin` / `fiber`
+    /// boot publicly once the variable named another account.
+    #[test]
+    fn the_literal_admin_is_checked_even_when_another_name_is_configured() {
+        assert_eq!(default_admin_candidates("admin"), ["admin"]);
+        assert_eq!(default_admin_candidates("root"), ["root", "admin"]);
+        assert_eq!(default_admin_candidates("Admin"), ["Admin", "admin"]);
     }
 
     #[test]
