@@ -71,9 +71,13 @@ jobs:
 
       - name: tag matches the workspace version
         id: version
+        # Through the environment, not interpolated into the script: a tag name or a
+        # dispatch input is text someone else chose.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$TAG"
           version=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -87,6 +91,12 @@ jobs:
       # so a tag could publish code that `make check` would have rejected.
       - run: make check
       - run: make test-rust
+
+      # A release must not publish attested binaries and images that carry a known
+      # advisory. v0.6.7 did: `deny` only ran in ci.yml, and nothing ran it on the tag.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
 
   # One native runner per architecture: a Rust build under QEMU is far too slow. Each
   # job pushes an untagged image by digest; `manifest` below joins them into one tag.

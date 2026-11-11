@@ -91,7 +91,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs, on push/PR to `main`:
 | Job | What it runs | Required check |
 |---|---|---|
 | `check` | `make check`, `make test-rust`, `make build`, and `git diff --exit-code Cargo.lock` | yes |
-| `deny` | `cargo deny check` — RustSec advisories, the licence allowlist, crates.io-only sources (`deny.toml`) | no |
+| `deny` | `cargo deny check` — RustSec advisories, the licence allowlist, crates.io-only sources (`deny.toml`) | yes |
 | `ui` | Biome (`pnpm check`), `tsc --noEmit`, vitest, `pnpm build`, and `git diff --exit-code src/routeTree.gen.ts` | yes |
 | `docker` | `docker build` of `deploy/Dockerfile` (both targets) and `apps/ui/Dockerfile.ui` | yes |
 | `smoke` | `scripts/smoke_compose.sh` — the whole Compose stack and one real pipeline | no |
@@ -126,6 +126,11 @@ When `deny` goes red on an advisory, the first move is `cargo update -p <crate>`
 lockfile-only commit. Only if there is genuinely no upgrade path does an entry go in
 `[advisories] ignore`, and it needs the advisory link and a sentence saying why. It is
 not part of `make check`, which has to work without the network.
+
+An advisory against a crate already in `Cargo.lock` arrives without any push, so three
+things keep it from going unseen: `.github/workflows/advisories.yml` runs the advisory
+check on `main` every day, `deny` is a required check, and the release workflow's `verify`
+job runs `cargo deny check` on the tag before anything is built or published.
 
 UI unit tests live next to their modules as `src/**/*.test.ts(x)` and run under `vitest.config.ts` (jsdom; `src/test-setup.ts` installs an in-memory `localStorage`).
 
