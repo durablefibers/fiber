@@ -86,21 +86,45 @@ access to the fork.
 
 A fork's pull request is code written by someone outside the project, while the pipeline
 and its secrets belong to the base repository. Fiber marks such a run **untrusted**
-(`runs.untrusted`) and applies two controls:
+(`runs.untrusted`) and applies three controls:
 
 1. **No project secrets.** No step of the run receives any, whatever its `secrets:` says.
    Provenance that cannot be determined from the payload counts as untrusted, and a retry
    of an untrusted run stays untrusted.
 2. **Project-dedicated agents only.** Untrusted steps are never offered to the global
-   pool — only to an agent bound to that project. If the project has no such agent, the
-   steps stay queued.
+   pool — only to an agent bound to that project, and only to one new enough to apply
+   the third control (0.6.8 or later). If the project has no such agent, the steps stay
+   queued.
+3. **Containers only.** The offer tells the agent the run is untrusted, and the agent
+   never runs such a step on its host shell: a step with an `image:`, on an agent with
+   Docker on, runs in its container; anything else **fails** before a line of the fork's
+   code is checked out. `FIBER_AGENT_ALLOW_HOST_SHELL=true` does not change this — that
+   setting is the operator vouching for the people who can write the pipeline, and a
+   fork's author is not one of them.
 
-**These reduce the blast radius; they do not sandbox the code.** A step still executes as
-the agent's user, so on a shared agent it could read that agent's token out of `/proc` and
-reach other projects' work. Run untrusted pull requests only on an agent you are willing
-to treat as compromised: dedicated to the project, disposable, and ideally running every
-step in a container (`image:`), which is what keeps the agent's own environment out of
-reach.
+So a pipeline that builds fork pull requests needs an `image:` on every step and a
+project agent with `FIBER_AGENT_USE_DOCKER=true`. Two consequences worth knowing before
+the first fork PR arrives:
+
+- **On a shell agent (`FIBER_AGENT_USE_DOCKER=false`) a fork's pull request fails**,
+  every step, with `fork pull request steps only run in containers, and this is a shell
+  agent …` in the step's log and error. That is intended: a shell agent has nowhere to put
+  the code except its own user account. Same-repository pull requests are unaffected.
+- A step without `image:` fails the same way on a Docker agent, even one that allows host
+  shell for the project's own runs.
+
+The third control is carried out by the agent, and an agent older than 0.6.8 (protocol
+revision below 3) does not know the flag — it would run the step on its host. So the
+server does not offer it one: **a fork pull request's steps wait in `queued` until an
+agent at 0.6.8 or later is online in the project's pool.** Nothing fails and nothing is
+leased in the meantime; an older agent in the same pool keeps taking the project's own
+runs, and the server logs one warning when such an agent connects. If a fork's pull
+request sits queued with a project agent online, check that agent's version.
+
+**These reduce the blast radius; they do not sandbox the code.** A container shares the
+host's kernel, has the network unless `FIBER_AGENT_DOCKER_NETWORK=none`, and writes to a
+workspace the agent later reads. Run untrusted pull requests only on an agent you are
+willing to treat as compromised: dedicated to the project and disposable.
 
 A step that needs a secret will fail on a fork's pull request. That is the intended
 outcome — do the privileged part on `push` to a branch you control, after review.

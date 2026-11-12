@@ -6,8 +6,58 @@ minor versions may carry breaking changes.
 
 ## [Unreleased]
 
+**Breaking: a Docker agent no longer runs a step without `image:`.** It used to run it on
+the agent's host shell without being asked; now the step fails, saying so. Add `image:` to
+the step, or put the old behaviour back with one line on the agent:
+`FIBER_AGENT_ALLOW_HOST_SHELL=true`. `FIBER_AGENT_USE_DOCKER` defaults to `true` in the
+binary, so an agent started without it is a Docker agent and is affected. Shell agents
+(`FIBER_AGENT_USE_DOCKER=false` — the published image, the plain Compose `agent` profile,
+`install-agent.sh` without `--docker`, `make agent`) are unchanged for the project's own
+runs. **A fork's pull request now runs in containers or
+fails** — on a shell agent it fails, every step, and no setting changes that.
+
+Wire: `Offer` gains `untrusted` (defaulted, so 0.6.7 agents and servers keep working with
+the new ones) and `PROTOCOL_VERSION` is now `3`. The fork-PR control is carried out
+by the agent, so the server offers a fork pull request's steps only to an agent that
+declared revision 3: **until a project agent at this release is online, those steps wait
+in `queued`.** Upgrade the agents, not only the API.
+
 ### Security
 
+- **A step without `image:` ran on the host of a Docker agent, as the agent's user.** An
+  agent with `FIBER_AGENT_USE_DOCKER=true` ran a step in a container only when the step
+  named an image, and dropped every other step to its own shell, with no way to refuse.
+  On the `agent-docker` Compose profile that shell is root with the engine's socket
+  mounted, so any project `writer` had root on the Docker host by leaving `image:` out —
+  and so did the author of a fork's pull request, through any imageless step that runs a
+  script from the repository.
+  - `FIBER_AGENT_ALLOW_HOST_SHELL` decides whether an agent runs steps on its host. Unset,
+    it is `false` on a Docker agent and `true` on a shell agent. It takes `true`, `false`,
+    `1` or `0`; anything else stops the agent at startup rather than meaning one of them.
+  - A refused step fails before anything is cloned or restored, with the remedy in its
+    log and its error: ``this agent runs steps in containers only: add `image:` to the
+    step, or set FIBER_AGENT_ALLOW_HOST_SHELL=true on the agent``.
+  - The `agent-docker` Compose profile pins it to `false`. The pin only takes effect when
+    the agent image is this release or later: the profile builds `FROM` the published
+    `fiber-agent:${FIBER_VERSION}`, and a 0.6.7 binary ignores the variable silently.
+    Rebuild the service, then confirm in its startup log a line beginning `steps run in
+    containers only`.
+  - An agent installed with `install-agent.sh --docker` gets the refusing default with no
+    extra flag. A `FIBER_AGENT_ALLOW_HOST_SHELL` line added to `/etc/fiber/agent.env` is
+    kept across re-runs of the installer.
+
+  [agents](docs/agents.md#steps-that-would-run-on-the-host).
+- **A fork's pull request never runs on an agent's host shell.** The offer now tells the
+  agent the run is untrusted, and the agent runs such a step in a container or fails it —
+  `FIBER_AGENT_ALLOW_HOST_SHELL=true` does not apply. A fork PR therefore needs an
+  `image:` on every step and a project agent with Docker on; on a shell agent it fails
+  with `fork pull request steps only run in containers, and this is a shell agent …`.
+  That is the intended outcome: a shell agent has nowhere to run the code but its own
+  account. An agent older than this release does not know the flag, so the server does
+  not offer it such a step: a project agent whose `Hello` declares a protocol revision
+  below 3 is passed over, the step stays `queued` rather than failing, and the server
+  warns once when that agent connects. The agent keeps taking the project's own runs.
+  [triggers](docs/triggers.md#pull-requests-from-forks).
 - **Seven RustSec advisories in the lockfile, all fixed by upgrades.** `rustls` 0.23.46
   (RUSTSEC-2026-0346 to -0349), `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382: certificate
   verification could accept a distrusted intermediate), `tokio` 1.54.1 (RUSTSEC-2026-0386)
@@ -23,6 +73,15 @@ minor versions may carry breaking changes.
   workflow runs `cargo deny check` before it builds anything.
 - The release workflow passes the tag to its version check through the environment
   rather than interpolating it into the script.
+- **The Compose agents carry a label each: `docker=true` on the `agent-docker` profile,
+  `executor=shell` on the plain `agent` profile,** both appended to `FIBER_AGENT_LABELS`.
+  An `image:` step asks for `docker=true` to reach the Docker agent. A step without
+  `image:` asks for `executor=shell` to stay off it — `docker=true` alone does not keep
+  it away, since a step matches any agent that has every label it asks for.
+  [agents](docs/agents.md#steps-that-would-run-on-the-host).
+- **`smoke-runs` covers the refusal.** Its fork-PR check now expects a shell agent to
+  refuse the run, then — where a Docker engine is available — runs the same pull request
+  in a container to check it gets no secrets.
 
 ## [0.6.7] — 2026-10-01
 

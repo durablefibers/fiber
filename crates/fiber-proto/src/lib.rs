@@ -19,7 +19,18 @@ pub mod validate;
 ///   accepts everything revision 1 did; a server that does not know `LogBatch` would
 ///   answer `Error { "invalid message" }` and lose the output, which is why the revision
 ///   is on the wire even though nothing gates on it yet.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - `3` — the agent reads `untrusted` on [`ServerMessage::Offer`] and never runs such a
+///   step on its host shell: it runs in a container or fails the step. It also refuses a
+///   step with no `image` when it is a Docker agent, unless its operator set
+///   `FIBER_AGENT_ALLOW_HOST_SHELL=true`. The server gates on this one: see
+///   [`UNTRUSTED_OFFER_PROTOCOL`].
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The revision from which an agent honours `untrusted` on [`ServerMessage::Offer`]. The
+/// server offers a step of an untrusted run only to an agent whose `Hello` declared this
+/// or later: an older one would ignore the flag and run a fork's pull request on its
+/// host, so for it the step stays queued until an agent that qualifies is online.
+pub const UNTRUSTED_OFFER_PROTOCOL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,6 +415,15 @@ pub enum ServerMessage {
         /// unless the server exports OpenTelemetry, and ignored by older agents.
         #[serde(default)]
         traceparent: Option<String>,
+        /// The run builds code from outside the project (a fork's pull request). An
+        /// agent that reads this never runs such a step on its host shell, whatever
+        /// `FIBER_AGENT_ALLOW_HOST_SHELL` says: it runs in a container or fails. Absent
+        /// from older servers, which the agent reads as the old contract — a trusted
+        /// run. An agent below [`UNTRUSTED_OFFER_PROTOCOL`] would ignore it and run the
+        /// step as before, so the server never sends such an agent an offer with this
+        /// set: the step waits in the queue for one that declared that revision.
+        #[serde(default)]
+        untrusted: bool,
     },
     Cancel {
         step_run_id: Uuid,
@@ -716,8 +736,9 @@ mod tests {
 
     #[test]
     fn an_offer_from_an_older_server_omits_the_newer_fields() {
-        // timeout_minutes / secret_keys / traceparent / working_directory / shell are all
-        // `#[serde(default)]` precisely so a mixed-version deploy keeps working.
+        // timeout_minutes / secret_keys / traceparent / working_directory / shell /
+        // untrusted are all `#[serde(default)]` precisely so a mixed-version deploy keeps
+        // working.
         let minimal = json!({
             "type": "offer",
             "step_run_id": Uuid::nil(),
@@ -738,11 +759,15 @@ mod tests {
             shell,
             artifacts,
             restore,
+            untrusted,
             ..
         } = msg
         else {
             panic!("expected an offer");
         };
+        // An older server cannot say a run is a fork's: absent reads as trusted, which is
+        // what that server's agents did with it anyway.
+        assert!(!untrusted);
         assert_eq!(timeout_minutes, None);
         assert!(secret_keys.is_empty());
         assert_eq!(traceparent, None);
@@ -750,6 +775,41 @@ mod tests {
         assert_eq!(shell, None);
         assert!(artifacts.is_empty());
         assert!(restore.is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_offer_says_so_on_the_wire() {
+        // The agent refuses host shell on this field alone, so it has to survive the trip
+        // under this exact name; an older agent skips a key it does not know.
+        let offer = ServerMessage::Offer {
+            step_run_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            step_id: "build".into(),
+            step_name: "Build".into(),
+            image: None,
+            run: "make".into(),
+            workspace: None,
+            env: vec![],
+            attempt: Some(1),
+            artifacts: vec![],
+            restore: vec![],
+            timeout_minutes: None,
+            working_directory: None,
+            shell: None,
+            secret_keys: vec![],
+            traceparent: None,
+            untrusted: true,
+        };
+        let v = serde_json::to_value(&offer).unwrap();
+        assert_eq!(v["untrusted"], json!(true));
+        let back: ServerMessage = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::Offer {
+                untrusted: true,
+                ..
+            }
+        ));
     }
 
     #[test]

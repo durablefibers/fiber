@@ -281,7 +281,9 @@ services:
       FIBER_API_URL: ws://fiber-api:8080
       FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
       FIBER_AGENT_NAME: ${FIBER_AGENT_NAME:-compose}
-      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
+      # `executor=shell` is what a step without `image:` asks for to stay off the
+      # agent-docker profile's agent, which has every other label this one does.
+      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux},executor=shell
       FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
       RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
       # `image:` steps need the docker CLI and the socket, which this image deliberately
@@ -299,7 +301,20 @@ services:
 
   # Optional worker for pipelines with `image:` steps:
   # `docker compose --profile agent-docker up -d fiber-agent-docker`. Same token and labels
-  # as fiber-agent (run one or the other). It gets the Docker socket — root on the host.
+  # as fiber-agent (run one or the other), plus `docker=true`. It gets the Docker socket —
+  # root on the host.
+  #
+  # Which is why FIBER_AGENT_ALLOW_HOST_SHELL is pinned to false here rather than read
+  # from .env: a step without `image:` would run in THIS container, as root, next to that
+  # socket. Such a step is refused; give it an `image:` or run it on the plain agent.
+  # The pin needs an agent binary that knows the variable: the image is built FROM
+  # fiber-agent:${FIBER_VERSION}, and 0.6.7 or older ignores it silently. Confirm with
+  # the startup log line "steps run in containers only".
+  #
+  # `docker=true` lets an `image:` step ask for this agent. It does NOT keep a step
+  # without `image:` away: a step matches any agent holding every label it asks for, and
+  # this agent holds all of the plain agent's. An imageless step opts out by asking for
+  # `executor=shell`, which only the plain agent has.
   #
   # The workspace is bound at the SAME absolute path inside this container and on the
   # Docker host. Steps run as `docker run -v <workspace>/<step>:/workspace`, and the daemon
@@ -321,9 +336,10 @@ services:
       FIBER_API_URL: ws://fiber-api:8080
       FIBER_AGENT_TOKEN: ${FIBER_AGENT_TOKEN:-}
       FIBER_AGENT_NAME: ${FIBER_AGENT_NAME:-compose}
-      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux}
+      FIBER_AGENT_LABELS: ${FIBER_AGENT_LABELS:-os=linux},docker=true
       FIBER_AGENT_CONCURRENCY: ${FIBER_AGENT_CONCURRENCY:-2}
       FIBER_AGENT_USE_DOCKER: "true"
+      FIBER_AGENT_ALLOW_HOST_SHELL: "false"
       FIBER_AGENT_WORKSPACE_DIR: ${FIBER_AGENT_DOCKER_WORKSPACE:-/var/lib/fiber/workspaces}
       RUST_LOG: ${RUST_LOG:-info,fiber_agent=info}
     volumes:

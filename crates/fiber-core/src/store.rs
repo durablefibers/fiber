@@ -2353,10 +2353,17 @@ impl Store {
     /// steps whose labels the agent satisfies (`labels <@ agent labels`; an empty
     /// requirement is contained in anything), so a long run of steps for some *other*
     /// kind of agent cannot push this agent's work past the scan limit.
+    ///
+    /// `include_untrusted` is false for a project agent too old to honour the offer's
+    /// `untrusted` flag (it would run the fork's step on its host). Filtered here, in the
+    /// query, for the same scan-limit reason: untrusted steps this agent may not take
+    /// must not fill the window ahead of the trusted ones it may. Nothing is leased and
+    /// nothing fails — the steps stay queued for an agent that qualifies.
     pub async fn list_queued_steps_for_pool(
         &self,
         agent_project_id: Option<Uuid>,
         agent_labels: &[String],
+        include_untrusted: bool,
     ) -> Result<Vec<StepRun>> {
         if let Some(pid) = agent_project_id {
             Ok(sqlx::query_as::<_, StepRun>(AssertSqlSafe(format!(
@@ -2366,11 +2373,13 @@ impl Store {
                  WHERE s.status = 'queued' AND r.project_id = $1
                    AND (s.not_before IS NULL OR s.not_before <= NOW())
                    AND s.labels <@ $2
+                   AND ($3 OR NOT r.untrusted)
                  ORDER BY s.queued_at, s.id
                  LIMIT {QUEUE_SCAN_LIMIT}"
             )))
             .bind(pid)
             .bind(json!(agent_labels))
+            .bind(include_untrusted)
             .fetch_all(&self.pool)
             .await?)
         } else {
