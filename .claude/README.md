@@ -15,7 +15,7 @@ Verify after any change here:
 
 ```bash
 python3 .claude/validate.py      # frontmatter, spec compliance, hook registration
-bash .claude/hooks/selftest.sh   # 24 deny/allow cases against the guard hooks
+bash .claude/hooks/selftest.sh   # 53 deny/allow cases against the guard hooks
 ```
 
 ## Skills — the procedures
@@ -48,8 +48,8 @@ Delegate work that needs its own context. Claude routes on the `description`, or
 | `fiber-devops` | inherit | Compose, Dockerfiles, CI workflow, ports, deploys |
 | `fiber-docs-syncer` | inherit | Fixes docs drift against the code |
 | `fiber-smoke-runner` | inherit | Runs the smokes, triages to a cause |
-| `fiber-reviewer` | opus | Reviews a diff against the real invariants (read-only) |
-| `fiber-security-reviewer` | opus | Auth, secrets, tokens, webhooks, artifacts (read-only) |
+| `fiber-reviewer` | inherit | Reviews a diff against the real invariants (read-only) |
+| `fiber-security-reviewer` | inherit | Auth, secrets, tokens, webhooks, artifacts (read-only) |
 | `fiber-dx-reviewer` | sonnet | Onboarding friction and the five files that drift (read-only) |
 
 The three reviewers have no `Edit`/`Write` — they report, you decide.
@@ -62,7 +62,7 @@ Deterministic, so they do not depend on the model remembering. Wired in `setting
 
 | Hook | Event | Does |
 |---|---|---|
-| `guard-bash.sh` | PreToolUse(Bash) | Denies the argv-pattern kill that also kills this session's parent shell; denies volume-destroying Compose teardown; denies writes to *committed* migrations; denies wholesale deletion of `data/workspaces` or `data/artifacts` |
+| `guard-bash.sh` | PreToolUse(Bash) | Denies the argv-pattern kill that also kills this session's parent shell (also inside `sh -c` and behind `xargs`); denies volume-destroying teardown under Docker or Podman, by Compose or by `volume rm`/`prune`; denies writing, copying or moving onto *committed* migrations, and deleting them; denies wholesale deletion of `data/`, `data/workspaces` or `data/artifacts` |
 | `guard-edits.sh` | PreToolUse(Edit\|Write) | Denies edits to applied migrations, `routeTree.gen.ts`, `data/`, `dist/`, `target/`, `Cargo.lock` |
 | `fmt-rust.sh` | PostToolUse(Edit\|Write) | `rustfmt` on edited `.rs` using the repo's `rustfmt.toml`, keeping `cargo fmt --check` green |
 | `fmt-ui.sh` | PostToolUse(Edit\|Write) | Biome (not Prettier) on edited `apps/ui` files |
@@ -79,4 +79,4 @@ Two design notes. `guard-bash.sh` strips heredoc bodies before matching, so *doc
 - **New agent**: `agents/<name>.md` with `name` and `description`. Reviewers should omit `Edit`/`Write`.
 - **New hook**: add the script to `hooks/`, `chmod +x`, register it in `settings.json`, and add deny *and* allow cases to `selftest.sh` — a guard that blocks legitimate work is worse than no guard.
 
-Run `python3 .claude/validate.py` before committing changes to this directory.
+Run `python3 .claude/validate.py` before committing changes to this directory. It also fails when a brief names a repository path that no longer exists, or when the counts in this file drift; CI runs it and the hook selftest in the `check` job.

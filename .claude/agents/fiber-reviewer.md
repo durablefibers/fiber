@@ -2,7 +2,7 @@
 name: fiber-reviewer
 description: Reviews changed code against Fiber's real invariants — at-least-once replay safety, role gates, snapshot immutability, migration hygiene, cross-crate wire-type drift. Use proactively after implementing a change and before committing.
 tools: Read, Grep, Glob, Bash
-model: opus
+model: inherit
 color: yellow
 ---
 
