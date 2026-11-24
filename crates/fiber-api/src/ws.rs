@@ -188,12 +188,11 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
         Some(s) => {
             artifacts = snapshot_str_list(s.get("artifacts"));
             env.extend(snapshot_env(s.get("env")));
-            timeout_minutes = s
-                .get("timeout_minutes")
-                .and_then(|v| v.as_u64())
-                // Out of range falls back to the default below; `as u32` wrapped 2^32 to
-                // 0, which the agent reads as no deadline at all.
-                .and_then(|m| u32::try_from(m).ok());
+            // The same reading the server's timeout sweep makes of it, so the agent
+            // and the backstop work to one deadline: clamped to a year when too large
+            // (`as u32` once wrapped 2^32 to 0, which the agent reads as no deadline
+            // at all), and the default below when it is not a timeout.
+            timeout_minutes = fiber_core::dag::stored_timeout_minutes(s.get("timeout_minutes"));
             // Re-checked here rather than trusted from the snapshot: it was
             // validated when the pipeline compiled, but a snapshot is a stored
             // document and this is the last point before it reaches an agent.
