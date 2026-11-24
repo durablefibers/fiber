@@ -27,7 +27,13 @@ yanked = "deny"
 unmaintained = "workspace"
 # Every entry needs a reason and a link, and is a statement that there is no upgrade
 # path yet — not a way to make the job green.
-ignore = []
+ignore = [
+  # chrono is unmaintained. It is not a vulnerability and no version is unaffected: chrono is
+  # used directly across the crates, and by `cron`, whose schedules are expressed in it.
+  # Remove this when chrono leaves the tree. A vulnerability in chrono would be a separate
+  # advisory and still fail.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, no upgrade exists: https://rustsec.org/advisories/RUSTSEC-2026-0543" },
+]
 
 [licenses]
 # Derived from the tree, not guessed: this list is exactly the set of identifiers needed

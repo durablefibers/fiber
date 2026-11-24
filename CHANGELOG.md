@@ -24,6 +24,9 @@ in `queued`.** Upgrade the agents, not only the API.
 
 ### Security
 
+- `url` 2.5.8 → 2.5.9 (RUSTSEC-2026-0592: stack overflow in `Url::origin()` on nested
+  `blob:` URLs). RUSTSEC-2026-0543 (chrono is unmaintained) is accepted in `deny.toml`: no
+  fixed version exists.
 - **A step without `image:` ran on the host of a Docker agent, as the agent's user.** An
   agent with `FIBER_AGENT_USE_DOCKER=true` ran a step in a container only when the step
   named an image, and dropped every other step to its own shell, with no way to refuse.
