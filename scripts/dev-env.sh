@@ -44,6 +44,10 @@ export FIBER_AGENT_WORKSPACE_DIR="${FIBER_AGENT_WORKSPACE_DIR:-$ROOT/data/worksp
 # export FIBER_AGENT_ENV_PASSTHROUGH=SSH_AUTH_SOCK
 # export FIBER_AGENT_DOCKER_NETWORK=none
 export FIBER_AGENT_USE_DOCKER="${FIBER_AGENT_USE_DOCKER:-false}"
+# Left unset on purpose: the agent's default follows FIBER_AGENT_USE_DOCKER (host shell
+# allowed for a shell agent, refused for a Docker one). Set it only to run steps without
+# `image:` on a Docker agent.
+# export FIBER_AGENT_ALLOW_HOST_SHELL=true
 export FIBER_AGENT_NAME="${FIBER_AGENT_NAME:-local}"
 export FIBER_AGENT_LABELS="${FIBER_AGENT_LABELS:-os=linux}"
 export FIBER_AGENT_CONCURRENCY="${FIBER_AGENT_CONCURRENCY:-1}"

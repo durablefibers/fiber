@@ -5,7 +5,9 @@ pipeline that no longer compiles, a step timeout, fork-PR isolation, and one dur
 Needs an agent already online with `os=linux` (CI's smoke-host starts one; locally see
 docs/development.md), and `psql` for the one check that has to break a stored definition
 the API would refuse to save. The fork-PR check starts its own project-scoped agent from
-`target/debug/fiber-agent` and stops it by PID afterwards.
+`target/debug/fiber-agent` and stops it by PID afterwards — once as a shell agent, which
+must refuse the run, and once as a Docker agent (when `docker info` works; it pulls
+`alpine:3`), which must run it in a container with no secrets.
 """
 from __future__ import annotations
 
@@ -224,10 +226,13 @@ def main() -> None:
         req("POST", f"/api/projects/{pid}/secrets", token, {"key": "SMOKE_SECRET", "value": "s3cret"})
         pr_secret = "smoke-runs-pr"
         req("PUT", f"/api/projects/{pid}/webhooks/github", token, {"secret": pr_secret})
+        # `image:` because a fork's pull request runs in a container or not at all. A shell
+        # agent ignores it, so the same-repository run below still runs on the host.
         create_pipeline(token, pid, "pr", {
             "name": "pr",
             "on": {"pull_request": {"branches": ["main"]}},
             "steps": [{"id": "probe", "name": "probe", "needs": [], "labels": labels,
+                       "image": "alpine:3",
                        "run": '[ -n "$SMOKE_SECRET" ] && echo has-secret || echo no-secret'}],
         })
         # Same repository: trusted, so any agent runs it and the secret is there. This is
@@ -249,23 +254,59 @@ def main() -> None:
         code, scoped = req("POST", "/api/agents", token,
                            {"name": "smoke-runs-scoped", "labels": labels, "concurrency": 1, "project_id": pid})
         check("create a project-scoped agent", code == 201, scoped)
-        env = dict(os.environ, FIBER_AGENT_TOKEN=scoped["token"], FIBER_API_URL=WS,
-                   FIBER_AGENT_USE_DOCKER="false", FIBER_AGENT_LABELS=",".join(labels),
-                   FIBER_AGENT_NAME="smoke-runs-scoped",
-                   FIBER_AGENT_WORKSPACE_DIR=os.path.join(tempfile.gettempdir(), "fiber-smoke-runs-ws"))
-        agent = subprocess.Popen([os.path.join(ROOT, "target/debug/fiber-agent")], env=env,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            fork = wait_run(token, fork_run)
-            probe = steps_by_id(fork)["probe"]
-            check("the project's own agent runs it, without the project's secrets",
-                  fork["run"]["status"] == "succeeded"
-                  and any("no-secret" in l["data"] for l in log_lines(token, probe["id"])),
-                  [l["data"] for l in log_lines(token, probe["id"])])
-        finally:
+
+        def scoped_agent(use_docker: bool) -> subprocess.Popen:
+            env = dict(os.environ, FIBER_AGENT_TOKEN=scoped["token"], FIBER_API_URL=WS,
+                       FIBER_AGENT_USE_DOCKER="true" if use_docker else "false",
+                       FIBER_AGENT_LABELS=",".join(labels), FIBER_AGENT_NAME="smoke-runs-scoped",
+                       FIBER_AGENT_WORKSPACE_DIR=os.path.join(tempfile.gettempdir(), "fiber-smoke-runs-ws"))
+            # Whatever the caller's shell exports, this agent takes the default for its mode.
+            env.pop("FIBER_AGENT_ALLOW_HOST_SHELL", None)
+            return subprocess.Popen([os.path.join(ROOT, "target/debug/fiber-agent")], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def stop(agent: subprocess.Popen) -> None:
             # By PID, never by name: a pattern can match the shell that started this.
             agent.send_signal(signal.SIGTERM)
             agent.wait(timeout=30)
+
+        try:
+            # A shell agent has nowhere to run a fork's code but its own account, so it
+            # refuses — even though the step names an image, which a shell agent ignores.
+            agent = scoped_agent(use_docker=False)
+            try:
+                fork = wait_run(token, fork_run)
+            finally:
+                stop(agent)
+            probe = steps_by_id(fork)["probe"]
+            check("the project's shell agent refuses to run a fork's PR on its host",
+                  fork["run"]["status"] == "failed"
+                  and "fork pull request steps only run in containers" in (probe.get("error") or ""),
+                  (fork["run"]["status"], probe.get("error")))
+
+            # In a container it runs, and without the project's secrets. Needs an engine,
+            # which CI's smoke host has; skipped out loud where there is none.
+            try:
+                have_docker = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                have_docker = False
+            if have_docker:
+                fork_run = pull_request(pid, pr_secret, "mallory/fork", 43)["started"][0]
+                agent = scoped_agent(use_docker=True)
+                try:
+                    # Longer than the default: the first run pulls the image.
+                    fork = wait_run(token, fork_run, timeout=240)
+                finally:
+                    stop(agent)
+                probe = steps_by_id(fork)["probe"]
+                check("the project's docker agent runs it in a container, without the project's secrets",
+                      fork["run"]["status"] == "succeeded"
+                      and any("no-secret" in l["data"] for l in log_lines(token, probe["id"])),
+                      [l["data"] for l in log_lines(token, probe["id"])])
+            else:
+                print("SKIP the project's docker agent runs a fork's PR in a container: no docker engine here")
+        finally:
             req("DELETE", f"/api/agents/{scoped['agent']['id']}", token)
 
         # ---- one durable fiber runs to completion ------------------------------------

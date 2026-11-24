@@ -6,7 +6,7 @@ An agent's identity is the token it connected with. The server binds `agent_id` 
 
 A lease belongs to the agent, not to the socket. A step keeps running through a lost connection — an API restart, a proxy timeout, a network blip — and the agent renews its leases on its first heartbeat back; the server judges every late message by the row (is the step still `running` under this agent, on the attempt the message names?), never by which session it arrived on. Every `Offer` carries the attempt number and the agent echoes it on each log batch, artifact, and completion — and on the HTTP artifact routes, as `X-Fiber-Attempt` on the upload and an `attempt` field in the presign and complete bodies ([api](./api.md#agent-endpoints)) — so output an agent held through a reclaim can never be filed under, overwrite, or close the attempt that replaced it; a message whose attempt is not the row's is dropped with a warning, and an upload for one is refused with `401`. A log line the agent re-sends after an aborted write can appear twice: `log_lines` is append-only with no dedupe. See [Lifecycle](#lifecycle) for the limits.
 
-`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **2**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path).
+`Hello` carries `protocol_version` (`fiber_proto::PROTOCOL_VERSION`, currently **3**; absent from older agents, read as `0`). The server logs it and uses it to tell an agent that keeps its steps across sessions (1 and up) from one that cancels them on any close (0), and a later server may refuse a revision it no longer supports. It is not yet stored on the agent row. `Welcome` carries the **server's** revision the same way, and the agent reads its absence as "older than `log_batch`" and sends one `log_chunk` per line to that server — so a rolling deploy in either order keeps a build's log, though **upgrade the API before the agents** remains the supported direction. Revision 2 adds batched log messages; see [Log path](#log-path). Revision 3 means the agent reads `untrusted` on an `Offer` and never runs a fork pull request's step on its host shell, and that a Docker agent refuses a step without `image:` unless told otherwise; see [Executor](#executor). `untrusted` is absent from an older server, which the agent reads as a trusted run. An older agent would ignore it, so the server gates on the revision (`fiber_proto::UNTRUSTED_OFFER_PROTOCOL`): a step of an untrusted run is offered only to a project agent whose `Hello` declared 3 or later, and otherwise stays `queued` — it is not leased and does not fail — until such an agent (0.6.8+) is online in the project's pool. The server warns once per session when a project agent below that revision connects.
 
 ## Pools
 
@@ -79,7 +79,10 @@ Two details that are not decoration:
 Downloads the release binary for the host architecture, creates the `fiber` system user,
 writes `/etc/fiber/agent.env` (mode `0640`, root-owned so the token is not world-readable),
 installs [`deploy/fiber-agent.service`](../deploy/fiber-agent.service), and enables it. Add
-`--docker` to allow `image:` steps (adds `fiber` to the `docker` group). `--uninstall`
+`--docker` to allow `image:` steps (adds `fiber` to the `docker` group); an agent installed
+that way runs steps in containers only and refuses one without `image:` — see
+[Executor](#executor). A `FIBER_AGENT_ALLOW_HOST_SHELL` line you add to `agent.env` is
+kept by the next run of the installer. `--uninstall`
 removes the service, keeping `/etc/fiber` and `/var/lib/fiber`.
 
 #### What it verifies
@@ -275,7 +278,22 @@ docker compose -f deploy/docker-compose.yml --profile agent up -d fiber-agent
 
 Pipelines with `image:` steps need the `agent-docker` profile instead. It builds the
 published agent plus the Docker CLI locally (`deploy/agent-docker.Dockerfile`), mounts the
-engine's socket, and runs as root, because the socket is root on the host anyway:
+engine's socket, and runs as root, because the socket is root on the host anyway. For
+that reason it runs steps **in containers only**: `FIBER_AGENT_ALLOW_HOST_SHELL` is pinned
+to `false` in the Compose file, so a step without `image:` is refused rather than run as
+root inside the agent's container, next to the socket.
+
+**The pin only works on an agent that knows the variable.** The profile's image is built
+`FROM` the published `fiber-agent:${FIBER_VERSION}`, and a 0.6.7 or older binary ignores
+`FIBER_AGENT_ALLOW_HOST_SHELL` without a word and runs imageless steps on its host as
+before. Set `FIBER_VERSION` to this release or later, rebuild the service, and confirm it
+took effect: the agent's startup log (`docker compose … logs fiber-agent-docker`) has a
+line beginning `steps run in containers only`. No such line means the old binary.
+
+It registers with `FIBER_AGENT_LABELS` plus `docker=true`, and the plain `agent` profile
+with `FIBER_AGENT_LABELS` plus `executor=shell`. See
+[Steps that would run on the host](#steps-that-would-run-on-the-host) for what those two
+labels do and do not route.
 
 ```bash
 echo "FIBER_AGENT_DOCKER_WORKSPACE=/var/lib/fiber/workspaces" >> deploy/.env
@@ -309,6 +327,8 @@ export FIBER_AGENT_NAME=local
 export FIBER_AGENT_LABELS=os=linux,docker=true
 export FIBER_AGENT_CONCURRENCY=1
 export FIBER_AGENT_USE_DOCKER=true   # false = host shell
+# With Docker on, a step without `image:` is refused. To run those on this host instead:
+# export FIBER_AGENT_ALLOW_HOST_SHELL=true
 export FIBER_AGENT_WORKSPACE_DIR=./data/workspaces
 cargo run -p fiber-agent
 # or: cargo run -p fiber-cli -- agent --token "$FIBER_AGENT_TOKEN"
@@ -420,8 +440,75 @@ repeat is identifiable.
 
 ## Executor
 
-- **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the step's workspace directory.
-- **Docker**: if `image` is set and docker mode is on, runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client. The image is checked against the docker reference grammar and passed after `--`, so a pipeline cannot smuggle a `docker run` flag through it.
+- **Shell** (`FIBER_AGENT_USE_DOCKER=false`): runs `run` in the step's workspace directory, on the host, as the agent's user. A step's `image:` is ignored.
+- **Docker** (`FIBER_AGENT_USE_DOCKER=true`, the binary's default): if `image` is set, runs inside the image with the workspace mounted, as a named container (`fiber-step-<uuid>`) so cancel and timeout `docker kill` it rather than only the client. The image is checked against the docker reference grammar and passed after `--`, so a pipeline cannot smuggle a `docker run` flag through it.
+
+### Steps that would run on the host
+
+A step runs on the host shell when it has no `image:`, or when the agent is a shell agent.
+The host shell is the agent's own user, with whatever that user can reach — on a Docker
+agent that includes the Docker engine, which is root on the host. So the agent decides,
+before it clones anything, whether a step may run there:
+
+| Step | Agent | `FIBER_AGENT_ALLOW_HOST_SHELL` | Run from a fork's pull request? | Outcome |
+|---|---|---|---|---|
+| has `image:` | Docker | any | either | container |
+| no `image:` | Docker | unset or `false` | no | **refused** |
+| no `image:` | Docker | `true` | no | host shell |
+| no `image:` | Docker | any | yes | **refused** |
+| either | shell | unset or `true` | no | host shell |
+| either | shell | any | yes | **refused** |
+
+`FIBER_AGENT_ALLOW_HOST_SHELL` defaults to `true` on a shell agent, where the host is all
+there is, and to `false` on a Docker agent. Set it to `true` on a Docker agent to run
+steps without `image:` on its host — that is the operator saying everyone who can write
+this agent's pipelines may act as the agent's user. It accepts `true`, `false`, `1` and
+`0`; anything else stops the agent at startup, and so does `false` on a shell agent, which
+could then run nothing.
+
+A fork's pull request is never run on the host shell, and the setting does not change
+that: its author is not someone the operator vouched for. Its steps need an `image:` and a
+project agent with Docker on. On a shell agent they fail, by design. The server offers
+them only to a project agent at 0.6.8 or later (protocol revision 3), since an older one
+would not know to refuse; until one is online they wait in `queued` — see
+[triggers](./triggers.md#pull-requests-from-forks).
+
+A refused step fails, and a retry on the same agent fails the same way. With `retries: N`
+a refused step is leased again up to N times, each to whichever matching agent has a free
+slot — so in a pool that mixes agents it may be refused N more times, or land on an agent
+that accepts it and pass. Its log and its `error` say which case it was and what to
+change; nothing is cloned or restored first:
+
+```text
+this agent runs steps in containers only: add `image:` to the step, or set FIBER_AGENT_ALLOW_HOST_SHELL=true on the agent
+fork pull request steps only run in containers: this run builds code from outside the project and the step has no `image:` …
+fork pull request steps only run in containers, and this is a shell agent (FIBER_AGENT_USE_DOCKER=false) …
+```
+
+Labels decide which agent a step reaches, and a step matches an agent that has **every**
+label the step asks for — extra labels on the agent do not exclude it. So a label that
+only the Docker agent carries (`docker=true`, which the Compose `agent-docker` profile
+adds) lets an `image:` step opt **in** to it; it does not keep a step without `image:`
+away, because that step asks for nothing the Docker agent lacks. To keep it away, the
+shell agent needs a label of its own that the Docker agent does not have, and the step
+has to ask for it. The Compose `agent` profile adds `executor=shell` for this:
+
+```yaml
+steps:
+  build:
+    image: rust:1-bookworm
+    labels: [os=linux, docker=true]     # only a Docker agent
+  notify:
+    run: ./scripts/notify.sh
+    labels: [os=linux, executor=shell]  # only a shell agent
+```
+
+A step that asks for neither can be leased by either kind of agent, and fails if the
+Docker agent gets it first. Agents you start yourself carry only the labels you give them
+in `FIBER_AGENT_LABELS`.
+
+Releases up to 0.6.7 ran a step without `image:` on a Docker agent's host without being
+asked, and ran a fork's pull request on the host shell like any other run.
 
 Process groups: cancel kills the step's process group so grandchildren die too.
 
@@ -471,7 +558,7 @@ Steps run repo-supplied shell, so the agent narrows what is reachable:
 | **Container limits** | `--security-opt no-new-privileges` and `--pids-limit 512` by default, plus `--user`, `--network`, `--memory`, `--cpus` from `FIBER_AGENT_DOCKER_*`. Memory and CPU limits are off unless set; whatever applies is printed as a `system` log line so an exit 137 is diagnosable |
 | **Workspace** | One directory per step, deleted when the step finishes — including on cancel, timeout, or failure. The run's tree goes when its last step on this agent finishes; anything older than `FIBER_AGENT_WORKSPACE_TTL_HOURS` (24) is swept at startup |
 | **Artifacts** | Only those produced by the steps this one transitively `needs` — enforced when the offer is built *and* again when the agent asks to download one |
-| **Untrusted runs** | A fork's pull request is offered only to agents bound to that project, never to the global pool, and receives no secrets — see [triggers](./triggers.md#pull-requests-from-forks) |
+| **Untrusted runs** | A fork's pull request is offered only to agents bound to that project, never to the global pool, receives no secrets, and runs in a container or not at all ([Executor](#steps-that-would-run-on-the-host)) — see [triggers](./triggers.md#pull-requests-from-forks) |
 
 A step with a git workspace is cloned from one reference clone per run, so a second step
 costs a local object copy rather than another fetch, and the checkout is self-contained
