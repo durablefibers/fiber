@@ -3577,6 +3577,92 @@ mod propagate_tests {
         }
     }
 
+    /// Writes golden vectors (`make vectors`) when `FIBER_VECTORS_OUT` names a file:
+    /// random runs, planned once and to a fixpoint. Ignored because it only emits.
+    #[test]
+    #[ignore = "emits conformance/vectors/transitions.json"]
+    fn emit_transition_vectors() {
+        let Ok(path) = std::env::var("FIBER_VECTORS_OUT") else {
+            return;
+        };
+        let mut seed = 7u64;
+        let mut below = |n: u64| {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) % n
+        };
+        let statuses = [
+            StepStatus::Pending,
+            StepStatus::Pending,
+            StepStatus::Pending,
+            StepStatus::Queued,
+            StepStatus::Running,
+            StepStatus::Succeeded,
+            StepStatus::Succeeded,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::Skipped,
+        ];
+        let ifs = [
+            None,
+            None,
+            Some("always()"),
+            Some(" always() "),
+            Some("never()"),
+            Some("success()"),
+            Some("os == 'linux'"),
+            Some("os == 'mac'"),
+            Some("bogus"),
+        ];
+        let show = |plan: &[(usize, Transition)]| -> Vec<Value> {
+            plan.iter()
+                .map(|(i, t)| match t {
+                    Transition::Queue => json!([i, "queue"]),
+                    Transition::Skip(r) => json!([i, "skip", r]),
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for _ in 0..2000 {
+            let n = 1 + below(7) as usize;
+            let mut steps = Vec::new();
+            let mut snap = Vec::new();
+            for i in 0..n {
+                let needs: Vec<String> = (0..i)
+                    .filter(|_| below(3) == 0)
+                    .map(|j| format!("s{j}"))
+                    .collect();
+                let refs: Vec<&str> = needs.iter().map(String::as_str).collect();
+                let status = statuses[below(statuses.len() as u64) as usize];
+                steps.push(step(&format!("s{i}"), status, &refs));
+                snap.push(json!({
+                    "id": format!("s{i}"),
+                    "if": ifs[below(ifs.len() as u64) as usize],
+                    "env": [["os", "linux"]],
+                    "continue_on_error": below(4) == 0,
+                }));
+            }
+            // Half the runs are declared dependents-first: taint has to reach a step that
+            // appears before the failure it inherits.
+            if below(2) == 0 {
+                steps.reverse();
+                snap.reverse();
+            }
+            let input: Vec<Value> = steps
+                .iter()
+                .map(|s| json!({"step_id": s.step_id, "status": s.status, "needs": s.needs}))
+                .collect();
+            let snap = Value::Array(snap);
+            let first = show(&plan_transitions(&steps, &snap));
+            run_to_fixpoint(&mut steps, &snap);
+            let end: Vec<&str> = steps.iter().map(|s| s.status.as_str()).collect();
+            out.push(json!({"steps": input, "snapshot": snap, "first": first, "end": end}));
+        }
+        std::fs::write(path, serde_json::to_string(&out).unwrap()).unwrap();
+    }
+
     #[test]
     fn queues_when_all_needs_succeeded() {
         let mut steps = vec![

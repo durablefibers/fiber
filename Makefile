@@ -172,3 +172,10 @@ smoke-compose:
 # its own, so anything needing the agent you already have must run before it.
 smoke: smoke-authz smoke-artifacts smoke-concurrency smoke-runs smoke-pools
 	@echo "Run smoke-s3 / smoke-compose separately as needed"
+
+# --- Golden vectors ------------------------------------------------------------------
+.PHONY: vectors
+
+vectors: ## Regenerate conformance/vectors from the Rust implementation
+	cargo run -q -p fiber-core --example emit_vectors > conformance/vectors/core.json
+	FIBER_VECTORS_OUT=$(CURDIR)/conformance/vectors/transitions.json cargo test -q -p fiber-core emit_transition_vectors -- --ignored
