@@ -29,8 +29,6 @@ argon2 = { workspace = true }
 aes-gcm = { workspace = true }
 zeroize = { workspace = true }
 getrandom = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
 
 [lints]

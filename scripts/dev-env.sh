@@ -8,7 +8,10 @@ export FIBER_ROOT="$ROOT"
 
 export FIBER_DATABASE_URL="${FIBER_DATABASE_URL:-postgres://fiber:fiber@127.0.0.1:15432/fiber}"
 export FIBER_REDIS_URL="${FIBER_REDIS_URL:-redis://:${FIBER_REDIS_PASSWORD:-fiber}@127.0.0.1:16379}"
-export FIBER_LISTEN="${FIBER_LISTEN:-0.0.0.0:18080}"
+# Loopback. To serve other machines set FIBER_LISTEN=0.0.0.0:18080 — fiber-api then
+# refuses to start while admin/fiber still works, unless FIBER_ALLOW_DEFAULT_ADMIN=1.
+export FIBER_LISTEN="${FIBER_LISTEN:-127.0.0.1:18080}"
+# export FIBER_ALLOW_DEFAULT_ADMIN=1
 export FIBER_ARTIFACTS_DIR="${FIBER_ARTIFACTS_DIR:-$ROOT/data/artifacts}"
 export FIBER_ADMIN_USER="${FIBER_ADMIN_USER:-admin}"
 export FIBER_ADMIN_PASSWORD="${FIBER_ADMIN_PASSWORD:-fiber}"
@@ -26,7 +29,8 @@ export RUST_LOG="${RUST_LOG:-info,fiber_api=info,fiber_agent=info}"
 # export FIBER_STEP_TIMEOUT_DEFAULT_MINUTES=60
 # export FIBER_STEP_TIMEOUT_GRACE_MINUTES=5
 
-# Optional secrets encryption (generate once: openssl rand -hex 32)
+# Optional secrets encryption (generate once: openssl rand -hex 32). Set but not 64 hex
+# characters is a boot error, not plaintext.
 # export FIBER_SECRETS_KEY=...
 
 # Optional S3 store (make infra-s3 first)

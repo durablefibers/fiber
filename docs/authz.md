@@ -6,12 +6,21 @@
 - `Authorization: Bearer <token>` on API calls  
 - `POST /api/auth/logout` invalidates the session  
 - Passwords: **argon2id** (legacy SHA-256 hashes verify and upgrade on login)  
-- Brute-force guard: 10 failed logins for a username within 10 minutes → that username is locked for 60 s (`429` + `Retry-After`; ~10 guesses/minute sustained). Keyed by username, so a known username can be held locked by an attacker — accepted over IP keying, which is spoofable behind a proxy  
-- Default bootstrap user: `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` (admin / fiber) — also the first **instance admin**
+- Brute-force guard: 10 failed logins for a username within 10 minutes → that username is locked for 60 s (`429` + `Retry-After`). An attempt is reserved **before** the password is verified, and attempts still being verified count against the same 10, so parallel requests cannot outrun the lockout: at most 10 guesses per username before it locks, then at most 10 per 60 s. Keyed by username, so a known username can be held locked by an attacker — accepted over IP keying, which is spoofable behind a proxy
+- Password hashing is bounded process-wide: at most **4** argon2id hashes or verifies run at once, across login, password change, and user creation. They run off the async workers, so a login flood cannot stall agent heartbeats, and a slot is held until the hash finishes even if the request that started it has gone. A request that finds all four busy waits its turn (first come, first served) for up to 5 s, then gets `503` with `Retry-After` and "server busy; nothing was checked" — never the `429` of a lockout, and never counted as a failed login. So a flood of made-up usernames slows logins down rather than refusing them: a real login waits roughly *(requests queued ahead ÷ 4) × one verify* (tens of milliseconds each). A flood that sustains more verifies than four slots can clear will push that past 5 s; rate-limit `/api/auth/login` per client at the reverse proxy to close that, since the API does not trust a forwarded client address
+- Every wrong login costs one argon2id verify — unknown username, wrong password, or an account still on a legacy SHA-256 hash — so response time does not reveal which usernames exist
+- The guard is in memory and per process: a restart clears it, and each `fiber-api` replica counts separately. It tracks up to 10,000 usernames; past that it drops expired entries, then those with the fewest failures — a flood of made-up usernames evicts itself before a real account's count
+- Default bootstrap user: `FIBER_ADMIN_USER` / `FIBER_ADMIN_PASSWORD` (admin / fiber) — also the first **instance admin**. `fiber-api` listens on loopback by default and refuses to start on any other address while that default password still works, unless `FIBER_ALLOW_DEFAULT_ADMIN=1`
 
 WebSocket `/ws/runs/{id}` takes the session token in the `Sec-WebSocket-Protocol` header as `fiber.token.<session>` (never the query string) and requires **reader** on the run’s project.
 
 Agent auth uses a separate agent token (`/ws/agent?token=` or Bearer on agent HTTP routes).
+The token decides **which** agent a connection is; the agent's database row decides what
+that agent may be offered. Pool scope comes from the row alone. Labels and concurrency are
+capped by the row: a connecting agent is registered with the row's labels that it also
+claims and the smaller of the two concurrencies, so holding a token does not let its
+holder claim labels or slots the agent was not registered with. A row with no labels
+grants none. See [agents](./agents.md#labels-and-concurrency-the-registration-is-the-ceiling).
 
 ## Roles
 
@@ -68,7 +77,7 @@ CLI: `fiber members …` — [cli.md](./cli.md).
 
 Project secrets (`POST/GET/DELETE /api/projects/{id}/secrets`) inject as env vars, except into runs built from a fork's pull request, which get none — see [triggers](./triggers.md). By default every step of the project receives all of them; a step can narrow that with `secrets:` in the pipeline (see [pipeline-yaml](./pipeline-yaml.md)). Agents mask secret values in log lines and pass them to containers through a private env-file rather than the command line.
 
-- At rest: AES-GCM when `FIBER_SECRETS_KEY` is 64 hex chars; otherwise plaintext (dev warning)
+- At rest: AES-GCM when `FIBER_SECRETS_KEY` is 64 hex chars; plaintext when it is unset (dev warning). A key that is set but invalid stops the API at boot — it is never treated as unset
 - Admins+ only to list/mutate
 - Special: `GITHUB_TOKEN` / `FIBER_GITHUB_TOKEN` used for PR file listing — see [Triggers](./triggers.md)
 

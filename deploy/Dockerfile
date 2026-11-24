@@ -40,7 +40,12 @@ RUN useradd --create-home --uid 10001 fiber \
     && chown -R 10001:10001 /data/artifacts
 USER 10001
 WORKDIR /home/fiber
-ENV FIBER_ARTIFACTS_DIR=/data/artifacts
+# The binary's own default is loopback, which inside a container reaches nobody; this
+# matches EXPOSE and the HEALTHCHECK below. On this address fiber-api refuses to start
+# while the admin password is the default, so a bare `docker run` needs
+# -e FIBER_ADMIN_PASSWORD=...
+ENV FIBER_ARTIFACTS_DIR=/data/artifacts \
+    FIBER_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 # /ready, not /health: it is the probe that means "Postgres answers and the background
 # loops are running". Compose overrides the timings; this is for a bare `docker run`.

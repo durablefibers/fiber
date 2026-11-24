@@ -34,11 +34,17 @@ on:
 
 PR webhooks do **not** include file lists. When path filters are set, Fiber lists files via the GitHub API:
 
-1. Project secret `GITHUB_TOKEN` or `FIBER_GITHUB_TOKEN`, else env `FIBER_GITHUB_TOKEN` / `GITHUB_TOKEN`
+1. Project secret `GITHUB_TOKEN` or `FIBER_GITHUB_TOKEN` (read access to the repository's pull requests). **Only** the project's secret: an environment variable of that name on `fiber-api` is not a fallback
 2. `GET /repos/{owner}/{repo}/pulls/{n}/files` (paginated)
 3. Optional `FIBER_GITHUB_API_URL` for GitHub Enterprise (default `https://api.github.com`)
 
 Without a token (and without embedded `changed_files` in a test payload), path-filtered PR pipelines **skip**.
+
+The token is per project because the repository it is spent on is named by the webhook
+payload, and the payload is trusted on the strength of the project's webhook secret —
+which the project's own admins set. An instance-wide token would be usable by any of
+them against any repository it can read. Up to 0.6.7 the environment variable was such a
+fallback; `fiber-api` now logs one warning if it is set and a project needed it.
 
 ## Schedules
 
@@ -72,8 +78,9 @@ A run started by a webhook records the commit that triggered it (`head_sha`, `he
 - The status links to the run page when `FIBER_PUBLIC_URL` is set.
 
 Posting needs a token with `repo:status` — a project secret `GITHUB_TOKEN` /
-`FIBER_GITHUB_TOKEN`, or the same environment variables on `fiber-api`. Without one,
-runs still work and the status is simply not posted. A failure to post never fails a run.
+`FIBER_GITHUB_TOKEN`. The environment variables of the same name on `fiber-api` are not
+used. Without a token, runs still work and the status is simply not posted. A failure to
+post never fails a run.
 
 ## What gets built
 

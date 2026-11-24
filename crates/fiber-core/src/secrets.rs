@@ -2,6 +2,10 @@
 //!
 //! Set `FIBER_SECRETS_KEY` to a 64-char hex string (32 bytes). When unset, values
 //! are stored plaintext (local/dev). Ciphertext is prefixed with `enc:v1:`.
+//!
+//! Unset and unusable are different things. A key that is set but is not 64 hex
+//! characters is an error — at boot, and on every encrypt or decrypt — never a quiet
+//! fall back to plaintext: an operator who set a key believes their secrets are encrypted.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -13,43 +17,73 @@ use zeroize::Zeroizing;
 
 const PREFIX: &str = "enc:v1:";
 
-static KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+static KEY: OnceLock<Result<Option<[u8; 32]>, KeyError>> = OnceLock::new();
 
-fn load_key() -> Option<[u8; 32]> {
-    let raw = std::env::var("FIBER_SECRETS_KEY").ok()?;
-    let raw = raw.trim();
+/// Why a `FIBER_SECRETS_KEY` that is set cannot be used. Carries a length, never the
+/// value: this ends up in a boot log.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
+    #[error(
+        "FIBER_SECRETS_KEY is set but is not hexadecimal ({chars} characters; it must be exactly 64 hex characters — generate one with `openssl rand -hex 32`, and check for quotes or stray characters)"
+    )]
+    NotHex { chars: usize },
+    #[error(
+        "FIBER_SECRETS_KEY is set but is {chars} hex characters long; it must be exactly 64 (32 bytes) — generate one with `openssl rand -hex 32`"
+    )]
+    WrongLength { chars: usize },
+}
+
+/// The key in `raw`, the value of `FIBER_SECRETS_KEY`.
+///
+/// `Ok(None)` only when there is no key at all — unset, empty, or whitespace (Compose
+/// passes an empty string for an unset variable). Anything else that is not 64 hex
+/// characters is an error. It used to be `None` as well, which logged the same "unset
+/// (dev only)" line as a missing key and stored every secret written afterwards in
+/// plaintext.
+pub fn parse_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, KeyError> {
+    let raw = raw.unwrap_or_default().trim();
     if raw.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let bytes = hex::decode(raw).ok()?;
-    if bytes.len() != 32 {
-        tracing::warn!(
-            len = bytes.len(),
-            "FIBER_SECRETS_KEY must be 32 bytes (64 hex chars); ignoring"
-        );
-        return None;
+    if !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(KeyError::NotHex {
+            chars: raw.chars().count(),
+        });
     }
     let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Some(key)
+    hex::decode_to_slice(raw, &mut key).map_err(|_| KeyError::WrongLength { chars: raw.len() })?;
+    Ok(Some(key))
 }
 
-fn key() -> Option<&'static [u8; 32]> {
-    KEY.get_or_init(load_key).as_ref()
+fn key_from_env() -> Result<Option<[u8; 32]>, KeyError> {
+    match std::env::var("FIBER_SECRETS_KEY") {
+        Ok(raw) => parse_key(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(KeyError::NotHex { chars: raw.len() }),
+    }
 }
 
-/// Call once at process start so missing-key warning is visible.
-pub fn init_from_env() {
-    match key() {
+fn key() -> Result<Option<&'static [u8; 32]>, KeyError> {
+    match KEY.get_or_init(key_from_env) {
+        Ok(key) => Ok(key.as_ref()),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// Call once at process start: an unusable key stops the boot, and a missing one is
+/// warned about where it will be seen.
+pub fn init_from_env() -> Result<(), KeyError> {
+    match key()? {
         Some(_) => tracing::info!("project secrets encryption enabled (FIBER_SECRETS_KEY)"),
         None => tracing::warn!(
             "FIBER_SECRETS_KEY unset — project secrets stored in plaintext (dev only)"
         ),
     }
+    Ok(())
 }
 
 pub fn encrypt_secret(plaintext: &str) -> Result<String> {
-    let Some(k) = key() else {
+    let Some(k) = key()? else {
         return Ok(plaintext.to_string());
     };
     encrypt_with(k, plaintext)
@@ -60,7 +94,7 @@ pub fn decrypt_secret(stored: &str) -> Result<String> {
         // Plaintext (legacy / no key).
         return Ok(stored.to_string());
     }
-    let Some(k) = key() else {
+    let Some(k) = key()? else {
         return Err(anyhow!(
             "encrypted secret found but FIBER_SECRETS_KEY is not set"
         ));
@@ -119,6 +153,56 @@ mod tests {
 
     const KEY_A: [u8; 32] = [7u8; 32];
     const KEY_B: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn no_key_is_allowed_and_means_plaintext() {
+        for raw in [None, Some(""), Some("   "), Some("\n")] {
+            assert_eq!(parse_key(raw), Ok(None), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_64_hex_key_is_accepted_in_either_case_and_trimmed() {
+        let lower = "07".repeat(32);
+        assert_eq!(parse_key(Some(&lower)), Ok(Some(KEY_A)));
+        assert_eq!(parse_key(Some(&format!("  {lower}\n"))), Ok(Some(KEY_A)));
+        assert_eq!(parse_key(Some(&"AB".repeat(32))), Ok(Some([0xab; 32])));
+    }
+
+    /// The fail-open this replaces: each of these was treated as "unset", and secrets
+    /// were then written in plaintext under a key the operator believed was in force.
+    #[test]
+    fn a_key_that_is_set_but_unusable_is_an_error_not_no_key() {
+        let hex64 = "07".repeat(32);
+        for (raw, want) in [
+            (hex64[..63].to_string(), KeyError::WrongLength { chars: 63 }),
+            (hex64[..62].to_string(), KeyError::WrongLength { chars: 62 }),
+            (format!("{hex64}07"), KeyError::WrongLength { chars: 66 }),
+            ("abcd".to_string(), KeyError::WrongLength { chars: 4 }),
+            (format!("\"{hex64}\""), KeyError::NotHex { chars: 66 }),
+            (
+                "correct horse battery staple".to_string(),
+                KeyError::NotHex { chars: 28 },
+            ),
+            (
+                format!("{}zz", &hex64[..62]),
+                KeyError::NotHex { chars: 64 },
+            ),
+        ] {
+            assert_eq!(parse_key(Some(&raw)), Err(want), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_key_error_names_the_problem_and_never_the_value() {
+        let secretish = "s3cr3t-value-that-is-not-hex";
+        for raw in [secretish.to_string(), "deadbeefcafe".to_string()] {
+            let msg = parse_key(Some(&raw)).unwrap_err().to_string();
+            assert!(msg.contains("FIBER_SECRETS_KEY"), "{msg}");
+            assert!(msg.contains("openssl rand -hex 32"), "{msg}");
+            assert!(!msg.contains(&raw), "{msg}");
+        }
+    }
 
     /// Written by aes-gcm 0.10 with `KEY_A`. Secrets already in the database were
     /// encrypted by whatever version was current when they were written, so a crate
@@ -227,7 +311,7 @@ mod tests {
     #[test]
     fn an_encrypted_value_without_a_configured_key_is_an_error_not_a_leak() {
         // Never hand the raw ciphertext back to a step as if it were the secret.
-        if key().is_none() {
+        if matches!(key(), Ok(None)) {
             let sealed = encrypt_with(&KEY_A, "hunter2").unwrap();
             let err = decrypt_secret(&sealed).unwrap_err().to_string();
             assert!(err.contains("FIBER_SECRETS_KEY is not set"), "{err}");
@@ -236,18 +320,9 @@ mod tests {
 
     #[test]
     fn without_a_key_the_env_facing_api_stores_plaintext() {
-        if key().is_none() {
+        if matches!(key(), Ok(None)) {
             assert_eq!(encrypt_secret("hello").unwrap(), "hello");
             assert_eq!(decrypt_secret("hello").unwrap(), "hello");
         }
-    }
-
-    #[test]
-    fn load_key_accepts_exactly_thirty_two_bytes_of_hex() {
-        // `load_key` reads the env directly; exercise the parsing rules it applies by
-        // driving the same hex decode, since the OnceLock can only be set once.
-        assert_eq!(hex::decode("ab".repeat(32)).unwrap().len(), 32);
-        assert_ne!(hex::decode("ab".repeat(16)).unwrap().len(), 32);
-        assert!(hex::decode("zz".repeat(32)).is_err());
     }
 }

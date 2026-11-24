@@ -9,9 +9,13 @@ ok() { echo "OK  $*"; }
 fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
 
 # The deployment profile expects deploy/.env; supply throwaway values when absent.
-# The four credentials are required by deploy/docker-compose.yml (no working defaults),
-# so without these exports `docker compose` refuses to interpolate the file at all.
-# FIBER_ADMIN_PASSWORD has to stay `fiber`: _compose_pipeline.py logs in with it.
+# The four credentials and the secrets key are required by deploy/docker-compose.yml
+# (no working defaults), so without these exports `docker compose` refuses to
+# interpolate the file at all.
+# FIBER_ADMIN_PASSWORD has to stay `fiber`: _compose_pipeline.py logs in with it. The
+# containerised fiber-api listens on 0.0.0.0 and would refuse to start with that
+# password, so say that it is meant here.
+export FIBER_ALLOW_DEFAULT_ADMIN="${FIBER_ALLOW_DEFAULT_ADMIN:-1}"
 export FIBER_SECRETS_KEY="${FIBER_SECRETS_KEY:-$(openssl rand -hex 32)}"
 export FIBER_POSTGRES_PASSWORD="${FIBER_POSTGRES_PASSWORD:-fiber}"
 export FIBER_REDIS_PASSWORD="${FIBER_REDIS_PASSWORD:-fiber}"

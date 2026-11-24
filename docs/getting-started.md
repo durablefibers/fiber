@@ -83,7 +83,7 @@ Now **fill in the four credentials** in `deploy/.env` — `FIBER_POSTGRES_PASSWO
 `FIBER_ADMIN_PASSWORD`. They have no defaults on purpose; Compose refuses to read the
 file until each one has a value, naming the one it is missing. The S3 pair is only used
 by the optional S3 profile, but it still needs a placeholder. Then generate the
-secrets key and start:
+secrets key, which Compose also requires, and start:
 
 ```bash
 sed -i'' -e "s/^FIBER_SECRETS_KEY=.*/FIBER_SECRETS_KEY=$(openssl rand -hex 32)/" deploy/.env   # keep a backup of this key
@@ -96,7 +96,7 @@ first boot of an empty database.
 Everything binds to `127.0.0.1` by default; see [operations → Deployment](./operations.md#deployment) for the reverse-proxy / TLS setup and how to expose it. Artifacts go to the local filesystem (a Docker volume); add `--profile s3` and `FIBER_S3_BUCKET=fiber-artifacts` for the S3 path. See [Artifacts](./artifacts.md).
 
 To run pipelines on the Compose stack, add a worker: create an agent (Agents page or
-`fiber agents create --name compose --labels os=linux`), put its token in `deploy/.env` as
+`fiber agents create --name compose --labels os=linux,executor=shell,docker=true`), put its token in `deploy/.env` as
 `FIBER_AGENT_TOKEN`, then:
 
 ```bash

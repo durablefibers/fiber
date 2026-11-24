@@ -6,50 +6,86 @@ use tracing::{info, warn};
 
 const DEFAULT_API: &str = "https://api.github.com";
 
-/// A token for **writing** a commit status: project secrets only.
-///
-/// Deliberately not `resolve_token`, whose environment fallback belongs to whoever runs
-/// `fiber-api`. Writing with that would let any project admin point a pipeline at a
-/// repository they do not own and post statuses to it under the instance's identity.
-pub async fn resolve_status_token(
-    store: &fiber_core::Store,
-    project_id: uuid::Uuid,
-) -> Result<Option<String>> {
-    for key in ["GITHUB_TOKEN", "FIBER_GITHUB_TOKEN"] {
-        if let Some(v) = store.get_secret_plain(project_id, key).await? {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Ok(Some(v));
-            }
-        }
-    }
-    Ok(None)
+/// Project secrets that may hold a GitHub token, in the order they are tried.
+const PROJECT_TOKEN_SECRETS: [&str; 2] = ["GITHUB_TOKEN", "FIBER_GITHUB_TOKEN"];
+/// Environment variables that used to be an instance-wide fallback. Read now only to
+/// tell the operator they are no longer used.
+const INSTANCE_TOKEN_ENV: [&str; 2] = ["FIBER_GITHUB_TOKEN", "GITHUB_TOKEN"];
+
+/// Which token a GitHub call made for a project uses.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenChoice {
+    /// The project's own secret.
+    Project(String),
+    /// The project has none, so the call is not made. `instance_token_ignored` says the
+    /// process environment holds one that was deliberately not used.
+    None { instance_token_ignored: bool },
 }
 
-/// Resolve a token for read-only GitHub API calls (the PR file list).
-/// Order: project secrets `GITHUB_TOKEN` / `FIBER_GITHUB_TOKEN`, then env
-/// `FIBER_GITHUB_TOKEN` / `GITHUB_TOKEN`.
-pub async fn resolve_token(
+/// The project's own token, or nothing — never the instance's.
+///
+/// The token is spent on a repository named by a webhook body (`repository.full_name`).
+/// The signature on that body proves only that the sender holds the project's webhook
+/// secret, and a project admin sets that secret themselves; any logged-in user can create
+/// a project and be its admin. With an instance-wide fallback, such a user could sign a
+/// `pull_request` payload naming a repository they cannot see and read from the response
+/// (`files_source`, `changed_files`, which path-filtered pipelines started) what the
+/// instance's token can. Requiring the payload's repository to match a pipeline's
+/// `workspace.repo` would not help: the same user writes the pipeline.
+///
+/// A project's secret is set by the same people who set its webhook secret, so spending
+/// it on a repository they name gives them nothing they did not have.
+fn select_token(
+    project_secrets: &[Option<String>],
+    instance_env: &[Option<String>],
+) -> TokenChoice {
+    fn first(values: &[Option<String>]) -> Option<String> {
+        values
+            .iter()
+            .flatten()
+            .map(|v| v.trim())
+            .find(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+    match first(project_secrets) {
+        Some(token) => TokenChoice::Project(token),
+        None => TokenChoice::None {
+            instance_token_ignored: first(instance_env).is_some(),
+        },
+    }
+}
+
+/// A token for GitHub API calls made on a project's behalf — the PR file list and commit
+/// statuses: the project secret `GITHUB_TOKEN` / `FIBER_GITHUB_TOKEN`, and nothing else.
+/// See [`select_token`] for why the process environment is not a fallback.
+pub async fn resolve_project_token(
     store: &fiber_core::Store,
     project_id: uuid::Uuid,
 ) -> Result<Option<String>> {
-    for key in ["GITHUB_TOKEN", "FIBER_GITHUB_TOKEN"] {
-        if let Some(v) = store.get_secret_plain(project_id, key).await? {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Ok(Some(v));
+    let mut project_secrets = Vec::with_capacity(PROJECT_TOKEN_SECRETS.len());
+    for key in PROJECT_TOKEN_SECRETS {
+        project_secrets.push(store.get_secret_plain(project_id, key).await?);
+    }
+    let instance_env = INSTANCE_TOKEN_ENV.map(|key| std::env::var(key).ok());
+    match select_token(&project_secrets, &instance_env) {
+        TokenChoice::Project(token) => Ok(Some(token)),
+        TokenChoice::None {
+            instance_token_ignored,
+        } => {
+            if instance_token_ignored {
+                // Once: this is an upgrade note, not an event.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!(
+                        %project_id,
+                        "FIBER_GITHUB_TOKEN / GITHUB_TOKEN in the environment is no longer used as a fallback; \
+                         set a project secret GITHUB_TOKEN for PR path filters and commit statuses"
+                    );
+                });
             }
+            Ok(None)
         }
     }
-    for key in ["FIBER_GITHUB_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(v) = std::env::var(key) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Ok(Some(v));
-            }
-        }
-    }
-    Ok(None)
 }
 
 pub fn api_base() -> String {
@@ -273,7 +309,7 @@ pub async fn report_run_status(store: &fiber_core::Store, run: &fiber_core::Run)
         warn!(%full_name, "refusing to post a status for an implausible repo or sha");
         return;
     }
-    let token = match resolve_status_token(store, run.project_id).await {
+    let token = match resolve_project_token(store, run.project_id).await {
         Ok(Some(t)) => t,
         Ok(None) => return,
         Err(e) => {
@@ -338,6 +374,47 @@ pub async fn report_run_status(store: &fiber_core::Store, run: &fiber_core::Run)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    /// The hole: a project with no token of its own borrowed the instance's, for a
+    /// repository its own webhook payload named.
+    #[test]
+    fn the_instance_token_is_never_chosen() {
+        assert_eq!(
+            select_token(&[None, None], &[some("ghp_instance"), None]),
+            TokenChoice::None {
+                instance_token_ignored: true
+            }
+        );
+        assert_eq!(
+            select_token(&[some("  "), None], &[None, some("ghp_instance")]),
+            TokenChoice::None {
+                instance_token_ignored: true
+            },
+            "a blank project secret is not a token, and still does not fall through"
+        );
+        assert_eq!(
+            select_token(&[None, None], &[None, some(" ")]),
+            TokenChoice::None {
+                instance_token_ignored: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_project_secret_is_used_trimmed_and_in_order() {
+        assert_eq!(
+            select_token(&[some(" ghp_a\n"), some("ghp_b")], &[some("ghp_instance")]),
+            TokenChoice::Project("ghp_a".into())
+        );
+        assert_eq!(
+            select_token(&[some(""), some("ghp_b")], &[]),
+            TokenChoice::Project("ghp_b".into())
+        );
+    }
 
     #[test]
     fn repo_from_remote_handles_common_forms() {

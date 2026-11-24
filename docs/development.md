@@ -11,6 +11,16 @@ docker compose -f deploy/docker-compose.yml up -d fiber-postgres fiber-redis
 make infra-s3
 ```
 
+`make infra` (and `make down`) supply throwaway credentials themselves — **unless you
+have a `deploy/.env`**, which then wins outright. Compose now requires
+`FIBER_SECRETS_KEY` there, so a `deploy/.env` written before that fails every `make`
+target that runs Compose with `required variable FIBER_SECRETS_KEY is missing a value`.
+Add one (this replaces an empty line and leaves a set one alone):
+
+```bash
+grep -q '^FIBER_SECRETS_KEY=.' deploy/.env || { sed -i.bak '/^FIBER_SECRETS_KEY=/d' deploy/.env; echo "FIBER_SECRETS_KEY=$(openssl rand -hex 32)" >> deploy/.env; }
+```
+
 Copy [`.env.example`](../.env.example) into your shell, or always use:
 
 ```bash

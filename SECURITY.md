@@ -49,7 +49,8 @@ boundaries are.
   Docker engine, so such a step is root on the host. A Docker agent refuses those steps
   by default.
 - **Defaults are for a local trial, not the internet.** `admin` / `fiber`, no secrets
-  encryption key, everything on loopback. [docs/operations.md](docs/operations.md#deployment)
+  encryption key, everything on loopback — `fiber-api` included, which also refuses to
+  start on any other address while `admin` / `fiber` still works. [docs/operations.md](docs/operations.md#deployment)
   describes what to change before exposing an instance.
 
 ## Hardening a deployment
