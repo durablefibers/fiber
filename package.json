@@ -1,0 +1,12 @@
+{
+  "name": "@fiber/workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "check": "biome check packages conformance",
+    "typecheck": "pnpm -r --filter './packages/*' typecheck",
+    "test": "pnpm -r --filter './packages/*' test"
+  },
+  "devDependencies": { "@biomejs/biome": "2.5.14" }
+}

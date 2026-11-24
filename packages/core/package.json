@@ -1,0 +1,22 @@
+{
+  "name": "@fiber/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fiber/proto": "workspace:*",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vitest": "5.0.1",
+    "@types/node": "24.10.1"
+  }
+}
