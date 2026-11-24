@@ -173,15 +173,9 @@ smoke-compose:
 smoke: smoke-authz smoke-artifacts smoke-concurrency smoke-runs smoke-pools
 	@echo "Run smoke-s3 / smoke-compose separately as needed"
 
-# --- TypeScript packages -------------------------------------------------------------
-.PHONY: ts-check ts-vectors
+# --- Golden vectors ------------------------------------------------------------------
+.PHONY: vectors
 
-ts-check: ## TypeScript gate: Biome, tsc, vitest with golden vectors
-	pnpm install --frozen-lockfile --ignore-scripts
-	pnpm check
-	pnpm typecheck
-	pnpm test
-
-ts-vectors: ## Regenerate golden vectors from the Rust implementation
+vectors: ## Regenerate conformance/vectors from the Rust implementation
 	cargo run -q -p fiber-core --example emit_vectors > conformance/vectors/core.json
 	FIBER_VECTORS_OUT=$(CURDIR)/conformance/vectors/transitions.json cargo test -q -p fiber-core emit_transition_vectors -- --ignored

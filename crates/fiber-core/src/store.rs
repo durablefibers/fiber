@@ -3577,7 +3577,7 @@ mod propagate_tests {
         }
     }
 
-    /// Writes golden vectors for the TypeScript port when `FIBER_VECTORS_OUT` names a file:
+    /// Writes golden vectors (`make vectors`) when `FIBER_VECTORS_OUT` names a file:
     /// random runs, planned once and to a fixpoint. Ignored because it only emits.
     #[test]
     #[ignore = "emits conformance/vectors/transitions.json"]

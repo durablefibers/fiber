@@ -1,4 +1,0 @@
-# apps/ui keeps its own lockfile until it joins the workspace in the control-plane phase.
-packages:
-  - "packages/*"
-minimumReleaseAge: 1440

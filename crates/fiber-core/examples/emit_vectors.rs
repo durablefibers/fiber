@@ -1,6 +1,5 @@
-//! Emit golden vectors for the TypeScript port: `cargo run -p fiber-core --example
-//! emit_vectors > conformance/vectors/core.json`. Inputs are fixed or come from a seeded
-//! generator, so the output only changes when the behaviour does.
+//! Emit golden vectors (`make vectors`). Inputs are fixed or come from a seeded generator, so
+//! the output only changes when the behaviour does.
 
 use chrono::{TimeZone, Utc};
 use fiber_core::{dag, path_filter, roles::ProjectRole, schedule, step_if};
