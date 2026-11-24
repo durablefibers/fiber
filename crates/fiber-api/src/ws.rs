@@ -292,6 +292,9 @@ async fn offer_for_step(state: &AppState, step: StepRun) -> Result<ServerMessage
         shell,
         secret_keys,
         traceparent: current_traceparent(),
+        // From the run row, like the secrets decision above: provenance is the run's,
+        // fixed when it started, and a retry of an untrusted run stays untrusted.
+        untrusted: run.untrusted,
     })
 }
 
@@ -1013,6 +1016,19 @@ async fn handle_agent(
                         "agent hello asked for more than its registration allows; registered with the allowed subset"
                     );
                 }
+                // Once per session, where an operator will see it; the scheduler's own
+                // note about each fill is at debug.
+                if project_id.is_some()
+                    && !fiber_scheduler::takes_untrusted_steps(project_id, protocol_version)
+                {
+                    warn!(
+                        %agent_id, %name, protocol_version,
+                        required = fiber_proto::UNTRUSTED_OFFER_PROTOCOL,
+                        "this project agent predates the untrusted-offer protocol and would run \
+                         a fork's pull request on its host; it will not be offered those steps, \
+                         which stay queued until an upgraded agent is online in the project's pool"
+                    );
+                }
                 state
                     .scheduler
                     .register_agent(
@@ -1020,6 +1036,7 @@ async fn handle_agent(
                         effective_labels,
                         effective_concurrency,
                         project_id,
+                        protocol_version,
                     )
                     .await;
                 // Re-bind connection under confirmed agent_id (same as token)
